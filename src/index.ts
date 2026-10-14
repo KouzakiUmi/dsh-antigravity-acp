@@ -104,10 +104,15 @@ export async function ensureAcpRuntime(
     handle.terminate()
     throw error
   }
-  // 子进程意外退出时同步关闭链接（在途请求按 AGY_LINK_CLOSED 拒绝）。
+  // 子进程意外退出：清掉 active 上的指向，否则下次 ensureAcpRuntime 会因
+  // `if (active.link) return active.link` 永久复用死链（S2 的姊妹场景）。
   void handle.done
     .catch(() => undefined)
-    .then(() => link.close())
+    .then(async () => {
+      if (active.link === link) active.link = undefined
+      if (active.handle === handle) active.handle = undefined
+      await link.close().catch(() => undefined)
+    })
   return link
 }
 

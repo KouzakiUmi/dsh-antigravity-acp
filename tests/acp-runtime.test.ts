@@ -159,3 +159,25 @@ describe('ensureAcpRuntime 失败清理（S2）', () => {
     expect(harness.spawns[0]?.terminated()).toBe(true)
   })
 })
+
+describe('ensureAcpRuntime 成功后子进程意外退出（R1）', () => {
+  it('子进程 done 后清空 active，下一次调用会全新 spawn 而不是复用死链', async () => {
+    const harness = await createRuntimeHarness((agent) => acceptHandshake(agent))
+    const first = await ensureAcpRuntime(harness.ctx, harness.config, handlers, harness.active)
+    expect(harness.spawns).toHaveLength(1)
+    expect(harness.active.link).toBe(first)
+
+    harness.spawns[0]?.crash()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(harness.active.link).toBeUndefined()
+    expect(harness.active.handle).toBeUndefined()
+
+    const second = await ensureAcpRuntime(harness.ctx, harness.config, handlers, harness.active)
+    expect(harness.spawns).toHaveLength(2)
+    expect(second).not.toBe(first)
+    expect(harness.active.link).toBe(second)
+    expect(harness.agents[1]?.requestsFor('initialize')).toHaveLength(1)
+  })
+})

@@ -9,7 +9,9 @@ DeepSeek Harness (DSH) host bundle：把 Google 官方 Antigravity ACP server
   并以 Agent Client Protocol v1（JSON-RPC over newline-delimited JSON）通信。
 - 本包通过 `src/index.ts` 向 `ctx.llm` 注册 provider `antigravity-acp`
   的 `LlmAdapter`。
-- 工具执行留在 DSH 侧（后续版本经 loopback MCP 桥接给官方 agent）。
+- 工具执行留在 DSH 侧：进程内私有 `127.0.0.1` loopback MCP 桥把当前
+  DSH 工具 schema 交给官方 agent；`tools/call` 被 park 后以 DSH
+  `tool-call` 结束本轮，下一轮带着 tool result 续同一 ACP prompt。
 
 安全边界（自动下载路径）：
 
@@ -19,7 +21,8 @@ DeepSeek Harness (DSH) host bundle：把 Google 官方 Antigravity ACP server
 - 下载先落临时文件，成功后原子重命名，失败清理残留。
 
 配置项：`binaryPath`（手动指定，优先级最高）、`autoDownload`（默认开启）、
-`extraArgs`、`acpVersion`、`requestTimeoutMs`。
+`extraArgs`、`acpVersion`、`requestTimeoutMs`、`authTimeoutMs`、
+`promptTimeoutMs`、`bridgeParkSettleMs`。
 环境变量：`AGY_ACP_BIN`（二进制覆盖）、`AGY_ACP_URL`（下载 URL 覆盖，
 供未验证平台组合使用）。
 

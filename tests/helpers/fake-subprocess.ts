@@ -16,8 +16,10 @@ export interface FakeAgentProcess {
   readonly handle: SubprocessHandle
   /** agent 侧消息级双向流；喂给 FakeAcpAgent 即可扮演官方 ACP server。 */
   readonly stream: Stream
-  /** 该进程是否已被 terminate()。 */
+  /** 该进程是否已被 terminate() 或模拟崩溃。 */
   terminated(): boolean
+  /** 模拟子进程自行退出（不经过被测代码的 terminate()）。 */
+  crash(): void
 }
 
 export interface FakeSubprocessHarness {
@@ -77,5 +79,8 @@ function createFakeAgentProcess(): FakeAgentProcess {
     Writable.toWeb(fromAgent) as WritableStream<Uint8Array>,
     Readable.toWeb(toAgent) as ReadableStream<Uint8Array>,
   )
-  return { handle, stream, terminated: () => terminated }
+  const crash = () => {
+    handle.terminate()
+  }
+  return { handle, stream, terminated: () => terminated, crash }
 }
