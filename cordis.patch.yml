@@ -1,0 +1,6 @@
+# 仅注册本 bundle 的 LLM adapter；不写入任何 agent-default-model row，
+# 用户的默认模型选择不受本插件影响。
+- insert:
+    - id: llm-antigravity-acp
+      name: dsh-bundle-antigravity-host
+      inject: [llm, subprocess]
