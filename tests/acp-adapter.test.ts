@@ -12,14 +12,15 @@ import {
   createSystemMessage,
   createToolResultMessage,
   createUserMessage,
+  resolveRetryPolicy,
   ToolCallId,
 } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, RequestMessage, StreamChunk, ToolSchema } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, SessionConfigOption } from '@agentclientprotocol/sdk'
-import { AntigravityAcpAdapter, AGY_PROVIDER_ID, AGY_UNSUPPORTED_OPTION, AGY_ADAPTER_ERROR } from '../src/adapter/antigravity-adapter.js'
+import { AntigravityAcpAdapter, AGY_PROVIDER_ID, AGY_PLACEHOLDER_MODEL_ID, AGY_UNSUPPORTED_OPTION, AGY_ADAPTER_ERROR } from '../src/adapter/antigravity-adapter.js'
 import { AGY_TURN_ERROR } from '../src/adapter/prompt-turn.js'
 import { AGY_BRIDGE_ERROR } from '../src/bridge/mcp-bridge.js'
-import { AgentLink } from '../src/protocol/agent-link.js'
+import { AgentLink, AGY_LINK_ERROR } from '../src/protocol/agent-link.js'
 import { AGY_CLIENT_CAPABILITIES } from '../src/index.js'
 import { parsePromptTranscript } from '../src/adapter/prompt-transcript.js'
 import { FakeAcpAgent, NO_REPLY } from './helpers/fake-acp-agent.js'
@@ -74,7 +75,15 @@ afterEach(async () => {
  * 组装「假 agent + adapter」。initialize / authenticate / session/new /
  * session/set_config_option 由假 agent 自动应答，session/prompt 留给测试脚本。
  */
-function createHarness(options: { parkSettleMs?: number; configOptions?: SessionConfigOption[] | null; promptTimeoutMs?: number } = {}): Harness {
+function createHarness(
+  options: {
+    parkSettleMs?: number
+    configOptions?: SessionConfigOption[] | null
+    promptTimeoutMs?: number
+    loadCachedCatalog?: () => Promise<{ id: string; name: string; description?: string }[] | undefined>
+    saveCatalog?: (models: readonly { id: string; name: string; description?: string }[]) => Promise<void> | void
+  } = {},
+): Harness {
   const agent = new FakeAcpAgent()
   let configOptions: SessionConfigOption[] | null = options.configOptions === undefined ? MODEL_CONFIG_OPTIONS : options.configOptions
   let sessionSeq = 0
@@ -114,6 +123,8 @@ function createHarness(options: { parkSettleMs?: number; configOptions?: Session
     },
     parkSettleMs: options.parkSettleMs ?? 15,
     promptTimeoutMs: options.promptTimeoutMs,
+    loadCachedCatalog: options.loadCachedCatalog,
+    saveCatalog: options.saveCatalog,
   })
   teardowns.push(async () => {
     await bridgeTeardown?.()
@@ -211,16 +222,161 @@ describe('模型目录来自 ACP 会话配置', () => {
     await streaming
 
     expect(harness.adapter.catalogObserved).toBe(true)
+    // 占位项始终排在首位且保留：用户多半在登录前就选了 server-default，
+    // 真实目录出现后把它挤掉会造成「当前模型不在列表里」的语义断裂。
     expect(await harness.adapter.listModels(AGY_PROVIDER_ID)).toEqual([
+      {
+        provider: AGY_PROVIDER_ID,
+        id: AGY_PLACEHOLDER_MODEL_ID,
+        name: 'Antigravity 默认（首次对话登录）',
+        description: '使用官方 ACP 会话的默认模型；第一次发消息时会下载/登录',
+        inputModalities: ['text'],
+      },
       { provider: AGY_PROVIDER_ID, id: 'gemini-3-pro', name: 'Gemini 3 Pro', description: '质量优先', inputModalities: ['text'] },
       { provider: AGY_PROVIDER_ID, id: 'gemini-3-flash', name: 'Gemini 3 Flash', inputModalities: ['text'] },
     ])
   })
 
-  it('listModels 不为列目录启动运行时（未观测时返回空目录，且零 ACP 交互）', async () => {
+  it('listModels 不为列目录启动运行时（未观测时广告占位模型，且零 ACP 交互）', async () => {
     const harness = createHarness()
-    expect(await harness.adapter.listModels(AGY_PROVIDER_ID)).toEqual([])
+    expect(await harness.adapter.listModels(AGY_PROVIDER_ID)).toEqual([
+      {
+        provider: AGY_PROVIDER_ID,
+        id: AGY_PLACEHOLDER_MODEL_ID,
+        name: 'Antigravity 默认（首次对话登录）',
+        description: '使用官方 ACP 会话的默认模型；第一次发消息时会下载/登录',
+        inputModalities: ['text'],
+      },
+    ])
     expect(harness.agent.requests).toHaveLength(0)
+  })
+
+  it('未观测到真实目录时用磁盘缓存兜住模型选择器，且仍零 ACP 交互', async () => {
+    const reads: number[] = []
+    const harness = createHarness({
+      loadCachedCatalog: async () => {
+        reads.push(1)
+        return [{ id: 'gemini-3-flash-cached', name: 'Gemini 3 Flash (缓存)', description: '上次会话观测到' }]
+      },
+    })
+    const models = await harness.adapter.listModels(AGY_PROVIDER_ID)
+    expect(models[0]?.id).toBe(AGY_PLACEHOLDER_MODEL_ID)
+    expect(models[1]).toEqual({
+      provider: AGY_PROVIDER_ID,
+      id: 'gemini-3-flash-cached',
+      name: 'Gemini 3 Flash (缓存)',
+      description: '上次会话观测到',
+      inputModalities: ['text'],
+    })
+    // 缓存是纯本地读取，绝不因此启动运行时。
+    expect(harness.agent.requests).toHaveLength(0)
+    // 只读一次，后续列目录不再碰文件系统。
+    await harness.adapter.listModels(AGY_PROVIDER_ID)
+    expect(reads).toHaveLength(1)
+  })
+
+  it('缓存读取抛错时静默降级为只留占位模型', async () => {
+    const harness = createHarness({
+      loadCachedCatalog: async () => {
+        throw new Error('cache unreadable')
+      },
+    })
+    const models = await harness.adapter.listModels(AGY_PROVIDER_ID)
+    expect(models).toHaveLength(1)
+    expect(models[0]?.id).toBe(AGY_PLACEHOLDER_MODEL_ID)
+  })
+
+  it('观测到真实目录后写入缓存，且写入失败不影响本轮', async () => {
+    const saved: { id: string; name: string; description?: string }[][] = []
+    const harness = createHarness({
+      saveCatalog: (models) => {
+        saved.push([...models])
+        return Promise.reject(new Error('disk full'))
+      },
+    })
+    const streaming = collect(harness.adapter.stream(baseOptions()))
+    await waitForRequest(harness.agent, 'session/prompt')
+    await harness.agent.reply('session/prompt', { stopReason: 'end_turn' })
+    await streaming
+
+    expect(saved).toHaveLength(1)
+    expect(saved[0]?.map((entry) => entry.id)).toEqual(['gemini-3-pro', 'gemini-3-flash'])
+    expect(JSON.stringify(saved[0])).not.toMatch(/token|secret|oauth/i)
+  })
+
+  it('未观测到 model 选择器时不写缓存', () => {
+    const saved: unknown[] = []
+    const harness = createHarness({
+      saveCatalog: (models) => {
+        saved.push(models)
+      },
+    })
+    // 只有 boolean 配置项 → findModelSelector 返回 undefined，不产生可缓存目录。
+    harness.adapter.observeSessionConfigOptions([
+      { id: 'thought', type: 'boolean', name: 'Deep Thinking', currentValue: false },
+    ])
+    expect(saved).toHaveLength(0)
+  })
+
+  it('providerRetryPolicy 不声明任何可重试失败码（整步重放会重复 spawn/OAuth/工具调用）', () => {
+    const harness = createHarness()
+    // 刻意 undefined：宿主默认词表不含任何 AGY_*，语义与显式空集一致，但更诚实。
+    expect(harness.adapter.providerRetryPolicy(AGY_PROVIDER_ID)).toBeUndefined()
+  })
+
+  it('我们抛出的失败码与宿主默认重试词表无交集（「返回 undefined 就不重试」的前提）', () => {
+    // 宿主在 providerRetryPolicy() ?? resolveRetryPolicy(undefined) 处装上的默认政策。
+    const defaults = resolveRetryPolicy(undefined, 'test.defaults')
+    const hostCodes = defaults.mode === 'normal' ? [...defaults.retryableCodes] : []
+    const agyCodes = [
+      ...Object.values(AGY_LINK_ERROR),
+      ...Object.values(AGY_ADAPTER_ERROR),
+      ...Object.values(AGY_TURN_ERROR),
+      ...Object.values(AGY_BRIDGE_ERROR),
+      'AGY_INVALID_PROXY',
+    ]
+    for (const code of agyCodes) {
+      expect(code.startsWith('AGY_')).toBe(true)
+      expect(hostCodes).not.toContain(code)
+    }
+  })
+
+  it('占位 id 与官方目录同名时去重，选择器不出现重复条目', async () => {
+    const harness = createHarness({
+      configOptions: [
+        {
+          id: 'model',
+          type: 'select',
+          name: 'Model',
+          category: 'model',
+          currentValue: AGY_PLACEHOLDER_MODEL_ID,
+          options: [{ value: AGY_PLACEHOLDER_MODEL_ID, name: 'Server Default' }, { value: 'gemini-3-flash', name: 'Gemini 3 Flash' }],
+        },
+      ],
+    })
+    harness.adapter.observeSessionConfigOptions([
+      {
+        id: 'model',
+        type: 'select',
+        name: 'Model',
+        category: 'model',
+        currentValue: AGY_PLACEHOLDER_MODEL_ID,
+        options: [{ value: AGY_PLACEHOLDER_MODEL_ID, name: 'Server Default' }, { value: 'gemini-3-flash', name: 'Gemini 3 Flash' }],
+      },
+    ])
+    const models = await harness.adapter.listModels(AGY_PROVIDER_ID)
+    const ids = models.map((model) => model.id)
+    expect(ids).toEqual([AGY_PLACEHOLDER_MODEL_ID, 'gemini-3-flash'])
+    expect(new Set(ids).size).toBe(ids.length)
+  })
+
+  it('占位模型不调用 session/set_config_option，沿用会话默认', async () => {
+    const harness = createHarness()
+    const streaming = collect(harness.adapter.stream(baseOptions({ model: AGY_PLACEHOLDER_MODEL_ID })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    expect(harness.agent.requestsFor('session/set_config_option')).toHaveLength(0)
+    await harness.agent.reply('session/prompt', { stopReason: 'end_turn' })
+    await streaming
   })
 
   it('非默认模型经 session/set_config_option 写入会话', async () => {
@@ -252,6 +408,13 @@ describe('模型目录来自 ACP 会话配置', () => {
     await harness.agent.reply('session/prompt', { stopReason: 'end_turn' })
     await streaming
     expect(await harness.adapter.listModels(AGY_PROVIDER_ID)).toEqual([
+      {
+        provider: AGY_PROVIDER_ID,
+        id: AGY_PLACEHOLDER_MODEL_ID,
+        name: 'Antigravity 默认（首次对话登录）',
+        description: '使用官方 ACP 会话的默认模型；第一次发消息时会下载/登录',
+        inputModalities: ['text'],
+      },
       { provider: AGY_PROVIDER_ID, id: 'gemini-3-flash', name: 'Gemini 3 Flash', inputModalities: ['text'] },
     ])
   })

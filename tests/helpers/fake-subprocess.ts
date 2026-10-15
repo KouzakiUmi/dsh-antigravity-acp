@@ -20,6 +20,12 @@ export interface FakeAgentProcess {
   terminated(): boolean
   /** 模拟子进程自行退出（不经过被测代码的 terminate()）。 */
   crash(): void
+  /**
+   * 追加 stderr 文本，模拟官方进程把诊断打到 stderr。
+   * 生产代码在 collect 模式下读 `handle.collected.stderr.readFrom(0)`，没有这个
+   * 能力的话脱敏逻辑在全部用例里恒读到空串，等于零覆盖。
+   */
+  writeStderr(text: string): void
 }
 
 export interface FakeSubprocessHarness {
@@ -51,6 +57,18 @@ function createFakeAgentProcess(): FakeAgentProcess {
   // agent 写入的字节经 fromAgent 流向 client。
   const toAgent = new PassThrough()
   const fromAgent = new PassThrough()
+  // collect 模式的 stderr 缓冲：与 dsh-subprocess 的 SubprocessOutputRead 形状对齐
+  // （{ text, nextOffset, lossy, spillPath? }），避免以后读这些字段时出现假绿。
+  let stderrBuffer = ''
+  const collected = {
+    stderr: {
+      readFrom: (offset: number) => ({
+        text: stderrBuffer.slice(offset),
+        nextOffset: stderrBuffer.length,
+        lossy: false,
+      }),
+    },
+  }
   let terminated = false
   let resolveExit: ((outcome: SubprocessOutcome) => void) | undefined
   const done = new Promise<SubprocessOutcome>((resolve) => {
@@ -61,7 +79,7 @@ function createFakeAgentProcess(): FakeAgentProcess {
     stdout: fromAgent,
     stderr: undefined,
     control: undefined,
-    collected: {},
+    collected,
     done,
     terminate: () => {
       if (terminated) return
@@ -82,5 +100,8 @@ function createFakeAgentProcess(): FakeAgentProcess {
   const crash = () => {
     handle.terminate()
   }
-  return { handle, stream, terminated: () => terminated, crash }
+  const writeStderr = (text: string) => {
+    stderrBuffer += text
+  }
+  return { handle, stream, terminated: () => terminated, crash, writeStderr }
 }

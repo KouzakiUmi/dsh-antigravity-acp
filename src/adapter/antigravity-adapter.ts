@@ -35,6 +35,13 @@ import { PromptTurn } from './prompt-turn.js'
 export const AGY_PROVIDER_ID = 'antigravity-acp'
 
 /**
+ * GUI 冷启动占位模型。DSH 模型选择器会丢掉 `options.length === 0` 的 provider
+ * 分组，因此未观测 ACP 会话前必须至少广告一条目录，否则设置页看不到本路由。
+ * 选中该 id 时不调用 session/set_config_option，沿用官方会话默认模型。
+ */
+export const AGY_PLACEHOLDER_MODEL_ID = 'server-default'
+
+/**
  * 不支持项的机器错误码。dsh-llm 0.2.1-alpha.2 的 `error.d.ts` 未导出
  * `UNSUPPORTED_OPTION` 常量，故使用字面量并集中在此定义。
  */
@@ -64,7 +71,41 @@ export interface AntigravityAcpAdapterOptions {
   parkSettleMs?: number
   /** session/new 使用的工作目录；缺省为进程 cwd。 */
   cwd?: string
+  /** 占位模型 server-default 映射到的官方模型 id；空则沿用会话默认。 */
+  preferredModel?: string
+  /**
+   * 冷启动目录读取（磁盘缓存）。返回 undefined 表示没有可用缓存；**不得**抛错。
+   * 元数据方法不得触网，因此这里只能读本地文件。
+   */
+  loadCachedCatalog?: () => Promise<CachedModel[] | undefined>
+  /** 观测到真实目录后的落盘回调；失败由实现方自行吞掉。 */
+  saveCatalog?: (models: readonly CachedModel[]) => Promise<void> | void
 }
+
+/** 目录缓存条目（只含模型元数据，不含任何凭据）。 */
+export interface CachedModel {
+  id: string
+  name: string
+  description?: string
+}
+
+/*
+ * 关于失败重试：**刻意不 override `providerRetryPolicy`**。
+ *
+ * 宿主若消费该策略（可选的 dsh-llm-retry 插件）在 failed-step 上会**整步重放**
+ * `stream()`。而本 adapter 的每一类失败都不可安全重放：
+ * - 握手失败 / 链路断开 → 重放等于重新 spawn 一条官方进程；
+ * - 认证超时（`AGY_AUTH_TIMEOUT`）→ 重放等于重新弹一次 Google 登录；
+ * - `session/prompt` 超时（`AGY_REQUEST_TIMEOUT`）→ 官方 agent 可能已经产出内容或
+ *   已发起工具调用，重放会新建会话并重放全部历史，造成重复内容与重复工具调用。
+ *
+ * 默认词表（`EMPTY_RESPONSE` / `RATE_LIMIT` / `SERVER` / `TIMEOUT` / `TRANSPORT`）
+ * 本 adapter 一个都不会抛：宿主在 `providerRetryPolicy() ?? resolveRetryPolicy(undefined)`
+ * 处装上的默认政策因此对本 provider 不生效。这里的前提是「我们抛的码一律带
+ * `AGY_` 前缀」，该前提由 `tests/acp-adapter.test.ts` 的「失败码与宿主默认重试
+ * 词表无交集」用例锁住——若将来 dsh-llm 把某个 AGY_ 码加进默认词表，测试会红。
+ * 真正需要重试语义时，应针对单类失败单独引入可证明幂等的路径，而不是整步重放。
+ */
 
 const DEFAULT_PROMPT_TIMEOUT_MS = 30 * 60_000
 const DEFAULT_PARK_SETTLE_MS = 50
@@ -75,6 +116,9 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   readonly #promptTimeoutMs: number
   readonly #parkSettleMs: number
   readonly #cwd: string
+  readonly #preferredModel: string
+  readonly #loadCachedCatalog?: AntigravityAcpAdapterOptions['loadCachedCatalog']
+  readonly #saveCatalog?: AntigravityAcpAdapterOptions['saveCatalog']
   readonly #bridge: McpToolBridge
   /** 身份稳定的 ACP 事件处理器：AgentLink 只在构造时取一次 handlers。 */
   readonly #handlers: AgentLinkHandlers
@@ -90,6 +134,8 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   #modelSelector: ModelSelector | undefined
   /** 模型目录的观察来源，用于列表页在真实会话之前就能给出缓存目录。 */
   #catalogObserved = false
+  /** 目录缓存的惰性读取结果（只读一次）。 */
+  #cacheLoad?: Promise<LlmModelInfo[]>
 
   constructor(options: AntigravityAcpAdapterOptions) {
     super()
@@ -98,6 +144,9 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     this.#promptTimeoutMs = options.promptTimeoutMs ?? DEFAULT_PROMPT_TIMEOUT_MS
     this.#parkSettleMs = options.parkSettleMs ?? DEFAULT_PARK_SETTLE_MS
     this.#cwd = options.cwd ?? process.cwd()
+    this.#preferredModel = options.preferredModel?.trim() ?? ''
+    this.#loadCachedCatalog = options.loadCachedCatalog
+    this.#saveCatalog = options.saveCatalog
     this.#bridge = new McpToolBridge()
     this.#registerBridgeTeardown(async () => {
       this.#releaseTurnSubscription()
@@ -130,11 +179,60 @@ export class AntigravityAcpAdapter extends LlmAdapter {
    * 「无副作用即可读到模型目录」的方法；而启动运行时必然走
    * `authenticate`（官方进程会自行弹浏览器）。
    *
-   * 因此本实现在无目录时返回空目录：真实目录会在第一次 `stream` 建立会话
-   * 后由 `observeSessionConfigOptions` 写入缓存（GUI 侧的目录刷新会读到它）。
+   * 因此本实现在无真实目录时广告一条占位模型（见 AGY_PLACEHOLDER_MODEL_ID），
+   * 让 GUI 能选出本 provider；真实目录会在第一次 `stream` 建立会话后由
+   * `observeSessionConfigOptions` 写入缓存。
+   */
+  /**
+   * 本 provider 的模型目录：占位项恒在首位，其余为观测到（或缓存）的官方目录。
+   * 官方目录里若也出现与占位同名的 id 会被去重，避免选择器出现重复条目。
    */
   override async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
-    return this.#catalog.map((model) => ({ ...model }))
+    const placeholder: LlmModelInfo = {
+      provider: _provider,
+      id: AGY_PLACEHOLDER_MODEL_ID,
+      name: 'Antigravity 默认（首次对话登录）',
+      description: '使用官方 ACP 会话的默认模型；第一次发消息时会下载/登录',
+      inputModalities: ['text'],
+    }
+    // 未观测到真实目录时用磁盘缓存兜住选择器空窗。
+    const source = this.#catalog.length > 0
+      ? this.#catalog
+      : await this.#cachedModels(_provider)
+    const rest = source.filter((model) => model.id !== AGY_PLACEHOLDER_MODEL_ID)
+      .map((model) => ({ ...model }))
+    return [placeholder, ...rest]
+  }
+
+  /** 读一次目录缓存（结果记忆在实例上，避免每次列目录都碰文件系统）。 */
+  async #cachedModels(provider: string): Promise<LlmModelInfo[]> {
+    this.#cacheLoad ??= (async () => {
+      if (!this.#loadCachedCatalog) return []
+      try {
+        const rows = await this.#loadCachedCatalog()
+        if (!rows || rows.length === 0) return []
+        return rows.map((row) => {
+          const entry: LlmModelInfo = { provider, id: row.id, name: row.name, inputModalities: ['text'] }
+          return row.description === undefined ? entry : { ...entry, description: row.description }
+        })
+      } catch {
+        // 缓存读不出来不是错误，退回占位即可。
+        return []
+      }
+    })()
+    return this.#cacheLoad
+  }
+
+  /**
+   * 本 provider **不声明**任何可重试失败码：宿主若整步重放 `stream()`，握手失败会
+   * 重复 spawn、认证超时会重复弹登录、prompt 超时会重放全部历史与工具调用。详见
+   * 文件里「关于失败重试」的说明。
+   *
+   * 注意返回 `undefined` 会让宿主装上自己的默认政策；它对本 provider 不生效的
+   * 前提（我们只抛 `AGY_` 前缀码）由测试锁住，不是靠这里的注释维持。
+   */
+  override providerRetryPolicy(_provider: string) {
+    return undefined
   }
 
   /**
@@ -319,6 +417,18 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     this.#catalogObserved = true
     this.#modelSelector = selector
     this.#catalog = toModelCatalog(AGY_PROVIDER_ID, selector)
+    // 观测到真实目录后缓存不再参与 listModels，避免配置变更后仍读到旧磁盘目录。
+    this.#cacheLoad = undefined
+    // 真实目录只在会话建立后才能观测到；落盘后重启不必退化成占位模型。
+    // 写入失败与并发写冲突都无所谓：缓存是优化，不是功能。
+    if (selector && this.#saveCatalog) {
+      const payload = this.#catalog.map((model) => (
+        model.description === undefined
+          ? { id: model.id, name: model.name }
+          : { id: model.id, name: model.name, description: model.description }
+      ))
+      void Promise.resolve(this.#saveCatalog(payload)).catch(() => undefined)
+    }
   }
 
   /** 是否已经从真实 ACP 会话观测到过配置（listModels 空目录时的诊断依据）。 */
@@ -334,6 +444,8 @@ export class AntigravityAcpAdapter extends LlmAdapter {
    * 不携带 configOptions，没有「new 之前设置」的通道）。
    */
   async #applyModelSelection(link: AgentLink, sessionId: string, model: string): Promise<void> {
+    const requested = model === AGY_PLACEHOLDER_MODEL_ID ? this.#preferredModel : model
+    if (!requested) return
     const selector = this.#modelSelector
     if (!selector) {
       throw new LlmError(
@@ -341,10 +453,10 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         AGY_ADAPTER_ERROR.NO_MODEL_SELECTOR,
       )
     }
-    if (selector.currentValue === model) return
+    if (selector.currentValue === requested) return
     // 目录成员资格按 dsh-llm 语义是建议性的：未登记的 id 仍然照发，由 ACP
     // agent 自己判定是否接受，而不是在这里静默改写成别的模型。
-    const response = await link.setConfigOption({ sessionId, configId: selector.configId, value: model })
+    const response = await link.setConfigOption({ sessionId, configId: selector.configId, value: requested })
     this.observeSessionConfigOptions(response.configOptions)
   }
 }

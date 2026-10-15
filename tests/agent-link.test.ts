@@ -5,7 +5,7 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AnyMessage } from '@agentclientprotocol/sdk'
-import { AgentLink, AGY_LINK_ERROR, AgentLinkError, OAUTH_PERSONAL_AUTH_METHOD, agentStreamFromSubprocess } from '../src/protocol/agent-link.js'
+import { AgentLink, AGY_LINK_ERROR, AgentLinkError, OAUTH_PERSONAL_AUTH_METHOD, agentStreamFromSubprocess, launchAcpAgent, officialAgentEnv } from '../src/protocol/agent-link.js'
 import type { Stream } from '@agentclientprotocol/sdk'
 
 /** client 侧 Stream 与 fake agent 侧读写端的交叉连接。 */
@@ -160,8 +160,10 @@ describe('AgentLink 超时与取消', () => {
     const link = new AgentLink({ stream: pair.stream, requestTimeoutMs: 10, authTimeoutMs: 40 })
     link.start()
     await link.initialize()
+    // 认证超时用独立错误码：它与普通请求超时的可重放性完全不同（重放等于重新
+    // spawn 并重新弹登录），必须能在上层被区分。
     await expect(link.authenticate()).rejects.toMatchObject({
-      code: AGY_LINK_ERROR.REQUEST_TIMEOUT,
+      code: AGY_LINK_ERROR.AUTH_TIMEOUT,
       message: expect.stringContaining('40ms'),
     })
     await link.close()
@@ -333,5 +335,97 @@ describe('AgentLink 关闭语义', () => {
     expect(() => agentStreamFromSubprocess({ stdin: undefined, stdout: undefined, stderr: undefined, control: undefined, collected: {}, done: Promise.resolve({ exitCode: 0, signal: null }), terminate: () => undefined, waitForExit: async () => true } as never)).toThrowError(
       expect.objectContaining({ code: AGY_LINK_ERROR.LAUNCH_FAILED }),
     )
+  })
+})
+
+describe('launchAcpAgent', () => {
+  it('默认把 cwd 和 PATH 设为官方二进制所在目录', () => {
+    const specs: unknown[] = []
+    const subprocess = {
+      spawn: (spec: unknown) => {
+        specs.push(spec)
+        return {
+          stdin: undefined,
+          stdout: undefined,
+          collected: {},
+          done: Promise.resolve({ exitCode: 0, signal: null }),
+          terminate: () => undefined,
+        }
+      },
+    }
+    const exe = process.platform === 'win32' ? 'D:\\cache\\agy_acp_server.exe' : '/cache/agy_acp_server.exe'
+    launchAcpAgent(subprocess as never, { executable: exe, tmpDir: 'D:\\tmp\\agy' })
+    expect(specs).toHaveLength(1)
+    const spec = specs[0] as { cwd: string; env: { PATH: string; TEMP: string; TMP: string }; argv: string[] }
+    expect(spec.argv[0]).toBe(exe)
+    expect(spec.cwd.toLowerCase()).toBe(process.platform === 'win32' ? 'd:\\cache' : '/cache')
+    expect(spec.env.PATH.toLowerCase().startsWith(spec.cwd.toLowerCase())).toBe(true)
+    expect(spec.env.TEMP).toBe('D:\\tmp\\agy')
+    expect(spec.env.TMP).toBe('D:\\tmp\\agy')
+  })
+
+  it('officialAgentEnv 为 PyInstaller 强制写入可写 TEMP/TMP', () => {
+    const env = officialAgentEnv({
+      binaryDir: 'D:\\bin',
+      tmpDir: 'D:\\tmp\\agy',
+      parent: { PATH: 'C:\\Windows\\System32', USERPROFILE: 'C:\\Users\\x', SystemRoot: 'C:\\Windows' },
+    })
+    expect(env.TEMP).toBe('D:\\tmp\\agy')
+    expect(env.TMP).toBe('D:\\tmp\\agy')
+    expect(env.TMPDIR).toBe('D:\\tmp\\agy')
+    expect(env.USERPROFILE).toBe('C:\\Users\\x')
+    expect(env.SystemRoot).toBe('C:\\Windows')
+  })
+
+  it('officialAgentEnv 未配置代理时不注入任何 *_PROXY 变量', () => {
+    const env = officialAgentEnv({ binaryDir: 'D:\\bin', tmpDir: 'D:\\tmp\\agy', parent: {} })
+    expect(Object.keys(env).filter((key) => key.toLowerCase().includes('proxy'))).toEqual([])
+  })
+
+  it('officialAgentEnv 把代理写入大小写两套变量，loopback 始终绕过', () => {
+    const env = officialAgentEnv({
+      binaryDir: 'D:\\bin',
+      tmpDir: 'D:\\tmp\\agy',
+      proxy: { url: '127.0.0.1:7890' },
+      parent: { HTTP_PROXY: 'http://stale:1' },
+    })
+    expect(env.HTTPS_PROXY).toBe('http://127.0.0.1:7890')
+    expect(env.https_proxy).toBe('http://127.0.0.1:7890')
+    expect(env.NO_PROXY).toBe('localhost,127.0.0.1,::1')
+    expect(env.TEMP).toBe('D:\\tmp\\agy')
+  })
+
+  it('launchAcpAgent 把代理透传给子进程 env', () => {
+    const specs: unknown[] = []
+    const subprocess = {
+      spawn: (spec: unknown) => {
+        specs.push(spec)
+        return { stdin: {}, stdout: {}, collected: { stderr: { readFrom: () => ({ text: '' }) } }, terminate: () => undefined }
+      },
+    }
+    launchAcpAgent(subprocess as never, {
+      executable: process.platform === 'win32' ? 'D:\\cache\\agy_acp_server.exe' : '/cache/agy_acp_server.exe',
+      tmpDir: 'D:\\tmp\\agy',
+      proxy: { url: 'http://127.0.0.1:7890', bypass: '10.0.0.0/8' },
+    })
+    const spec = specs[0] as { env: Record<string, string> }
+    expect(spec.env.HTTPS_PROXY).toBe('http://127.0.0.1:7890')
+    expect(spec.env.NO_PROXY).toBe('10.0.0.0/8,localhost,127.0.0.1,::1')
+  })
+
+  it('代理地址非法时 launchAcpAgent 就地抛出，不 spawn', () => {
+    let spawned = false
+    const subprocess = {
+      spawn: () => {
+        spawned = true
+        return { stdin: {}, stdout: {}, terminate: () => undefined }
+      },
+    }
+    expect(() => launchAcpAgent(subprocess as never, {
+      executable: process.platform === 'win32' ? 'D:\\cache\\agy_acp_server.exe' : '/cache/agy_acp_server.exe',
+      tmpDir: 'D:\\tmp\\agy',
+      proxy: { url: 'ftp://127.0.0.1:21' },
+    })).toThrow()
+    expect(spawned).toBe(false)
   })
 })

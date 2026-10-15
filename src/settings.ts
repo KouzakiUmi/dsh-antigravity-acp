@@ -25,6 +25,21 @@ export interface AntigravityHostConfig {
   promptTimeoutMs?: number
   /** 并发 MCP tools/call 的聚合窗口（毫秒），决定同一轮携带多少 tool-call block。 */
   bridgeParkSettleMs?: number
+  /**
+   * 首选官方模型 id。选择器里的 server-default 占位会映射到此值；
+   * 留空则沿用官方会话默认模型。
+   */
+  preferredModel?: string
+  /**
+   * 官方进程出网代理（如 http://127.0.0.1:7890）。留空表示直连；
+   * 填入后同时注入大小写两套 *_PROXY 与 NO_PROXY。
+   */
+  proxyUrl?: string
+  /**
+   * 代理排除列表（逗号分隔）。localhost/127.0.0.1/::1 始终自动排除，
+   * 因为私有 MCP 桥与 OAuth 回调都在 loopback 上。
+   */
+  proxyBypass?: string
 }
 
 export const Config = Schema.object({
@@ -36,4 +51,7 @@ export const Config = Schema.object({
   authTimeoutMs: Schema.natural().default(300_000).description('authenticate（需人工在浏览器完成 OAuth 授权）的等待上限（毫秒）'),
   promptTimeoutMs: Schema.natural().default(1_800_000).description('单轮 session/prompt 的等待上限（毫秒）'),
   bridgeParkSettleMs: Schema.natural().default(50).description('并发 MCP tools/call 的聚合窗口（毫秒）'),
+  preferredModel: Schema.string().description('首选官方模型 id（如 gemini-3.8-flash-high）。选择器占位 server-default 会映射到此值；留空则用官方默认'),
+  proxyUrl: Schema.string().description('官方进程出网代理，如 http://127.0.0.1:7890（缺 scheme 按 http 处理）。留空则直连'),
+  proxyBypass: Schema.string().description('代理排除列表，逗号分隔，如 10.0.0.0/8,*.internal。localhost/127.0.0.1/::1 始终自动排除'),
 })

@@ -10,6 +10,7 @@
  * 进程启动不在此文件内触碰 child_process：stdio 通道由调用方注入
  * （生产路径经宿主注入的 ctx.subprocess，测试路径注入 fake 双向流）。
  */
+import { dirname, delimiter } from 'node:path'
 import { Writable, Readable } from 'node:stream'
 import { PROTOCOL_VERSION, ndJsonStream } from '@agentclientprotocol/sdk'
 import type {
@@ -36,6 +37,8 @@ import type {
   Stream,
 } from '@agentclientprotocol/sdk'
 import type { SubprocessHandle, SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
+import { buildProxyEnv } from '../runtime/proxy-env.js'
+import type { ProxySettings } from '../runtime/proxy-env.js'
 
 /** 本包原创协议层错误码（AGY_* 前缀命名体系）。 */
 export const AGY_LINK_ERROR = {
@@ -45,6 +48,8 @@ export const AGY_LINK_ERROR = {
   HANDSHAKE_TIMEOUT: 'AGY_HANDSHAKE_TIMEOUT',
   /** 普通请求等待响应超时。 */
   REQUEST_TIMEOUT: 'AGY_REQUEST_TIMEOUT',
+  /** authenticate 等待人工授权超时（与普通请求超时区分，便于诊断与重试策略）。 */
+  AUTH_TIMEOUT: 'AGY_AUTH_TIMEOUT',
   /** 链接已关闭后再发起请求，或链接对端断开。 */
   LINK_CLOSED: 'AGY_LINK_CLOSED',
   /** 收到无法路由/结构非法的消息。 */
@@ -362,11 +367,26 @@ export class AgentLink {
    * 认证；默认官方 personal OAuth 方法。
    *
    * 走**独立的** `authTimeoutMs`（默认 5 分钟）：该流程要人工在浏览器里完成
-   * 授权，用普通请求的 30s 超时会在用户还没点完就判死。其余控制流不变。
+   * 授权，用普通请求的 30s 超时会在用户还没点完就判死。
+   *
+   * 超时被改写成 `AGY_AUTH_TIMEOUT` 而不是通用的 `AGY_REQUEST_TIMEOUT`：认证超时
+   * 之后重放请求等于重新 spawn 一次官方进程并重新弹一次登录，**不可重试**，必须
+   * 与普通请求超时在错误码上分开。
    */
   async authenticate(methodId: AuthMethodId = OAUTH_PERSONAL_AUTH_METHOD): Promise<AuthenticateResponse> {
     this.#requireInitialized('authenticate')
-    return this.request<AuthenticateResponse>('authenticate', { methodId }, { timeoutMs: this.#authTimeoutMs })
+    try {
+      return await this.request<AuthenticateResponse>('authenticate', { methodId }, { timeoutMs: this.#authTimeoutMs })
+    } catch (error) {
+      if (error instanceof AgentLinkError && error.code === AGY_LINK_ERROR.REQUEST_TIMEOUT) {
+        throw new AgentLinkError(
+          AGY_LINK_ERROR.AUTH_TIMEOUT,
+          `ACP authenticate 超时（${this.#authTimeoutMs}ms）：等待人工完成授权未果`,
+          { cause: error },
+        )
+      }
+      throw error
+    }
   }
 
   /** 创建会话并保存会话 id。 */
@@ -437,14 +457,76 @@ export function agentStreamFromSubprocess(handle: SubprocessHandle): Stream {
   return ndJsonStream(stdinWeb, stdoutWeb)
 }
 
+/**
+ * PyInstaller 冻结的官方 exe 需要可写 TEMP。DSH subprocess 会 scrub 父环境，
+ * 只显式传入的键会保留；若不转发 TMP/TEMP，bootloader 报
+ * `[PYI-…:ERROR] Could not create temporary directory!` 后立刻退出。
+ */
+export function officialAgentEnv(options: {
+  binaryDir: string
+  tmpDir: string
+  /** 出网代理；留空则不注入任何代理变量（官方进程直连）。 */
+  proxy?: ProxySettings | undefined
+  parent?: NodeJS.ProcessEnv
+}): NodeJS.ProcessEnv {
+  const parent = options.parent ?? process.env
+  const pathPrefix = `${options.binaryDir}${delimiter}`
+  const parentPath = parent.PATH ?? ''
+  const env: NodeJS.ProcessEnv = {
+    PATH: parentPath.startsWith(pathPrefix) ? parentPath : `${pathPrefix}${parentPath}`,
+    TEMP: options.tmpDir,
+    TMP: options.tmpDir,
+    TMPDIR: options.tmpDir,
+  }
+  const forward = [
+    'USERPROFILE',
+    'HOME',
+    'HOMEDRIVE',
+    'HOMEPATH',
+    'LOCALAPPDATA',
+    'APPDATA',
+    'USERNAME',
+    'USERDOMAIN',
+    'SystemRoot',
+    'SYSTEMROOT',
+    'windir',
+    'WINDIR',
+    'ComSpec',
+    'COMSPEC',
+    'PATHEXT',
+    'SystemDrive',
+  ] as const
+  for (const key of forward) {
+    const value = parent[key]
+    if (value) env[key] = value
+  }
+  if (!env.SystemRoot && process.platform === 'win32') env.SystemRoot = 'C:\\Windows'
+  // 代理放在最后合并：用户配置优先于上面前向的任何同名键。
+  Object.assign(env, buildProxyEnv(options.proxy))
+  return env
+}
+
 /** 经 ctx.subprocess 启动官方 ACP server（本文件不触碰 child_process）。 */
 export function launchAcpAgent(
   subprocess: SubprocessRuntime,
-  options: { executable: string; extraArgs?: readonly string[]; cwd: string; signal?: AbortSignal },
+  options: {
+    executable: string
+    extraArgs?: readonly string[]
+    cwd?: string
+    tmpDir: string
+    proxy?: ProxySettings | undefined
+    signal?: AbortSignal
+  },
 ): SubprocessHandle {
+  const executable = options.executable
+  const binaryDir = dirname(executable)
+  // 官方 zip 带 sibling（如 localharness_external.exe）。cwd 必须是二进制目录，
+  // 否则 Windows 上进程立刻退出，stdout EOF，上层只会看到「ACP 链路已关闭」。
+  const cwd = options.cwd ?? binaryDir
   return subprocess.spawn({
-    argv: [options.executable, ...(options.extraArgs ?? [])],
-    cwd: options.cwd,
+    argv: [executable, ...(options.extraArgs ?? [])],
+    cwd,
+    env: officialAgentEnv({ binaryDir, tmpDir: options.tmpDir, proxy: options.proxy }),
     stdio: { stdin: 'pipe', stdout: 'pipe', stderr: { maxBytes: 64 * 1024 } },
     graceMs: 5_000,
     signal: options.signal,
