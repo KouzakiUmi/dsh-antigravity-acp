@@ -310,7 +310,18 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
   // 官方 agy CLI 的只读取数通道（额度 /usage 与模型清单 models）。2026-10-16
   // 用户授权「不 wrap agy CLI」**仅限只读取数用途**：只跑这两个只读命令，
   // 不发对话、不写文件。子进程一律经 ctx.subprocess。
-  const cliRun = createSubprocessCliRun(ctx.subprocess)
+  //
+  // 代理规则与官方 ACP 进程一致：**配置的 proxyUrl 优先，其次宿主环境自身导出的
+  // 代理**。CLI 每次启动都会做登录/配置刷新，缺代理会一直挂在网络上（实测），
+  // 表现为额度药丸永远停在「额度…」。地址非法时这里不报错——首次启动 ACP 链路时
+  // 会以 AGY_INVALID_PROXY 明确失败。
+  let cliProxy: ResolvedProxy | undefined
+  try {
+    cliProxy = resolveProxy({ url: config.proxyUrl, bypass: config.proxyBypass })
+  } catch {
+    cliProxy = undefined
+  }
+  const cliRun = createSubprocessCliRun(ctx.subprocess, cliProxy)
   const cliPath = agyCliCandidates().find((candidate) => existsSync(candidate))
 
   /**
@@ -348,6 +359,12 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
     saveCatalog: (models) => writeCachedCatalog({ cacheDir, acpVersion, models }),
     // 官方清单补齐会话观测之外的型号（Opus 5.5 / Sonnet 5.5 / Argon 等）。
     loadCliCatalog: () => loadCliModels(),
+    // 自诊断：模型路由与 set_config_option 失败会写进宿主日志（宿主对 typert /
+    // 适配器内部一律不记日志，出问题时这是唯一的现场）。
+    log: {
+      info: (message: string) => ctx.logger?.info?.(message),
+      warn: (message: string, error?: unknown) => ctx.logger?.warn?.(message, error),
+    },
   })
   const registration = ctx.llm.registerAdapter([AGY_PROVIDER_ID], adapter)
 

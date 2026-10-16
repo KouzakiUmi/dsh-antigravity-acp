@@ -308,6 +308,17 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /** 给 promise 加超时：Host 侧异常时界面也要落到可读错误，而不是永远 pending。 */
+    function withTimeout(promise, ms, message) {
+      let timer
+      return Promise.race([
+        Promise.resolve(promise),
+        new Promise((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error(message)), ms)
+        }),
+      ]).finally(() => clearTimeout(timer))
+    }
+
     /** 组装额度读取器：remote.agyQuota 由 Host 注册后才出现，短轮询等待就绪。 */
     function makeQuotaReader(scope) {
       return async (force) => {
@@ -315,7 +326,13 @@ window.__ModuleLoader__.load({
         for (;;) {
           const service = scope.get('remote.agyQuota')
           if (service && typeof service.read === 'function') {
-            return service.read(force ? { force: true } : undefined)
+            // Host 侧会起官方 agy CLI 取数（其启动含登录刷新）。万一它挂在网络上，
+            // 也要让药丸显示「读取失败 + 原因」，而不是一直停在「额度…」。
+            return await withTimeout(
+              service.read(force ? { force: true } : undefined),
+              60_000,
+              '额度读取超时（Host 侧 agy CLI 60 秒内没有返回；常见原因是该子进程没走代理）',
+            )
           }
           if (Date.now() >= deadline) {
             throw new Error('额度服务未就绪（Host 端 remote.agyQuota 未挂载）')

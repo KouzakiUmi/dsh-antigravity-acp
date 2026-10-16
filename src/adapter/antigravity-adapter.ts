@@ -96,6 +96,17 @@ export interface AntigravityAcpAdapterOptions {
    * 用途）。用于补齐会话观测之外的官方型号；失败由 adapter 吞掉。
    */
   loadCliCatalog?: () => Promise<readonly { id: string; name: string }[]>
+  /**
+   * 宿主日志（index.ts 接 `ctx.logger`）。仅用于**自诊断**：模型路由决策与
+   * `session/set_config_option` 失败原因。缺省时不产任何日志。
+   */
+  log?: AdapterLog
+}
+
+/** 适配器可用的最小日志面（与 cordis 的 `ctx.logger` 结构兼容）。 */
+export interface AdapterLog {
+  info(message: string): void
+  warn(message: string, error?: unknown): void
 }
 
 /** 目录缓存条目（只含模型元数据，不含任何凭据）。 */
@@ -138,6 +149,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   readonly #loadCachedCatalog?: AntigravityAcpAdapterOptions['loadCachedCatalog']
   readonly #saveCatalog?: AntigravityAcpAdapterOptions['saveCatalog']
   readonly #loadCliCatalog?: AntigravityAcpAdapterOptions['loadCliCatalog']
+  readonly #log?: AdapterLog
   /** 官方 CLI 清单的进程内一次性结果。 */
   #cliCatalog?: Promise<readonly { id: string; name: string }[]>
   /** 家族 → 支持的思考强度档位（由 listModels 折叠得到）。 */
@@ -179,6 +191,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     this.#loadCachedCatalog = options.loadCachedCatalog
     this.#saveCatalog = options.saveCatalog
     this.#loadCliCatalog = options.loadCliCatalog
+    this.#log = options.log
     this.#bridge = new McpToolBridge()
     this.#registerBridgeTeardown(async () => {
       this.#releaseTurnSubscription()
@@ -612,9 +625,24 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       )
     }
     if (selector.currentValue === requested) return
+    // 自诊断：把路由结果落进宿主日志（模型选择出问题时，这是唯一能看到「DSH
+    // 给的 id → 我们发出去的 configId/value」的地方）。
+    this.#log?.info(
+      `antigravity-acp: 模型路由 dsh=${model} → configId=${selector.configId} value=${requested}` +
+        `（family=${family}${effortTier ? ` effort=${effortTier}` : ''}${pinnedTier ? ' 档位已钉住' : ''}）`,
+    )
     // 目录成员资格按 dsh-llm 语义是建议性的：未登记的 id 仍然照发，由 ACP
     // agent 自己判定是否接受，而不是在这里静默改写成别的模型。
-    const response = await link.setConfigOption({ sessionId, configId: selector.configId, value: requested })
+    let response: { configOptions?: readonly SessionConfigOption[] }
+    try {
+      response = await link.setConfigOption({ sessionId, configId: selector.configId, value: requested })
+    } catch (error) {
+      this.#log?.warn(
+        `antigravity-acp: session/set_config_option 失败（configId=${selector.configId} value=${requested}）`,
+        error,
+      )
+      throw error
+    }
     this.observeSessionConfigOptions(response.configOptions)
   }
 }

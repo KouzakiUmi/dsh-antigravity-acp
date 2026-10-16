@@ -15,6 +15,8 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import type { SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import { redactSensitiveText } from './redact.js'
+import { ambientProxyEnv, buildProxyEnv } from './proxy-env.js'
+import type { ProxySettings } from './proxy-env.js'
 import type { QuotaBucket, QuotaGroup, QuotaSnapshot } from './quota.js'
 
 /** 单次 CLI 只读调用的返回面（由宿主经 ctx.subprocess 实现）。 */
@@ -304,7 +306,10 @@ function firstString(value: unknown): string | undefined {
  * 环境按最小可用集显式传入：Windows 系统键 + 用户目录键 + 出网代理键；
  * DSH_* 内部键一律不透传给官方二进制。
  */
-export function createSubprocessCliRun(subprocess: SubprocessRuntime): CliRun {
+export function createSubprocessCliRun(
+  subprocess: SubprocessRuntime,
+  proxy?: ProxySettings | undefined,
+): CliRun {
   return async ({ argv, timeoutMs }) => {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), timeoutMs ?? AGY_CLI_TIMEOUT_MS)
@@ -314,7 +319,7 @@ export function createSubprocessCliRun(subprocess: SubprocessRuntime): CliRun {
         // cwd 用 CLI 自身目录：与 ACP server 的启动约定一致，避免工作目录
         // 影响官方二进制的相对资源解析。
         cwd: dirname(String(argv[0])),
-        env: cliEnv(),
+        env: cliEnv(process.env, proxy),
         stdio: {
           stdin: 'ignore',
           stdout: { maxBytes: 512 * 1024 },
@@ -335,21 +340,32 @@ export function createSubprocessCliRun(subprocess: SubprocessRuntime): CliRun {
   }
 }
 
-/** 官方 CLI 的最小环境：系统键 + 用户目录键 + 代理键，其余不透传。 */
+/**
+ * 官方 CLI 的最小环境：系统键 + 用户目录键 + 代理，其余不透传。
+ *
+ * **代理必须在这里补齐**：`agy` 每次启动都会做登录/配置刷新（实测无代理时
+ * `-p /usage` 会一直挂在网络上、直到被杀），而 DSH 的 subprocess 会 scrub 父环境。
+ * 宿主进程环境里未必有代理变量——插件配置的 `proxyUrl` 才是权威来源。规则与官方
+ * ACP 进程保持一致：**插件配置优先，其次宿主环境自身导出的代理**。
+ */
 export function cliEnv(
   parent: Readonly<Record<string, string | undefined>> = process.env,
+  proxy?: ProxySettings | undefined,
 ): Record<string, string> {
   const keys = [
     'SystemRoot', 'SystemDrive', 'windir', 'COMSPEC', 'PATHEXT', 'PATH',
     'USERPROFILE', 'HOME', 'HOMEDRIVE', 'HOMEPATH', 'USERNAME', 'USER',
     'LOCALAPPDATA', 'APPDATA', 'TEMP', 'TMP', 'TMPDIR',
-    'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
-    'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy',
   ]
   const env: Record<string, string> = {}
   for (const key of keys) {
     const value = parent[key]
     if (value !== undefined && value !== '') env[key] = value
+  }
+  // 代理最后合并：配置的 proxyUrl 覆盖宿主环境里的同名键。
+  const proxyEnv = proxy ? buildProxyEnv(proxy) : ambientProxyEnv(parent)
+  for (const [key, value] of Object.entries(proxyEnv ?? {})) {
+    if (typeof value === 'string' && value !== '') env[key] = value
   }
   return env
 }

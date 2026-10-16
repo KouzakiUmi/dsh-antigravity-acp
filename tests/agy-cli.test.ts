@@ -286,3 +286,52 @@ describe('CLI 调用面', () => {
     expect(candidates[0]).toContain('AppData\\Local\\agy\\bin\\agy.exe')
   })
 })
+
+/**
+ * cliEnv 的代理补齐（2026-10-16 回归）。
+ *
+ * 实测：`agy -p /usage` 启动时会做登录/配置刷新，**没有代理会一直挂在网络上**
+ * （无代理变体 60s 未返回，有代理变体 5–8s 返回额度表）。而 DSH 的 subprocess 会
+ * scrub 父环境，宿主进程也未必导出代理变量——插件配置的 proxyUrl 才是权威来源。
+ * 规则必须与官方 ACP 进程一致：**配置优先，其次宿主环境**。
+ */
+describe('cliEnv 代理补齐', () => {
+  const parent = {
+    SystemRoot: 'C:\Windows',
+    PATH: 'C:\Windows\system32',
+    USERPROFILE: 'C:\Users\tester',
+    LOCALAPPDATA: 'C:\Users\tester\AppData\Local',
+    HTTPS_PROXY: 'http://ambient:8080',
+    NO_PROXY: 'example.com',
+    UNRELATED_SECRET: 'should-not-pass',
+  }
+
+  it('配置了 proxyUrl 时注入大小写两套代理，并始终排除 loopback', () => {
+    const env = cliEnv(parent, { url: 'http://127.0.0.1:7890' })
+    expect(env.HTTPS_PROXY).toBe('http://127.0.0.1:7890')
+    expect(env.https_proxy).toBe('http://127.0.0.1:7890')
+    expect(env.HTTP_PROXY).toBe('http://127.0.0.1:7890')
+    // 配置的代理覆盖宿主环境里的同名值。
+    expect(env.HTTPS_PROXY).not.toBe(parent.HTTPS_PROXY)
+    // loopback 必须绕过（私有 MCP 桥、OAuth 回调都在本机）。
+    expect(env.NO_PROXY).toContain('127.0.0.1')
+  })
+
+  it('未配置 proxyUrl 时转发宿主环境自身的代理', () => {
+    const env = cliEnv(parent)
+    expect(env.HTTPS_PROXY).toBe('http://ambient:8080')
+    expect(env.NO_PROXY).toContain('127.0.0.1')
+    expect(env.NO_PROXY).toContain('example.com')
+  })
+
+  it('两边都没有代理时不注入任何代理键', () => {
+    const env = cliEnv({ SystemRoot: 'C:\Windows' })
+    expect(Object.keys(env).filter((key) => /proxy/i.test(key))).toEqual([])
+  })
+
+  it('白名单之外的环境变量一律不透传', () => {
+    expect(cliEnv(parent)).not.toHaveProperty('UNRELATED_SECRET')
+    expect(cliEnv(parent).SystemRoot).toBe('C:\Windows')
+    expect(cliEnv(parent).USERPROFILE).toBe('C:\Users\tester')
+  })
+})
