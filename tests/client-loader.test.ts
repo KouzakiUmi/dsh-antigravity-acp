@@ -22,7 +22,22 @@ interface SlotRegistration {
 }
 
 /** 在带最小 React 桩的上下文里加载 client.js，取出它注册的全部槽条目。 */
-function loadRegistrations(): Map<string, SlotRegistration> {
+/** 最近一次 `loadRegistrations` 期间，组件写 state 时传入的值（按顺序）。 */
+let lastStateCalls: unknown[] = []
+
+/** 注入的额度 remote 替身：药丸会 `scope.get('remote.agyQuota')` 后再 `.read()`。 */
+interface QuotaStubOptions {
+  /** 返回 remote 的原始回包（**未拆信封**），与真实网关一致。 */
+  quotaRead?: () => Promise<unknown>
+  /**
+   * 注入会话模型目录的当前 provider。药丸只在 provider 匹配时取数，因此要驱动
+   * 取数链路就必须把它设成 `antigravity-acp`；缺省保持空快照（渲染即 null）。
+   */
+  quotaProvider?: string
+}
+
+function loadRegistrations(options: QuotaStubOptions = {}): Map<string, SlotRegistration> {
+  lastStateCalls = []
   let registration: {
     factory: (require: (id: string) => unknown) => { apply: (ctx: Record<string, unknown>) => void }
   } | undefined
@@ -32,6 +47,7 @@ function loadRegistrations(): Map<string, SlotRegistration> {
     setInterval,
     clearInterval,
     setTimeout,
+    clearTimeout,
   })
   if (!registration) throw new Error('client.js 未向 __ModuleLoader__ 注册')
 
@@ -39,7 +55,8 @@ function loadRegistrations(): Map<string, SlotRegistration> {
     createElement(type: unknown, props: Record<string, unknown> | null, ...children: unknown[]): StubElement {
       return { type, props: props ?? {}, children: children.flat() }
     },
-    useState: (initial: unknown) => [initial, () => {}],
+    // 记录 setState 的入参：额度链路「拆信封」的回归就靠它断言。
+    useState: (initial: unknown) => [initial, (value: unknown) => { lastStateCalls.push(value) }],
     useCallback: <T,>(fn: T) => fn,
     // 卡片只在首次渲染时挂载，effect 立即执行即可触发首次取数；
     // 清理函数随即执行（等价于挂载后立刻卸载），避免测试留下活动定时器。
@@ -73,10 +90,16 @@ function loadRegistrations(): Map<string, SlotRegistration> {
       fn(scope)
       return () => {}
     },
-    get: () => undefined,
+    get: (name: string) =>
+      name === 'remote.agyQuota' && options.quotaRead ? { read: () => options.quotaRead!() } : undefined,
     remote: {},
     modelDirectories: {
-      directoryFor: () => ({ store: { subscribe: () => () => {}, getSnapshot: () => ({}) } }),
+      directoryFor: () => ({
+        store: {
+          subscribe: () => () => {},
+          getSnapshot: () => (options.quotaProvider ? { current: { provider: options.quotaProvider } } : {}),
+        },
+      }),
     },
   }
   const plugin = registration.factory(() => react)
@@ -285,5 +308,71 @@ describe('额度药丸（conversation.input.right）', () => {
     await Promise.resolve()
     await Promise.resolve()
     expect(tree).not.toBeNull()
+  })
+})
+
+/**
+ * 额度药丸的 remote 回包拆信封（2026-10-17 回归）。
+ *
+ * 实测：Typert remote 的一元调用回包是 `{ ok, value }`（宿主上正常工作的
+ * dsh-subusage 客户端同样先查 `response.ok` 再读 `response.value`）。药丸早先直接
+ * `setData(结果)`，信封没拆 → `data.status` 恒为 undefined → 标签永远停在
+ * 「额度…」、面板正文渲染成空。这里把「拆了」固化下来。
+ */
+describe('额度药丸：remote 回包拆信封', () => {
+  const snapshot = {
+    status: 'ok',
+    updatedAt: '2026-10-17T00:00:00.000Z',
+    plan: 'Antigravity',
+    groups: [
+      {
+        name: 'Gemini Models',
+        buckets: [{ name: 'Five Hour Limit Remaining', window: '5h', remainingPct: 98.55, disabled: false }],
+      },
+    ],
+  }
+
+  /** 等两轮微任务，让 readQuota → setData 链路跑完。 */
+  const settle = async (): Promise<void> => {
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  }
+
+  it('ok 信封：写入 state 的是 value 本身，而不是信封', async () => {
+    const entry = loadRegistrations({ quotaRead: async () => ({ ok: true, value: snapshot }), quotaProvider: 'antigravity-acp' }).get('antigravity-quota')
+    if (!entry) throw new Error('未注册额度药丸')
+    // 药丸的 readQuota 来自槽位注入（与真实宿主一致）：先取注入面，再以它渲染。
+    const inject = entry.row.inject
+    if (typeof inject !== 'function') throw new Error('额度药丸槽位未声明 inject')
+    const props = inject('session-1') as {
+      store: unknown
+      readQuota: (force?: boolean) => Promise<unknown>
+    }
+    entry.component(props)
+    await settle()
+    // 断言：写进 state 的是拆开后的快照（带 status/groups），而不是 { ok, value } 信封。
+    const written = lastStateCalls.at(-1) as Record<string, unknown>
+    expect(written.status).toBe('ok')
+    expect(written.groups).toEqual(snapshot.groups)
+    expect(written).not.toHaveProperty('ok')
+  })
+
+  it('失败信封：转成可读错误状态（不再静默 pending）', async () => {
+    const entry = loadRegistrations({
+      quotaRead: async () => ({ ok: false, error: { message: 'remote denied' } }),
+      quotaProvider: 'antigravity-acp',
+    }).get('antigravity-quota')
+    if (!entry) throw new Error('未注册额度药丸')
+    const inject = entry.row.inject
+    if (typeof inject !== 'function') throw new Error('额度药丸槽位未声明 inject')
+    const props = inject('session-1') as {
+      store: unknown
+      readQuota: (force?: boolean) => Promise<unknown>
+    }
+    entry.component(props)
+    await settle()
+    const written = lastStateCalls.at(-1) as { status?: string; error?: { text?: string } }
+    expect(written.status).toBe('error')
+    expect(written.error?.text).toContain('remote denied')
   })
 })

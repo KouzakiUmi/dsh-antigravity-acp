@@ -211,7 +211,10 @@ window.__ModuleLoader__.load({
 
       const load = React.useCallback((force) => {
         Promise.resolve(readQuota(force))
-          .then((snapshot) => setData(snapshot))
+          // Typert remote 的回包是 `{ ok, value }` 信封（设置卡片、以及同宿主上
+          // 正常工作的 dsh-subusage 都先拆再读）。不拆的话 `data.status` 恒为
+          // undefined：药丸永远停在「额度…」，面板正文渲染成空。
+          .then((result) => setData(unwrap(result)))
           .catch((cause) => setData({
             status: 'error',
             updatedAt: new Date().toISOString(),
