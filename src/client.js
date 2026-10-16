@@ -327,7 +327,10 @@ window.__ModuleLoader__.load({
       return async (force) => {
         const deadline = Date.now() + 20_000
         for (;;) {
-          const service = scope.get('remote.agyQuota')
+          // 优先走注入面（`remote.agyQuota` 已在 inject 里声明，正常必然存在）；
+          // get() 作为兜底，兼容宿主挂载时序上的短暂空窗。
+          const injected = scope?.remote?.agyQuota
+          const service = injected && typeof injected.read === 'function' ? injected : scope.get('remote.agyQuota')
           if (service && typeof service.read === 'function') {
             // Host 侧会起官方 agy CLI 取数（其启动含登录刷新）。万一它挂在网络上，
             // 也要让药丸显示「读取失败 + 原因」，而不是一直停在「额度…」。
@@ -369,7 +372,14 @@ window.__ModuleLoader__.load({
         )
         // 额度药丸：紧邻模型选择器左侧（宿主把 conversation.input.right 渲染在
         // conversation.input.model 之前）。modelDirectories 是会话模型目录服务。
-        ctx.inject(['slots', 'modelDirectories'], (scope) => {
+        //
+        // `remote.agyQuota` **必须写进 inject**：每个 `remote.<ns>` 面都是独立的
+        // 可注入服务，漏声明时读属性会抛「cannot get property "remote.<ns>" without
+        // inject」，而用 `get()` 只是永远拿到 undefined（药丸于是等不到服务、
+        // 也不会发出任何取数请求——2026-10-17 实测：宿主日志里只有模型清单调用，
+        // 没有 `/usage`）。cordis 的 inject 会等该服务出现再执行回调，所以这里同时
+        // 充当「等 Host 把 remote 挂上来」的等待。
+        ctx.inject(['slots', 'modelDirectories', 'remote.agyQuota'], (scope) => {
           scope.effect(
             () =>
               scope.slots.inject('conversation.input.right', () =>

@@ -98,14 +98,29 @@ export function registerAgYQuotaRemote(ctx: Context): void {
   ctx.inject(['typert'], (scope) => {
     scope.effect(() => {
       const candidate: unknown = scope.get('typert')
-      if (!isRegistrar(candidate)) return () => undefined
-      return candidate.register({
-        package: PACKAGE_NAME,
-        face: 'host',
-        schemas: [],
-        model: { services: [], events: [], objects: [] },
-        invocations: AGY_QUOTA_INVOCATIONS,
-      })
+      if (!isRegistrar(candidate)) {
+        // 必须留痕：typert 缺席时以前是「静默跳过」，出问题时无法与「注册成功但
+        // 客户端没挂上」区分（2026-10-17 排查额度药丸就卡在这里）。
+        ctx.logger?.warn?.('antigravity-acp: typert 服务不可用，额度 remote 未注册')
+        return () => undefined
+      }
+      let dispose: () => void | Promise<void>
+      try {
+        dispose = candidate.register({
+          package: PACKAGE_NAME,
+          face: 'host',
+          schemas: [],
+          model: { services: [], events: [], objects: [] },
+          invocations: AGY_QUOTA_INVOCATIONS,
+        })
+      } catch (error) {
+        ctx.logger?.warn?.('antigravity-acp: 额度 remote 注册失败', error)
+        return () => undefined
+      }
+      ctx.logger?.info?.(
+        `antigravity-acp: 额度 remote 已注册（package=${PACKAGE_NAME} service=${AGY_QUOTA_SERVICE} method=read）`,
+      )
+      return dispose
     }, 'antigravity-acp: quota remote')
   })
 }
@@ -119,6 +134,8 @@ export interface AgYQuotaServiceOptions {
    * 官方 CLI 是套餐额度的唯一可用来源。
    */
   cli?: { run: CliRun; cliPath: string }
+  /** 宿主日志（index.ts 接 `ctx.logger`）；用于记录每次取数的来源与结果。 */
+  log?: { info(message: string): void; warn(message: string, error?: unknown): void }
 }
 
 /** 额度取数服务：`read(request)` 返回快照，失败折叠成 `status: 'error'` 而不抛。 */
@@ -126,11 +143,13 @@ export class AgYQuotaService extends TypertRemoteService {
   readonly #cache: { value?: QuotaSnapshot; at?: number } = {}
   readonly #deps: QuotaDeps
   readonly #cli: { run: CliRun; cliPath: string } | undefined
+  readonly #log: AgYQuotaServiceOptions['log']
 
   constructor(ctx: Context, options: AgYQuotaServiceOptions = {}) {
     super(ctx, AGY_QUOTA_SERVICE)
     this.#deps = options.deps ?? {}
     this.#cli = options.cli
+    this.#log = options.log
   }
 
   /** 客户端药丸的取数入口。 */
@@ -139,21 +158,30 @@ export class AgYQuotaService extends TypertRemoteService {
       delete this.#cache.value
       delete this.#cache.at
     }
+    // 这条日志让「药丸到底有没有把请求发到 Host」可证：浏览器侧完全无法写宿主日志。
+    const source = this.#cli ? `cli=${this.#cli.cliPath}` : 'http（未找到 agy CLI）'
+    this.#log?.info(`antigravity-acp: 额度取数请求（force=${request?.force === true}，来源 ${source}）`)
     try {
       const cli = this.#cli
       if (!cli) return await fetchQuotaSnapshot(this.#cache, this.#deps)
       const now = Date.now()
       const cached = this.#cache.value
       if (cached && this.#cache.at !== undefined && now - this.#cache.at < QUOTA_CACHE_MS && cached.status === 'ok') {
+        this.#log?.info(`antigravity-acp: 额度取数命中缓存（${cached.groups.length} 组）`)
         return cached
       }
       const snapshot = await fetchAgyUsage(cli.run, cli.cliPath)
       this.#cache.value = snapshot
       this.#cache.at = now
+      this.#log?.info(
+        `antigravity-acp: 额度取数结果 status=${snapshot.status} 组数=${snapshot.groups.length}` +
+          (snapshot.error ? ` 错误=${snapshot.error.code}:${snapshot.error.message.slice(0, 160)}` : ''),
+      )
       return snapshot
     } catch (error) {
       // 取数实现自身已折叠错误；这里兜住意外异常，绝不让原始错误穿到客户端。
       const message = error instanceof Error ? error.message : String(error)
+      this.#log?.warn?.('antigravity-acp: 额度取数抛异常', error)
       return {
         status: 'error',
         updatedAt: new Date().toISOString(),

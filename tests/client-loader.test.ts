@@ -25,6 +25,9 @@ interface SlotRegistration {
 /** 最近一次 `loadRegistrations` 期间，组件写 state 时传入的值（按顺序）。 */
 let lastStateCalls: unknown[] = []
 
+/** 最近一次 `loadRegistrations` 期间，各处 `ctx.inject([...])` 声明的依赖列表。 */
+let lastInjectDeps: string[][] = []
+
 /** 注入的额度 remote 替身：药丸会 `scope.get('remote.agyQuota')` 后再 `.read()`。 */
 interface QuotaStubOptions {
   /** 返回 remote 的原始回包（**未拆信封**），与真实网关一致。 */
@@ -38,6 +41,7 @@ interface QuotaStubOptions {
 
 function loadRegistrations(options: QuotaStubOptions = {}): Map<string, SlotRegistration> {
   lastStateCalls = []
+  lastInjectDeps = []
   let registration: {
     factory: (require: (id: string) => unknown) => { apply: (ctx: Record<string, unknown>) => void }
   } | undefined
@@ -86,7 +90,8 @@ function loadRegistrations(options: QuotaStubOptions = {}): Map<string, SlotRegi
       fn()
       return () => {}
     },
-    inject: (_deps: unknown, fn: (child: unknown) => void) => {
+    inject: (deps: unknown, fn: (child: unknown) => void) => {
+      lastInjectDeps.push(Array.isArray(deps) ? (deps as string[]) : [])
       fn(scope)
       return () => {}
     },
@@ -374,5 +379,21 @@ describe('额度药丸：remote 回包拆信封', () => {
     const written = lastStateCalls.at(-1) as { status?: string; error?: { text?: string } }
     expect(written.status).toBe('error')
     expect(written.error?.text).toContain('remote denied')
+  })
+})
+
+/**
+ * 药丸必须把 `remote.agyQuota` 写进 inject（2026-10-17 回归）。
+ *
+ * 每个 `remote.<ns>` 面都是独立的可注入服务：漏声明时读属性会抛
+ * 「cannot get property "remote.<ns>" without inject」，而用 `get()` 只会永远拿到
+ * undefined —— 药丸于是等不到服务、**一次取数请求都不会发出**（宿主日志里只有
+ * 模型清单调用、没有 `/usage`）。这条断言把依赖声明钉住。
+ */
+describe('额度药丸：remote 依赖声明', () => {
+  it('inject 里包含 remote.agyQuota', () => {
+    loadRegistrations()
+    const declared = lastInjectDeps.some((deps) => deps.includes('remote.agyQuota'))
+    expect(declared, `实际声明：${JSON.stringify(lastInjectDeps)}`).toBe(true)
   })
 })

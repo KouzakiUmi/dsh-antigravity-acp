@@ -373,7 +373,14 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
   // Cloud Code Assist HTTP 线（需账号开通 companion 项目）。取数只读，
   // 凭据不写回、不进日志。
   registerAgYQuotaRemote(ctx)
-  ctx.plugin(AgYQuotaService, cliPath ? { cli: { run: cliRun, cliPath } } : {})
+  ctx.plugin(AgYQuotaService, {
+    ...(cliPath ? { cli: { run: cliRun, cliPath } } : {}),
+    // 取数打点：浏览器侧无法写宿主日志，这条是「药丸有没有真的发请求、结果如何」的唯一现场。
+    log: {
+      info: (message: string) => ctx.logger?.info?.(message),
+      warn: (message: string, error?: unknown) => ctx.logger?.warn?.(message, error),
+    },
+  })
 
   // 把 Config schema 投到设置表单（插件页）。弱依赖 settings，无 Web 的 profile 仍能加载。
   ctx.inject(['settings'], (settingsCtx) => {
