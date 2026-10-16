@@ -8,7 +8,8 @@
  * 经 ctx.subprocess 启动的 ACP 子进程 → 关闭插件进程内的私有 loopback MCP 桥。
  */
 import { mkdir } from 'node:fs/promises'
-import { join } from 'node:path'
+import { existsSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-llm'
@@ -17,11 +18,22 @@ import type { SubprocessHandle, SubprocessRuntime } from '@deepseek-ai/dsh-subpr
 import { AntigravityAcpAdapter, AGY_PROVIDER_ID } from './adapter/antigravity-adapter.js'
 import { AgentLink, agentStreamFromSubprocess, AGY_LINK_ERROR, launchAcpAgent } from './protocol/agent-link.js'
 import type { AgentLinkHandlers } from './protocol/agent-link.js'
-import { ensureAgentBinary, resolveCacheDir, DEFAULT_ACP_SERVER_VERSION } from './runtime/binary.js'
+import {
+  AGY_BINARY_ERROR,
+  cleanupStalePyiTempDirs,
+  DEFAULT_ACP_SERVER_VERSION,
+  ensureAgentBinary,
+  resolveCacheDir,
+} from './runtime/binary.js'
 import { resolveProxy } from './runtime/proxy-env.js'
 import type { ResolvedProxy } from './runtime/proxy-env.js'
+import { ensureAcpCredentials } from './runtime/credentials.js'
+import type { AcpCredentialResult } from './runtime/credentials.js'
+import { describeLowIntegrity, isLowIntegrityTarget } from './runtime/integrity.js'
 import { describeAuthWait, redactSensitiveText } from './runtime/redact.js'
 import { readCachedCatalog, writeCachedCatalog } from './runtime/catalog-cache.js'
+import { agyCliCandidates, createSubprocessCliRun, fetchAgyModels } from './runtime/agy-cli.js'
+import { AgYQuotaService, registerAgYQuotaRemote } from './quota/quota-remote.js'
 import type { AntigravityHostConfig } from './settings.js'
 
 export { AGY_PROVIDER_ID } from './adapter/antigravity-adapter.js'
@@ -86,6 +98,20 @@ export async function disposeAcpRuntime(active: ActiveAcpRuntime): Promise<void>
 export type { AgentLinkHandlers }
 
 /**
+ * 启动路径上的可注入外部依赖。
+ *
+ * 两者都是「会碰真实环境」的动作（读/写用户 profile、跑系统命令），生产用默认
+ * 实现，测试用假实现——否则单元测试会去动真实登录态、并让假 subprocess 收到一条
+ * 它不认识的 icacls 进程。
+ */
+export interface AcpRuntimeDeps {
+  /** 备好官方登录态（acp_token.json + settings.json）；默认导入本机官方 CLI 凭据。 */
+  ensureCredentials?: () => Promise<AcpCredentialResult>
+  /** Windows 低完整性探测；默认经 ctx.subprocess 只读跑一次 icacls。 */
+  probeLowIntegrity?: (executablePath: string, subprocess: SubprocessRuntime) => Promise<boolean>
+}
+
+/**
  * 创建并启动 ACP 运行时（解析二进制 → ctx.subprocess spawn → initialize →
  * authenticate）。
  *
@@ -109,6 +135,7 @@ export async function ensureAcpRuntime(
   config: AntigravityHostConfig,
   handlers: AgentLinkHandlers,
   active: ActiveAcpRuntime,
+  deps: AcpRuntimeDeps = {},
 ): Promise<AgentLink> {
   if (active.disposed) {
     throw new LlmError('Antigravity ACP 插件已卸载，无法启动 ACP 链路', AGY_LINK_ERROR.LINK_CLOSED)
@@ -116,7 +143,7 @@ export async function ensureAcpRuntime(
   if (active.inflight) return active.inflight
   if (active.link) return active.link
   // 同步赋值：startAcpRuntime 内部第一个 await 之前不会有别的调用者插进来。
-  const inflight = startAcpRuntime(ctx, config, handlers, active)
+  const inflight = startAcpRuntime(ctx, config, handlers, active, deps)
   active.inflight = inflight
   try {
     return await inflight
@@ -133,6 +160,7 @@ async function startAcpRuntime(
   config: AntigravityHostConfig,
   handlers: AgentLinkHandlers,
   active: ActiveAcpRuntime,
+  deps: AcpRuntimeDeps,
 ): Promise<AgentLink> {
   const subprocess: SubprocessRuntime = ctx.subprocess
   const resolution = await ensureAgentBinary({
@@ -140,6 +168,14 @@ async function startAcpRuntime(
     autoDownload: config.autoDownload,
     version: config.acpVersion,
   })
+  // Windows：映像文件若带 Low 强制完整性标签（例如装在带该标签的 DSH home 下），
+  // 官方进程会被降成 LOW，受 MIC「禁止向上写」约束而写不进 ~/.gemini/antigravity-acp，
+  // 表现为 session/new 永久挂起。这里只读探测一次并显式报错，不把挂死留给用户。
+  const probeLowIntegrity =
+    deps.probeLowIntegrity ?? ((path: string, sp: SubprocessRuntime) => isLowIntegrityTarget(path, (target) => runIcacls(sp, target)))
+  if (await probeLowIntegrity(resolution.executablePath, subprocess)) {
+    throw new LlmError(describeLowIntegrity(resolution.executablePath), AGY_BINARY_ERROR.LOW_INTEGRITY)
+  }
   // 下载可能耗时数分钟，期间插件可能被卸载：这时不再 spawn，避免出现一个
   // dispose 之后才出生、无人终止的进程。
   if (active.disposed) {
@@ -151,6 +187,10 @@ async function startAcpRuntime(
   if (active.disposed) {
     throw new LlmError('Antigravity ACP 插件已卸载，取消启动 ACP 链路', AGY_LINK_ERROR.LINK_CLOSED)
   }
+  // 登录态在 spawn 前备好：优先导入本机官方 CLI 的已登录凭据（用户要求不弹浏览器
+  // 登录页）。备好 acp_token.json + settings.json 后，官方 server 启动时自行完成
+  // 认证，因此可以跳过 authenticate —— 该请求在没有交互式浏览器时会一直挂着。
+  const credentials = await (deps.ensureCredentials ?? ensureAcpCredentials)()
   // 代理在 spawn 前解析：地址非法就当场失败，不要等到官方进程出网才报连接错误。
   let proxy: ResolvedProxy | undefined
   try {
@@ -178,13 +218,16 @@ async function startAcpRuntime(
     // initialize 上报关闭全部本地能力的 clientCapabilities（ACP v1 的
     // ClientCapabilities 属于 initialize 请求，session/new 没有这个字段）。
     await link.initialize({ clientCapabilities: AGY_CLIENT_CAPABILITIES })
-    await link.authenticate()
+    // 登录态已就绪（acp_token.json + settings.json 齐备）时跳过 authenticate：
+    // 官方 server 已从 settings.json 推断出 oauth-personal 并自行完成认证，
+    // 而 authenticate 在没有交互式浏览器时会一直挂着（旧行为会白等 5 分钟）。
+    if (!credentials.ready) await link.authenticate()
   } catch (error) {
     // active.link 尚未被写入（只有认证成功才写），这里只需摘掉 handle 指向。
     if (active.handle === handle) active.handle = undefined
     await link.close().catch(() => undefined)
     handle.terminate()
-    throw toLaunchError(error, readStderr(handle))
+    throw toLaunchError(error, readStderr(handle), credentials.ready ? undefined : credentials.note)
   }
   // 认证成功后才登记链接：`active.link` 可复用就等于「链路已认证」，因此复用它
   // 的调用方不需要、也不应该看到认证窗口内的中间状态。
@@ -211,20 +254,45 @@ function readStderr(handle: SubprocessHandle): string {
 }
 
 /**
+ * 只读跑一次 `icacls <目标>` 读强制完整性标签。
+ *
+ * 经宿主的 subprocess 服务执行（本插件不 import child_process）；任何失败都返回
+ * undefined，由调用方 fail-open——探测不可用不能让正常配置变得不可用。
+ */
+async function runIcacls(subprocess: SubprocessRuntime, target: string): Promise<string | undefined> {
+  try {
+    const handle = subprocess.spawn({
+      argv: ['icacls', target],
+      cwd: dirname(target),
+      env: { SystemRoot: process.env.SystemRoot ?? 'C:\\Windows' },
+      stdio: { stdin: 'ignore', stdout: { maxBytes: 32 * 1024 }, stderr: { maxBytes: 8 * 1024 } },
+      graceMs: 3_000,
+      signal: AbortSignal.timeout(10_000),
+    })
+    await handle.done.catch(() => undefined)
+    return handle.collected.stdout?.readFrom(0).text
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * 把启动/握手失败包成 `LlmError`。
  *
- * 两处特例：
+ * 三处特例：
  * - 认证等待超时：官方会打印 `Launching browser login flow...`，此时用户需要的是
  *   「去浏览器完成授权」这条指引，而不是一串带凭据片段的 URL；
+ * - 登录态准备失败（`note` 非空）：说明为什么插件没能免登录启动；
  * - 其余情况：附上脱敏后的 stderr 尾部作为诊断线索。
  */
-function toLaunchError(error: unknown, stderr: string): LlmError {
+function toLaunchError(error: unknown, stderr: string, credentialsNote?: string): LlmError {
   const code = error instanceof Error && 'code' in error && typeof error.code === 'string' ? error.code : 'AGY_LINK_CLOSED'
   const message = error instanceof Error ? error.message : String(error)
   const waitingForLogin = describeAuthWait(stderr) !== undefined
   const detail = waitingForLogin ? describeAuthWait(stderr) : stderr || undefined
+  const parts = [detail, credentialsNote].filter((part): part is string => Boolean(part))
   return new LlmError(
-    detail ? `${message}（官方进程诊断：${detail}）` : message,
+    parts.length > 0 ? `${message}（诊断：${parts.join('；')}）` : message,
     code,
     { cause: error },
   )
@@ -234,6 +302,36 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
   const active: ActiveAcpRuntime = {}
   const cacheDir = resolveCacheDir()
   const acpVersion = config.acpVersion ?? DEFAULT_ACP_SERVER_VERSION
+
+  // onefile 解压目录在进程被强杀后不会自清理，实测会累积到数十 GB。挂在装载期做
+  // 一次尽力而为的清理（只删超过 1 小时的陈旧目录），不阻塞任何请求路径。
+  void cleanupStalePyiTempDirs(join(cacheDir, 'pyi-tmp')).catch(() => 0)
+
+  // 官方 agy CLI 的只读取数通道（额度 /usage 与模型清单 models）。2026-10-16
+  // 用户授权「不 wrap agy CLI」**仅限只读取数用途**：只跑这两个只读命令，
+  // 不发对话、不写文件。子进程一律经 ctx.subprocess。
+  const cliRun = createSubprocessCliRun(ctx.subprocess)
+  const cliPath = agyCliCandidates().find((candidate) => existsSync(candidate))
+
+  /**
+   * 官方模型清单：缓存先行（选择器即时可用），命中后后台刷新一遍供下次生效；
+   * 没有缓存时现取现用。失败返回空，不影响目录主体（占位 + 会话观测）。
+   */
+  const loadCliModels = async (): Promise<readonly { id: string; name: string }[]> => {
+    const cached = await readCachedCatalog({ cacheDir, acpVersion, fileName: 'cli-models.json' })
+    const rows = cached?.map((row) => ({ id: row.id, name: row.name })) ?? []
+    const refresh = async () => {
+      if (!cliPath) return []
+      const models = await fetchAgyModels(cliRun, cliPath)
+      await writeCachedCatalog({ cacheDir, acpVersion, fileName: 'cli-models.json', models })
+      return models
+    }
+    if (rows.length > 0) {
+      void refresh().catch(() => undefined)
+      return rows
+    }
+    return refresh()
+  }
 
   const adapter = new AntigravityAcpAdapter({
     // handler 对象由 adapter 构造时创建且身份稳定：AgentLink 只在构造时取一次
@@ -248,8 +346,17 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
     // 冷启动目录：真实目录只能观测到之后才有，先用磁盘缓存兜住模型选择器。
     loadCachedCatalog: () => readCachedCatalog({ cacheDir, acpVersion }),
     saveCatalog: (models) => writeCachedCatalog({ cacheDir, acpVersion, models }),
+    // 官方清单补齐会话观测之外的型号（Opus 5.5 / Sonnet 5.5 / Argon 等）。
+    loadCliCatalog: () => loadCliModels(),
   })
   const registration = ctx.llm.registerAdapter([AGY_PROVIDER_ID], adapter)
+
+  // 额度监控：套餐额度取数服务 + Typert remote（供浏览器端药丸读取）。
+  // 首选官方 CLI 的 /usage（本账户唯一可用来源）；没有 CLI 时退回
+  // Cloud Code Assist HTTP 线（需账号开通 companion 项目）。取数只读，
+  // 凭据不写回、不进日志。
+  registerAgYQuotaRemote(ctx)
+  ctx.plugin(AgYQuotaService, cliPath ? { cli: { run: cliRun, cliPath } } : {})
 
   // 把 Config schema 投到设置表单（插件页）。弱依赖 settings，无 Web 的 profile 仍能加载。
   ctx.inject(['settings'], (settingsCtx) => {

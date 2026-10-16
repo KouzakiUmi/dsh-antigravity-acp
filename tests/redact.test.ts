@@ -33,6 +33,12 @@ describe('redactSensitiveText', () => {
       .toBe('state=*** and code_challenge: ***')
   })
 
+  it('打码 Bearer 凭据头（额度取数等错误文本可能携带）', () => {
+    expect(redactSensitiveText('HTTP 401 for Authorization: Bearer ya29.test-token-abcdef123456'))
+      .toBe('HTTP 401 for Authorization: Bearer ***')
+    expect(redactSensitiveText('Bearer abc')).toBe('Bearer abc')
+  })
+
   it('不动与凭据无关的文本', () => {
     const line = 'I1015 12:57:06 main.py:118] Starting AGY ACP Server...\n'
       + 'settings: path=C:\\Users\\x\\.gemini\\antigravity-acp\\settings.json status=missing'

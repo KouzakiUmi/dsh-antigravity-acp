@@ -123,3 +123,46 @@ export function buildProxyEnv(settings: ProxySettings | undefined): NodeJS.Proce
     no_proxy: resolved.bypass,
   }
 }
+
+/**
+ * 进程自身的代理环境（用户为整台机器/终端导出的那一套）——插件未配置 proxyUrl
+ * 时的兜底。
+ *
+ * 为什么需要转发：DSH 的 `subprocess` 会 scrub 父环境，用户导出的 `*_PROXY`
+ * **不会**自动到达官方子进程；不转发就会出现「宿主走代理、官方进程直连」的
+ * 分裂路由（本机直连 Google 是不通的，表现为认证/模型请求超时）。
+ *
+ * 只转发用户确实写过的名字（大小写成对补齐），一个都没有时返回 undefined
+ * （直连，不无中生有）。NO_PROXY 始终并入 loopback 条目：私有 MCP 桥与官方
+ * OAuth 回调都在 127.0.0.1。
+ */
+export function ambientProxyEnv(
+  parent: Readonly<Record<string, string | undefined>> = process.env,
+): NodeJS.ProcessEnv | undefined {
+  const pick = (names: readonly string[]): string | undefined => {
+    for (const name of names) {
+      const value = parent[name]
+      if (value && value.trim().length > 0) return value.trim()
+    }
+    return undefined
+  }
+  const generic = pick(['all_proxy', 'ALL_PROXY'])
+  const httpProxy = pick(['http_proxy', 'HTTP_PROXY']) ?? generic
+  const httpsProxy = pick(['https_proxy', 'HTTPS_PROXY']) ?? generic
+  if (!httpProxy && !httpsProxy) return undefined
+  const bypass = resolveProxyBypass(pick(['no_proxy', 'NO_PROXY']))
+  const env: NodeJS.ProcessEnv = { NO_PROXY: bypass, no_proxy: bypass }
+  if (httpProxy) {
+    env.HTTP_PROXY = httpProxy
+    env.http_proxy = httpProxy
+  }
+  if (httpsProxy) {
+    env.HTTPS_PROXY = httpsProxy
+    env.https_proxy = httpsProxy
+  }
+  if (generic) {
+    env.ALL_PROXY = generic
+    env.all_proxy = generic
+  }
+  return env
+}

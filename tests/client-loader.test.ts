@@ -2,66 +2,100 @@ import { readFileSync } from 'node:fs'
 import { runInNewContext } from 'node:vm'
 import { describe, expect, it } from 'vitest'
 
-/** 组件返回的元素树节点（createElement 桩的产物）。 */
+/** 组件返回的元素树节点（createElement 桩的产物）；条件渲染时可能返回 null。 */
 interface StubElement {
   type: unknown
   props: Record<string, unknown>
   children: unknown[]
 }
 
-type CardComponent = (props: { remote: unknown }) => StubElement
+type StubComponent = (props: Record<string, unknown>) => StubElement | null
 
-/** 在带最小 React 桩的上下文里加载 client.js，取出它注册的设置卡片组件。 */
-function loadCard(): CardComponent {
+interface SlotRegistration {
+  row: {
+    id: string
+    name?: string
+    order?: number
+    inject?: (sessionId: string) => Record<string, unknown>
+  }
+  component: StubComponent
+}
+
+/** 在带最小 React 桩的上下文里加载 client.js，取出它注册的全部槽条目。 */
+function loadRegistrations(): Map<string, SlotRegistration> {
   let registration: {
     factory: (require: (id: string) => unknown) => { apply: (ctx: Record<string, unknown>) => void }
   } | undefined
   runInNewContext(readFileSync(new URL('../src/client.js', import.meta.url), 'utf8'), {
     window: { __ModuleLoader__: { load: (value: unknown) => { registration = value as typeof registration } } },
+    // vm 上下文没有浏览器/Node 宿主 API；药丸的轮询定时器需要显式注入。
+    setInterval,
+    clearInterval,
+    setTimeout,
   })
   if (!registration) throw new Error('client.js 未向 __ModuleLoader__ 注册')
 
-  let component: CardComponent | undefined
   const react = {
     createElement(type: unknown, props: Record<string, unknown> | null, ...children: unknown[]): StubElement {
       return { type, props: props ?? {}, children: children.flat() }
     },
     useState: (initial: unknown) => [initial, () => {}],
-    useCallback: <T>(fn: T) => fn,
-    // 卡片只在首次渲染时挂载，effect 立即执行即可触发首次取数。
+    useCallback: <T,>(fn: T) => fn,
+    // 卡片只在首次渲染时挂载，effect 立即执行即可触发首次取数；
+    // 清理函数随即执行（等价于挂载后立刻卸载），避免测试留下活动定时器。
     useEffect: (fn: () => void | (() => void)) => {
-      fn()
+      const cleanup = fn()
+      if (typeof cleanup === 'function') cleanup()
+    },
+    useSyncExternalStore: (_subscribe: unknown, getSnapshot: () => unknown) => getSnapshot(),
+    useMemo: <T,>(fn: () => T) => fn(),
+    useRef: <T,>(initial: T) => ({ current: initial }),
+  }
+
+  const registrations = new Map<string, SlotRegistration>()
+  const slots = {
+    inject: (_name: string, factory: () => unknown) => {
+      factory()
+      return () => {}
+    },
+    register: (row: SlotRegistration['row'], target: StubComponent) => {
+      registrations.set(row.id, { row, component: target })
+      return () => {}
     },
   }
-  const plugin = registration.factory(() => react)
-  plugin.apply({
-    slots: {
-      inject: (_name: string, factory: () => unknown) => {
-        factory()
-        return () => {}
-      },
-      register: (_row: unknown, target: CardComponent) => {
-        component = target
-        return () => {}
-      },
-    },
+  const scope = {
+    slots,
     effect: (fn: () => () => void) => {
       fn()
       return () => {}
     },
+    inject: (_deps: unknown, fn: (child: unknown) => void) => {
+      fn(scope)
+      return () => {}
+    },
+    get: () => undefined,
     remote: {},
-  })
-  if (!component) throw new Error('client.js 未注册 settings.section 组件')
-  return component
+    modelDirectories: {
+      directoryFor: () => ({ store: { subscribe: () => () => {}, getSnapshot: () => ({}) } }),
+    },
+  }
+  const plugin = registration.factory(() => react)
+  plugin.apply(scope)
+  return registrations
 }
 
-/** 深度优先收集所有节点。 */
-function walk(node: unknown, visit: (element: StubElement) => void): void {
-  if (!node || typeof node !== 'object') return
-  const element = node as StubElement
-  if (!('props' in element)) return
-  visit(element)
-  for (const child of element.children) walk(child, visit)
+/** 取设置卡片（settings.section 槽，id=antigravity-acp）。 */
+function loadCard(): StubComponent {
+  const card = loadRegistrations().get('antigravity-acp')?.component
+  if (!card) throw new Error('client.js 未注册 settings.section 卡片')
+  return card
+}
+
+/** 取额度药丸（conversation.input.right 槽，id=antigravity-quota）。 */
+function loadPill(): { component: StubComponent; row: SlotRegistration['row'] } {
+  const entry = loadRegistrations().get('antigravity-quota')
+  if (!entry) throw new Error('client.js 未注册额度药丸')
+  return entry
 }
 
 /** 收集卡片里所有文本节点，用于断言渲染出的说明文案。 */
@@ -71,6 +105,14 @@ function texts(node: unknown, into: string[] = []): string[] {
     for (const child of (node as StubElement).children ?? []) texts(child, into)
   }
   return into
+}
+
+/** 构造模型目录 store 快照（决定药丸是否出现）。 */
+function modelStore(provider: string | null) {
+  return {
+    subscribe: () => () => {},
+    getSnapshot: () => ({ status: provider ? 'ready' : 'loading', current: provider ? { provider } : null }),
+  }
 }
 
 describe('browser client module', () => {
@@ -101,7 +143,9 @@ describe('browser client module', () => {
     expect(registration?.id).toBe('dsh-bundle-antigravity-host')
     const plugin = registration!.factory(requireModule)
     expect(plugin.name).toBe('dsh-bundle-antigravity-host')
-    expect(plugin.inject).toEqual(['slots', 'remote'])
+    // remote.settings / remote.llm 必须逐个声明：缺任一项时读属性会抛
+    // 「cannot get property "remote.<ns>" without inject」并击穿 settings.section。
+    expect(plugin.inject).toEqual(['slots', 'remote', 'remote.settings', 'remote.llm'])
     expect(plugin.apply).toBeTypeOf('function')
   })
 
@@ -173,5 +217,73 @@ describe('browser client module', () => {
     const Card = loadCard()
     const tree = Card({ remote: {} })
     expect(texts(tree).join('\n')).toContain('Antigravity ACP')
+  })
+
+  it('remote.<ns> 属性访问抛「without inject」时降级，绝不把异常抛出组件', () => {
+    const Card = loadCard()
+    // 复现宿主 ReflectService 的行为：缺 inject 时连读属性都会抛。
+    const denied = (ns: string) => {
+      throw new Error(`cannot get property "${ns}" without inject`)
+    }
+    const remote = {
+      get settings() {
+        return denied('remote.settings')
+      },
+      get llm() {
+        return denied('remote.llm')
+      },
+      $on: () => () => {},
+    }
+
+    // 异常若穿出组件，React 侧会击穿 settings.section 卡片并弄坏设置页。
+    expect(() => Card({ remote })).not.toThrow()
+    const tree = Card({ remote })
+    expect(texts(tree).join('\n')).toContain('Antigravity ACP')
+  })
+})
+
+describe('额度药丸（conversation.input.right）', () => {
+  it('注册在模型选择器左侧的槽位，带稳定 id 与 order', () => {
+    const { row } = loadPill()
+    expect(row.name).toBe('conversation.input.right')
+    expect(row.id).toBe('antigravity-quota')
+    expect(row.order).toBeTypeOf('number')
+  })
+
+  it('当前模型不是 antigravity-acp 时不渲染', () => {
+    const { component } = loadPill()
+    expect(component({ store: modelStore('deepseek-official'), readQuota: async () => ({}) })).toBeNull()
+    expect(component({ store: modelStore(null), readQuota: async () => ({}) })).toBeNull()
+  })
+
+  it('选中 antigravity-acp 时渲染药丸并在挂载时取数', async () => {
+    const { component } = loadPill()
+    const calls: boolean[] = []
+    const tree = component({
+      store: modelStore('antigravity-acp'),
+      readQuota: async (force?: boolean) => {
+        calls.push(Boolean(force))
+        return { status: 'ok', updatedAt: new Date().toISOString(), groups: [] }
+      },
+    })
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(tree).not.toBeNull()
+    expect(texts(tree).join('')).toContain('额度')
+    expect(calls.length).toBeGreaterThanOrEqual(1)
+  })
+
+  it('取数失败降级为可读文案，不把异常抛出组件', async () => {
+    const { component } = loadPill()
+    const boom = async () => {
+      throw new Error('额度服务未就绪（Host 端 remote.agyQuota 未挂载）')
+    }
+    let tree: StubElement | null = null
+    expect(() => {
+      tree = component({ store: modelStore('antigravity-acp'), readQuota: boom })
+    }).not.toThrow()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(tree).not.toBeNull()
   })
 })

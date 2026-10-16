@@ -1,5 +1,5 @@
 /**
- * 模型目录的磁盘缓存（只存模型 id/name/description，不含任何凭据）。
+ * 模型目录的磁盘缓存（只存模型 id/name/description/contextWindow，不含任何凭据）。
  *
  * 为什么需要：ACP v1 没有「不建会话、不认证」的只读目录方法，真实目录只能从
  * `session/new` 之后观测到。插件或官方进程一旦重启，内存目录归零，模型选择器
@@ -19,7 +19,15 @@ import { join } from 'node:path'
 interface CatalogCacheFile {
   acpVersion: string
   format: number
-  models: { id: string; name: string; description?: string }[]
+  models: CachedModelRow[]
+}
+
+/** 单条缓存记录；contextWindow 来自实测（usage_update.size），可缺省。 */
+interface CachedModelRow {
+  id: string
+  name: string
+  description?: string
+  contextWindow?: number
 }
 
 /** 缓存格式版本：字段语义变化时 +1，旧文件自然作废。 */
@@ -29,8 +37,10 @@ const CACHE_FORMAT = 1
 export async function readCachedCatalog(options: {
   cacheDir: string
   acpVersion: string
-}): Promise<{ id: string; name: string; description?: string }[] | undefined> {
-  const file = join(options.cacheDir, 'catalog.json')
+  /** 缓存文件名（默认 catalog.json）；CLI 清单另存一份时用它区分。 */
+  fileName?: string
+}): Promise<CachedModelRow[] | undefined> {
+  const file = join(options.cacheDir, options.fileName ?? 'catalog.json')
   let raw: string
   try {
     raw = await readFile(file, 'utf8')
@@ -42,7 +52,7 @@ export async function readCachedCatalog(options: {
     if (parsed.format !== CACHE_FORMAT) return undefined
     if (parsed.acpVersion !== options.acpVersion) return undefined
     if (!Array.isArray(parsed.models) || parsed.models.length === 0) return undefined
-    const models = parsed.models.filter((entry): entry is { id: string; name: string; description?: string } => (
+    const models = parsed.models.filter((entry): entry is CachedModelRow => (
       typeof entry?.id === 'string' && entry.id !== '' && typeof entry.name === 'string'
     ))
     return models.length > 0 ? models : undefined
@@ -58,20 +68,23 @@ export async function readCachedCatalog(options: {
 export async function writeCachedCatalog(options: {
   cacheDir: string
   acpVersion: string
-  models: readonly { id: string; name: string; description?: string }[]
+  models: readonly CachedModelRow[]
+  /** 缓存文件名（默认 catalog.json）。 */
+  fileName?: string
 }): Promise<void> {
   if (options.models.length === 0) return
   const payload: CatalogCacheFile = {
     acpVersion: options.acpVersion,
     format: CACHE_FORMAT,
-    models: options.models.map((model) => (
-      model.description === undefined
-        ? { id: model.id, name: model.name }
-        : { id: model.id, name: model.name, description: model.description }
-    )),
+    models: options.models.map((model) => ({
+      id: model.id,
+      name: model.name,
+      ...(model.description === undefined ? {} : { description: model.description }),
+      ...(model.contextWindow === undefined ? {} : { contextWindow: model.contextWindow }),
+    })),
   }
   try {
-    await writeFile(join(options.cacheDir, 'catalog.json'), `${JSON.stringify(payload, null, 2)}\n`, 'utf8')
+    await writeFile(join(options.cacheDir, options.fileName ?? 'catalog.json'), `${JSON.stringify(payload, null, 2)}\n`, 'utf8')
   } catch {
     // 缓存写不进去不影响功能。
   }

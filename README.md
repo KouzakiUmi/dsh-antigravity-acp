@@ -12,6 +12,12 @@ DeepSeek Harness (DSH) host bundle：把 Google 官方 Antigravity ACP server
 - 工具执行留在 DSH 侧：进程内私有 `127.0.0.1` loopback MCP 桥把当前
   DSH 工具 schema 交给官方 agent；`tools/call` 被 park 后以 DSH
   `tool-call` 结束本轮，下一轮带着 tool result 续同一 ACP prompt。
+- 登录态由本包**导入**：读本机官方 CLI 已登录的
+  `~/.gemini/antigravity-cli/antigravity-oauth-token`（只读），换发一颗
+  access token 后落成官方 server 认的 `~/.gemini/antigravity-acp/acp_token.json`，
+  并补写 `settings.json` 的 `auth.type = oauth-personal`。因此**不会拉起浏览器
+  登录页**，也不再发 `authenticate` 请求（该请求在没有交互式浏览器时会一直挂着）。
+  只有导入不到任何登录态时才回退到官方浏览器授权流程。
 
 安全边界（自动下载路径）：
 
@@ -25,7 +31,25 @@ DeepSeek Harness (DSH) host bundle：把 Google 官方 Antigravity ACP server
 `promptTimeoutMs`、`bridgeParkSettleMs`、`preferredModel`、`proxyUrl`、
 `proxyBypass`。
 环境变量：`AGY_ACP_BIN`（二进制覆盖）、`AGY_ACP_URL`（下载 URL 覆盖，
-供未验证平台组合使用）。
+供未验证平台组合使用）、`AGY_ACP_HOME`（可执行文件安装根目录覆盖）。
+
+## 二进制装在哪里（重要）
+
+自动下载的官方 server **不放在 DSH home 下**，默认装到用户级应用数据目录：
+
+- Windows：`%LOCALAPPDATA%\dsh-antigravity-host\<版本>\`
+- macOS / Linux：`$XDG_CACHE_HOME/dsh-antigravity-host/<版本>/`，其次 `~/.cache/...`
+
+原因不是洁癖，而是**功能必需**：DSH 会把 `$DSH_HOME`（默认 `~/.dsh`）整棵树标为
+**Low 强制完整性**（`icacls` 可见 `Mandatory Label\Low Mandatory Level`），而 Windows
+在创建进程时**会采用映像文件的强制完整性标签**。装在 `~/.dsh` 下的 exe 因此只能以
+LOW 运行，受 MIC「禁止向上写」约束，写不进中等完整性的 `~/.gemini/antigravity-acp/`：
+官方 server 保存凭据用的 `tempfile.NamedTemporaryFile` 会在 `PermissionError` 上
+无限重试，`session/new` 永不返回——表现为「Gemini 一直不回话」且没有任何报错。
+
+插件在启动前会**只读**跑一次 `icacls` 探测该标签；一旦命中就直接报
+`AGY_BINARY_LOW_INTEGRITY` 并给出修法，而不是把卡死留给用户（探测本身失败不会阻断
+启动）。手动指定 `binaryPath` 时请同样避开带该标签的目录。
 
 ## 出网代理
 
@@ -54,8 +78,31 @@ ACP v1 没有「不建会话、不认证」就能读到模型目录的方法：`
 - 占位项**始终保留在列表首位**，即使真实目录已经出现 —— 用户往往在登录前就选了
   `server-default`，把它挤掉会造成「当前模型不在列表里」。
 - 观测到的目录会写入 `$DSH_HOME/cache/antigravity-acp/catalog.json`（只含
-  id/name/description，不含任何凭据），重启后用它兜住选择器；ACP server 版本变化
+  id/name/description/contextWindow，不含任何凭据），重启后用它兜住选择器；ACP server 版本变化
   或文件损坏即失效，回落为占位项。
+- **家族折叠 + 思考强度路由**（2026-10-16 用户指示）：官方把思考强度编码进
+  模型 id（`claude-opus-5-5-{low,medium,high}`），但模型选择**只出家族一行**
+  （`claude-opus-5-5`「Claude Opus 5.5」），强度由 DSH 的思考强度菜单（低/中/高）
+  决定，路由到对应档位模型（选「高」→ `claude-opus-5-5-high`；未选走默认档位
+  `medium`，与官方默认 `Gemini 3.8 Flash (Medium)` 一致）。家族来源是会话观测
+  目录与官方 CLI 只读 `agy models` 清单（2026-10-16 授权「不 wrap agy CLI」
+  **仅限只读取数用途**，缓存 `cli-models.json`）折叠去重；`gpt-oss-120b` 整族
+  排除（临近下架，用户指示不进选择器）。配置里显式钉住档位 id（如
+  `gemini-3.8-flash-high`）且未选强度时，尊重钉住的档位。
+- **上下文容量**：官方目录不报告 context window，本包不填猜测值；首个回合收到
+  官方 `usage_update.size`（协议定义即 total context window size）后，把实测值
+  写进 `resolveModel().context` 并随目录落盘，压缩引擎由此可量化上下文，不再
+  每步报 `no context capacity`。首轮回话之前仍是未知。
+
+### 请求项映射
+
+ACP v1 没有采样参数通道，以下请求项的处理是明确的：
+
+| 请求项 | 行为 |
+| --- | --- |
+| `reasoningEffort` | **路由键**（不是不支持项）：低/中/高 → 家族的 `-low`/`-medium`/`-high` 档位模型；家族缺该档位时取最接近档位。 |
+| `maxTokens` | **静默忽略**（输出上限由官方 agent 自己的会话配置决定）。宿主的会话标题等内建流程固定携带它，硬拒绝会让这些功能永久失败。 |
+| `temperature` / `stop` | 抛 `UNSUPPORTED_OPTION`：用户显式要求的效果无法兑现，不假装接受。 |
 
 ## 稳定性与诊断
 
@@ -78,19 +125,72 @@ ACP v1 没有「不建会话、不认证」就能读到模型目录的方法：`
 写入（改 `preferredModel` / `proxyUrl` / `proxyBypass`），`remote.llm.listProviders()`
 确认路由是否注册。宿主**没有** `remote.llm.listModels`，所以模型目录不在卡片里展示。
 
+客户端插件的 `inject` 必须逐个声明用到的 remote 命名空间
+（`remote`、`remote.settings`、`remote.llm`）：宿主把每个命名空间做成独立服务，
+漏声明时连读属性都会抛 `cannot get property "remote.<ns>" without inject`，
+击穿 `settings.section` 卡片。卡片对属性读取异常一律降级为卡内可读错误，
+不再让异常穿出组件。
+
+## 额度监控（模型选择器旁用量药丸）
+
+选中 `antigravity-acp` 的模型时，输入区模型选择器**左侧**出现用量药丸
+（`conversation.input.right` 槽，宿主 InputBar 把它渲染在模型选择器之前；
+实现手法参考 dsh-subusage 的同位置药丸）。点开可见各组额度窗的剩余百分比、
+重置倒计时与订阅档位；读取失败会显示可读原因，不把未知当充足。
+
+取数链路（Host 侧 `remote.agyQuota.read`）：
+
+1. **首选官方 CLI 的只读额度查询**：`agy -p /usage --output-format json`（slash
+   命令由 CLI 本地处理，实测 `num_turns: 0`、`total_tokens: 0`，无模型回合），
+   结果取 `command.data.groups[].buckets[]`（`window`/`remaining_fraction`/
+   `reset_time`）。CLI 路径可用 `AGY_CLI_BIN` 覆盖，缺省按
+   `%LOCALAPPDATA%\agy\bin\agy.exe` 等默认位置探测。
+2. 无官方 CLI 时退回 Cloud Code Assist HTTP 线（读 `antigravity-oauth-token`
+   → 过期时内存内换发 → `loadCodeAssist` → `retrieveUserQuotaSummary`）。
+
+边界（2026-10-16 经用户明确授权）：
+
+- 「不 wrap agy CLI」放宽为**仅限只读取数用途**：只跑 `/usage` 与 `models` 两个
+  只读命令，不发对话、不写文件；子进程一律经 DSH 的 `ctx.subprocess`。
+- 「bundle 不读 OAuth 凭据」放宽为额度取数只读：登录态**只读不写**，换发出的
+  access token 只在内存里用，绝不改官方登录文件；
+- token 材料不进快照、不进错误文本、不进日志（错误统一过 `redactSensitiveText`，
+  含 `Bearer <token>` 打码）；
+- 取数失败折叠成 `status: 'error'` 的可读快照，不把异常抛穿到界面。
+
+实测状态（2026-10-16，本机账户，真实跑通）：官方 CLI 额度查询解析出 3 组额度窗
+（Gemini Models / Claude and GPT models / Gemini 4 Argon，weekly 与 5h 窗、
+剩余百分比与重置时间齐全）。Cloud Code Assist HTTP 线是 **Gemini Code Assist
+（企业授权产品）**：本账户 `retrieveUserQuotaSummary` 403「no valid license of
+this product (#3501)」，仅作备用。原生 gRPC 接口
+`google.gca.aicode.v1main.JetskiRemoteAgentProxyService/GetUserQuotaSummary`
+已定位（宿主 `aicode.googleapis.com:443`）但服务端路由未接通，记录备查。
+
 ## 安装参考
 
 通用 CLI 示例（`web` 只是文档用的 profile 名，不是本机 Desktop）：
 
 ```sh
-dsh plugin --profile web add ./dsh-bundle-antigravity-host-0.1.0.tgz
+dsh plugin --profile web add ./dsh-bundle-antigravity-host-0.1.10.tgz
 ```
 
 本机 Desktop 壳独占 `desktop` profile，公共 `dsh` 不能对它执行 `plugin add`。
 请在 DSH NEXT 的插件管理器里添加本地包，路径示例：
 
-`D:\dsh-antigravity-acp\.local-install\dsh-bundle-antigravity-host-0.1.0.tgz`
+`D:\dsh-antigravity-acp\.local-install\dsh-bundle-antigravity-host-0.1.10.tgz`
 
-装好后需要完全退出并重开 Desktop。首次对话可能由官方 `agy_acp_server` 打开浏览器做 `oauth-personal`。模型路由名为 `antigravity-acp`。
+装好后需要完全退出并重开 Desktop。只要本机官方 CLI 已登录过，
+`oauth-personal` 登录态会自动导入，**不会**弹浏览器登录页。模型路由名为
+`antigravity-acp`。
+
+## 排障
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| 首次对话后 Gemini 完全不回话、也没有报错 | 二进制落在 Low 强制完整性目录，官方进程被降权后卡在凭据保存 | 插件现在会直接报 `AGY_BINARY_LOW_INTEGRITY`；删掉 DSH home 下的旧 `cache/antigravity-acp/*/extract-*` 即可，新版本默认装到 `%LOCALAPPDATA%` |
+| 启动即失败 `AGY_BINARY_MISSING` | 未配置 `binaryPath`、无缓存且 `autoDownload=false` | 打开 `autoDownload` 或指定 `binaryPath` |
+| 认证环节等到超时 | 导入不到任何本机登录态，退回官方浏览器授权 | 先用官方 CLI 登录一次，或在插件配置里填 `proxyUrl` 后重试 |
+| 官方进程连不上 Google | 宿主 scrub 了父环境，代理需显式注入 | 填 `proxyUrl`（留空时会自动转发宿主自身的 `*_PROXY`） |
+| 磁盘被 `_MEI*` 目录吃掉几十 GB | onefile 解压目录在进程被强杀后不会自清理 | 装载插件时会自动清理超过 1 小时的陈旧目录 |
 
 本 README 仅描述代码与产物现状，不构成已安装或兼容性承诺。

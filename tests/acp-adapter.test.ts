@@ -82,6 +82,7 @@ function createHarness(
     promptTimeoutMs?: number
     loadCachedCatalog?: () => Promise<{ id: string; name: string; description?: string }[] | undefined>
     saveCatalog?: (models: readonly { id: string; name: string; description?: string }[]) => Promise<void> | void
+    loadCliCatalog?: () => Promise<readonly { id: string; name: string }[]>
   } = {},
 ): Harness {
   const agent = new FakeAcpAgent()
@@ -125,6 +126,7 @@ function createHarness(
     promptTimeoutMs: options.promptTimeoutMs,
     loadCachedCatalog: options.loadCachedCatalog,
     saveCatalog: options.saveCatalog,
+    loadCliCatalog: options.loadCliCatalog,
   })
   teardowns.push(async () => {
     await bridgeTeardown?.()
@@ -431,6 +433,93 @@ describe('模型目录来自 ACP 会话配置', () => {
     const resolved = await harness.adapter.resolveModel(AGY_PROVIDER_ID, '未登记的模型')
     expect(resolved).toMatchObject({ id: '未登记的模型', name: '未登记的模型', inputModalities: ['text'] })
   })
+
+  it('listModels 折叠成家族（Opus 5.5 / Sonnet 5.5 / Argon），不把思考强度放进模型', async () => {
+    const harness = createHarness({
+      loadCachedCatalog: async () => [{ id: 'gemini-3-flash', name: 'Gemini 3 Flash' }],
+      loadCliCatalog: async () => [
+        { id: 'gemini-3-flash', name: '重复条目以目录为准' },
+        { id: 'claude-opus-5-5-high', name: 'Claude Opus 5.5 (High)' },
+        { id: 'claude-opus-5-5-low', name: 'Claude Opus 5.5 (Low)' },
+        { id: 'gemini-4-argon-medium', name: 'Gemini 4 Argon (Medium)' },
+        { id: 'claude-sonnet-5-5-low', name: 'Claude Sonnet 5.5 (Low)' },
+        { id: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' },
+      ],
+    })
+    const models = await harness.adapter.listModels(AGY_PROVIDER_ID)
+    const ids = models.map((model) => model.id)
+    expect(ids[0]).toBe(AGY_PLACEHOLDER_MODEL_ID)
+    expect(ids).toContain('claude-opus-5-5')
+    expect(ids).toContain('gemini-4-argon')
+    expect(ids).toContain('claude-sonnet-5-5')
+    // 选择器里不出现档位化 id，也不出现临近下架的 gpt-oss-120b。
+    expect(ids.some((id) => /-(low|medium|high)$/.test(id))).toBe(false)
+    expect(ids.some((id) => id.includes('gpt-oss'))).toBe(false)
+    // 同 id 时保留目录侧的名称。
+    expect(models.find((model) => model.id === 'gemini-3-flash')?.name).toBe('Gemini 3 Flash')
+    expect(models.find((model) => model.id === 'claude-opus-5-5')?.name).toBe('Claude Opus 5.5')
+  })
+
+  it('CLI 清单取数失败时目录主体不受影响', async () => {
+    const harness = createHarness({
+      loadCachedCatalog: async () => [{ id: 'gemini-3-pro', name: 'Gemini 3 Pro' }],
+      loadCliCatalog: async () => {
+        throw new Error('cli 不可用')
+      },
+    })
+    const models = await harness.adapter.listModels(AGY_PROVIDER_ID)
+    expect(models.map((model) => model.id)).toEqual([AGY_PLACEHOLDER_MODEL_ID, 'gemini-3-pro'])
+  })
+
+  it('resolveModel 声明思考强度菜单（低/中/高），默认档位 medium', async () => {
+    const harness = createHarness()
+    const resolved = await harness.adapter.resolveModel(AGY_PROVIDER_ID, 'claude-opus-5-5')
+    expect(resolved.reasoning?.efforts.map((effort) => String(effort.id))).toEqual(['low', 'medium', 'high'])
+    expect(String(resolved.reasoning?.defaultEffort)).toBe('medium')
+    expect(resolved.reasoning?.efforts.map((effort) => effort.name)).toEqual(['低', '中', '高'])
+  })
+
+  it('思考强度路由：选 high 就落到 claude-opus-5-5-high', async () => {
+    const harness = createHarness()
+    const streaming = collect(harness.adapter.stream(baseOptions({ model: 'claude-opus-5-5', reasoningEffort: 'high' as never })))
+    await waitForRequest(harness.agent, 'session/set_config_option')
+    await harness.agent.reply('session/prompt', { stopReason: 'end_turn' })
+    await streaming
+    const requested = harness.agent.requests
+      .filter((request) => request.method === 'session/set_config_option')
+      .map((request) => (request.params as { value: string }).value)
+    expect(requested).toContain('claude-opus-5-5-high')
+  })
+
+  it('思考强度路由：未选强度且家族档位已知时走默认档位 medium', async () => {
+    const harness = createHarness({
+      loadCliCatalog: async () => [
+        { id: 'gemini-4-argon-low', name: 'Gemini 4 Argon (Low)' },
+        { id: 'gemini-4-argon-medium', name: 'Gemini 4 Argon (Medium)' },
+        { id: 'gemini-4-argon-high', name: 'Gemini 4 Argon (High)' },
+      ],
+    })
+    const streaming = collect(harness.adapter.stream(baseOptions({ model: 'gemini-4-argon' })))
+    await waitForRequest(harness.agent, 'session/set_config_option')
+    await harness.agent.reply('session/prompt', { stopReason: 'end_turn' })
+    await streaming
+    const requested = harness.agent.requests
+      .filter((request) => request.method === 'session/set_config_option')
+      .map((request) => (request.params as { value: string }).value)
+    expect(requested).toContain('gemini-4-argon-medium')
+  })
+
+  it('配置显式钉住档位且未选强度时，尊重钉住的档位', async () => {
+    const harness = createHarness()
+    const streaming = collect(harness.adapter.stream(baseOptions({ model: 'gemini-3.8-flash-high' })))
+    await waitForRequest(harness.agent, 'session/set_config_option')
+    await harness.agent.reply('session/prompt', { stopReason: 'end_turn' })
+    await streaming
+    const requested = harness.agent.requests
+      .filter((request) => request.method === 'session/set_config_option')
+      .map((request) => (request.params as { value: string }).value)
+    expect(requested).toContain('gemini-3.8-flash-high')
+  })
 })
 
 describe('StreamChunk 序列映射', () => {
@@ -528,14 +617,32 @@ describe('StreamChunk 序列映射', () => {
     await harness.agent.reply('session/prompt', { stopReason: 'end_turn' })
     expect(await streaming).toEqual([{ type: 'finish', reason: { kind: 'stop' } }])
   })
+
+  it('usage_update.size 记为实测上下文容量，出现在 resolveModel().context', async () => {
+    const harness = createHarness()
+    const streaming = collect(harness.adapter.stream(baseOptions()))
+    await waitForRequest(harness.agent, 'session/prompt')
+    await harness.agent.notify('session/update', {
+      sessionId: SESSION_1,
+      update: { sessionUpdate: 'usage_update', used: 10, size: 1_048_576 },
+    })
+    await harness.agent.reply('session/prompt', { stopReason: 'end_turn' })
+    await streaming
+    const resolved = await harness.adapter.resolveModel(AGY_PROVIDER_ID, 'gemini-3-pro')
+    expect(resolved.context).toEqual({ contextWindow: 1_048_576 })
+  })
+
+  it('未实测容量的模型不声明 context（官方目录不报告，绝不填猜测值）', async () => {
+    const harness = createHarness()
+    const resolved = await harness.adapter.resolveModel(AGY_PROVIDER_ID, 'gemini-3-pro')
+    expect(resolved.context).toBeUndefined()
+  })
 })
 
 describe('不支持的请求项', () => {
   const cases: Array<[string, Partial<GenerateOptions>]> = [
     ['temperature', { temperature: 0.5 }],
-    ['maxTokens', { maxTokens: 256 }],
     ['stop', { stop: ['END'] }],
-    ['reasoningEffort', { reasoningEffort: 'high' as never }],
   ]
   for (const [label, patch] of cases) {
     it(`${label} 抛 UNSUPPORTED_OPTION 且不发起任何 ACP 交互`, async () => {
@@ -547,9 +654,17 @@ describe('不支持的请求项', () => {
     })
   }
 
-  it('缺省 reasoningEffort 不报错', async () => {
+  it('maxTokens 被静默忽略而不是整单拒绝（会话标题等宿主流程固定携带它）', async () => {
     const harness = createHarness()
-    const streaming = collect(harness.adapter.stream(baseOptions()))
+    const streaming = collect(harness.adapter.stream(baseOptions({ maxTokens: 256 })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    await harness.agent.reply('session/prompt', { stopReason: 'end_turn' })
+    await expect(streaming).resolves.toEqual([{ type: 'finish', reason: { kind: 'stop' } }])
+  })
+
+  it('reasoningEffort 是路由键而不是不支持项（菜单选强度 → 路由到档位模型）', async () => {
+    const harness = createHarness()
+    const streaming = collect(harness.adapter.stream(baseOptions({ reasoningEffort: 'low' as never })))
     await waitForRequest(harness.agent, 'session/prompt')
     await harness.agent.reply('session/prompt', { stopReason: 'end_turn' })
     await expect(streaming).resolves.toEqual([{ type: 'finish', reason: { kind: 'stop' } }])

@@ -10,7 +10,8 @@
  * 策略：只做**结构化、可证明**的替换，不做关键词猜测：
  * 1. URL userinfo（`scheme://user:pass@host`）→ `scheme://***@`；
  * 2. URL query 中命中敏感键名的参数值 → `***`；
- * 3. 形如 `code_challenge=…` / `state=…` 的裸键值对（不在 URL 里的）→ `***`。
+ * 3. 形如 `code_challenge=…` / `state=…` 的裸键值对（不在 URL 里的）→ `***`；
+ * 4. `Bearer <token>` 形态的凭据头（额度取数等错误文本可能携带）→ `Bearer ***`。
  *
  * 刻意不做：不删除整行（会丢掉「凭据缺失或无效，需要浏览器登录」这类真正有用
  * 的诊断信息）；不猜测未列入的键名（如泛化的 `key` 极易误伤正常日志），宁可漏脱敏
@@ -49,6 +50,9 @@ const BARE_SENSITIVE_PAIR = new RegExp(
   'gi',
 )
 
+/** `Authorization: Bearer <token>` / `Bearer <token>` 形态的凭据值。 */
+const BEARER_TOKEN = /\b(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi
+
 /** 打码占位符；刻意不可反推原值。 */
 const MASK = '***'
 
@@ -59,6 +63,7 @@ export function redactSensitiveText(text: string | undefined | null): string {
     .replace(URL_USERINFO, `$1${MASK}@`)
     .replace(SENSITIVE_QUERY_PARAM, `$1${MASK}`)
     .replace(BARE_SENSITIVE_PAIR, `$1$2${MASK}`)
+    .replace(BEARER_TOKEN, `$1${MASK}`)
 }
 
 /**

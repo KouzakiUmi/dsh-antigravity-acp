@@ -14,9 +14,10 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
-import { disposeAcpRuntime, ensureAcpRuntime } from '../src/index.js'
-import type { ActiveAcpRuntime } from '../src/index.js'
+import { disposeAcpRuntime, ensureAcpRuntime as startAcpRuntimeRaw } from '../src/index.js'
+import type { ActiveAcpRuntime, AcpRuntimeDeps } from '../src/index.js'
 import { AGY_LINK_ERROR } from '../src/protocol/agent-link.js'
+import { AGY_BINARY_ERROR } from '../src/runtime/binary.js'
 import type { AgentLinkHandlers } from '../src/protocol/agent-link.js'
 import type { AntigravityHostConfig } from '../src/settings.js'
 import { FakeAcpAgent } from './helpers/fake-acp-agent.js'
@@ -44,6 +45,35 @@ const cleanups: Array<() => Promise<void>> = []
 afterEach(async () => {
   while (cleanups.length > 0) await cleanups.pop()?.()
 })
+
+/**
+ * 启动路径上的假依赖。
+ *
+ * `ready: false` 保留旧行为（仍会走 authenticate），因此既有的「认证等待」用例语义不变；
+ * `probeLowIntegrity` 固定 false，避免假 subprocess 收到一条它不认识的 icacls 进程。
+ */
+const TEST_DEPS: AcpRuntimeDeps = {
+  ensureCredentials: async () => ({
+    ready: false,
+    status: 'unavailable',
+    authType: 'oauth-personal',
+    tokenPath: '',
+    settingsPath: '',
+    settingsWritten: false,
+    note: '测试替身：无可用登录态',
+  }),
+  probeLowIntegrity: async () => false,
+}
+
+/** 注入测试依赖的启动入口（调用点保持与生产一致的签名）。 */
+function ensureAcpRuntime(
+  ctx: Context,
+  config: AntigravityHostConfig,
+  handlers: AgentLinkHandlers,
+  active: ActiveAcpRuntime,
+) {
+  return startAcpRuntimeRaw(ctx, config, handlers, active, TEST_DEPS)
+}
 
 /** 组装「假 ctx.subprocess + 每个 spawn 对应一个假 agent」的运行时。 */
 async function createRuntimeHarness(
@@ -385,5 +415,82 @@ describe('启动失败的诊断文本脱敏', () => {
     expect(message).toContain('握手失败')
     expect(message).toContain('proxy dial failed')
     expect(message).not.toContain('hunter2')
+  })
+})
+
+describe('启动路径的新增前置检查', () => {
+  it('登录态已就绪时跳过 authenticate（无交互浏览器时会白等 5 分钟）', async () => {
+    const harness = await createRuntimeHarness((agent) => {
+      agent.on('initialize', () => ({ protocolVersion: 1, agentCapabilities: {} }))
+      // 刻意注册 authenticate 处理器：若被调用就会留下记录。
+      agent.on('authenticate', () => ({}))
+    })
+    try {
+      const link = await startAcpRuntimeRaw(harness.ctx, harness.config, handlers, harness.active, {
+        ensureCredentials: async () => ({
+          ready: true,
+          status: 'imported',
+          authType: 'oauth-personal',
+          tokenPath: '',
+          settingsPath: '',
+          settingsWritten: true,
+        }),
+        probeLowIntegrity: async () => false,
+      })
+      expect(link).toBeDefined()
+      expect(harness.agents[0]!.requestsFor('authenticate')).toHaveLength(0)
+      expect(harness.agents[0]!.requestsFor('initialize')).toHaveLength(1)
+    } finally {
+      await harness.dispose()
+    }
+  })
+
+  it('二进制落在低完整性目录时立刻报错，不 spawn（否则表现为无解释的挂死）', async () => {
+    const harness = await createRuntimeHarness(() => undefined)
+    try {
+      await expect(
+        startAcpRuntimeRaw(harness.ctx, harness.config, handlers, harness.active, {
+          ensureCredentials: async () => ({
+            ready: true,
+            status: 'existing',
+            authType: 'oauth-personal',
+            tokenPath: '',
+            settingsPath: '',
+            settingsWritten: false,
+          }),
+          probeLowIntegrity: async () => true,
+        }),
+      ).rejects.toMatchObject({ code: AGY_BINARY_ERROR.LOW_INTEGRITY })
+      expect(harness.spawns).toHaveLength(0)
+    } finally {
+      await harness.dispose()
+    }
+  })
+
+  it('登录态不就绪时仍走 authenticate，并把原因带进错误消息', async () => {
+    // 官方 authenticate 在没有交互式浏览器时不会应答：用极短 authTimeoutMs 复现该等待。
+    const harness = await createRuntimeHarness((agent) => {
+      agent.on('initialize', () => ({ protocolVersion: 1, agentCapabilities: {} }))
+    })
+    const config: AntigravityHostConfig = { ...harness.config, authTimeoutMs: 30 }
+    try {
+      await expect(
+        startAcpRuntimeRaw(harness.ctx, config, handlers, harness.active, {
+          ensureCredentials: async () => ({
+            ready: false,
+            status: 'unavailable',
+            authType: 'oauth-personal',
+            tokenPath: '',
+            settingsPath: '',
+            settingsWritten: false,
+            note: '未找到可导入的官方登录态',
+          }),
+          probeLowIntegrity: async () => false,
+        }),
+      ).rejects.toThrow(/未找到可导入的官方登录态/)
+      expect(harness.agents[0]!.requestsFor('authenticate')).toHaveLength(1)
+    } finally {
+      await harness.dispose()
+    }
   })
 })

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  ambientProxyEnv,
   buildProxyEnv,
   normalizeProxyUrl,
   ProxyConfigError,
@@ -93,5 +94,34 @@ describe('buildProxyEnv', () => {
       all_proxy: 'socks5://127.0.0.1:7891',
       no_proxy: 'localhost,127.0.0.1,::1',
     })
+  })
+})
+
+describe('ambientProxyEnv', () => {
+  it('没有代理环境时返回 undefined（不无中生有）', () => {
+    expect(ambientProxyEnv({})).toBeUndefined()
+    expect(ambientProxyEnv({ NO_PROXY: 'example.com' })).toBeUndefined()
+  })
+
+  it('转发用户写过的名字并补全大小写，loopback 始终并入排除列表', () => {
+    const env = ambientProxyEnv({ HTTPS_PROXY: 'http://127.0.0.1:7890', no_proxy: '10.0.0.0/8' })
+    expect(env).toEqual({
+      NO_PROXY: '10.0.0.0/8,localhost,127.0.0.1,::1',
+      no_proxy: '10.0.0.0/8,localhost,127.0.0.1,::1',
+      HTTPS_PROXY: 'http://127.0.0.1:7890',
+      https_proxy: 'http://127.0.0.1:7890',
+    })
+  })
+
+  it('ALL_PROXY 作为两个 scheme 的兜底，同时也单独转发', () => {
+    const env = ambientProxyEnv({ ALL_PROXY: 'socks5://127.0.0.1:7891' })
+    expect(env?.HTTPS_PROXY).toBe('socks5://127.0.0.1:7891')
+    expect(env?.HTTP_PROXY).toBe('socks5://127.0.0.1:7891')
+    expect(env?.ALL_PROXY).toBe('socks5://127.0.0.1:7891')
+  })
+
+  it('小写名优先于大写名（与 undici 的读取顺序一致）', () => {
+    const env = ambientProxyEnv({ https_proxy: 'http://lower:1', HTTPS_PROXY: 'http://upper:2' })
+    expect(env?.HTTPS_PROXY).toBe('http://lower:1')
   })
 })

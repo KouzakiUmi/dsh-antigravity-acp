@@ -12,20 +12,31 @@
  * 不支持项一律抛 `LlmError(..., 'UNSUPPORTED_OPTION')`（dsh-llm 0.2.1 的
  * error.d.ts 未导出该码的官方常量，因此用字面量并在下方集中定义）。
  */
-import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
+import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type {
   GenerateOptions,
   LlmModelInfo,
+  LlmModelReasoningInfo,
   LlmProviderInfo,
   LlmResolvedModelInfo,
   PreparedAdapterCall,
   RequestMessage,
   StreamChunk,
 } from '@deepseek-ai/dsh-llm'
-import type { AnyRequest, McpServer as AcpMcpServer, SessionConfigOption } from '@agentclientprotocol/sdk'
+import type { AnyRequest, McpServer as AcpMcpServer, SessionConfigOption, SessionNotification } from '@agentclientprotocol/sdk'
 import type { AgentLink, AgentLinkHandlers } from '../protocol/agent-link.js'
 import { McpToolBridge } from '../bridge/mcp-bridge.js'
 import type { BridgeToolResult } from '../bridge/mcp-bridge.js'
+import {
+  AGY_REASONING_EFFORTS,
+  AGY_REASONING_EFFORT_NAMES,
+  DEFAULT_AGY_REASONING_EFFORT,
+  foldAgyModelFamilies,
+  modelFamilyId,
+  routeTieredModelId,
+  tierForModelId,
+} from '../runtime/agy-cli.js'
+import type { AgyReasoningEffort } from '../runtime/agy-cli.js'
 import { findModelSelector, toModelCatalog } from './model-catalog.js'
 import type { ModelSelector } from './model-catalog.js'
 import { buildPromptContent, renderToolResultText } from './prompt-transcript.js'
@@ -80,6 +91,11 @@ export interface AntigravityAcpAdapterOptions {
   loadCachedCatalog?: () => Promise<CachedModel[] | undefined>
   /** 观测到真实目录后的落盘回调；失败由实现方自行吞掉。 */
   saveCatalog?: (models: readonly CachedModel[]) => Promise<void> | void
+  /**
+   * 官方 CLI 模型清单（`agy models` 的只读取数，2026-10-16 授权仅限只读取数
+   * 用途）。用于补齐会话观测之外的官方型号；失败由 adapter 吞掉。
+   */
+  loadCliCatalog?: () => Promise<readonly { id: string; name: string }[]>
 }
 
 /** 目录缓存条目（只含模型元数据，不含任何凭据）。 */
@@ -87,6 +103,8 @@ export interface CachedModel {
   id: string
   name: string
   description?: string
+  /** 实测上下文容量（usage_update.size）；官方目录不报告，故可缺省。 */
+  contextWindow?: number
 }
 
 /*
@@ -119,6 +137,11 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   readonly #preferredModel: string
   readonly #loadCachedCatalog?: AntigravityAcpAdapterOptions['loadCachedCatalog']
   readonly #saveCatalog?: AntigravityAcpAdapterOptions['saveCatalog']
+  readonly #loadCliCatalog?: AntigravityAcpAdapterOptions['loadCliCatalog']
+  /** 官方 CLI 清单的进程内一次性结果。 */
+  #cliCatalog?: Promise<readonly { id: string; name: string }[]>
+  /** 家族 → 支持的思考强度档位（由 listModels 折叠得到）。 */
+  #familyTiers = new Map<string, ReadonlySet<AgyReasoningEffort>>()
   readonly #bridge: McpToolBridge
   /** 身份稳定的 ACP 事件处理器：AgentLink 只在构造时取一次 handlers。 */
   readonly #handlers: AgentLinkHandlers
@@ -136,6 +159,14 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   #catalogObserved = false
   /** 目录缓存的惰性读取结果（只读一次）。 */
   #cacheLoad?: Promise<LlmModelInfo[]>
+  /**
+   * 各 DSH 路由键（`GenerateOptions.model`）实测到的上下文容量，来自官方
+   * `usage_update.size`（ACP 对 `size` 的定义即 total context window size）。
+   * 有了它压缩引擎才能量化上下文，而不是每步报「no context capacity」。
+   */
+  #contextWindows = new Map<string, number>()
+  /** 当前 ACP 会话对应的 DSH 路由键，用于把 usage_update 归属到具体模型。 */
+  #routeModelId: string | undefined
 
   constructor(options: AntigravityAcpAdapterOptions) {
     super()
@@ -147,13 +178,17 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     this.#preferredModel = options.preferredModel?.trim() ?? ''
     this.#loadCachedCatalog = options.loadCachedCatalog
     this.#saveCatalog = options.saveCatalog
+    this.#loadCliCatalog = options.loadCliCatalog
     this.#bridge = new McpToolBridge()
     this.#registerBridgeTeardown(async () => {
       this.#releaseTurnSubscription()
       await this.#bridge.close()
     })
     this.#handlers = {
-      onSessionUpdate: (notification) => this.#turn?.handleSessionUpdate(notification),
+      onSessionUpdate: (notification) => {
+        this.#observeUsageUpdate(notification)
+        return this.#turn?.handleSessionUpdate(notification)
+      },
       onRequestPermission: (request) => this.#turn?.handleRequestPermission(request)
         ?? { outcome: { outcome: 'cancelled' } },
       onUnexpectedAgentRequest: (method, request) => this.#handleUnexpectedRequest(method, request),
@@ -184,8 +219,12 @@ export class AntigravityAcpAdapter extends LlmAdapter {
    * `observeSessionConfigOptions` 写入缓存。
    */
   /**
-   * 本 provider 的模型目录：占位项恒在首位，其余为观测到（或缓存）的官方目录。
-   * 官方目录里若也出现与占位同名的 id 会被去重，避免选择器出现重复条目。
+   * 本 provider 的模型目录：占位项恒在首位，其余是**家族**条目。
+   *
+   * 家族折叠（2026-10-16 用户指示）：官方把思考强度编码进模型 id
+   * （`claude-opus-5-5-{low,medium,high}`），但模型选择只出家族一行，强度由
+   * 思考强度菜单路由（见 #applyModelSelection）。会话观测目录与官方 CLI 清单
+   * 一并折叠，同 id 去重；被排除的家族（gpt-oss-120b 临近下架）不出现。
    */
   override async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
     const placeholder: LlmModelInfo = {
@@ -195,13 +234,57 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       description: '使用官方 ACP 会话的默认模型；第一次发消息时会下载/登录',
       inputModalities: ['text'],
     }
+    const folded = await this.#foldCatalog(_provider)
+    return [
+      placeholder,
+      ...folded.models.map((model) => ({
+        provider: _provider,
+        id: model.id,
+        name: model.name,
+        ...(model.description === undefined ? {} : { description: model.description }),
+        inputModalities: ['text'] as const,
+      })),
+    ]
+  }
+
+  /**
+   * 折叠家族档位表：会话观测目录（或磁盘缓存）+ 官方 CLI 清单。
+   * listModels 与模型路由共用；占位 id 不进家族表。
+   */
+  async #foldCatalog(provider: string): Promise<{
+    models: Array<{ id: string; name: string; description?: string }>
+    tiers: Map<string, ReadonlySet<AgyReasoningEffort>>
+  }> {
     // 未观测到真实目录时用磁盘缓存兜住选择器空窗。
     const source = this.#catalog.length > 0
       ? this.#catalog
-      : await this.#cachedModels(_provider)
-    const rest = source.filter((model) => model.id !== AGY_PLACEHOLDER_MODEL_ID)
-      .map((model) => ({ ...model }))
-    return [placeholder, ...rest]
+      : await this.#cachedModels(provider)
+    const folded = foldAgyModelFamilies([
+      ...source
+        .filter((model) => model.id !== AGY_PLACEHOLDER_MODEL_ID)
+        .map((model) => ({
+          id: model.id,
+          name: model.name,
+          ...(model.description === undefined ? {} : { description: model.description }),
+        })),
+      ...await this.#cliRawRows(),
+    ])
+    this.#familyTiers = folded.tiers
+    return folded
+  }
+
+  /** 官方 CLI 模型清单的原始行（进程内只取一次；失败返回空，不影响目录主体）。 */
+  async #cliRawRows(): Promise<readonly { id: string; name: string }[]> {
+    const load = this.#loadCliCatalog
+    if (!load) return []
+    this.#cliCatalog ??= (async () => {
+      try {
+        return await load()
+      } catch {
+        return []
+      }
+    })()
+    return this.#cliCatalog
   }
 
   /** 读一次目录缓存（结果记忆在实例上，避免每次列目录都碰文件系统）。 */
@@ -212,6 +295,10 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         const rows = await this.#loadCachedCatalog()
         if (!rows || rows.length === 0) return []
         return rows.map((row) => {
+          // 缓存里若带实测上下文容量，重启后压缩引擎无需等下一次 usage_update。
+          if (typeof row.contextWindow === 'number' && Number.isFinite(row.contextWindow) && row.contextWindow > 0) {
+            this.#contextWindows.set(row.id, row.contextWindow)
+          }
           const entry: LlmModelInfo = { provider, id: row.id, name: row.name, inputModalities: ['text'] }
           return row.description === undefined ? entry : { ...entry, description: row.description }
         })
@@ -242,13 +329,34 @@ export class AntigravityAcpAdapter extends LlmAdapter {
    */
   override async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
     const known = this.#catalog.find((entry) => entry.id === model)
+    // 上下文容量只在**实测**过（usage_update.size）或缓存过时才声明；官方目录
+    // 不报告容量，绝不填猜测值。缺省时不带 context，压缩引擎按未知处理。
+    const contextWindow = this.#contextWindows.get(model)
     return {
       provider,
       id: model,
       name: known?.name ?? model,
       inputModalities: ['text'],
       ...(known?.description === undefined ? {} : { description: known.description }),
+      ...(contextWindow === undefined ? {} : { context: { contextWindow } }),
+      // 思考强度菜单：官方把强度编码进模型 id 后缀，本 provider 只出家族条目，
+      // 由菜单选择路由到对应档位（2026-10-16 用户指示）。
+      reasoning: this.#reasoningInfo(model),
     }
+  }
+
+  /** 该路由可选的思考强度（low/medium/high，弱→强）；缺省档位为 medium。 */
+  #reasoningInfo(model: string): LlmModelReasoningInfo {
+    const tiers = this.#familyTiers.get(modelFamilyId(model))
+    // 已知该 id 没有档位变体（目录里的普通 id）：强度菜单不适用，不显示。
+    if (tiers !== undefined && tiers.size === 0) return { efforts: [] }
+    const efforts = AGY_REASONING_EFFORTS
+      .filter((effort) => tiers === undefined || tiers.has(effort))
+      .map((effort) => ({
+        id: ReasoningEffortId(effort),
+        name: AGY_REASONING_EFFORT_NAMES[effort],
+      }))
+    return { efforts, defaultEffort: ReasoningEffortId(DEFAULT_AGY_REASONING_EFFORT) }
   }
 
   override async prepareCall(provider: string, model: string, signal?: AbortSignal): Promise<PreparedAdapterCall> {
@@ -296,6 +404,8 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   }
 
   async *#runNewRound(options: GenerateOptions): AsyncGenerator<StreamChunk> {
+    // usage_update 的上下文容量归属到本次请求的 DSH 路由键。
+    this.#routeModelId = options.model
     const link = await this.#getLink(this.#handlers)
     const tools = options.tools ?? []
     this.#bridge.publishTools(tools)
@@ -311,7 +421,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
 
     const session = await link.newSession({ cwd: this.#cwd, mcpServers })
     this.observeSessionConfigOptions(session.configOptions)
-    await this.#applyModelSelection(link, session.sessionId, options.model)
+    await this.#applyModelSelection(link, session.sessionId, options.model, options.reasoningEffort)
 
     const turn = new PromptTurn(session.sessionId, {
       link,
@@ -409,6 +519,24 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   }
 
   /**
+   * 从 `usage_update` 观察上下文容量：ACP 对 `size` 的定义是
+   * 「Total context window size in tokens」，正好填 `LlmResolvedModelInfo.context`。
+   * 归属到当前回合的 DSH 路由键（`#routeModelId`）；只认正的有限数。
+   */
+  #observeUsageUpdate(notification: SessionNotification): void {
+    const update = notification.update
+    if (update.sessionUpdate !== 'usage_update') return
+    const size = update.size
+    if (typeof size !== 'number' || !Number.isFinite(size) || size <= 0) return
+    const model = this.#routeModelId
+    if (!model) return
+    if (this.#contextWindows.get(model) === size) return
+    this.#contextWindows.set(model, size)
+    // 容量随目录一起落盘，重启后压缩引擎不必等下一次 usage_update。
+    this.#persistCatalog()
+  }
+
+  /**
    * 观察一次 ACP 会话配置：刷新模型目录缓存与 model 选择器。
    * `session/new`、`session/set_config_option` 与 `config_option_update` 共用。
    */
@@ -421,14 +549,21 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     this.#cacheLoad = undefined
     // 真实目录只在会话建立后才能观测到；落盘后重启不必退化成占位模型。
     // 写入失败与并发写冲突都无所谓：缓存是优化，不是功能。
-    if (selector && this.#saveCatalog) {
-      const payload = this.#catalog.map((model) => (
-        model.description === undefined
-          ? { id: model.id, name: model.name }
-          : { id: model.id, name: model.name, description: model.description }
-      ))
-      void Promise.resolve(this.#saveCatalog(payload)).catch(() => undefined)
-    }
+    if (selector) this.#persistCatalog()
+  }
+
+  /** 把当前目录（含实测上下文容量）落盘；写失败不影响功能。 */
+  #persistCatalog(): void {
+    if (!this.#saveCatalog || this.#catalog.length === 0) return
+    const payload = this.#catalog.map((model) => ({
+      id: model.id,
+      name: model.name,
+      ...(model.description === undefined ? {} : { description: model.description }),
+      ...(this.#contextWindows.get(model.id) === undefined
+        ? {}
+        : { contextWindow: this.#contextWindows.get(model.id) }),
+    }))
+    void Promise.resolve(this.#saveCatalog(payload)).catch(() => undefined)
   }
 
   /** 是否已经从真实 ACP 会话观测到过配置（listModels 空目录时的诊断依据）。 */
@@ -442,10 +577,33 @@ export class AntigravityAcpAdapter extends LlmAdapter {
    * ACP v1 的 `session/set_config_option` 需要既有 sessionId，因此顺序是
    * `session/new` → `set_config_option` → `session/prompt`（initialize 响应
    * 不携带 configOptions，没有「new 之前设置」的通道）。
+   *
+   * **家族 + 思考强度路由**（2026-10-16 用户指示）：模型选择只出家族
+   * （`claude-opus-5-5`），思考强度菜单（low/medium/high）决定路由到哪个
+   * 官方档位模型（`claude-opus-5-5-high`）。未选强度且配置里显式钉了档位时
+   * 尊重钉住的档位；否则走默认档位（medium）。
    */
-  async #applyModelSelection(link: AgentLink, sessionId: string, model: string): Promise<void> {
-    const requested = model === AGY_PLACEHOLDER_MODEL_ID ? this.#preferredModel : model
-    if (!requested) return
+  async #applyModelSelection(
+    link: AgentLink,
+    sessionId: string,
+    model: string,
+    effort?: { toString(): string },
+  ): Promise<void> {
+    const base = model === AGY_PLACEHOLDER_MODEL_ID ? this.#preferredModel : model
+    if (!base) return
+    // 档位表可能尚未建立（API 直调时选择器还没列过目录）：先折叠一次再路由。
+    await this.#foldCatalog(AGY_PROVIDER_ID)
+    const family = modelFamilyId(base)
+    const pinnedTier = tierForModelId(base)
+    const effortTier = normalizeEffort(effort)
+    const tiers = this.#familyTiers.get(family)
+    const requested = effortTier !== undefined
+      ? routeTieredModelId(family, effortTier, tiers)
+      : pinnedTier !== undefined
+        ? base
+        : tiers !== undefined && tiers.size > 0
+          ? routeTieredModelId(family, DEFAULT_AGY_REASONING_EFFORT, tiers)
+          : family
     const selector = this.#modelSelector
     if (!selector) {
       throw new LlmError(
@@ -470,17 +628,24 @@ async function* drainTurn(turn: PromptTurn): AsyncGenerator<StreamChunk> {
   }
 }
 
+/** 把 DSH 传来的思考强度归一到官方档位；无法识别时返回 undefined（走默认档位）。 */
+function normalizeEffort(effort?: { toString(): string }): AgyReasoningEffort | undefined {
+  const raw = effort === undefined ? undefined : effort.toString().toLowerCase()
+  return AGY_REASONING_EFFORTS.find((candidate) => candidate === raw)
+}
+
 /**
- * 不支持项检查。temperature / maxTokens / stop 没有 ACP 对应通道；显式
- * reasoningEffort 亦然（ACP 侧思考档位由 agent 自己的 configOption 表达，
- * 本 adapter 不代 DSH 映射）。缺省的 reasoningEffort（undefined）不报错。
+ * 不支持项检查。temperature / stop 没有 ACP 对应通道，显式传入即拒绝。
+ *
+ * `reasoningEffort` **不是**不支持项：它现在是家族 → 档位模型的路由键
+ * （2026-10-16 用户指示「菜单选择思考强度自动路由到对应模型」），见
+ * `#applyModelSelection`。`maxTokens` 同样静默忽略（宿主会话标题等流程固定
+ * 携带它，硬拒绝会让这些功能永久失败）。
  */
 function assertSupportedOptions(options: GenerateOptions): void {
   const unsupported: string[] = []
   if (options.temperature !== undefined) unsupported.push('temperature')
-  if (options.maxTokens !== undefined) unsupported.push('maxTokens')
   if (options.stop !== undefined) unsupported.push('stop')
-  if (options.reasoningEffort !== undefined) unsupported.push('reasoningEffort')
   if (unsupported.length === 0) return
   throw new LlmError(
     `Antigravity ACP provider 不支持这些请求项：${unsupported.join('、')}。ACP v1 未为它们定义会话通道，值由官方 agent 自身的会话配置决定`,

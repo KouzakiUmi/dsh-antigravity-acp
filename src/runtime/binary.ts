@@ -7,7 +7,7 @@
  * 便于单元测试。
  */
 import { createWriteStream } from 'node:fs'
-import { access, chmod, mkdir, mkdtemp, readdir, rename, rm, writeFile } from 'node:fs/promises'
+import { access, chmod, mkdir, mkdtemp, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { homedir as osHomedir, tmpdir } from 'node:os'
 import { join, normalize, resolve, sep } from 'node:path'
@@ -18,8 +18,12 @@ import yauzl from 'yauzl'
 export const DEFAULT_ACP_SERVER_VERSION = '1.4.0'
 /** 唯一允许的下载域名。 */
 export const DOWNLOAD_HOST_WHITELIST = 'dl.google.com'
-/** 缓存目录在 DSH home 下的相对位置。 */
+/** 数据缓存（模型清单等**非可执行**产物）在 DSH home 下的相对位置。 */
 export const CACHE_SUBPATH = ['cache', 'antigravity-acp'] as const
+/** 可执行文件安装根目录的目录名。 */
+export const INSTALL_DIR_NAME = 'dsh-antigravity-host'
+/** 覆盖可执行文件安装根目录的环境变量名。 */
+export const INSTALL_ROOT_ENV = 'AGY_ACP_HOME'
 
 /**
  * 本包原创错误码体系（AGY_*）。与协议层的 AGY_LAUNCH_FAILED 等共用前缀，
@@ -42,6 +46,8 @@ export const AGY_BINARY_ERROR = {
   BINARY_MISSING: 'AGY_BINARY_MISSING',
   /** 当前平台/架构无法映射出已知的下载坐标。 */
   PLATFORM_UNSUPPORTED: 'AGY_PLATFORM_UNSUPPORTED',
+  /** 可执行文件落在 Low 强制完整性目录：进程会被降权，官方 server 必然挂死。 */
+  LOW_INTEGRITY: 'AGY_BINARY_LOW_INTEGRITY',
 } as const
 
 export class AgyBinaryError extends Error {
@@ -197,9 +203,13 @@ export function extractDirName(version: string): string {
 }
 
 /**
- * 解析缓存根目录。优先 $DSH_HOME（宿主注入的环境变量）；缺失时回退到
- * 用户 home 下的 `.dsh`（与 DSH 默认 home 布局一致，注释性回退而非承诺）；
- * 两者都不可用则退到系统临时目录，保证本插件在无 DSH_HOME 的开发环境也能运行。
+ * 解析缓存根目录（**只放数据，不放可执行文件**）。优先 $DSH_HOME（宿主注入的
+ * 环境变量）；缺失时回退到用户 home 下的 `.dsh`（与 DSH 默认 home 布局一致，
+ * 注释性回退而非承诺）；两者都不可用则退到系统临时目录，保证本插件在无
+ * DSH_HOME 的开发环境也能运行。
+ *
+ * 注意：目录树可能带 Low 强制完整性标签，因此**可执行文件绝不能装在这里**，
+ * 见 {@link resolveInstallRoot}。
  */
 export function resolveCacheDir(
   env: Readonly<Record<string, string | undefined>> = process.env,
@@ -216,10 +226,89 @@ export function resolveCacheDir(
   }
 }
 
+/**
+ * 解析**可执行文件**安装根目录——刻意不放在 `$DSH_HOME` 之下。
+ *
+ * ## 为什么必须离开 DSH home
+ *
+ * DSH 把 `$DSH_HOME`（默认 `~/.dsh`）整棵树显式标成 **Low 强制完整性**
+ * （`icacls` 可见 `Mandatory Label\Low Mandatory Level:(OI)(CI)(NW)`，属沙箱地基），
+ * 新建文件一律继承该标签；而 Windows 在创建进程时**会采用映像文件的强制完整性
+ * 标签**。于是装在 `~/.dsh` 下的官方 exe 只能以 LOW 运行，受 MIC「禁止向上写」
+ * 约束，写不进中等完整性的 `~/.gemini/antigravity-acp/`——官方 server 保存凭据用的
+ * `tempfile.NamedTemporaryFile` 会因此在 `PermissionError` 上无限重试，
+ * `session/new` 永不返回（2026-10-16 实测定位，详见 `integrity.ts`）。
+ *
+ * 因此安装根默认取用户级应用数据目录（Windows: `%LOCALAPPDATA%`；
+ * POSIX: `$XDG_CACHE_HOME` 或 `~/.cache`），它们不在 Low 标签树内。
+ * 可用 `AGY_ACP_HOME` 或配置项 `binaryPath` 覆盖。
+ */
+export function resolveInstallRoot(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+  platform: NodeJS.Platform = process.platform,
+  homedir: () => string = osHomedir,
+): string {
+  const override = env[INSTALL_ROOT_ENV]
+  if (override && override.trim().length > 0) return override.trim()
+  if (platform === 'win32') {
+    const localAppData = env.LOCALAPPDATA?.trim()
+    if (localAppData) return join(localAppData, INSTALL_DIR_NAME)
+    const profile = env.USERPROFILE?.trim()
+    if (profile) return join(profile, 'AppData', 'Local', INSTALL_DIR_NAME)
+    return join(tmpdir(), INSTALL_DIR_NAME)
+  }
+  const xdgCache = env.XDG_CACHE_HOME?.trim()
+  if (xdgCache) return join(xdgCache, INSTALL_DIR_NAME)
+  try {
+    return join(homedir(), '.cache', INSTALL_DIR_NAME)
+  } catch {
+    return join(tmpdir(), INSTALL_DIR_NAME)
+  }
+}
+
 /** 版本缓存目录与其解压子目录。 */
 export function versionCachePaths(cacheDir: string, version: string): { versionDir: string; extractDir: string } {
   const versionDir = join(cacheDir, version)
   return { versionDir, extractDir: join(versionDir, extractDirName(version)) }
+}
+
+/** PyInstaller onefile 的解压目录前缀。 */
+export const PYI_TEMP_PREFIX = '_MEI'
+/** 判定「陈旧」的默认阈值；足够大，不会碰到并发实例正在用的目录。 */
+export const PYI_TEMP_MAX_AGE_MS = 3_600_000
+
+/**
+ * 清理 PyInstaller onefile 留下的陈旧 `_MEI*` 解压目录。
+ *
+ * 官方 server 是 onefile 打包：每次启动把 ~330MB 解压到 TMPDIR，正常退出时自行
+ * 删除。但进程被强杀（含本插件终止链路、用户关机、崩溃）时不会清理，实测重复
+ * 调试后会累积到几十 GB。这里按**目录 mtime 早于阈值**判定陈旧，避免误删并发
+ * 实例正在使用的目录；任何失败都忽略（清理是尽力而为，不能影响启动）。
+ *
+ * @returns 实际删除的目录数。
+ */
+export async function cleanupStalePyiTempDirs(
+  dir: string,
+  options: { maxAgeMs?: number; now?: () => number } = {},
+): Promise<number> {
+  const maxAgeMs = options.maxAgeMs ?? PYI_TEMP_MAX_AGE_MS
+  const now = (options.now ?? Date.now)()
+  let removed = 0
+  const entries = await readdir(dir, { withFileTypes: true }).catch(() => undefined)
+  if (!entries) return 0
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith(PYI_TEMP_PREFIX)) continue
+    const target = join(dir, entry.name)
+    try {
+      const info = await stat(target)
+      if (now - info.mtimeMs < maxAgeMs) continue
+      await rm(target, { recursive: true, force: true, maxRetries: 2 })
+      removed += 1
+    } catch {
+      // 目录正被占用（并发实例）或权限不足：跳过，不影响启动。
+    }
+  }
+  return removed
 }
 
 /**
@@ -334,6 +423,7 @@ export interface AgentBinaryOptions {
   fetchImpl?: FetchLike
   signal?: AbortSignal
   env?: Readonly<Record<string, string | undefined>>
+  /** 安装根目录覆盖；默认 {@link resolveInstallRoot}（**不是** DSH home）。 */
   cacheDir?: string
 }
 
@@ -376,7 +466,9 @@ async function findExtractedExecutable(extractDir: string, flavor: ExecutableFla
 export async function ensureAgentBinary(options: AgentBinaryOptions = {}): Promise<AgentBinaryResolution> {
   const env = options.env ?? process.env
   const version = options.version ?? DEFAULT_ACP_SERVER_VERSION
-  const cacheDir = options.cacheDir ?? resolveCacheDir(env)
+  // 安装根目录取用户级应用数据目录，**不是** DSH home：后者带 Low 完整性标签，
+  // 会把进程降成 LOW 并导致 session/new 静默挂死（见 resolveInstallRoot 注释）。
+  const cacheDir = options.cacheDir ?? resolveInstallRoot(env)
   const { platform, arch } = mapNodePlatform(process.platform, process.arch)
   const flavor: ExecutableFlavor = platform === 'windows' ? 'windows' : 'posix'
 

@@ -37,7 +37,7 @@ import type {
   Stream,
 } from '@agentclientprotocol/sdk'
 import type { SubprocessHandle, SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
-import { buildProxyEnv } from '../runtime/proxy-env.js'
+import { ambientProxyEnv, buildProxyEnv } from '../runtime/proxy-env.js'
 import type { ProxySettings } from '../runtime/proxy-env.js'
 
 /** 本包原创协议层错误码（AGY_* 前缀命名体系）。 */
@@ -501,8 +501,9 @@ export function officialAgentEnv(options: {
     if (value) env[key] = value
   }
   if (!env.SystemRoot && process.platform === 'win32') env.SystemRoot = 'C:\\Windows'
-  // 代理放在最后合并：用户配置优先于上面前向的任何同名键。
-  Object.assign(env, buildProxyEnv(options.proxy))
+  // 代理放在最后合并：用户配置优先；未配置时转发宿主自身的代理环境，避免出现
+  // 「宿主走代理、官方进程直连」的分裂路由（本机直连 Google 不通）。
+  Object.assign(env, options.proxy ? buildProxyEnv(options.proxy) : ambientProxyEnv(parent))
   return env
 }
 
