@@ -166,18 +166,61 @@ this product (#3501)」，仅作备用。原生 gRPC 接口
 `google.gca.aicode.v1main.JetskiRemoteAgentProxyService/GetUserQuotaSummary`
 已定位（宿主 `aicode.googleapis.com:443`）但服务端路由未接通，记录备查。
 
+## 宿主（DSH Core）兼容性声明
+
+宿主在**安装/启用时**会校验插件 manifest 里的 DSH 版本要求，不通过就拒绝安装
+（`ManagementFailure(incompatible-version)`，诊断文本以 `dsh: installation rejected:`
+开头）。规则（读自宿主 `@deepseek-ai/dsh-app-boot` 的 `evaluatePluginCompatibility`）：
+
+- 若声明了 `engines.dsh`，**该范围单独决定**，`peerDependencies` 一律忽略；
+- 否则逐个校验 `peerDependencies` 中名为 `@deepseek-ai/dsh` 或以 `@deepseek-ai/dsh-`
+  开头的项，其余包（含 `@deepseek-ai/cordis`）**不参与**该判定；
+- 比较对象是**运行时版本**，取 `@deepseek-ai/dsh-app-boot` 自身 `package.json` 的
+  `version`（即实际加载的 Core 版本，不是壳版本、也不是任何全局 CLI 版本），
+  且按 `includePrerelease: true` 参与范围匹配。
+
+本包当前声明（0.1.11）：
+
+| peer | 范围 | 说明 |
+|---|---|---|
+| `@deepseek-ai/dsh-llm` | `>=0.2.0-rc.1 <0.2.1-0 \|\| >=0.2.1-0 <0.3.0-0` | 参与宿主校验 |
+| `@deepseek-ai/dsh-subprocess` | 同上 | 参与宿主校验 |
+| `@deepseek-ai/dsh-typert-protocol` | 同上 | 参与宿主校验 |
+| `@deepseek-ai/cordis` | `~4.0.4 \|\| 4.0.5-alpha.1 \|\| 4.0.5-alpha.2` | 宿主不校验，仅供 pnpm peer 解析 |
+
+0.1.10 及更早版本把三个 `dsh-*` peer 写成了逐版本枚举（止于 `0.2.1-alpha.3`），
+在宿主升到 `0.2.1-alpha.4` 后判定为不兼容；0.1.11 换成上面这条宽范围
+（与社区插件 `dsh-subusage` 0.13.4 一致），对 `0.2.1-alpha.x`、`0.2.2` 均为真，
+对 `0.3.0-0` 及以后为假。
+
+若宿主将来越过该范围：可以更新本包的范围，或在插件管理器 / `dsh plugin allow-version`
+里为**精确的 name@version + 精确运行时版本**授予豁免（豁免记录在 profile 的
+`compatibility.json`）。豁免是显式接受风险，不是默认恢复步骤。
+
+契约面（非声明面）的核对状态：以宿主 0.2.1-alpha.4 的实际产物逐项对比过——
+`dsh-subprocess` 与 `cordis` 的类型声明逐字节相同；`dsh-llm` 只有新增可选成员
+（`imageRequestTarget`、`defaultBaseURL` 等，基类提供默认实现）；`dsh-typert-protocol`
+新增 `resources`/`principal` 等可选访问控制面，`register(contribution)` 签名未变，
+本包用的 contribution 形态（`{package, face, schemas, model, invocations}`）与同宿主上
+可用的 `dsh-subusage` 0.13.4 完全一致；客户端依赖的 `conversation.input.right` /
+`conversation.input.model` slot、`__ModuleLoader__`、`listProviders` 在新壳中均存在。
+开发依赖已对齐宿主版本并精确锁定（`dsh-llm` / `dsh-subprocess` / `dsh-typert-protocol`
+= `0.2.1-alpha.4`，`cordis` = `4.0.5-alpha.2`），`npm run check`（255 测试 / 17 文件 +
+类型检查 + 构建）在该版本类型上全绿。**未做**：真机安装 0.1.11 后的 GUI 验收
+（对话与额度药丸）。
+
 ## 安装参考
 
 通用 CLI 示例（`web` 只是文档用的 profile 名，不是本机 Desktop）：
 
 ```sh
-dsh plugin --profile web add ./dsh-bundle-antigravity-host-0.1.10.tgz
+dsh plugin --profile web add ./dsh-bundle-antigravity-host-0.1.11.tgz
 ```
 
 本机 Desktop 壳独占 `desktop` profile，公共 `dsh` 不能对它执行 `plugin add`。
 请在 DSH NEXT 的插件管理器里添加本地包，路径示例：
 
-`D:\dsh-antigravity-acp\.local-install\dsh-bundle-antigravity-host-0.1.10.tgz`
+`D:\dsh-antigravity-acp\.local-install\dsh-bundle-antigravity-host-0.1.11.tgz`
 
 装好后需要完全退出并重开 Desktop。只要本机官方 CLI 已登录过，
 `oauth-personal` 登录态会自动导入，**不会**弹浏览器登录页。模型路由名为
