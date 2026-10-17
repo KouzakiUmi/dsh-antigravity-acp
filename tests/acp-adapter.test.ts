@@ -18,6 +18,7 @@ import {
 import type { GenerateOptions, RequestMessage, StreamChunk, ToolSchema } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, SessionConfigOption } from '@agentclientprotocol/sdk'
 import { AntigravityAcpAdapter, AGY_PROVIDER_ID, AGY_PLACEHOLDER_MODEL_ID, AGY_UNSUPPORTED_OPTION, AGY_ADAPTER_ERROR } from '../src/adapter/antigravity-adapter.js'
+import { NATIVE_REFUSAL_LIMIT } from '../src/adapter/prompt-turn.js'
 import { AGY_TURN_ERROR } from '../src/adapter/prompt-turn.js'
 import { AGY_BRIDGE_ERROR } from '../src/bridge/mcp-bridge.js'
 import { AgentLink, AGY_LINK_ERROR } from '../src/protocol/agent-link.js'
@@ -932,7 +933,7 @@ describe('MCP 工具桥：park 与续轮', () => {
 })
 
 describe('权限与原生活动策略', () => {
-  it('session/request_permission 一律拒绝并以 AGY_PERMISSION_DENIED 结束回合', async () => {
+  it('session/request_permission 一律拒绝，但首轮拒绝不终止回合（模型可改用工具桥）', async () => {
     const harness = createHarness()
     const streaming = collect(harness.adapter.stream(baseOptions()))
     await waitForRequest(harness.agent, 'session/prompt')
@@ -944,18 +945,16 @@ describe('权限与原生活动策略', () => {
         { optionId: 'no', name: '拒绝一次', kind: 'reject_once' },
       ],
     })
+    // 仍然一律拒绝（不授予任何本地能力）。
     expect(response).toMatchObject({ result: { outcome: { outcome: 'selected', optionId: 'no' } } })
-    await harness.agent.reply('session/prompt', { stopReason: 'cancelled' })
-
-    expect(await streaming).toEqual([
-      {
-        type: 'finish',
-        reason: { kind: 'error', failure: { code: AGY_TURN_ERROR.PERMISSION_DENIED, message: expect.stringContaining('tc-1') } },
-      },
-    ])
+    // 但回合继续：模型照常收尾，不产生 error finish。
+    await harness.agent.reply('session/prompt', { stopReason: 'end_turn' })
+    const last = (await streaming).at(-1) as { type: string; reason?: { kind?: string } }
+    expect(last.type).toBe('finish')
+    expect(last.reason?.kind).not.toBe('error')
   })
 
-  it('未预期的原生请求（fs/write_text_file）终止回合而非静默吞掉', async () => {
+  it('未预期的原生请求（fs/write_text_file）回 method-not-found，首次不终止回合', async () => {
     const harness = createHarness()
     const streaming = collect(harness.adapter.stream(baseOptions()))
     await waitForRequest(harness.agent, 'session/prompt')
@@ -964,13 +963,32 @@ describe('权限与原生活动策略', () => {
       path: '/etc/passwd',
       content: 'x',
     })
-    // AgentLink 仍按既有语义回 method-not-found。
+    // AgentLink 仍按既有语义回 method-not-found（能力没有开放）。
     expect(response).toMatchObject({ error: { code: -32601 } })
-    await harness.agent.reply('session/prompt', { stopReason: 'cancelled' })
-    expect((await streaming).at(-1)).toMatchObject({
+    await harness.agent.reply('session/prompt', { stopReason: 'end_turn' })
+    const last = (await streaming).at(-1) as { type: string; reason?: { kind?: string } }
+    expect(last.type).toBe('finish')
+    expect(last.reason?.kind).not.toBe('error')
+  })
+
+  it('同一回合反复索要原生能力超过上限时按 fail-closed 终止回合', async () => {
+    const harness = createHarness()
+    const streaming = collect(harness.adapter.stream(baseOptions()))
+    await waitForRequest(harness.agent, 'session/prompt')
+    // 上限 3：连续 4 次「拒绝但继续」之后才终止。
+    for (let attempt = 1; attempt <= NATIVE_REFUSAL_LIMIT + 1; attempt += 1) {
+      await harness.agent.callClient('fs/read_text_file', { sessionId: SESSION_1, path: `/tmp/${attempt}` })
+    }
+    const last = (await streaming).at(-1) as { type: string; reason?: { kind?: string; failure?: { code?: string } } }
+    expect(last).toMatchObject({
       type: 'finish',
-      reason: { kind: 'error', failure: { code: AGY_TURN_ERROR.NATIVE_ACTIVITY_REFUSED, message: expect.stringContaining('fs/write_text_file') } },
+      reason: {
+        kind: 'error',
+        failure: { code: AGY_TURN_ERROR.NATIVE_ACTIVITY_REFUSED, message: expect.stringContaining('fs/read_text_file') },
+      },
     })
+    // 收尾：不留下未应答的 prompt（流已结束）。
+    await harness.agent.reply('session/prompt', { stopReason: 'cancelled' }).catch(() => undefined)
   })
 
   it('initialize 上报全关闭的 client 能力（fs / terminal / elicitation）', async () => {

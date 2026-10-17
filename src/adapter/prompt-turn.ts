@@ -69,7 +69,21 @@ export interface PromptTurnOptions {
   parkSettleMs: number
   /** config_option_update 的观察者（用于刷新模型目录）。 */
   onConfigOptions?(options: readonly SessionConfigOption[]): void
+  /**
+   * 被容忍的一次原生能力拒绝（尚未终止回合）。用于落日志：模型索要 fs/terminal
+   * 是「它想绕开工具桥」的信号，但首次拒绝后它通常会改用桥过去的工具。
+   */
+  onNativeRefusal?(info: { kind: 'permission' | 'request'; detail: string; count: number }): void
 }
+
+/**
+ * 同一回合内容忍的原生能力索要次数上限。
+ *
+ * 超过该次数说明模型在反复尝试绕开工具桥，此时才终止回合（fail closed on
+ * insistence）；首次若干次只拒绝、不掐回合——否则偏好原生工具的型号（不同模型
+ * 对工具的使用风格不同）会每一轮都被判失败，用户看到的就是「选了型号没反应」。
+ */
+export const NATIVE_REFUSAL_LIMIT = 3
 
 export class PromptTurn {
   /** ACP 会话 id。 */
@@ -83,6 +97,9 @@ export class PromptTurn {
   readonly #parked: BridgeParkedCall[] = []
   #settledWaiters: Array<() => void> = []
   #onConfigOptions: ((options: readonly SessionConfigOption[]) => void) | undefined
+  /** 本回合内被拒绝的原生能力索要次数（超过 NATIVE_REFUSAL_LIMIT 才终止回合）。 */
+  #nativeRefusals = 0
+  #onNativeRefusal: PromptTurnOptions['onNativeRefusal']
   #nextIndex = 0
   #open: OpenBlock | undefined
   #producerDone = false
@@ -101,6 +118,7 @@ export class PromptTurn {
     this.#promptTimeoutMs = options.promptTimeoutMs
     this.#parkSettleMs = options.parkSettleMs
     this.#onConfigOptions = options.onConfigOptions
+    this.#onNativeRefusal = options.onNativeRefusal
   }
 
   /** 本回合的 ACP prompt 是否已有应答；应答后无法再「在同一 prompt 内续轮」。 */
@@ -127,26 +145,44 @@ export class PromptTurn {
 
   /**
    * 权限询问一律拒绝（无人值守）：优先回绝选项，无可选项时回 cancelled。
-   * 拒绝同时终止本回合——无人值守语境下不应授予 agent 任何本地能力。
+   *
+   * **拒绝本身不终止回合**：模型看到拒绝后通常改用本插件桥过去的 DSH 工具。只有
+   * 同一回合内反复索要超过 {@link NATIVE_REFUSAL_LIMIT} 次（明显在坚持绕开工具桥）
+   * 才按 fail-closed 终止，避免「选了偏好原生工具的型号就永远没反应」。
    */
   handleRequestPermission(request: RequestPermissionRequest): RequestPermissionResponse {
     const rejection = request.options.find((option) => option.kind === 'reject_once')
       ?? request.options.find((option) => option.kind === 'reject_always')
-    this.#fail({
-      code: AGY_TURN_ERROR.PERMISSION_DENIED,
-      message: `Antigravity ACP 请求的本地能力已被拒绝（${request.toolCall.toolCallId}）：本插件在无人值守模式下不授予 agent 任何 fs/terminal 权限`,
-    })
+    this.#recordNativeRefusal('permission', request.toolCall.toolCallId)
     return rejection
       ? { outcome: { outcome: 'selected', optionId: rejection.optionId } }
       : { outcome: { outcome: 'cancelled' } }
   }
 
-  /** clientCapabilities 已全部关闭，因此这里出现的任何 agent→client 请求都是非预期的。 */
+  /**
+   * clientCapabilities 已全部关闭，因此这里出现的任何 agent→client 请求都是非预期的。
+   * 与权限询问同样处理：响应照旧由 AgentLink 回 method-not-found，本回合先继续。
+   */
   handleUnexpectedAgentRequest(method: string): void {
-    this.#fail({
-      code: AGY_TURN_ERROR.NATIVE_ACTIVITY_REFUSED,
-      message: `Antigravity ACP 发起了未预期的原生请求 ${method}：本插件已关闭 fs/terminal 能力，工具一律经私有 MCP 桥暴露`,
-    })
+    this.#recordNativeRefusal('request', method)
+  }
+
+  /** 计数并在超过上限时终止回合；未超限只记录（回合继续跑）。 */
+  #recordNativeRefusal(kind: 'permission' | 'request', detail: string): void {
+    this.#nativeRefusals += 1
+    this.#onNativeRefusal?.({ kind, detail, count: this.#nativeRefusals })
+    if (this.#nativeRefusals <= NATIVE_REFUSAL_LIMIT) return
+    this.#fail(
+      kind === 'permission'
+        ? {
+            code: AGY_TURN_ERROR.PERMISSION_DENIED,
+            message: `Antigravity ACP 反复索要本地能力（${detail}，本回合第 ${this.#nativeRefusals} 次）：本插件在无人值守模式下不授予 agent 任何 fs/terminal 权限`,
+          }
+        : {
+            code: AGY_TURN_ERROR.NATIVE_ACTIVITY_REFUSED,
+            message: `Antigravity ACP 反复发起未预期的原生请求 ${detail}（本回合第 ${this.#nativeRefusals} 次）：本插件已关闭 fs/terminal 能力，工具一律经私有 MCP 桥暴露`,
+          },
+    )
   }
 
   /**

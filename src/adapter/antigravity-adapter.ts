@@ -442,6 +442,13 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       promptTimeoutMs: this.#promptTimeoutMs,
       parkSettleMs: this.#parkSettleMs,
       onConfigOptions: (observed) => this.observeSessionConfigOptions(observed),
+      // 模型索要原生 fs/terminal 时先拒绝、继续回合（只有反复索要才终止）；
+      // 落一条日志，便于判断「选了某个型号没反应」是不是这条路径造成的。
+      onNativeRefusal: (info) =>
+        this.#log?.warn(
+          `antigravity-acp: 已拒绝模型的原生能力索要（${info.kind} ${info.detail}，本回合第 ${info.count} 次），` +
+            '请它改用桥过去的 DSH 工具',
+        ),
     })
     this.#turn = turn
     this.#subscribeTurn(turn)

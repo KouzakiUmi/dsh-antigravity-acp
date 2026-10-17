@@ -101,12 +101,23 @@ function loadRegistrations(options: QuotaStubOptions = {}): Map<string, SlotRegi
     },
     get: (name: string) =>
       name === 'remote.agyQuota' && options.quotaRead ? { read: () => options.quotaRead!() } : undefined,
-    remote: {
-      $mount: (declaration: unknown) => {
-        lastMountCalls.push(declaration as (typeof lastMountCalls)[number])
-        return Promise.resolve(() => {})
+    // 忠实模拟 cordis 的 ReflectService：读取**未 inject** 的 `remote.<ns>` 属性会抛
+    // 「cannot get property "remote.<ns>" without inject」。贡献型 remote 不进 inject，
+    // 因此组件只能走 `ctx.get('remote.<ns>')`；这条替身行为让写错的一行在测试里就暴露。
+    remote: new Proxy(
+      {
+        $mount: (declaration: unknown) => {
+          lastMountCalls.push(declaration as (typeof lastMountCalls)[number])
+          return Promise.resolve(() => {})
+        },
       },
-    },
+      {
+        get(target, prop, receiver) {
+          if (typeof prop === 'string' && prop in target) return Reflect.get(target, prop, receiver)
+          throw new Error(`cannot get property "remote.${String(prop)}" without inject`)
+        },
+      },
+    ),
     modelDirectories: {
       directoryFor: () => ({
         store: {

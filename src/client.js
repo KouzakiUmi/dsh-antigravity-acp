@@ -327,17 +327,18 @@ window.__ModuleLoader__.load({
       return async (force) => {
         const deadline = Date.now() + 20_000
         for (;;) {
-          // 优先走注入面（`remote.agyQuota` 已在 inject 里声明，正常必然存在）；
-          // get() 作为兜底，兼容宿主挂载时序上的短暂空窗。
-          const injected = scope?.remote?.agyQuota
-          const service = injected && typeof injected.read === 'function' ? injected : scope.get('remote.agyQuota')
+          // **只能用 `get()`**：`scope.remote.agyQuota` 这种属性访问在未 inject 的
+          // 命名空间上会由 cordis 直接抛「cannot get property "remote.<ns>" without
+          // inject」，而这正是本药丸的处境（贡献型 remote 由 $mount 挂载、不进 inject）。
+          // 参考实现 dsh-subusage 同样是 `ctx.get("remote.subUsage")`。
+          const service = scope.get('remote.agyQuota')
           if (service && typeof service.read === 'function') {
             // Host 侧会起官方 agy CLI 取数（其启动含登录刷新）。万一它挂在网络上，
             // 也要让药丸显示「读取失败 + 原因」，而不是一直停在「额度…」。
             return await withTimeout(
               service.read(force ? { force: true } : undefined),
               60_000,
-              '额度读取超时（Host 侧 agy CLI 60 秒内没有返回；常见原因是该子进程没走代理）',
+              '额度读取超时（Host 侧 agy CLI 60 秒内没有返回）',
             )
           }
           if (Date.now() >= deadline) {
