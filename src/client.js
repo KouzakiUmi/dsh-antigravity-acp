@@ -348,12 +348,76 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /**
+     * 客户端侧的额度 remote 声明。
+     *
+     * **贡献型 remote 必须在客户端显式挂载一次**（`ctx.remote.$mount(...)`），
+     * `remote.agyQuota` 才会成为客户端可查的服务——同宿主上正常工作的
+     * `dsh-subusage` 就是这么写的（`ctx.remote.$mount(subUsageRemote)` 之后再
+     * `ctx.get("remote.subUsage")`）。只做 Host 侧注册而不挂载，客户端永远查不到服务。
+     *
+     * 声明必须与 Host 侧 `AGY_QUOTA_INVOCATIONS` 逐字段一致：id / service / namespace /
+     * method / 参数与结果的 codec（客户端要按同一 codec 编解码）。
+     */
+    const AGY_QUOTA_PACKAGE = 'dsh-bundle-antigravity-host'
+    const AGY_QUOTA_SERVICE = 'agyQuota'
+
+    function strictCodec(typeSymbol, parse) {
+      const schema = { parse }
+      return { mode: 'strict', typeSymbol, create: () => schema }
+    }
+
+    function parseQuotaRequest(value) {
+      if (value === undefined || value === null) return undefined
+      if (typeof value !== 'object' || Array.isArray(value)) throw new TypeError('Invalid AgYQuotaRequest')
+      if (value.force !== undefined && typeof value.force !== 'boolean') throw new TypeError('Invalid AgYQuotaRequest.force')
+      return value
+    }
+
+    function parseQuotaResult(value) {
+      if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new TypeError('Invalid AgYQuotaResult')
+      if (value.status !== 'ok' && value.status !== 'error') throw new TypeError('Invalid AgYQuotaResult.status')
+      if (!Array.isArray(value.groups)) throw new TypeError('Invalid AgYQuotaResult.groups')
+      return value
+    }
+
+    const AGY_QUOTA_REMOTE = {
+      package: AGY_QUOTA_PACKAGE,
+      descriptors: [
+        {
+          id: `${AGY_QUOTA_PACKAGE}#${AGY_QUOTA_SERVICE}/read`,
+          service: AGY_QUOTA_SERVICE,
+          namespace: AGY_QUOTA_SERVICE,
+          method: 'read',
+          invocation: { kind: 'direct' },
+          parameters: [
+            {
+              name: 'request',
+              wire: 'request',
+              source: 'json',
+              acceptsUndefined: true,
+              codec: strictCodec(`${AGY_QUOTA_PACKAGE}#AgYQuotaRequest`, parseQuotaRequest),
+            },
+          ],
+          result: strictCodec(`${AGY_QUOTA_PACKAGE}#AgYQuotaResult`, parseQuotaResult),
+        },
+      ],
+    }
+
     return {
       name: 'dsh-bundle-antigravity-host',
       // remote.settings / remote.llm 必须逐个声明：remote 各命名空间是独立服务，
       // 漏声明会在读取属性时抛「without inject」并击穿 settings.section 卡片。
       inject: ['slots', 'remote', 'remote.settings', 'remote.llm'],
       apply(ctx) {
+        // 挂载本包贡献的 remote（幂等，随 fiber 一起 dispose）。挂载失败不影响其它卡片：
+        // 药丸会自行超时并显示「额度服务未就绪」的原因。
+        try {
+          const mounted = ctx.remote.$mount(AGY_QUOTA_REMOTE)
+          ctx.effect(() => mounted, 'antigravity-acp: mount quota remote')
+        } catch (error) {
+          console.error('[dsh-bundle-antigravity-host] 额度 remote 客户端挂载失败:', error)
+        }
         ctx.effect(
           () =>
             ctx.slots.inject('settings.section', () =>
@@ -373,13 +437,11 @@ window.__ModuleLoader__.load({
         // 额度药丸：紧邻模型选择器左侧（宿主把 conversation.input.right 渲染在
         // conversation.input.model 之前）。modelDirectories 是会话模型目录服务。
         //
-        // `remote.agyQuota` **必须写进 inject**：每个 `remote.<ns>` 面都是独立的
-        // 可注入服务，漏声明时读属性会抛「cannot get property "remote.<ns>" without
-        // inject」，而用 `get()` 只是永远拿到 undefined（药丸于是等不到服务、
-        // 也不会发出任何取数请求——2026-10-17 实测：宿主日志里只有模型清单调用，
-        // 没有 `/usage`）。cordis 的 inject 会等该服务出现再执行回调，所以这里同时
-        // 充当「等 Host 把 remote 挂上来」的等待。
-        ctx.inject(['slots', 'modelDirectories', 'remote.agyQuota'], (scope) => {
+        // 注意：这里**不能**把 `remote.agyQuota` 写进 inject。贡献型 remote 的客户端
+        // 服务要等 `ctx.remote.$mount(...)`（见 apply 里那段）完成后才存在，写进 inject
+        // 会让整个注册回调一直等待 —— 表现为**药丸彻底消失**（2026-10-17 实测踩过）。
+        // 正确做法是照常注册 slot，由读取器短轮询等服务出现。
+        ctx.inject(['slots', 'modelDirectories'], (scope) => {
           scope.effect(
             () =>
               scope.slots.inject('conversation.input.right', () =>

@@ -28,6 +28,9 @@ let lastStateCalls: unknown[] = []
 /** 最近一次 `loadRegistrations` 期间，各处 `ctx.inject([...])` 声明的依赖列表。 */
 let lastInjectDeps: string[][] = []
 
+/** 最近一次 `loadRegistrations` 期间，`ctx.remote.$mount(...)` 收到的 remote 声明。 */
+let lastMountCalls: Array<{ package?: string; descriptors?: Array<{ id?: string; method?: string }> }> = []
+
 /** 注入的额度 remote 替身：药丸会 `scope.get('remote.agyQuota')` 后再 `.read()`。 */
 interface QuotaStubOptions {
   /** 返回 remote 的原始回包（**未拆信封**），与真实网关一致。 */
@@ -42,6 +45,7 @@ interface QuotaStubOptions {
 function loadRegistrations(options: QuotaStubOptions = {}): Map<string, SlotRegistration> {
   lastStateCalls = []
   lastInjectDeps = []
+  lastMountCalls = []
   let registration: {
     factory: (require: (id: string) => unknown) => { apply: (ctx: Record<string, unknown>) => void }
   } | undefined
@@ -97,7 +101,12 @@ function loadRegistrations(options: QuotaStubOptions = {}): Map<string, SlotRegi
     },
     get: (name: string) =>
       name === 'remote.agyQuota' && options.quotaRead ? { read: () => options.quotaRead!() } : undefined,
-    remote: {},
+    remote: {
+      $mount: (declaration: unknown) => {
+        lastMountCalls.push(declaration as (typeof lastMountCalls)[number])
+        return Promise.resolve(() => {})
+      },
+    },
     modelDirectories: {
       directoryFor: () => ({
         store: {
@@ -383,17 +392,30 @@ describe('额度药丸：remote 回包拆信封', () => {
 })
 
 /**
- * 药丸必须把 `remote.agyQuota` 写进 inject（2026-10-17 回归）。
+ * 贡献型 remote 的客户端挂载（2026-10-17 回归）。
  *
- * 每个 `remote.<ns>` 面都是独立的可注入服务：漏声明时读属性会抛
- * 「cannot get property "remote.<ns>" without inject」，而用 `get()` 只会永远拿到
- * undefined —— 药丸于是等不到服务、**一次取数请求都不会发出**（宿主日志里只有
- * 模型清单调用、没有 `/usage`）。这条断言把依赖声明钉住。
+ * 实测契约（对照同宿主上正常工作的 dsh-subusage）：贡献型 remote 必须在客户端显式
+ * `ctx.remote.$mount({ package, descriptors })`，之后 `ctx.get("remote.<ns>")` 才查得到。
+ * 只做 Host 侧注册而漏挂载 → 药丸永远等不到服务（空着）；把 `remote.<ns>` 写进 inject
+ * 等它出现 → 注入永不满足，**药丸彻底消失**。两条都踩过，这里把它们钉住。
  */
-describe('额度药丸：remote 依赖声明', () => {
-  it('inject 里包含 remote.agyQuota', () => {
+describe('额度药丸：remote 客户端挂载', () => {
+  it('apply 时以本包名义 $mount，且 descriptor 指向 agyQuota/read', () => {
     loadRegistrations()
-    const declared = lastInjectDeps.some((deps) => deps.includes('remote.agyQuota'))
-    expect(declared, `实际声明：${JSON.stringify(lastInjectDeps)}`).toBe(true)
+    expect(lastMountCalls.length).toBeGreaterThan(0)
+    const call = lastMountCalls[0]!
+    expect(call.package).toBe('dsh-bundle-antigravity-host')
+    expect(call.descriptors?.[0]?.id).toBe('dsh-bundle-antigravity-host#agyQuota/read')
+    expect(call.descriptors?.[0]?.method).toBe('read')
+  })
+
+  it('药丸的 inject 不得依赖 remote.agyQuota（否则注入永不满足、药丸消失）', () => {
+    loadRegistrations()
+    const requiresRemote = lastInjectDeps.some((deps) => deps.includes('remote.agyQuota'))
+    expect(requiresRemote, `实际声明：${JSON.stringify(lastInjectDeps)}`).toBe(false)
+    const registersPillWithoutRemote = lastInjectDeps.some(
+      (deps) => deps.includes('slots') && deps.includes('modelDirectories'),
+    )
+    expect(registersPillWithoutRemote).toBe(true)
   })
 })

@@ -445,9 +445,24 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     })
     this.#turn = turn
     this.#subscribeTurn(turn)
+    // 回合生命周期打点：选具体型号后「没有反应」这类问题，只靠这条能分清是
+    // 「prompt 没送出去」「送出去了但没有块回来」还是「块回来了但没被消费」。
+    this.#log?.info(
+      `antigravity-acp: 回合开始 model=${options.model} session=${session.sessionId} tools=${tools.length}` +
+        `${options.reasoningEffort === undefined ? '' : ` effort=${String(options.reasoningEffort)}`}`,
+    )
     turn.startPrompt(buildPromptContent(options.system, options.messages), options.signal)
     try {
-      yield* drainTurn(turn)
+      let chunks = 0
+      for await (const chunk of drainTurn(turn)) {
+        if (chunks === 0) this.#log?.info(`antigravity-acp: 回合首块到达（type=${chunk.type}）`)
+        chunks += 1
+        yield chunk
+      }
+      this.#log?.info(`antigravity-acp: 回合结束 model=${options.model} 块数=${chunks}`)
+    } catch (error) {
+      this.#log?.warn(`antigravity-acp: 回合失败 model=${options.model}`, error)
+      throw error
     } finally {
       // 只有该 ACP prompt **真正结束**（已应答且不再等待回喂）才退订；
       // finish(tool-calls) 之后 prompt 还活着，订阅必须留给续轮。
