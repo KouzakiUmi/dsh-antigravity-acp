@@ -14,7 +14,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
-import { disposeAcpRuntime, ensureAcpRuntime as startAcpRuntimeRaw } from '../src/index.js'
+import { disposeAcpRuntime, recycleAcpRuntime, ensureAcpRuntime as startAcpRuntimeRaw } from '../src/index.js'
 import type { ActiveAcpRuntime, AcpRuntimeDeps } from '../src/index.js'
 import { AGY_LINK_ERROR } from '../src/protocol/agent-link.js'
 import { AGY_BINARY_ERROR } from '../src/runtime/binary.js'
@@ -122,6 +122,23 @@ function acceptHandshake(agent: FakeAcpAgent): void {
 }
 
 describe('ensureAcpRuntime 失败清理（S2）', () => {
+  it('回收当前连接会终止受管进程且不卸载插件，下一次调用创建新进程', async () => {
+    const harness = await createRuntimeHarness((agent) => acceptHandshake(agent))
+    const first = await ensureAcpRuntime(harness.ctx, harness.config, handlers, harness.active)
+    await recycleAcpRuntime(harness.active, first)
+    expect(harness.spawns[0]?.terminated()).toBe(true)
+    expect(harness.active.link).toBeUndefined()
+    expect(harness.active.handle).toBeUndefined()
+    expect(harness.active.disposed).not.toBe(true)
+    const second = await ensureAcpRuntime(harness.ctx, harness.config, handlers, harness.active)
+    expect(second).not.toBe(first)
+    expect(harness.spawns).toHaveLength(2)
+    // 旧回合迟到的清理不能摘掉或终止新连接。
+    await recycleAcpRuntime(harness.active, first)
+    expect(harness.active.link).toBe(second)
+    expect(harness.spawns[1]?.terminated()).toBe(false)
+  })
+
   it('initialize 失败后 active 无残留 link/handle，旧进程被终止，第二次调用全新重试', async () => {
     const harness = await createRuntimeHarness((agent, index) => {
       if (index === 0) {
@@ -465,6 +482,22 @@ describe('启动路径的新增前置检查', () => {
     } finally {
       await harness.dispose()
     }
+  })
+
+  it('已关闭的死链不会被复用：下次调用终止旧进程并全新启动', async () => {
+    // 协议违规 / 流读取失败会让 AgentLink 自行关闭，但子进程仍活着、handle.done 不触发，
+    // 以前 `if (active.link) return active.link` 会把这条死链永久交给调用方。
+    const harness = await createRuntimeHarness((agent) => acceptHandshake(agent))
+    const first = await ensureAcpRuntime(harness.ctx, harness.config, handlers, harness.active)
+    await first.close()
+    expect(first.closed).toBe(true)
+    expect(harness.spawns[0]?.terminated()).toBe(false)
+    const second = await ensureAcpRuntime(harness.ctx, harness.config, handlers, harness.active)
+    expect(second).not.toBe(first)
+    expect(second.closed).toBe(false)
+    expect(harness.spawns).toHaveLength(2)
+    expect(harness.spawns[0]?.terminated()).toBe(true)
+    expect(harness.active.link).toBe(second)
   })
 
   it('登录态不就绪时仍走 authenticate，并把原因带进错误消息', async () => {

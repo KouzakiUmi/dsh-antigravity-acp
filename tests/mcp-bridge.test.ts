@@ -80,6 +80,40 @@ function textOf(result: unknown): string | undefined {
 }
 
 describe('MCP 桥多会话隔离', () => {
+  it('未知或已撤销的工具调用立即拒绝，不产生 park', async () => {
+    const bridge = makeBridge()
+    await bridge.start()
+    const client = await connectClient(endpointOf(bridge), 'catalog-check')
+    const parked = vi.fn()
+    bridge.onParked(parked)
+    // 超时仅用来让缺失白名单校验的旧实现快速失败，不作为成功条件。
+    const unknown = await client.callTool({ name: 'not_published', arguments: {} }, undefined, { timeout: 150 })
+    expect(unknown.isError).toBe(true)
+    expect(textOf(unknown)).toContain(AGY_BRIDGE_ERROR.UNKNOWN_TOOL)
+    bridge.publishTools([])
+    const revoked = await client.callTool({ name: 'read_file', arguments: { path: 'x' } }, undefined, { timeout: 150 })
+    expect(revoked.isError).toBe(true)
+    expect(parked).not.toHaveBeenCalled()
+    expect(bridge.pendingCallIds()).toEqual([])
+  })
+
+  it('切换回合后旧通道不能向新回合投递调用，且凭证轮换', async () => {
+    const bridge = makeBridge()
+    const [serverSide, clientSide] = InMemoryTransport.createLinkedPair()
+    await bridge.attach(serverSide)
+    const client = new Client({ name: 'old-round', version: '0.0.0' })
+    clients.push(client)
+    await client.connect(clientSide)
+    const previousToken = bridge.token
+    expect((await client.listTools()).tools).toHaveLength(1)
+    bridge.beginRound(TOOLS)
+    expect(bridge.token).not.toBe(previousToken)
+    expect((await client.listTools()).tools).toEqual([])
+    const result = await client.callTool({ name: 'read_file', arguments: { path: 'old.txt' } })
+    expect(result.isError).toBe(true)
+    expect(bridge.pendingCallIds()).toEqual([])
+  })
+
   it('两个独立 MCP Client 都能 connect/initialize 到同一桥端点，回喂互不串扰', async () => {
     const bridge = makeBridge()
     await bridge.start()
@@ -206,5 +240,51 @@ describe('MCP 桥多会话隔离', () => {
     expect((await client.listTools()).tools.map((tool) => tool.name)).toEqual(['read_file'])
     expect(endpointOf(bridge).headers[BRIDGE_AUTH_HEADER]).toBe(`Bearer ${bridge.token}`)
     expect(BRIDGE_MCP_SERVER_NAME).toBe('dsh-tools')
+  })
+
+  it('切换回合时关闭上一回合的 MCP 会话通道，旧 session id 被拒', async () => {
+    const bridge = makeBridge()
+    await bridge.start()
+    const old = await connectClient(endpointOf(bridge), 'old-round')
+    const oldSessionId = (old.transport as StreamableHTTPClientTransport).sessionId
+    expect(oldSessionId).toBeTruthy()
+
+    bridge.beginRound(TOOLS)
+    const endpoint = endpointOf(bridge)
+    // 修复前：通道只在 transport.onclose 时摘除，旧连接会按回合累积。
+    const stale = await fetch(endpoint.url, {
+      method: 'POST',
+      headers: {
+        ...endpoint.headers,
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        [BRIDGE_SESSION_HEADER]: oldSessionId as string,
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
+    })
+    expect(stale.status).toBe(404)
+    expect(await stale.text()).toContain(AGY_BRIDGE_ERROR.UNKNOWN_SESSION)
+
+    // 新回合照常握手并可用。
+    const fresh = await connectClient(endpoint, 'new-round')
+    expect((await fresh.listTools()).tools.map((tool) => tool.name)).toEqual(['read_file'])
+  })
+
+  it('无 session 头且不是 initialize 的请求失败后不留下会话通道', async () => {
+    const bridge = makeBridge()
+    await bridge.start()
+    const endpoint = endpointOf(bridge)
+    const malformed = await fetch(endpoint.url, {
+      method: 'POST',
+      headers: { ...endpoint.headers, 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
+    })
+    expect(malformed.status).toBe(400)
+
+    // 畸形请求不污染桥：随后的正常 initialize 与列工具照常工作。
+    const client = await connectClient(endpoint, 'after-malformed')
+    expect((await client.listTools()).tools.map((tool) => tool.name)).toEqual(['read_file'])
+    // 运行期 HTTP 错误没有被静默丢弃（健康时应为 undefined）。
+    expect(bridge.lastHttpError).toBeUndefined()
   })
 })

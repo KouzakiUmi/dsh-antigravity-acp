@@ -27,6 +27,27 @@ const MESSAGE_OPEN_SUFFIX = '">'
 const MESSAGE_CLOSE = '</dsh-message>'
 const SYSTEM_OPEN = '<dsh-system>'
 const SYSTEM_CLOSE = '</dsh-system>'
+/** 工具策略说明块的哨兵（固定文本，不参与消息逆解析）。 */
+const POLICY_OPEN = '<dsh-tool-policy>'
+const POLICY_CLOSE = '</dsh-tool-policy>'
+
+/**
+ * 每次 prompt 都会附带的一段工具策略说明。
+ *
+ * 为什么必须有：官方 agent 自带一整套原生工具（`read_file` / `write_file` /
+ * `edit_file` / `run_command` / `view_file` / `list_dir` / `grep_search` /
+ * `find_by_name`…），而本集成**不声明** fs/terminal 客户端能力，这些原生步骤在这里
+ * 必然拿不到权限。**只拒绝不告知**时，偏好原生工具的型号会反复索要原生权限——实测
+ * 2026-10-17 表现为「默认占位模型能对话，选具体型号就没反应」。明确告诉模型「用随会话
+ * 提供的工具」后，它会改用桥过去的 DSH 工具。
+ * 同类做法见 `@estebanforge/pi-antigravity-bridge` 的 tool-priority note（MIT）。
+ */
+export const TOOL_POLICY_TEXT = [
+  '本会话运行在 DSH（DeepSeek Harness）集成中，工具与 DSH 对齐：',
+  '- 随本会话提供的工具列表就是你的工具入口；读写文件、执行命令、搜索代码请一律使用它们，它们与 DSH 的权限与审计一致。',
+  '- agy 的原生工具（read_file / write_file / edit_file / run_command / view_file / list_dir / grep_search / find_by_name 等）在本集成中不可用：客户端未声明 fs/terminal 能力，相关请求会被拒绝。',
+  '- 不要反复索要原生能力；直接改用等价的随会话工具完成。',
+].join('\n')
 
 /** 解析出的单条消息信封。 */
 export interface TranscriptEntry {
@@ -54,6 +75,8 @@ export function encodeMessage(message: RequestMessage): string {
 export function buildPromptContent(system: string | undefined, messages: readonly RequestMessage[]): ContentBlock[] {
   const blocks: ContentBlock[] = []
   if (system !== undefined && system !== '') blocks.push(textBlock(`${SYSTEM_OPEN}${system}${SYSTEM_CLOSE}`))
+  // 工具策略紧随 system：告诉模型原生 fs/terminal 在这里拿不到权限，请用随会话工具。
+  blocks.push(textBlock(`${POLICY_OPEN}${TOOL_POLICY_TEXT}${POLICY_CLOSE}`))
   for (const message of messages) blocks.push(textBlock(encodeMessage(message)))
   return blocks
 }

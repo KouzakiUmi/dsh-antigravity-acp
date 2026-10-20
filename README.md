@@ -91,8 +91,9 @@ ACP v1 没有「不建会话、不认证」就能读到模型目录的方法：`
   `gemini-3.8-flash-high`）且未选强度时，尊重钉住的档位。
 - **上下文容量**：官方目录不报告 context window，本包不填猜测值；首个回合收到
   官方 `usage_update.size`（协议定义即 total context window size）后，把实测值
-  写进 `resolveModel().context` 并随目录落盘，压缩引擎由此可量化上下文，不再
-  每步报 `no context capacity`。首轮回话之前仍是未知。
+  写进 `resolveModel().context` 并随目录落盘（目录条目是官方档位 id，落盘时按家族
+  id 对齐，折叠前后都能读回），压缩引擎由此可量化上下文，不再每步报
+  `no context capacity`。首轮回话之前仍是未知。
 
 ### 请求项映射
 
@@ -105,6 +106,27 @@ ACP v1 没有采样参数通道，以下请求项的处理是明确的：
 | `temperature` / `stop` | 抛 `UNSUPPORTED_OPTION`：用户显式要求的效果无法兑现，不假装接受。 |
 
 ## 稳定性与诊断
+
+- **当前权限限制**：ACP `session/request_permission` 尚未可靠区分原生与桥接调用，
+  因此仍按现有规则拒绝。官方 `call_mcp_tool` 也可能在到达 DSH 之前被拒绝；
+  纯文本回复成功不代表工具执行已验收，不能靠扩大目录白名单或全局自动批准来掩盖。
+  权限诊断只记录固定字段是否存在、会话/桥目录匹配关系和选项种类；不记录标题、调用 id、
+  参数正文、路径值或令牌，也不据此自动授权。可信身份不足时继续拒绝。
+- 主对话与后台标题可以并发调用同一个 provider。适配器在首次异步启动前占位、
+  串行调度；工具 park 期间保留主回合所有权，标题等待，不能覆盖当前回合或撤销工具桥。
+  同会话同步压缩则走放弃旧 prompt、按完整历史重建的兜底，避免等待自身工具结果而死锁。
+- 官方返回 `end_turn` 却没有可见文本或工具调用时，返回 `AGY_EMPTY_RESPONSE`，
+  不把空白、仅思考或仅进度通知当成成功回复。回合日志区分 `purpose`、文本/思考字符数与结束原因，
+  不记录回复正文。
+- MCP 调用在入桥时重新核对当前工具目录，未知或已撤销的工具直接返回错误，不进入
+  DSH 工具执行队列；每个新 ACP 回合轮换 token 与授权代次，旧通道不能向新回合投递调用。
+  MCP 会话通道按回合回收：新回合开始时关闭上一回合的全部通道（未完成 initialize 的
+  请求也会被就地收尾），通道数不随回合累积。
+- `finish(tool-calls)` 只封住当前 DSH 输出，不代表官方 prompt 结束。封口后到达的
+  调用与文本暂存到续轮，避免聚合窗口之外的并发调用丢失；等待工具期间仍响应取消。
+- 失败或取消会撤销桥授权，经宿主 `ctx.subprocess` 回收该连接的受管进程。
+  下一回合等待回收完成；无法确认退出时拒绝继续，不把本地 finish 当成后台已停止。
+  这是协议与进程生命周期保护，**不是 OS 文件系统沙箱**，不扩大原生工具权限。
 
 - `ensureAcpRuntime` 是 single-flight：并发首轮只 spawn 一条官方进程、只做一次
   `authenticate`，不会留下 dispose 杀不到的孤儿进程，也不会重复弹登录。
@@ -179,7 +201,7 @@ this product (#3501)」，仅作备用。原生 gRPC 接口
   `version`（即实际加载的 Core 版本，不是壳版本、也不是任何全局 CLI 版本），
   且按 `includePrerelease: true` 参与范围匹配。
 
-本包当前声明（0.1.11）：
+本包当前声明（0.1.22）：
 
 | peer | 范围 | 说明 |
 |---|---|---|
@@ -205,8 +227,8 @@ this product (#3501)」，仅作备用。原生 gRPC 接口
 可用的 `dsh-subusage` 0.13.4 完全一致；客户端依赖的 `conversation.input.right` /
 `conversation.input.model` slot、`__ModuleLoader__`、`listProviders` 在新壳中均存在。
 开发依赖已对齐宿主版本并精确锁定（`dsh-llm` / `dsh-subprocess` / `dsh-typert-protocol`
-= `0.2.1-alpha.4`，`cordis` = `4.0.5-alpha.2`），`npm run check`（255 测试 / 17 文件 +
-类型检查 + 构建）在该版本类型上全绿。**未做**：真机安装 0.1.11 后的 GUI 验收
+= `0.2.1-alpha.4`，`cordis` = `4.0.5-alpha.2`），`npm run check`（320 测试 / 21 文件 +
+类型检查 + 构建）在该版本类型上全绿。**未做**：真机安装 0.1.22 后的 GUI 验收
 （对话与额度药丸）。
 
 ## 安装参考
@@ -214,13 +236,13 @@ this product (#3501)」，仅作备用。原生 gRPC 接口
 通用 CLI 示例（`web` 只是文档用的 profile 名，不是本机 Desktop）：
 
 ```sh
-dsh plugin --profile web add ./dsh-bundle-antigravity-host-0.1.11.tgz
+dsh plugin --profile web add ./dsh-bundle-antigravity-host-0.1.22.tgz
 ```
 
 本机 Desktop 壳独占 `desktop` profile，公共 `dsh` 不能对它执行 `plugin add`。
 请在 DSH NEXT 的插件管理器里添加本地包，路径示例：
 
-`D:\dsh-antigravity-acp\.local-install\dsh-bundle-antigravity-host-0.1.11.tgz`
+`D:\dsh-antigravity-acp\.local-install\dsh-bundle-antigravity-host-0.1.22.tgz`
 
 装好后需要完全退出并重开 Desktop。只要本机官方 CLI 已登录过，
 `oauth-personal` 登录态会自动导入，**不会**弹浏览器登录页。模型路由名为

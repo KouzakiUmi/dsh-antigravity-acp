@@ -24,7 +24,7 @@
  * - token 全文不进日志、不进错误消息；
  * - 不硬编码任何账号/项目标识：`project_id` 只从既有文件继承或由注入的解析器取得。
  */
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir as osHomedir } from 'node:os'
 import { join } from 'node:path'
 import { parseTokenState, refreshAccessToken, resolveOAuthClient } from './quota.js'
@@ -153,8 +153,12 @@ export interface AcpCredentialDeps {
   refresh?: (state: QuotaTokenState, client: OAuthClientMeta) => Promise<QuotaTokenState>
   /** 解析 OAuth client 元数据；默认走 quota.ts（env 覆盖 → 官方二进制内嵌）。 */
   resolveClient?: (env: Readonly<Record<string, string | undefined>>) => Promise<OAuthClientMeta | undefined>
+  /** 目标 ACP server 版本（定位缓存里已解压的官方二进制）；缺省用默认版本。 */
+  acpVersion?: string
   /** 解析项目 id；默认不解析（省略 project_id，由 server 自行解析）。 */
   resolveProjectId?: (accessToken: string) => Promise<string | undefined>
+  /** 换发所用的 fetch（插件代理在 index.ts 装好）；缺省为全局 fetch。 */
+  fetchImpl?: typeof fetch
   readFileImpl?: (path: string) => Promise<string>
   writeFileImpl?: (path: string, data: string) => Promise<void>
   mkdirImpl?: (path: string) => Promise<void>
@@ -165,6 +169,24 @@ export interface AcpCredentialDeps {
 
 const DEFAULT_FRESHNESS_MARGIN_MS = 60_000
 
+/**
+ * 默认写入：同目录临时文件 + rename，且文件权限 0600。
+ *
+ * 凭据文件里有 refresh_token：POSIX 上默认 umask 会让它对同机其他用户可读；
+ * 中途崩溃也不能留下半截 JSON 让官方 server 读到坏文件。Windows 忽略 mode，
+ * 继承用户目录 ACL。
+ */
+async function writeFileAtomic(path: string, data: string): Promise<void> {
+  const temp = `${path}.${process.pid}.${Date.now()}.tmp`
+  try {
+    await writeFile(temp, data, { encoding: 'utf8', mode: 0o600 })
+    await rename(temp, path)
+  } catch (error) {
+    await rm(temp, { force: true }).catch(() => undefined)
+    throw error
+  }
+}
+
 async function readJsonOrUndefined(
   path: string,
   read: (path: string) => Promise<string>,
@@ -173,6 +195,27 @@ async function readJsonOrUndefined(
     return JSON.parse(await read(path)) as unknown
   } catch {
     return undefined
+  }
+}
+
+/**
+ * 读 JSON 并区分「读不出来（多为文件不存在）」与「存在但无法解析」。
+ * settings.json 需要这个区别：前者可以新建，后者说明用户手里有内容，不能整份覆盖。
+ */
+async function readJsonState(
+  path: string,
+  read: (path: string) => Promise<string>,
+): Promise<{ kind: 'missing' } | { kind: 'corrupt' } | { kind: 'ok'; value: unknown }> {
+  let raw: string
+  try {
+    raw = await read(path)
+  } catch {
+    return { kind: 'missing' }
+  }
+  try {
+    return { kind: 'ok', value: JSON.parse(raw) as unknown }
+  } catch {
+    return { kind: 'corrupt' }
   }
 }
 
@@ -192,7 +235,7 @@ export async function ensureAcpCredentials(deps: AcpCredentialDeps = {}): Promis
   const home = deps.homedir?.() ?? osHomedir()
   const env = deps.env ?? process.env
   const read = deps.readFileImpl ?? ((path: string) => readFile(path, 'utf8'))
-  const write = deps.writeFileImpl ?? ((path: string, data: string) => writeFile(path, data, 'utf8'))
+  const write = deps.writeFileImpl ?? writeFileAtomic
   const makeDir = deps.mkdirImpl ?? ((path: string) => mkdir(path, { recursive: true }).then(() => undefined))
   const now = deps.now ?? Date.now
   const margin = deps.freshnessMarginMs ?? DEFAULT_FRESHNESS_MARGIN_MS
@@ -203,7 +246,8 @@ export async function ensureAcpCredentials(deps: AcpCredentialDeps = {}): Promis
 
   const existingRaw = await readJsonOrUndefined(tokenPath, read)
   const existing = readAcpCredentialState(existingRaw)
-  const settingsRaw = await readJsonOrUndefined(settingsPath, read)
+  const settingsState = await readJsonState(settingsPath, read)
+  const settingsRaw = settingsState.kind === 'ok' ? settingsState.value : undefined
   const settingsAuthType = readSettingsAuthType(settingsRaw)
   const authType = settingsAuthType ?? ACP_AUTH_TYPE
 
@@ -224,12 +268,25 @@ export async function ensureAcpCredentials(deps: AcpCredentialDeps = {}): Promis
       ? { ...base, ready: true, status: 'existing', settingsWritten, note }
       : { ...base, ready: false, status: 'unavailable', settingsWritten, note }
 
-  // settings.json 只在不存在的场合补写；已有内容（含 gcp 字段或别的认证方式）一律尊重。
+  // settings.json 只补 auth.type，已有内容（含 gcp 字段、别的认证方式）一律尊重：
+  // 文件存在但缺 auth.type 时与既有字段合并，不整份覆盖；存在却无法解析时不碰它。
   let settingsWritten = false
+  if (settingsState.kind === 'corrupt') {
+    return {
+      ...base,
+      ready: false,
+      status: 'unavailable',
+      settingsWritten: false,
+      note: `settings.json（${settingsPath}）存在但不是合法 JSON，已保留原文件未覆盖；请修复或删除它后重试`,
+    }
+  }
   if (settingsAuthType === undefined) {
     try {
       await makeDir(acpDir)
-      await write(settingsPath, `${JSON.stringify(buildAcpSettingsDocument(), null, 2)}\n`)
+      const merged = isRecord(settingsRaw)
+        ? { ...settingsRaw, auth: { ...(isRecord(settingsRaw.auth) ? settingsRaw.auth : {}), ...buildAcpSettingsDocument().auth } }
+        : buildAcpSettingsDocument()
+      await write(settingsPath, `${JSON.stringify(merged, null, 2)}\n`)
       settingsWritten = true
     } catch (error) {
       return {
@@ -273,7 +330,12 @@ export async function ensureAcpCredentials(deps: AcpCredentialDeps = {}): Promis
 
   let client: OAuthClientMeta | undefined
   try {
-    client = deps.resolveClient ? await deps.resolveClient(env) : await resolveOAuthClient({ env })
+    client = deps.resolveClient
+      ? await deps.resolveClient(env)
+      : await resolveOAuthClient({
+        env,
+        ...(deps.acpVersion === undefined ? {} : { acpVersion: deps.acpVersion }),
+      })
   } catch {
     client = undefined
   }
@@ -284,13 +346,29 @@ export async function ensureAcpCredentials(deps: AcpCredentialDeps = {}): Promis
     )
   }
 
-  let refreshed: QuotaTokenState
+  // 换发候选链：既有 refresh_token 优先；失败（常见于被撤销 / invalid_grant）时
+  // 改用官方 CLI 当前的登录态再试一次——CLI 重新登录后它是新的，不该因为
+  // acp_token.json 里留着一颗作废的旧 token 就判成不可用。
+  const doRefresh = (candidate: QuotaTokenState, meta: OAuthClientMeta): Promise<QuotaTokenState> =>
+    deps.refresh ? deps.refresh(candidate, meta) : refreshWithDefaults(candidate, meta, env, deps.fetchImpl)
+  let refreshed: QuotaTokenState | undefined
+  let refreshError: unknown
   try {
-    refreshed = deps.refresh
-      ? await deps.refresh(state, client)
-      : await refreshWithDefaults(state, client, env)
+    refreshed = await doRefresh(state, client)
   } catch (error) {
-    return degrade(`换发 access token 失败：${describeFsError(error)}`, settingsWritten)
+    refreshError = error
+    const cliState = parseTokenState(await readJsonOrUndefined(cliTokenPath, read))
+    if (cliState.refreshToken && cliState.refreshToken !== state.refreshToken) {
+      try {
+        refreshed = await doRefresh(cliState, client)
+        source = 'imported'
+      } catch (fallbackError) {
+        refreshError = fallbackError
+      }
+    }
+  }
+  if (!refreshed) {
+    return degrade(`换发 access token 失败：${describeFsError(refreshError)}`, settingsWritten)
   }
 
   // project_id 依次取：既有文件 → 注入的解析器（默认不解析，交给 server 自己解析）。
@@ -313,13 +391,14 @@ export async function ensureAcpCredentials(deps: AcpCredentialDeps = {}): Promis
   return { ...base, ready: true, status: source, settingsWritten }
 }
 
-/** 默认换发实现：走 quota.ts 的 OAuth 刷新（fetch 由宿主装好代理 dispatcher）。 */
+/** 默认换发实现：走 quota.ts 的 OAuth 刷新。 */
 async function refreshWithDefaults(
   state: QuotaTokenState,
   client: OAuthClientMeta,
   env: Readonly<Record<string, string | undefined>>,
+  fetchImpl?: typeof fetch,
 ): Promise<QuotaTokenState> {
-  return refreshAccessToken(state, client, { env })
+  return refreshAccessToken(state, client, { env, ...(fetchImpl ? { fetchImpl } : {}) })
 }
 
 /** 错误文案只保留类型与消息，绝不回显任何 token 片段。 */

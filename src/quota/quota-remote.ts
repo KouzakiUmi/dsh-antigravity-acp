@@ -19,6 +19,7 @@ import { fetchQuotaSnapshot, QuotaError, QUOTA_CACHE_MS } from '../runtime/quota
 import type { QuotaDeps, QuotaSnapshot } from '../runtime/quota.js'
 import { fetchAgyUsage } from '../runtime/agy-cli.js'
 import type { CliRun } from '../runtime/agy-cli.js'
+import { redactSensitiveText } from '../runtime/redact.js'
 
 export const PACKAGE_NAME = 'dsh-bundle-antigravity-host'
 /** Typert service / wire namespace。 */
@@ -138,50 +139,94 @@ export interface AgYQuotaServiceOptions {
   log?: { info(message: string): void; warn(message: string, error?: unknown): void }
 }
 
-/** 额度取数服务：`read(request)` 返回快照，失败折叠成 `status: 'error'` 而不抛。 */
+/**
+ * 额度取数服务：`read(request)` 返回快照，失败折叠成 `status: 'error'` 而不抛。
+ *
+ * 字段刻意用 TS `private` 而非 ES `#私有`：Cordis Service 的方法经 Proxy 调用，
+ * `this` 是代理而非真实实例，`#x` 会抛 “Cannot read private member #x from an
+ * object whose class did not declare it”。
+ */
 export class AgYQuotaService extends TypertRemoteService {
-  readonly #cache: { value?: QuotaSnapshot; at?: number } = {}
-  readonly #deps: QuotaDeps
-  readonly #cli: { run: CliRun; cliPath: string } | undefined
-  readonly #log: AgYQuotaServiceOptions['log']
+  private readonly _cache: { value?: QuotaSnapshot; at?: number } = {}
+  private readonly _deps: QuotaDeps
+  private readonly _cli: { run: CliRun; cliPath: string } | undefined
+  private readonly _log: AgYQuotaServiceOptions['log']
+  /** 在途取数：并发调用（多会话药丸 / 定时器 + 手动刷新）共享同一次取数，而不是各起一个进程。 */
+  private _inflight: Promise<QuotaSnapshot> | undefined
+  /** 在途取数是否真的绕过了缓存（而非「命中缓存」的即时返回）；force 的合并判定依据。 */
+  private _inflightBypassed = false
 
   constructor(ctx: Context, options: AgYQuotaServiceOptions = {}) {
     super(ctx, AGY_QUOTA_SERVICE)
-    this.#deps = options.deps ?? {}
-    this.#cli = options.cli
-    this.#log = options.log
+    this._deps = options.deps ?? {}
+    this._cli = options.cli
+    this._log = options.log
   }
 
-  /** 客户端药丸的取数入口。 */
+  /** 客户端药丸的取数入口；并发调用合并为同一次取数。 */
   async read(request?: AgYQuotaRequest): Promise<QuotaSnapshot> {
+    const force = request?.force === true
+    while (this._inflight) {
+      const existing = this._inflight
+      // force 只并入「确实在取新数」的在途读取（结果即新数据）；在途读取若只是
+      // 命中缓存的即时返回，必须等它结束后另行取数，否则刷新会拿到旧缓存。
+      if (!force || this._inflightBypassed) return existing
+      await existing.catch(() => undefined)
+    }
+    const run = this._read(request)
+    this._inflight = run
+    try {
+      return await run
+    } finally {
+      if (this._inflight === run) this._inflight = undefined
+    }
+  }
+
+  private async _read(request?: AgYQuotaRequest): Promise<QuotaSnapshot> {
+    // 本次读取是否真正取了新数（_read 的同步段就会定出，供 read() 做合并判定）。
+    this._inflightBypassed = false
     if (request?.force === true) {
-      delete this.#cache.value
-      delete this.#cache.at
+      // 只让缓存失效（清时间戳），保留上一次成功的数据：刷新失败时还能以 stale 形式展示。
+      delete this._cache.at
     }
     // 这条日志让「药丸到底有没有把请求发到 Host」可证：浏览器侧完全无法写宿主日志。
-    const source = this.#cli ? `cli=${this.#cli.cliPath}` : 'http（未找到 agy CLI）'
-    this.#log?.info(`antigravity-acp: 额度取数请求（force=${request?.force === true}，来源 ${source}）`)
+    const source = this._cli ? `cli=${this._cli.cliPath}` : 'http（未找到 agy CLI）'
+    this._log?.info(`antigravity-acp: 额度取数请求（force=${request?.force === true}，来源 ${source}）`)
     try {
-      const cli = this.#cli
-      if (!cli) return await fetchQuotaSnapshot(this.#cache, this.#deps)
       const now = Date.now()
-      const cached = this.#cache.value
-      if (cached && this.#cache.at !== undefined && now - this.#cache.at < QUOTA_CACHE_MS && cached.status === 'ok') {
-        this.#log?.info(`antigravity-acp: 额度取数命中缓存（${cached.groups.length} 组）`)
+      const cached = this._cache.value
+      if (cached && this._cache.at !== undefined && now - this._cache.at < QUOTA_CACHE_MS && cached.status === 'ok' && cached.stale !== true) {
+        this._log?.info(`antigravity-acp: 额度取数命中缓存（${cached.groups.length} 组）`)
         return cached
       }
-      const snapshot = await fetchAgyUsage(cli.run, cli.cliPath)
-      this.#cache.value = snapshot
-      this.#cache.at = now
-      this.#log?.info(
+      this._inflightBypassed = true
+      // 上一次成功数据必须在取数**前**捕获：HTTP 回退实现（fetchQuotaSnapshot）
+      // 会把失败快照写进同一个缓存对象，取完再读就只剩失败结果了。
+      const previous = this._cache.value
+      const cli = this._cli
+      const fresh = cli
+        ? await fetchAgyUsage(cli.run, cli.cliPath)
+        : await fetchQuotaSnapshot(this._cache, this._deps)
+      // 刷新失败但手里有上一次成功的数据：继续展示它并标记 stale，而不是让药丸
+      // 因为一次网络抖动就从「剩余 62%」变成「额度读取失败」。CLI 与 HTTP 回退
+      // 共用同一条 stale 保留语义。
+      const snapshot: QuotaSnapshot = fresh.status === 'error' && previous?.status === 'ok'
+        ? { ...previous, stale: true, staleReason: fresh.error?.message ?? '刷新失败' }
+        : fresh
+      this._cache.value = snapshot
+      // stale 不算新鲜：不刷新时间戳，也不被缓存命中分支当作可复用结果，下次调用立刻重试。
+      if (snapshot.stale === true) delete this._cache.at
+      else this._cache.at = now
+      this._log?.info(
         `antigravity-acp: 额度取数结果 status=${snapshot.status} 组数=${snapshot.groups.length}` +
           (snapshot.error ? ` 错误=${snapshot.error.code}:${snapshot.error.message.slice(0, 160)}` : ''),
       )
       return snapshot
     } catch (error) {
       // 取数实现自身已折叠错误；这里兜住意外异常，绝不让原始错误穿到客户端。
-      const message = error instanceof Error ? error.message : String(error)
-      this.#log?.warn?.('antigravity-acp: 额度取数抛异常', error)
+      // 脱敏与快照内其它错误一致：token / URL userinfo 等不能进 UI 或宿主日志。
+      const message = redactSensitiveText(error instanceof Error ? error.message : String(error))
+      this._log?.warn?.('antigravity-acp: 额度取数抛异常', error)
       return {
         status: 'error',
         updatedAt: new Date().toISOString(),

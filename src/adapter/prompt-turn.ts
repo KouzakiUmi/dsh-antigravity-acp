@@ -28,10 +28,13 @@ import type {
 } from '@agentclientprotocol/sdk'
 import type { AgentLink } from '../protocol/agent-link.js'
 import type { BridgeParkedCall, BridgeToolResult, McpToolBridge } from '../bridge/mcp-bridge.js'
+import { BRIDGE_MCP_SERVER_NAME } from '../bridge/mcp-bridge.js'
+import { describePermissionRequest } from './permission-diagnostic.js'
+import type { PermissionDiagnostic } from './permission-diagnostic.js'
 
 /** 本文件使用的原创错误码（AGY_* 体系，与 agent-link / mcp-bridge 同族）。 */
 export const AGY_TURN_ERROR = {
-  /** agent 请求本地能力被拒（无人值守策略）。 */
+  /** ACP 工具权限请求被拒，不能据此判断请求一定是原生能力。 */
   PERMISSION_DENIED: 'AGY_PERMISSION_DENIED',
   /** agent 发起了 clientCapabilities 已关闭的原生能力请求（fs/terminal/…）。 */
   NATIVE_ACTIVITY_REFUSED: 'AGY_NATIVE_ACTIVITY_REFUSED',
@@ -41,6 +44,8 @@ export const AGY_TURN_ERROR = {
   REFUSED: 'AGY_AGENT_REFUSED',
   /** 本回合没有等待回喂的 park 调用，却收到了续轮回喂请求。 */
   NO_PENDING_TOOL_CALL: 'AGY_NO_PENDING_TOOL_CALL',
+  /** 官方宣告 end_turn，但没有可见文本/工具调用；不能冒充成功。 */
+  EMPTY_RESPONSE: 'AGY_EMPTY_RESPONSE',
 } as const
 
 /** 未分类的意外状态（link 关闭、agent 异常取消等）在此码下归一。 */
@@ -70,18 +75,22 @@ export interface PromptTurnOptions {
   /** config_option_update 的观察者（用于刷新模型目录）。 */
   onConfigOptions?(options: readonly SessionConfigOption[]): void
   /**
-   * 被容忍的一次原生能力拒绝（尚未终止回合）。用于落日志：模型索要 fs/terminal
-   * 是「它想绕开工具桥」的信号，但首次拒绝后它通常会改用桥过去的工具。
+   * 未自然结束的回合失败/取消：由 adapter 回收受管运行时，不依赖对端实现取消。
+   * `info.clean === true` 表示 prompt 已**正常应答**的干净失败（refusal / 空回复 /
+   * 未知 stopReason）：agent 状态自洽，调用方可以复用链接而不必回收。
    */
+  onTerminate(reason: string, info?: { clean?: boolean }): void
+  /** 尚未终止回合的一次拒绝；permission 不等于原生 fs/terminal，不能据此做身份判断。 */
   onNativeRefusal?(info: { kind: 'permission' | 'request'; detail: string; count: number }): void
+  /** 固定词表的权限结构摘要；仅诊断，不作为放行依据。 */
+  onPermissionDiagnostic?(diagnostic: PermissionDiagnostic): void
 }
 
 /**
- * 同一回合内容忍的原生能力索要次数上限。
+ * 同一回合重复拒绝的保护上限（历史导出名保留）。
  *
- * 超过该次数说明模型在反复尝试绕开工具桥，此时才终止回合（fail closed on
- * insistence）；首次若干次只拒绝、不掐回合——否则偏好原生工具的型号（不同模型
- * 对工具的使用风格不同）会每一轮都被判失败，用户看到的就是「选了型号没反应」。
+ * 计数包含 ACP permission 和原生客户端请求；超过上限仅说明重复请求了未授予的
+ * 能力，不足以证明它在绕开工具桥。首次若干次只拒绝、不掐回合。
  */
 export const NATIVE_REFUSAL_LIMIT = 3
 
@@ -100,6 +109,7 @@ export class PromptTurn {
   /** 本回合内被拒绝的原生能力索要次数（超过 NATIVE_REFUSAL_LIMIT 才终止回合）。 */
   #nativeRefusals = 0
   #onNativeRefusal: PromptTurnOptions['onNativeRefusal']
+  readonly #onPermissionDiagnostic: PromptTurnOptions['onPermissionDiagnostic']
   #nextIndex = 0
   #open: OpenBlock | undefined
   #producerDone = false
@@ -110,6 +120,11 @@ export class PromptTurn {
   #truncated = false
   #parkTimer: ReturnType<typeof setTimeout> | undefined
   #abortCleanup: (() => void) | undefined
+  #terminated = false
+  #hasOutput = false
+  readonly #onTerminate: PromptTurnOptions['onTerminate']
+  /** 本轮封口不等于 ACP prompt 结束；封口后的事件留给下一次 stream 消费。 */
+  #deferred: Array<{ kind: 'call'; call: BridgeParkedCall } | { kind: 'update'; update: SessionUpdate }> = []
 
   constructor(sessionId: string, options: PromptTurnOptions) {
     this.sessionId = sessionId
@@ -119,6 +134,8 @@ export class PromptTurn {
     this.#parkSettleMs = options.parkSettleMs
     this.#onConfigOptions = options.onConfigOptions
     this.#onNativeRefusal = options.onNativeRefusal
+    this.#onPermissionDiagnostic = options.onPermissionDiagnostic
+    this.#onTerminate = options.onTerminate
   }
 
   /** 本回合的 ACP prompt 是否已有应答；应答后无法再「在同一 prompt 内续轮」。 */
@@ -126,34 +143,48 @@ export class PromptTurn {
     return this.#promptSettled
   }
 
-  /** 本回合 park 的工具调用（按 park 顺序）。 */
+  /** 本地已终止，不再允许续接；对端回收由 adapter 的屏障保证。 */
+  get terminated(): boolean {
+    return this.#terminated
+  }
+
+  /** 本回合已交给 DSH 的工具调用（迟到调用在 resume 后才加入）。 */
   get parkedCalls(): readonly BridgeParkedCall[] {
     return this.#parked
   }
 
   /** 本回合是否停在「等待 DSH 回喂工具结果」的续轮状态。 */
   get awaitingToolResults(): boolean {
-    return this.#roundEnded && this.#parked.some((call) => this.#bridge.hasPending(call.callId))
+    return !this.#terminated && this.#roundEnded && this.#parked.some((call) => this.#bridge.hasPending(call.callId))
   }
 
   /** 把 session/update 交给当前回合（由 adapter 的稳定 handler 转发）。 */
   handleSessionUpdate(notification: SessionNotification): void {
-    if (this.#roundEnded) return
-    if (notification.sessionId !== this.sessionId) return
+    if (notification.sessionId !== this.sessionId || this.#terminated || this.#promptSettled) return
+    if (this.#roundEnded) {
+      this.#deferred.push({ kind: 'update', update: notification.update })
+      return
+    }
     this.#applyUpdate(notification.update)
   }
 
   /**
    * 权限询问一律拒绝（无人值守）：优先回绝选项，无可选项时回 cancelled。
    *
-   * **拒绝本身不终止回合**：模型看到拒绝后通常改用本插件桥过去的 DSH 工具。只有
-   * 同一回合内反复索要超过 {@link NATIVE_REFUSAL_LIMIT} 次（明显在坚持绕开工具桥）
-   * 才按 fail-closed 终止，避免「选了偏好原生工具的型号就永远没反应」。
+   * ACP 权限询问也可能来自 MCP 包装调用，不能一概称为原生 fs/terminal 请求。
+   * 尚缺实际请求的可信身份采样：本轮仅增加脱敏诊断，不按 title 或 rawInput 猜测放行。
+   * 拒绝本身不立即终止回合；保留既有的重复拒绝上限。
    */
   handleRequestPermission(request: RequestPermissionRequest): RequestPermissionResponse {
+    this.#onPermissionDiagnostic?.(describePermissionRequest(request, {
+      sessionId: this.sessionId,
+      serverName: BRIDGE_MCP_SERVER_NAME,
+      toolNames: this.#bridge.toolNames(),
+    }))
     const rejection = request.options.find((option) => option.kind === 'reject_once')
       ?? request.options.find((option) => option.kind === 'reject_always')
-    this.#recordNativeRefusal('permission', request.toolCall.toolCallId)
+    // 调用 id 同样是不可信字符串，不进入日志或错误正文。
+    this.#recordNativeRefusal('permission', 'session/request_permission')
     return rejection
       ? { outcome: { outcome: 'selected', optionId: rejection.optionId } }
       : { outcome: { outcome: 'cancelled' } }
@@ -176,7 +207,7 @@ export class PromptTurn {
       kind === 'permission'
         ? {
             code: AGY_TURN_ERROR.PERMISSION_DENIED,
-            message: `Antigravity ACP 反复索要本地能力（${detail}，本回合第 ${this.#nativeRefusals} 次）：本插件在无人值守模式下不授予 agent 任何 fs/terminal 权限`,
+            message: `Antigravity ACP 反复请求工具执行授权（${detail}，本回合第 ${this.#nativeRefusals} 次）：当前拒绝规则未授予权限，桥调用身份需另行核验`,
           }
         : {
             code: AGY_TURN_ERROR.NATIVE_ACTIVITY_REFUSED,
@@ -203,15 +234,18 @@ export class PromptTurn {
 
   /** 收到 abort 信号：取消 ACP 会话当前回合并以 aborted 结束。 */
   abort(reason: string): void {
-    if (this.#roundEnded) return
+    if (this.#terminated || this.#promptSettled) return
     this.#aborted = true
     this.#fail({ code: AGY_TURN_ERROR.ABORTED, message: `Antigravity ACP 回合被调用方中止：${reason}` })
-    void this.#link.cancel(this.sessionId).catch(() => undefined)
   }
 
   /** 桥 park 了新调用：进入当前回合。 */
   handleParked(call: BridgeParkedCall): void {
-    if (this.#roundEnded) return
+    if (this.#terminated) return
+    if (this.#roundEnded) {
+      this.#deferred.push({ kind: 'call', call })
+      return
+    }
     this.#parked.push(call)
     this.#emitToolCallBlock(call)
     // 重置聚合窗口，让同一批次里随后到达的并发调用并入同一轮。
@@ -238,7 +272,16 @@ export class PromptTurn {
     this.#failure = undefined
     this.#aborted = false
     this.#truncated = false
+    this.#abortCleanup?.()
+    this.#abortCleanup = undefined
     if (signal) this.#attachAbort(signal)
+    const deferred = this.#deferred
+    this.#deferred = []
+    for (const event of deferred) {
+      if (this.#terminated) break
+      if (event.kind === 'call') this.handleParked(event.call)
+      else this.#applyUpdate(event.update)
+    }
   }
 
   /** 续轮回喂：把 DSH 的 tool result 交给桥 resolve 对应的 MCP 调用。 */
@@ -293,6 +336,7 @@ export class PromptTurn {
 
   #markPromptSettled(): void {
     this.#promptSettled = true
+    this.dispose()
     const waiters = this.#settledWaiters
     this.#settledWaiters = []
     for (const resolve of waiters) resolve()
@@ -301,7 +345,17 @@ export class PromptTurn {
   #finishWith(response: PromptResponse): void {
     const reason = this.#mapStopReason(response.stopReason)
     if (reason) {
-      this.#fail(reason)
+      // stopReason 已随响应到达（refusal / cancelled / 未知）：prompt 正常应答，
+      // 属于干净失败，链接可复用。
+      this.#fail(reason, true)
+      return
+    }
+    if (response.stopReason === 'end_turn' && !this.#hasOutput) {
+      // end_turn 已应答，只是没有可见产出：同样是干净失败。
+      this.#fail({
+        code: AGY_TURN_ERROR.EMPTY_RESPONSE,
+        message: 'Antigravity ACP 已结束回合，但没有返回可见文本或工具调用；本次不是成功回复',
+      }, true)
       return
     }
     this.finishRound(mapUsage(response.usage))
@@ -326,9 +380,22 @@ export class PromptTurn {
     }
   }
 
-  #fail(failure: LlmFailure): void {
-    this.#failure ??= failure
+  /**
+   * 结束本回合并以失败封口。`clean = true` 仅在 prompt 已正常应答的失败
+   * （refusal / 空回复 / 未知 stopReason）时传入：此时 agent 状态自洽，
+   * onTerminate 会带 `info.clean`，调用方可复用链接而不必回收。
+   */
+  #fail(failure: LlmFailure, clean = false): void {
+    if (this.#failure) return
+    this.#failure = failure
     this.finishRound()
+    this.dispose()
+    this.#deferred = []
+    // 协作式 cancel 仅尽力发送；不能把本地 finish 当成对端已停止的证明。
+    // 即使 prompt 已超时/拒绝，仍回收连接，避免复用残留执行状态。
+    this.#terminated = true
+    if (!this.#promptSettled) void this.#link.cancel(this.sessionId).catch(() => undefined)
+    this.#onTerminate(failure.message, clean ? { clean: true } : undefined)
   }
 
   /**
@@ -343,7 +410,10 @@ export class PromptTurn {
     this.#push({ type: 'finish', reason: this.#resolveFinish() })
     this.#producerDone = true
     this.#wake()
-    this.dispose()
+    if (this.#parkTimer) clearTimeout(this.#parkTimer)
+    this.#parkTimer = undefined
+    // 工具执行期间仍需响应取消；只在 ACP prompt 真正结束时移除 abort 监听。
+    if (this.#promptSettled) this.dispose()
   }
 
   #resolveFinish(): FinishChunk['reason'] {
@@ -383,6 +453,7 @@ export class PromptTurn {
   #appendText(blockType: 'text' | 'reasoning', messageId: string | undefined, content: unknown): void {
     const text = renderContentText(content)
     if (text === undefined) return
+    if (blockType === 'text' && text.trim().length > 0) this.#hasOutput = true
     if (this.#open && (this.#open.blockType !== blockType || this.#open.messageId !== messageId)) {
       this.closeOpenBlock()
     }
@@ -397,6 +468,7 @@ export class PromptTurn {
   }
 
   #emitToolCallBlock(call: BridgeParkedCall): void {
+    this.#hasOutput = true
     this.closeOpenBlock()
     const index = this.#nextIndex++
     this.#push({ type: 'block-start', index, blockType: 'tool-call' })

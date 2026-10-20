@@ -208,23 +208,38 @@ window.__ModuleLoader__.load({
       const provider = state?.current?.provider
       const [data, setData] = React.useState(null)
       const [expanded, setExpanded] = React.useState(false)
+      /** 每次取数自增；只有最新一次的回包允许写入 state（防止过期响应覆盖）。 */
+      const loadVersion = React.useRef(0)
 
       const load = React.useCallback((force) => {
+        const version = (loadVersion.current += 1)
         Promise.resolve(readQuota(force))
           // Typert remote 的回包是 `{ ok, value }` 信封（设置卡片、以及同宿主上
           // 正常工作的 dsh-subusage 都先拆再读）。不拆的话 `data.status` 恒为
           // undefined：药丸永远停在「额度…」，面板正文渲染成空。
-          .then((result) => setData(unwrap(result)))
-          .catch((cause) => setData({
-            status: 'error',
-            updatedAt: new Date().toISOString(),
-            groups: [],
-            error: { code: 'request-failed', text: cause instanceof Error ? cause.message : String(cause) },
-          }))
+          .then((result) => {
+            if (loadVersion.current !== version) return
+            setData(unwrap(result))
+          })
+          .catch((cause) => {
+            if (loadVersion.current !== version) return
+            setData({
+              status: 'error',
+              updatedAt: new Date().toISOString(),
+              groups: [],
+              error: { code: 'request-failed', text: cause instanceof Error ? cause.message : String(cause) },
+            })
+          })
       }, [readQuota])
 
       React.useEffect(() => {
-        if (provider !== PROVIDER) return undefined
+        if (provider !== PROVIDER) {
+          // 换到别的 provider 时清掉旧额度并作废在途请求，切回时不会先闪旧数据。
+          loadVersion.current += 1
+          setData(null)
+          setExpanded(false)
+          return undefined
+        }
         load(false)
         const timer = setInterval(() => load(false), 300_000)
         return () => clearInterval(timer)
@@ -239,8 +254,9 @@ window.__ModuleLoader__.load({
         : data?.status === 'error'
           ? '额度读取失败'
           : '额度…'
+      const staleNote = data?.stale ? `（最近一次刷新失败，显示的是旧数据：${data.staleReason ?? '未知原因'}）` : ''
       const title = bucket
-        ? `${bucket.group ? `${bucket.group} · ` : ''}${bucket.name}：剩余 ${bucket.remainingPct ?? '?'}%${resetCountdown(bucket.resetTime) ? `，${resetCountdown(bucket.resetTime)} 后重置` : ''}`
+        ? `${bucket.group ? `${bucket.group} · ` : ''}${bucket.name}：剩余 ${bucket.remainingPct ?? '?'}%${resetCountdown(bucket.resetTime) ? `，${resetCountdown(bucket.resetTime)} 后重置` : ''}${staleNote}`
         : data?.status === 'error'
           ? (data.error?.text ?? data.error?.message ?? '额度读取失败')
           : '正在读取 Antigravity 套餐额度…'
@@ -443,6 +459,9 @@ window.__ModuleLoader__.load({
         // 会让整个注册回调一直等待 —— 表现为**药丸彻底消失**（2026-10-17 实测踩过）。
         // 正确做法是照常注册 slot，由读取器短轮询等服务出现。
         ctx.inject(['slots', 'modelDirectories'], (scope) => {
+          // 读取器按 scope 建一次：药丸的取数 effect 依赖 readQuota 的身份，若每次
+          // inject 都新建函数，身份变化会让 effect 反复重跑、重复触发 Host 侧 CLI 取数。
+          const readQuota = makeQuotaReader(scope)
           scope.effect(
             () =>
               scope.slots.inject('conversation.input.right', () =>
@@ -453,7 +472,7 @@ window.__ModuleLoader__.load({
                     order: 1002,
                     inject: (sessionId) => ({
                       store: scope.modelDirectories.directoryFor(sessionId).store,
-                      readQuota: makeQuotaReader(scope),
+                      readQuota,
                     }),
                   },
                   AgYQuotaPill,

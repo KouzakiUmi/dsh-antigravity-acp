@@ -116,7 +116,8 @@ export interface McpToolBridgeOptions {
  * 工具集合按**请求时**读取，因此所有 MCP 会话看到同一份当前工具。
  */
 export class McpToolBridge {
-  readonly #token: string
+  #token: string
+  #generation = 0
   readonly #requestedPort: number
   readonly #pending = new Map<string, PendingEntry>()
   readonly #listeners = new Set<(call: BridgeParkedCall) => void>()
@@ -130,6 +131,8 @@ export class McpToolBridge {
   #closed = false
   #address: string | undefined
   #callSeq = 0
+  /** HTTP 监听器的最近一次运行期错误（诊断用；listen 阶段的错误走 spawn 的 reject）。 */
+  #httpError: Error | undefined
 
   constructor(options: McpToolBridgeOptions = {}) {
     this.#token = options.token ?? randomBytes(32).toString('hex')
@@ -151,6 +154,11 @@ export class McpToolBridge {
     return this.#bound
   }
 
+  /** HTTP 监听器的最近一次运行期错误；健康时为 undefined。 */
+  get lastHttpError(): Error | undefined {
+    return this.#httpError
+  }
+
   /** 订阅 park 事件；返回退订函数。 */
   onParked(listener: (call: BridgeParkedCall) => void): () => void {
     this.#listeners.add(listener)
@@ -162,6 +170,34 @@ export class McpToolBridge {
   /** 发布本回合 DSH 交给 agent 的工具（tools/list 的数据源）。 */
   publishTools(tools: readonly ToolSchema[]): void {
     this.#tools = [...tools]
+  }
+
+  /** 新 ACP 回合取得独立授权代次，旧连接不能把调用投递到新回合。 */
+  beginRound(tools: readonly ToolSchema[]): void {
+    this.invalidateRound('已切换 ACP 回合')
+    this.publishTools(tools)
+    // 上一回合的 MCP 会话通道已无用（新回合会新建 ACP 会话与连接），在这里
+    // 收掉以免按回合累积。**不能**放进 invalidateRound：回合失败/取消时
+    // resetPending 刚把错误结果结算给 agent，立即关闭 transport 会截断那个响应，
+    // MCP 客户端会一直等它。
+    this.#closeSessionChannels()
+  }
+
+  /** 撤销本回合目录、凭证和所有未完成调用；server 本身仍可用于下个回合。 */
+  invalidateRound(reason: string): void {
+    this.#generation += 1
+    this.#token = randomBytes(32).toString('hex')
+    this.#tools = []
+    this.resetPending(reason)
+  }
+
+  /** 关闭已握手完成（已登记 mcp-session-id）的全部 MCP 会话通道。 */
+  #closeSessionChannels(): void {
+    for (const [sessionId, channel] of this.#sessions) {
+      this.#sessions.delete(sessionId)
+      void channel.transport.close().catch(() => undefined)
+      void channel.server.close().catch(() => undefined)
+    }
   }
 
   /** 当前发布的工具名集合。 */
@@ -244,7 +280,17 @@ export class McpToolBridge {
     // 模式禁止跨请求复用同一 transport（"Stateless transport cannot be reused
     // across requests"），因此不做无状态复用。
     const http = createServer((req: IncomingMessage, res: ServerResponse) => {
-      void this.#handleHttp(req, res)
+      // #createHttpChannel 等路径的异常不在 #handleHttp 的 try 内：这里兜住，否则
+      // 它会变成 unhandledRejection 并终止整个宿主进程。
+      this.#handleHttp(req, res).catch(() => {
+        if (!res.headersSent) res.statusCode = 500
+        if (!res.writableEnded) res.end()
+      })
+    })
+    // 运行期错误必须有人接住：Node 的 http.Server 在没有 'error' 监听时会抛出
+    // 未捕获异常，直接终止宿主进程。这里只记录，供诊断读取。
+    http.on('error', (error: Error) => {
+      this.#httpError = error
     })
     await new Promise<void>((resolve, reject) => {
       http.once('error', reject)
@@ -324,6 +370,13 @@ export class McpToolBridge {
         res.statusCode = 500
         res.end()
       }
+    } finally {
+      // 无 session 头却没能完成 initialize 的请求（畸形 JSON、失败的握手）不会被
+      // transport 登记进 #sessions；这里主动收掉，避免每次畸形请求都泄漏一条通道。
+      // 已生成 sessionId 的会话保留，供后续请求按 mcp-session-id 分发。
+      if (!channel.transport.sessionId) {
+        await channel.transport.close().catch(() => undefined)
+      }
     }
   }
 
@@ -355,9 +408,10 @@ export class McpToolBridge {
    * per-tool 静态注册、且同名会冲突）。
    */
   #createServer(): McpServer {
+    const generation = this.#generation
     const server = new McpServer({ name: BRIDGE_MCP_SERVER_NAME, version: '0.1.0' }, { capabilities: { tools: {} } })
-    server.server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: this.#mcpTools() }))
-    server.server.setRequestHandler(CallToolRequestSchema, (request) => this.#parkCall(request.params.name, request.params.arguments))
+    server.server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: generation === this.#generation ? this.#mcpTools() : [] }))
+    server.server.setRequestHandler(CallToolRequestSchema, (request) => this.#parkCall(request.params.name, request.params.arguments, generation))
     return server
   }
 
@@ -369,7 +423,14 @@ export class McpToolBridge {
     }))
   }
 
-  #parkCall(name: string, args: Record<string, unknown> | undefined): Promise<CallToolResult> {
+  #parkCall(name: string, args: Record<string, unknown> | undefined, generation: number): Promise<CallToolResult> {
+    // tools/list 不是授权凭证；每次调用都重新检查当前目录，拒绝撤销/未知工具。
+    if (this.#closed || generation !== this.#generation || !this.#tools.some((tool) => tool.name === name)) {
+      return Promise.resolve({
+        content: [{ type: 'text', text: `${this.#closed ? AGY_BRIDGE_ERROR.CLOSED : AGY_BRIDGE_ERROR.UNKNOWN_TOOL}: ${name}` }],
+        isError: true,
+      })
+    }
     const callId = `${BRIDGE_MCP_SERVER_NAME}-${++this.#callSeq}`
     const call: BridgeParkedCall = { callId, name, arguments: JSON.stringify(args ?? {}) }
     return new Promise<CallToolResult>((resolve) => {

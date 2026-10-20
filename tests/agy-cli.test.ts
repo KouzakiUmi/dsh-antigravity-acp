@@ -267,6 +267,7 @@ describe('CLI 调用面', () => {
   it('cliEnv 只透传系统/用户/代理键，不带 DSH_* 内部键', () => {
     const env = cliEnv({
       SystemRoot: 'C:\\Windows',
+      ComSpec: 'C:\\Windows\\system32\\cmd.exe',
       PATH: 'C:\\bin',
       USERPROFILE: 'C:\\Users\\x',
       HTTPS_PROXY: 'http://127.0.0.1:7890',
@@ -274,7 +275,13 @@ describe('CLI 调用面', () => {
       DSH_TOKEN: 'leak',
       RANDOM_KEY: 'nope',
     })
-    expect(env).toMatchObject({ SystemRoot: 'C:\\Windows', PATH: 'C:\\bin', HTTPS_PROXY: 'http://127.0.0.1:7890' })
+    expect(env).toMatchObject({
+      SystemRoot: 'C:\\Windows',
+      // Windows 的 CLI 可能按这种大小写拼写读取 ComSpec。
+      ComSpec: 'C:\\Windows\\system32\\cmd.exe',
+      PATH: 'C:\\bin',
+      HTTPS_PROXY: 'http://127.0.0.1:7890',
+    })
     expect(Object.keys(env)).not.toContain('DSH_HOME')
     expect(Object.keys(env)).not.toContain('DSH_TOKEN')
     expect(Object.keys(env)).not.toContain('RANDOM_KEY')

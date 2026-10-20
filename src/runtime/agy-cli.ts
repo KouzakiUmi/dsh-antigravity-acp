@@ -353,7 +353,7 @@ export function cliEnv(
   proxy?: ProxySettings | undefined,
 ): Record<string, string> {
   const keys = [
-    'SystemRoot', 'SystemDrive', 'windir', 'COMSPEC', 'PATHEXT', 'PATH',
+    'SystemRoot', 'SystemDrive', 'windir', 'COMSPEC', 'ComSpec', 'PATHEXT', 'PATH',
     'USERPROFILE', 'HOME', 'HOMEDRIVE', 'HOMEPATH', 'USERNAME', 'USER',
     'LOCALAPPDATA', 'APPDATA', 'TEMP', 'TMP', 'TMPDIR',
   ]

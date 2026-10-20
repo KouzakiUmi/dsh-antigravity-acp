@@ -16,6 +16,8 @@ import yauzl from 'yauzl'
 
 /** 默认下载的官方 server 版本（可经 config.acpVersion 配置）。 */
 export const DEFAULT_ACP_SERVER_VERSION = '1.4.0'
+/** 官方 zip 下载的整体超时（含读完响应体）。 */
+export const DOWNLOAD_TIMEOUT_MS = 10 * 60_000
 /** 唯一允许的下载域名。 */
 export const DOWNLOAD_HOST_WHITELIST = 'dl.google.com'
 /** 数据缓存（模型清单等**非可执行**产物）在 DSH home 下的相对位置。 */
@@ -119,11 +121,15 @@ export type FetchLike = (
  */
 export async function downloadBinary(
   url: string,
-  options: { fetchImpl?: FetchLike; signal?: AbortSignal } = {},
+  options: { fetchImpl?: FetchLike; signal?: AbortSignal; timeoutMs?: number } = {},
 ): Promise<Uint8Array> {
   assertDownloadUrl(url)
   const doFetch: FetchLike = options.fetchImpl ?? ((url2, init) => fetch(url2, init))
-  const response = await doFetch(url, { redirect: 'manual', signal: options.signal })
+  // 整体超时：无超时的 fetch 在网络挂住时会让首轮对话永远等下去（连同 single-flight
+  // 汇聚的所有并发回合）。调用方的 signal（卸载取消）与超时任一触发都中止。
+  const timeout = AbortSignal.timeout(options.timeoutMs ?? DOWNLOAD_TIMEOUT_MS)
+  const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout
+  const response = await doFetch(url, { redirect: 'manual', signal })
   if (response.status >= 300 && response.status < 400) {
     throw new AgyBinaryError(
       AGY_BINARY_ERROR.REDIRECT_REFUSED,
@@ -351,13 +357,27 @@ export async function extractZipSafely(zipPath: string, destDir: string): Promis
   try {
     for (;;) {
       const entry = await new Promise<yauzl.Entry | null>((resolveNext, rejectNext) => {
-        zip.readEntry()
-        zip.once('entry', (e) => resolveNext(e))
+        // 每次读取只挂一条 entry/error/end 监听，settle 后立即摘除：条目很多时
+        // 累积监听器会触发 MaxListenersExceededWarning，并让旧条目的事件重复结算。
+        let settled = false
+        const cleanup = (): void => {
+          zip.removeListener('entry', onEntry)
+          zip.removeListener('error', onError)
+          zip.removeListener('end', onEnd)
+        }
+        const settleOnce = (run: () => void): void => {
+          if (settled) return
+          settled = true
+          cleanup()
+          run()
+        }
+        const onEntry = (e: yauzl.Entry): void => settleOnce(() => resolveNext(e))
         // yauzl 自身也会对恶意 fileName 报 error（absolute path / invalid
         // relative path / invalid characters in fileName）；统一映射为
         // UNSAFE_ENTRY，与我们的条目校验共用一个错误码。
-        zip.once('error', (error) => {
-          const unsafe = error instanceof Error && /fileName|relative path|absolute path/.test(error.message)
+        const onError = (error: Error): void => settleOnce(() => {
+          const message = error instanceof Error ? error.message : String(error)
+          const unsafe = /fileName|relative path|absolute path/.test(message)
           rejectNext(
             new AgyBinaryError(
               unsafe ? AGY_BINARY_ERROR.UNSAFE_ENTRY : AGY_BINARY_ERROR.ARCHIVE_READ,
@@ -366,7 +386,11 @@ export async function extractZipSafely(zipPath: string, destDir: string): Promis
             ),
           )
         })
-        zip.once('end', () => resolveNext(null))
+        const onEnd = (): void => settleOnce(() => resolveNext(null))
+        zip.on('entry', onEntry)
+        zip.on('error', onError)
+        zip.on('end', onEnd)
+        zip.readEntry()
       })
       if (!entry) break
       const safeRelative = validateZipEntryPath(entry.fileName)

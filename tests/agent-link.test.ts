@@ -210,7 +210,7 @@ describe('AgentLink 超时与取消', () => {
     const pending = link.request('session/prompt', { sessionId: 's', prompt: [] }, { signal: controller.signal })
     controller.abort()
     await expect(pending).rejects.toMatchObject({ code: AGY_LINK_ERROR.REQUEST_TIMEOUT })
-    await vi.waitFor(() => expect(cancelNotifications.length).toBeGreaterThan(0))
+    await vi.waitFor(() => expect(cancelNotifications).toEqual([{ requestId: 2 }]))
     await link.close()
   })
 })
@@ -427,5 +427,35 @@ describe('launchAcpAgent', () => {
       proxy: { url: 'ftp://127.0.0.1:21' },
     })).toThrow()
     expect(spawned).toBe(false)
+  })
+})
+
+describe('AgentLink 请求写出失败', () => {
+  it('写出失败时清理未完成请求，不留下 unhandled rejection', async () => {
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason)
+    }
+    process.on('unhandledRejection', onUnhandled)
+    const stream: Stream = {
+      writable: new WritableStream<AnyMessage>({
+        write() {
+          throw new Error('pipe broken')
+        },
+      }),
+      readable: new ReadableStream<AnyMessage>({ start() { /* 永不产出 */ } }),
+    }
+    const link = new AgentLink({ stream, requestTimeoutMs: 30 })
+    link.start()
+    try {
+      await expect(link.request('session/list', {})).rejects.toThrow('pipe broken')
+      // 等超过 requestTimeoutMs：修复前该 pending 条目没人消费，定时器到期后会
+      // reject 一个无人 await 的 promise（Node 默认行为是终止进程）。
+      await new Promise((resolve) => setTimeout(resolve, 120))
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+      await link.close()
+    }
+    expect(unhandled).toEqual([])
   })
 })

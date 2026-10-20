@@ -16,7 +16,7 @@ import type {} from '@deepseek-ai/dsh-llm'
 import type { ClientCapabilities } from '@agentclientprotocol/sdk'
 import type { SubprocessHandle, SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import { AntigravityAcpAdapter, AGY_PROVIDER_ID } from './adapter/antigravity-adapter.js'
-import { AgentLink, agentStreamFromSubprocess, AGY_LINK_ERROR, launchAcpAgent } from './protocol/agent-link.js'
+import { AgentLink, agentStreamFromSubprocess, AGY_CLIENT_INFO, AGY_LINK_ERROR, launchAcpAgent } from './protocol/agent-link.js'
 import type { AgentLinkHandlers } from './protocol/agent-link.js'
 import {
   AGY_BINARY_ERROR,
@@ -26,6 +26,7 @@ import {
   resolveCacheDir,
 } from './runtime/binary.js'
 import { resolveProxy } from './runtime/proxy-env.js'
+import { createProxiedFetch } from './runtime/proxied-fetch.js'
 import type { ResolvedProxy } from './runtime/proxy-env.js'
 import { ensureAcpCredentials } from './runtime/credentials.js'
 import type { AcpCredentialResult } from './runtime/credentials.js'
@@ -71,6 +72,8 @@ export interface ActiveAcpRuntime {
   inflight?: Promise<AgentLink>
   /** 插件已卸载。置位后不再启动新链路，dispose 会等在途启动收尾再清理。 */
   disposed?: boolean
+  /** 卸载时中止在途的二进制下载（否则卸载要等一次可能长达数分钟的下载）。 */
+  abort?: AbortController
   /** 插件进程内私有 loopback MCP 桥的关闭钩子（由 adapter 登记）。 */
   bridgeTeardown?: () => Promise<void>
 }
@@ -89,6 +92,7 @@ export interface ActiveAcpRuntime {
  */
 export async function disposeAcpRuntime(active: ActiveAcpRuntime): Promise<void> {
   active.disposed = true
+  active.abort?.abort(new Error('插件已卸载'))
   await active.link?.close().catch(() => undefined)
   active.handle?.terminate()
   await active.inflight?.catch(() => undefined)
@@ -96,6 +100,18 @@ export async function disposeAcpRuntime(active: ActiveAcpRuntime): Promise<void>
 }
 
 export type { AgentLinkHandlers }
+
+/** 回收失败/取消的连接与其受管进程，不卸载插件；旧连接不能终止后来者。 */
+export async function recycleAcpRuntime(active: ActiveAcpRuntime, link: AgentLink): Promise<void> {
+  const handle = active.link === link ? active.handle : undefined
+  handle?.terminate()
+  await link.close()
+  if (handle && !await handle.waitForExit(AbortSignal.timeout(10_000))) {
+    throw new LlmError('Antigravity ACP 受管进程未能在回收期限内退出，拒绝开启新回合', AGY_LINK_ERROR.LINK_CLOSED)
+  }
+  if (active.link === link) active.link = undefined
+  if (handle && active.handle === handle) active.handle = undefined
+}
 
 /**
  * 启动路径上的可注入外部依赖。
@@ -105,6 +121,8 @@ export type { AgentLinkHandlers }
  * 它不认识的 icacls 进程。
  */
 export interface AcpRuntimeDeps {
+  /** 插件自身 HTTPS 请求（下载、换发）所用的 fetch；默认按配置的代理构造。 */
+  fetchImpl?: typeof fetch
   /** 备好官方登录态（acp_token.json + settings.json）；默认导入本机官方 CLI 凭据。 */
   ensureCredentials?: () => Promise<AcpCredentialResult>
   /** Windows 低完整性探测；默认经 ctx.subprocess 只读跑一次 icacls。 */
@@ -141,7 +159,15 @@ export async function ensureAcpRuntime(
     throw new LlmError('Antigravity ACP 插件已卸载，无法启动 ACP 链路', AGY_LINK_ERROR.LINK_CLOSED)
   }
   if (active.inflight) return active.inflight
-  if (active.link) return active.link
+  if (active.link) {
+    if (!active.link.closed) return active.link
+    // 链路自己关了（协议违规 / 流读取失败 / 回收中途失败）但子进程可能仍活着、
+    // handle.done 不会触发：不能把这条死链永久交给调用方，否则之后每个回合都会
+    // 在 session/new 上报「ACP 链路已关闭」直到重启。终止旧进程并全新启动。
+    active.handle?.terminate()
+    active.link = undefined
+    active.handle = undefined
+  }
   // 同步赋值：startAcpRuntime 内部第一个 await 之前不会有别的调用者插进来。
   const inflight = startAcpRuntime(ctx, config, handlers, active, deps)
   active.inflight = inflight
@@ -163,10 +189,22 @@ async function startAcpRuntime(
   deps: AcpRuntimeDeps,
 ): Promise<AgentLink> {
   const subprocess: SubprocessRuntime = ctx.subprocess
+  active.abort ??= new AbortController()
+  let downloadProxy: ResolvedProxy | undefined
+  try {
+    downloadProxy = resolveProxy({ url: config.proxyUrl, bypass: config.proxyBypass })
+  } catch {
+    // 地址非法由后面的 AGY_INVALID_PROXY 明确报错；这里直连即可。
+    downloadProxy = undefined
+  }
+  const pluginFetch = deps.fetchImpl ?? createProxiedFetch(downloadProxy)
   const resolution = await ensureAgentBinary({
     binaryPath: config.binaryPath,
     autoDownload: config.autoDownload,
     version: config.acpVersion,
+    signal: active.abort.signal,
+    // 下载只允许 dl.google.com 且不跟随重定向：包一层只换传输，不放宽这两条。
+    fetchImpl: (url, init) => pluginFetch(url, init) as Promise<Response>,
   })
   // Windows：映像文件若带 Low 强制完整性标签（例如装在带该标签的 DSH home 下），
   // 官方进程会被降成 LOW，受 MIC「禁止向上写」约束而写不进 ~/.gemini/antigravity-acp，
@@ -190,7 +228,9 @@ async function startAcpRuntime(
   // 登录态在 spawn 前备好：优先导入本机官方 CLI 的已登录凭据（用户要求不弹浏览器
   // 登录页）。备好 acp_token.json + settings.json 后，官方 server 启动时自行完成
   // 认证，因此可以跳过 authenticate —— 该请求在没有交互式浏览器时会一直挂着。
-  const credentials = await (deps.ensureCredentials ?? ensureAcpCredentials)()
+  // 传入 acpVersion：OAuth client 元数据要从对应版本的缓存二进制里提取。
+  const credentials = await (deps.ensureCredentials
+    ?? (() => ensureAcpCredentials({ acpVersion: config.acpVersion, fetchImpl: pluginFetch })))()
   // 代理在 spawn 前解析：地址非法就当场失败，不要等到官方进程出网才报连接错误。
   let proxy: ResolvedProxy | undefined
   try {
@@ -208,6 +248,7 @@ async function startAcpRuntime(
   active.handle = handle
   const link = new AgentLink({
     stream: agentStreamFromSubprocess(handle),
+    clientInfo: AGY_CLIENT_INFO,
     handlers,
     requestTimeoutMs: config.requestTimeoutMs,
     // 认证需要人工在浏览器里点授权，走独立的更长超时（默认 5 分钟）。
@@ -325,29 +366,41 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
   const cliPath = agyCliCandidates().find((candidate) => existsSync(candidate))
 
   /**
-   * 官方模型清单：缓存先行（选择器即时可用），命中后后台刷新一遍供下次生效；
-   * 没有缓存时现取现用。失败返回空，不影响目录主体（占位 + 会话观测）。
+   * 官方模型清单：缓存先行（选择器即时可用），并在**后台**刷新一遍供下次生效。
+   *
+   * 没有任何缓存时也**不阻塞**：CLI 冷启动会做登录/配置刷新（实测可达数十秒），
+   * 让模型选择器等它会把整个 GUI 拖住。这里后台取一次并立即返回空，取到后
+   * 进程内缓存生效（刷新失败不重试，重启后再试）。
    */
+  let cliModelRows: readonly { id: string; name: string }[] | undefined
+  let cliDiskRead = false
+  let cliRefresh: Promise<void> | undefined
+  let cliRefreshDone = false
   const loadCliModels = async (): Promise<readonly { id: string; name: string }[]> => {
-    const cached = await readCachedCatalog({ cacheDir, acpVersion, fileName: 'cli-models.json' })
-    const rows = cached?.map((row) => ({ id: row.id, name: row.name })) ?? []
-    const refresh = async () => {
-      if (!cliPath) return []
-      const models = await fetchAgyModels(cliRun, cliPath)
-      await writeCachedCatalog({ cacheDir, acpVersion, fileName: 'cli-models.json', models })
-      return models
+    if (!cliDiskRead) {
+      cliDiskRead = true
+      const cached = await readCachedCatalog({ cacheDir, acpVersion, fileName: 'cli-models.json' })
+      if (cached) cliModelRows = cached.map((row) => ({ id: row.id, name: row.name }))
     }
-    if (rows.length > 0) {
-      void refresh().catch(() => undefined)
-      return rows
+    if (cliPath && cliRefresh === undefined && !cliRefreshDone) {
+      cliRefresh = (async () => {
+        const models = await fetchAgyModels(cliRun, cliPath)
+        if (models.length === 0) return
+        await writeCachedCatalog({ cacheDir, acpVersion, fileName: 'cli-models.json', models })
+        cliModelRows = models
+      })().catch(() => undefined).finally(() => {
+        cliRefresh = undefined
+        cliRefreshDone = true
+      })
     }
-    return refresh()
+    return cliModelRows ?? []
   }
 
   const adapter = new AntigravityAcpAdapter({
     // handler 对象由 adapter 构造时创建且身份稳定：AgentLink 只在构造时取一次
     // handlers，后续回合只更换 adapter 内部的当前回合。
     getLink: (handlers) => ensureAcpRuntime(ctx, config, handlers, active),
+    recycleLink: (link) => recycleAcpRuntime(active, link),
     registerBridgeTeardown: (teardown) => {
       active.bridgeTeardown = teardown
     },
@@ -374,6 +427,8 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
   // 凭据不写回、不进日志。
   registerAgYQuotaRemote(ctx)
   ctx.plugin(AgYQuotaService, {
+    // HTTP 回退路径要从对应版本的缓存二进制里提取 OAuth client 元数据。
+    deps: { cacheDir, acpVersion, fetchImpl: createProxiedFetch(cliProxy) },
     ...(cliPath ? { cli: { run: cliRun, cliPath } } : {}),
     // 取数打点：浏览器侧无法写宿主日志，这条是「药丸有没有真的发请求、结果如何」的唯一现场。
     log: {

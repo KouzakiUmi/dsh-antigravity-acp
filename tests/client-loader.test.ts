@@ -334,6 +334,21 @@ describe('额度药丸（conversation.input.right）', () => {
     await Promise.resolve()
     expect(tree).not.toBeNull()
   })
+
+  it('切到其它 provider 时清掉旧额度数据（切回不闪旧值）', async () => {
+    const { component } = loadPill()
+    const readQuota = async (): Promise<unknown> => ({
+      status: 'ok',
+      updatedAt: new Date().toISOString(),
+      groups: [],
+    })
+    component({ store: modelStore('antigravity-acp'), readQuota })
+    await Promise.resolve()
+    await Promise.resolve()
+    component({ store: modelStore('deepseek-official'), readQuota })
+    // 清状态走 setData(null)；修复前旧快照会一直留到下一次取数。
+    expect(lastStateCalls).toContain(null)
+  })
 })
 
 /**

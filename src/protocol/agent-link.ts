@@ -10,7 +10,9 @@
  * 进程启动不在此文件内触碰 child_process：stdio 通道由调用方注入
  * （生产路径经宿主注入的 ctx.subprocess，测试路径注入 fake 双向流）。
  */
+import { readFileSync } from 'node:fs'
 import { dirname, delimiter } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { Writable, Readable } from 'node:stream'
 import { PROTOCOL_VERSION, ndJsonStream } from '@agentclientprotocol/sdk'
 import type {
@@ -133,7 +135,18 @@ const DEFAULT_HANDSHAKE_TIMEOUT_MS = 15_000
 const DEFAULT_AUTH_TIMEOUT_MS = 5 * 60_000
 
 /** 官方 client 实现信息（initialize 上报）。 */
-export const AGY_CLIENT_INFO: Implementation = { name: 'dsh-bundle-antigravity-host', version: '0.1.0' }
+export const AGY_CLIENT_INFO: Implementation = { name: 'dsh-bundle-antigravity-host', version: readPackageVersion() }
+
+/** 读本包 package.json 的版本（src 与 dist 到它的相对路径一致）；读不到不影响启动。 */
+function readPackageVersion(): string {
+  try {
+    const file = fileURLToPath(new URL('../../package.json', import.meta.url))
+    const version = (JSON.parse(readFileSync(file, 'utf8')) as { version?: unknown }).version
+    return typeof version === 'string' && version.length > 0 ? version : '0.0.0'
+  } catch {
+    return '0.0.0'
+  }
+}
 
 /**
  * ACP v1 客户端链接。生命周期：new AgentLink({ stream }) → start() →
@@ -166,6 +179,11 @@ export class AgentLink {
     this.#handshakeTimeoutMs = options.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS
     this.#authTimeoutMs = options.authTimeoutMs ?? DEFAULT_AUTH_TIMEOUT_MS
     this.#handlers = options.handlers ?? {}
+  }
+
+  /** 链路是否已关闭（主动 close、对端断流或协议违规都会置位）；已关闭的链路不可复用。 */
+  get closed(): boolean {
+    return this.#closed
   }
 
   /** 是否已完成 initialize。 */
@@ -250,7 +268,12 @@ export class AgentLink {
     }
     // 其余 agent→client 方法本阶段未实现，回标准 method-not-found。
     // 先给可选观测回调一个机会（worker2 补丁）：它只旁路记录，不改变回包。
-    await this.#handlers.onUnexpectedAgentRequest?.(request.method, request)
+    // 观测回调出错不能让 agent 的请求永远得不到应答，也不能变成 unhandledRejection。
+    try {
+      await this.#handlers.onUnexpectedAgentRequest?.(request.method, request)
+    } catch {
+      // 仅旁路观测；照旧回 method-not-found。
+    }
     await this.#write({
       jsonrpc: '2.0',
       id: request.id,
@@ -262,7 +285,14 @@ export class AgentLink {
     if (notification.method !== 'session/update') return
     const handler = this.#handlers.onSessionUpdate
     if (!handler) return
-    void handler(notification.params as SessionNotification)
+    // 回调属于上层（adapter）逻辑：同步抛错会沿 #route → #pump 把整条链路判死，
+    // 异步 reject 无人接会变成 unhandledRejection 终止宿主进程。两者都隔离在这里。
+    try {
+      const outcome = handler(notification.params as SessionNotification)
+      if (outcome) void Promise.resolve(outcome).catch(() => undefined)
+    } catch {
+      // 单条通知处理失败不影响后续消息与在途请求。
+    }
   }
 
   #routeResponse(response: AnyResponse): void {
@@ -304,29 +334,47 @@ export class AgentLink {
     if (this.#closed) {
       throw new AgentLinkError(AGY_LINK_ERROR.LINK_CLOSED, `ACP 链路已关闭，无法发起请求 ${method}`)
     }
+    // signal 在发起前就已中止：不发请求（否则会留下一个无人关心的在途请求）。
+    if (options.signal?.aborted) {
+      throw new AgentLinkError(AGY_LINK_ERROR.REQUEST_TIMEOUT, `ACP 请求被中止: ${method}`, { cause: options.signal.reason })
+    }
     const id: JsonRpcId = this.#nextId++
     const timeoutMs = options.timeoutMs ?? this.#requestTimeoutMs
     const pending = new Promise<Response>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.#pending.delete(id)
         // 协作式取消：JSON-RPC 标准的 $/cancel_request 通知（尽力而为）。
-        void this.#write({ jsonrpc: '2.0', method: '$/cancel_request', params: { id } }).catch(() => undefined)
+        void this.#write({ jsonrpc: '2.0', method: '$/cancel_request', params: { requestId: id } }).catch(() => undefined)
         reject(new AgentLinkError(AGY_LINK_ERROR.REQUEST_TIMEOUT, `ACP 请求超时（${timeoutMs}ms）: ${method}`))
       }, timeoutMs)
       this.#pending.set(id, { resolve: resolve as (value: unknown) => void, reject, timer, method })
     })
+    // 写失败路径不会 await 这个 promise：先挂一个 no-op 处理器，保证任何时序下
+    // 它的 rejection 都不会变成 unhandledRejection（那会终止宿主进程）。
+    // 正常路径仍用 `await pending` 取到同一 rejection，语义不变。
+    void pending.catch(() => undefined)
     const abortHandler = () => {
       const entry = this.#pending.get(id)
       if (!entry) return
       this.#pending.delete(id)
       clearTimeout(entry.timer)
-      void this.#write({ jsonrpc: '2.0', method: '$/cancel_request', params: { id } }).catch(() => undefined)
+      void this.#write({ jsonrpc: '2.0', method: '$/cancel_request', params: { requestId: id } }).catch(() => undefined)
       entry.reject(new AgentLinkError(AGY_LINK_ERROR.REQUEST_TIMEOUT, `ACP 请求被中止: ${method}`, { cause: options.signal?.reason }))
     }
     options.signal?.addEventListener('abort', abortHandler, { once: true })
     try {
       await this.#write({ jsonrpc: '2.0', id, method, params })
       return await pending
+    } catch (error) {
+      // 写出失败（对端断流、链路关闭）时 pending 条目没有人消费：必须当场摘除并
+      // 清掉超时定时器，否则它会一直留在表里，定时器到期后写出多余的
+      // $/cancel_request，并 reject 一个无人等待的 promise。
+      const entry = this.#pending.get(id)
+      if (entry) {
+        this.#pending.delete(id)
+        clearTimeout(entry.timer)
+      }
+      throw error
     } finally {
       options.signal?.removeEventListener('abort', abortHandler)
     }

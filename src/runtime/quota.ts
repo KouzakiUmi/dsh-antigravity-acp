@@ -69,6 +69,9 @@ export interface QuotaSnapshot {
   status: 'ok' | 'error'
   /** 取数时间（ISO 8601）。 */
   updatedAt: string
+  /** 本次刷新失败，展示的是上一次成功的数据（`staleReason` 说明失败原因）。 */
+  stale?: boolean
+  staleReason?: string
   /** 订阅档位名（loadCodeAssist 的 paidTier/currentTier.name）。 */
   plan?: string
   groups: QuotaGroup[]
@@ -98,12 +101,26 @@ export interface QuotaDeps {
   cacheDir?: string
   /** 候选官方二进制路径（用于提取 OAuth client 元数据）。 */
   binaryPaths?: readonly string[]
+  /**
+   * 目标 ACP server 版本（用于在缓存目录里定位已解压的官方二进制）。
+   * 缺省为 {@link DEFAULT_ACP_SERVER_VERSION}。
+   */
+  acpVersion?: string
   baseUrl?: string
   tokenUrl?: string
 }
 
 function defaultReadFile(path: string): Promise<string> {
   return readFile(path, 'utf8')
+}
+
+/**
+ * 读官方二进制用于正则提取 client 元数据：按 latin1 解码。
+ * 目标串全是 ASCII，latin1 逐字节映射，结果与 utf8 等价；而 utf8 解码 200MB 级
+ * 二进制要 ~700ms（实测），latin1 只要 ~60ms。
+ */
+function defaultReadBinary(path: string): Promise<string> {
+  return readFile(path, 'latin1')
 }
 
 /** 解析登录态文件：兼容嵌套 `token.{...}` 与平铺两种历史形态。 */
@@ -158,7 +175,7 @@ export async function resolveOAuthClient(deps: QuotaDeps = {}): Promise<OAuthCli
   const clientId = env.AGY_OAUTH_CLIENT_ID?.trim()
   const clientSecret = env.AGY_OAUTH_CLIENT_SECRET?.trim()
   if (clientId && clientSecret) return { clientId, clientSecret }
-  const readFileImpl = deps.readFileImpl ?? defaultReadFile
+  const readFileImpl = deps.readFileImpl ?? defaultReadBinary
   for (const candidate of await candidateBinaryPaths(deps)) {
     try {
       const text = await readFileImpl(candidate)
@@ -182,23 +199,26 @@ async function candidateBinaryPaths(deps: QuotaDeps): Promise<string[]> {
   const home = (deps.homedir ?? homedir)()
   const env = deps.env ?? process.env
   const cacheDir = deps.cacheDir ?? resolveCacheDir({ DSH_HOME: env.DSH_HOME }, deps.homedir)
-  const { extractDir } = versionCachePaths(cacheDir, DEFAULT_ACP_SERVER_VERSION)
+  const { extractDir } = versionCachePaths(cacheDir, deps.acpVersion ?? DEFAULT_ACP_SERVER_VERSION)
   const names = process.platform === 'win32'
-    ? ['agy_acp_server.exe', 'agy.exe']
-    : ['agy_acp_server', 'agy']
+    ? ['agy.exe', 'agy_acp_server.exe']
+    : ['agy', 'agy_acp_server']
+  // 官方 agy CLI 才携带 client 元数据，排最前；缓存里的 ACP server 只是兜底
+  // （每次白扫它要多读 80MB+）。
   const out: string[] = []
-  try {
-    for (const entry of await readdir(extractDir)) {
-      if (names.includes(entry)) out.push(join(extractDir, entry))
-    }
-  } catch {
-    // 缓存目录不存在：跳过。
-  }
   const localAppData = env.LOCALAPPDATA
   if (localAppData && localAppData.trim().length > 0) out.push(join(localAppData, 'agy', 'bin', 'agy.exe'))
   out.push(join(home, 'AppData', 'Local', 'agy', 'bin', 'agy.exe'))
   out.push(join(home, '.local', 'bin', 'agy'))
   out.push(join(home, 'bin', 'agy'))
+  try {
+    const entries = await readdir(extractDir)
+    for (const name of names) {
+      if (entries.includes(name)) out.push(join(extractDir, name))
+    }
+  } catch {
+    // 缓存目录不存在：跳过。
+  }
   return out
 }
 

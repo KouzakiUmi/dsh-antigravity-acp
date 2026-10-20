@@ -40,7 +40,7 @@ import type { AgyReasoningEffort } from '../runtime/agy-cli.js'
 import { findModelSelector, toModelCatalog } from './model-catalog.js'
 import type { ModelSelector } from './model-catalog.js'
 import { buildPromptContent, renderToolResultText } from './prompt-transcript.js'
-import { PromptTurn } from './prompt-turn.js'
+import { AGY_TURN_ERROR, PromptTurn } from './prompt-turn.js'
 
 /** DSH 侧 provider 标识符；与 cordis.patch.yml 的 id 及文档保持一致。 */
 export const AGY_PROVIDER_ID = 'antigravity-acp'
@@ -74,6 +74,8 @@ export interface AntigravityAcpAdapterOptions {
    * 首个 handler 集合固化到被缓存的 AgentLink 上，后续回合只更换其内部状态。
    */
   getLink: (handlers: AgentLinkHandlers) => Promise<AgentLink>
+  /** 回收指定连接及其受管子进程；完成前禁止开启下一个回合。 */
+  recycleLink: (link: AgentLink) => Promise<void>
   /** 登记桥的关闭钩子（index.ts 把它挂到 ActiveAcpRuntime.bridgeTeardown）。 */
   registerBridgeTeardown: (teardown: () => Promise<void>) => void
   /** session/prompt 等待上限（毫秒）。 */
@@ -141,6 +143,13 @@ const DEFAULT_PARK_SETTLE_MS = 50
 
 export class AntigravityAcpAdapter extends LlmAdapter {
   readonly #getLink: AntigravityAcpAdapterOptions['getLink']
+  readonly #recycleLink: AntigravityAcpAdapterOptions['recycleLink']
+  #cleanup: Promise<void> = Promise.resolve()
+  /**
+   * 回收未成功的连接。回收失败（旧进程暂时没退干净）时屏障仍然挡住新回合，但不能
+   * 永久中毒：下一轮会对**同一条连接**重试回收，旧进程之后退出了就自动恢复。
+   */
+  #unrecycledLink: AgentLink | undefined
   readonly #registerBridgeTeardown: AntigravityAcpAdapterOptions['registerBridgeTeardown']
   readonly #promptTimeoutMs: number
   readonly #parkSettleMs: number
@@ -154,10 +163,20 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   #cliCatalog?: Promise<readonly { id: string; name: string }[]>
   /** 家族 → 支持的思考强度档位（由 listModels 折叠得到）。 */
   #familyTiers = new Map<string, ReadonlySet<AgyReasoningEffort>>()
+  /**
+   * 最近一次家族折叠的结果（id → 折叠后的条目）。供 `resolveModel` 同步取
+   * 显示名：DSH 的路由键是折叠后的家族 id，而 `#catalog` 只含 ACP 的档位 id。
+   */
+  #foldedFamilies = new Map<string, { id: string; name: string; description?: string }>()
   readonly #bridge: McpToolBridge
   /** 身份稳定的 ACP 事件处理器：AgentLink 只在构造时取一次 handlers。 */
   readonly #handlers: AgentLinkHandlers
   #turn: PromptTurn | undefined
+  /** 在首次 await 前占位，避免并发首轮同时通过 #turn 尚未建立的窗口。 */
+  #streamActive = false
+  #disposed = false
+  #turnOwner: Pick<GenerateOptions, 'sessionId' | 'purpose'> | undefined
+  readonly #accessWaiters = new Set<() => void>()
   /**
    * 当前 ACP 回合的 park 订阅。生命周期是**回合**而不是单次 `stream` 调用：
    * 首轮以 `finish(tool-calls)` 收尾时 ACP prompt 仍然活着（agent 挂起等回喂），
@@ -183,6 +202,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   constructor(options: AntigravityAcpAdapterOptions) {
     super()
     this.#getLink = options.getLink
+    this.#recycleLink = options.recycleLink
     this.#registerBridgeTeardown = options.registerBridgeTeardown
     this.#promptTimeoutMs = options.promptTimeoutMs ?? DEFAULT_PROMPT_TIMEOUT_MS
     this.#parkSettleMs = options.parkSettleMs ?? DEFAULT_PARK_SETTLE_MS
@@ -194,6 +214,9 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     this.#log = options.log
     this.#bridge = new McpToolBridge()
     this.#registerBridgeTeardown(async () => {
+      this.#disposed = true
+      this.#wakeAccessWaiters()
+      this.#turn?.dispose()
       this.#releaseTurnSubscription()
       await this.#bridge.close()
     })
@@ -283,10 +306,16 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       ...await this.#cliRawRows(),
     ])
     this.#familyTiers = folded.tiers
+    this.#foldedFamilies = new Map(folded.models.map((model) => [model.id, model]))
     return folded
   }
 
-  /** 官方 CLI 模型清单的原始行（进程内只取一次；失败返回空，不影响目录主体）。 */
+  /**
+   * 官方 CLI 模型清单的原始行（进程内只取一次；失败返回空，不影响目录主体）。
+   *
+   * 空结果不永久记忆：首次调用时 CLI 取数可能被设计成后台刷新（避免拖慢
+   * 模型选择器），下次列目录要能重新拿到刷新后的清单。
+   */
   async #cliRawRows(): Promise<readonly { id: string; name: string }[]> {
     const load = this.#loadCliCatalog
     if (!load) return []
@@ -297,7 +326,9 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         return []
       }
     })()
-    return this.#cliCatalog
+    const rows = await this.#cliCatalog
+    if (rows.length === 0) this.#cliCatalog = undefined
+    return rows
   }
 
   /** 读一次目录缓存（结果记忆在实例上，避免每次列目录都碰文件系统）。 */
@@ -310,7 +341,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         return rows.map((row) => {
           // 缓存里若带实测上下文容量，重启后压缩引擎无需等下一次 usage_update。
           if (typeof row.contextWindow === 'number' && Number.isFinite(row.contextWindow) && row.contextWindow > 0) {
-            this.#contextWindows.set(row.id, row.contextWindow)
+            this.#rememberContextWindow(row.id, row.contextWindow)
           }
           const entry: LlmModelInfo = { provider, id: row.id, name: row.name, inputModalities: ['text'] }
           return row.description === undefined ? entry : { ...entry, description: row.description }
@@ -341,7 +372,11 @@ export class AntigravityAcpAdapter extends LlmAdapter {
    * 真正的能力拒绝发生在 ACP 会话侧（模型不存在时 agent 自行报错）。
    */
   override async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+    // DSH 的路由键是折叠后的家族 id（`claude-opus-5-5`），而 `#catalog` 只含
+    // ACP 声明的档位 id（`…-high`）。查不到时用最近一次折叠结果补上显示名，
+    // 不要退化成裸 id。
     const known = this.#catalog.find((entry) => entry.id === model)
+      ?? this.#foldedFamilies.get(model)
     // 上下文容量只在**实测**过（usage_update.size）或缓存过时才声明；官方目录
     // 不报告容量，绝不填猜测值。缺省时不带 context，压缩引擎按未知处理。
     const contextWindow = this.#contextWindows.get(model)
@@ -386,13 +421,49 @@ export class AntigravityAcpAdapter extends LlmAdapter {
    * 判定「续轮 vs 新轮」：messages 尾部的连续 tool 结果消息与当前回合 park
    * 的 MCP 调用**按顺序一一匹配**且该回合的 ACP prompt 尚未应答 → 续轮；
    * 否则按新轮重建（放弃旧回合、新建 ACP session、重放完整 messages）。
-   * 并发防御：若上一轮仍**在产出中**（既非封口也非等待回喂），新轮直接抛
-   * AGY_BUSY——DSH 语义本就是单路活跃 stream，静默抢占会让 pending 表错乱。
+   * 并发防御：主对话与标题/压缩请求可以同时进入同一个 adapter；从首个 await
+   * 之前串行化 stream。工具 park 保留回合所有权，辅助请求等待而不是抢占主回合。
    */
   override async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     // 1) 不支持项先行拒绝：必须在任何 IO 之前失败。
     assertSupportedOptions(options)
+    if (options.signal?.aborted) {
+      yield { type: 'finish', reason: { kind: 'aborted', failure: {
+        code: AGY_TURN_ERROR.ABORTED, message: 'Antigravity ACP 请求在发起前已取消',
+      } } }
+      return
+    }
+    await this.#acquireStream(options)
+    try {
+      yield* this.#streamExclusive(options)
+    } finally {
+      this.#streamActive = false
+      this.#wakeAccessWaiters()
+    }
+  }
 
+  /**
+   * 等待上一次回收完成。上一次失败时本轮照旧失败（屏障不能被绕过），但同时把
+   * 屏障复位为「重试同一条连接的回收」：失败的 promise 不再被每一轮原样重放。
+   */
+  async #settleRecycle(): Promise<void> {
+    try {
+      await this.#cleanup
+    } catch (error) {
+      const stuck = this.#unrecycledLink
+      this.#cleanup = stuck === undefined
+        ? Promise.resolve()
+        : this.#recycleLink(stuck).then(() => {
+          if (this.#unrecycledLink === stuck) this.#unrecycledLink = undefined
+        })
+      // 重试在后台进行；它失败时下一轮会再次走到这里。
+      void this.#cleanup.catch(() => undefined)
+      throw error
+    }
+  }
+
+  /** 同一时刻只有一个 stream 能创建/切换会话或消费回合队列。 */
+  async *#streamExclusive(options: GenerateOptions): AsyncGenerator<StreamChunk> {
     const tail = trailingToolResults(options.messages)
     let turn = this.#turn
     if (turn?.awaitingToolResults) {
@@ -416,15 +487,60 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     yield* this.#runNewRound(options)
   }
 
+  #wakeAccessWaiters(): void {
+    const waiters = [...this.#accessWaiters]
+    this.#accessWaiters.clear()
+    for (const wake of waiters) wake()
+  }
+
+  #sameTurnOwner(options: GenerateOptions): boolean {
+    return this.#turnOwner?.sessionId === options.sessionId && this.#turnOwner?.purpose === options.purpose
+  }
+
+  async #acquireStream(options: GenerateOptions): Promise<void> {
+    for (;;) {
+      if (this.#disposed) throw new LlmError('Antigravity ACP adapter 已卸载', 'AGY_LINK_CLOSED')
+      if (options.signal?.aborted) throw new LlmError('Antigravity ACP 请求在等待调度时被取消', AGY_TURN_ERROR.ABORTED)
+      // 压缩由主循环在下一步之前同步等待，不能排在它自己尚未回喂的工具回合后面；
+      // 同会话压缩沿用下方的 abandon + 完整历史重建兜底，标题等后台请求则必须等待。
+      const inlineCompaction = options.purpose === 'compaction' && this.#turnOwner?.sessionId === options.sessionId
+      const foreignPark = this.#turn?.awaitingToolResults && !this.#sameTurnOwner(options) && !inlineCompaction
+      if (!this.#streamActive && !foreignPark) {
+        this.#streamActive = true
+        return
+      }
+      await new Promise<void>((resolve, reject) => {
+        const cleanup = (): void => {
+          this.#accessWaiters.delete(wake)
+          options.signal?.removeEventListener('abort', onAbort)
+        }
+        const wake = (): void => { cleanup(); resolve() }
+        const onAbort = (): void => {
+          cleanup()
+          reject(new LlmError('Antigravity ACP 请求在等待调度时被取消', AGY_TURN_ERROR.ABORTED))
+        }
+        this.#accessWaiters.add(wake)
+        options.signal?.addEventListener('abort', onAbort, { once: true })
+        if (options.signal?.aborted) onAbort()
+      })
+    }
+  }
+
   async *#runNewRound(options: GenerateOptions): AsyncGenerator<StreamChunk> {
+    await this.#settleRecycle()
+    if (this.#disposed) throw new LlmError('Antigravity ACP adapter 已卸载', 'AGY_LINK_CLOSED')
+    this.#turnOwner = {
+      ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
+      ...(options.purpose === undefined ? {} : { purpose: options.purpose }),
+    }
     // usage_update 的上下文容量归属到本次请求的 DSH 路由键。
     this.#routeModelId = options.model
     const link = await this.#getLink(this.#handlers)
     const tools = options.tools ?? []
-    this.#bridge.publishTools(tools)
+    this.#bridge.beginRound(tools)
     let mcpServers: AcpMcpServer[] = []
     if (tools.length > 0) {
-      // 端口/token 随桥实例固定，跨回合复用同一台 server；register/teardown
+      // 端口跨回合复用；token 与授权代次每个新 ACP 回合轮换。register/teardown
       // 已在构造时挂到 ActiveAcpRuntime.bridgeTeardown。
       if (!this.#bridge.listening) await this.#bridge.start()
       mcpServers = this.#bridge.acpRegistration()
@@ -441,13 +557,32 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       bridge: this.#bridge,
       promptTimeoutMs: this.#promptTimeoutMs,
       parkSettleMs: this.#parkSettleMs,
+      onTerminate: (reason, info) => {
+        this.#bridge.invalidateRound(reason)
+        this.#releaseTurnSubscription(turn)
+        if (info?.clean === true) {
+          // prompt 已正常应答的干净失败（refusal / 空回复等）：agent 状态自洽，
+          // 链接可复用——不为下一次对话重新 spawn 官方进程、不重弹登录。
+          this.#wakeAccessWaiters()
+          return
+        }
+        // 让本次入站权限/fs 请求先完成拒绝响应，再拆连接；下一回合必须等回收。
+        this.#unrecycledLink = link
+        this.#cleanup = new Promise<void>((resolve) => setTimeout(resolve, 0))
+          .then(() => this.#recycleLink(link))
+          .then(() => {
+            if (this.#unrecycledLink === link) this.#unrecycledLink = undefined
+          })
+        void this.#cleanup.catch((error: unknown) => this.#log?.warn('antigravity-acp: 回合回收失败', error))
+        this.#wakeAccessWaiters()
+      },
       onConfigOptions: (observed) => this.observeSessionConfigOptions(observed),
-      // 模型索要原生 fs/terminal 时先拒绝、继续回合（只有反复索要才终止）；
-      // 落一条日志，便于判断「选了某个型号没反应」是不是这条路径造成的。
+      onPermissionDiagnostic: (diagnostic) =>
+        this.#log?.warn(`antigravity-acp: 权限请求结构（仅诊断，不代表授权） ${JSON.stringify(diagnostic)}`),
       onNativeRefusal: (info) =>
         this.#log?.warn(
-          `antigravity-acp: 已拒绝模型的原生能力索要（${info.kind} ${info.detail}，本回合第 ${info.count} 次），` +
-            '请它改用桥过去的 DSH 工具',
+          `antigravity-acp: 已拒绝${info.kind === 'permission' ? ' ACP 工具权限申请' : '原生客户端请求'}` +
+            `（${info.detail}，本回合第 ${info.count} 次）`,
         ),
     })
     this.#turn = turn
@@ -455,18 +590,27 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     // 回合生命周期打点：选具体型号后「没有反应」这类问题，只靠这条能分清是
     // 「prompt 没送出去」「送出去了但没有块回来」还是「块回来了但没被消费」。
     this.#log?.info(
-      `antigravity-acp: 回合开始 model=${options.model} session=${session.sessionId} tools=${tools.length}` +
+      `antigravity-acp: 回合开始 model=${options.model} purpose=${options.purpose ?? 'chat'} session=${session.sessionId} tools=${tools.length}` +
         `${options.reasoningEffort === undefined ? '' : ` effort=${String(options.reasoningEffort)}`}`,
     )
     turn.startPrompt(buildPromptContent(options.system, options.messages), options.signal)
     try {
       let chunks = 0
+      let textChars = 0
+      let reasoningChars = 0
+      let finish = ''
       for await (const chunk of drainTurn(turn)) {
+        if (chunk.type === 'text-delta') textChars += chunk.text.length
+        if (chunk.type === 'reasoning-delta') reasoningChars += chunk.text.length
+        if (chunk.type === 'finish') finish = chunk.reason.kind
         if (chunks === 0) this.#log?.info(`antigravity-acp: 回合首块到达（type=${chunk.type}）`)
         chunks += 1
         yield chunk
       }
-      this.#log?.info(`antigravity-acp: 回合结束 model=${options.model} 块数=${chunks}`)
+      this.#log?.info(
+        `antigravity-acp: 回合结束 model=${options.model} purpose=${options.purpose ?? 'chat'}` +
+          ` 块数=${chunks} textChars=${textChars} reasoningChars=${reasoningChars} finish=${finish}`,
+      )
     } catch (error) {
       this.#log?.warn(`antigravity-acp: 回合失败 model=${options.model}`, error)
       throw error
@@ -478,6 +622,15 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   }
 
   async *#runContinuation(turn: PromptTurn, options: GenerateOptions, tail: readonly RequestMessage[]): AsyncGenerator<StreamChunk> {
+    this.#bridge.publishTools(options.tools ?? [])
+    if (turn.terminated) {
+      // 终止的回合不会再有生产者。必须**先于 resume()** 判定：resume 会把
+      // producerDone 复位，之后 drainTurn 会因无人生产而永久挂起。
+      yield { type: 'finish', reason: { kind: 'aborted', failure: {
+        code: AGY_TURN_ERROR.ABORTED, message: '续轮目标回合已被终止，按取消处理',
+      } } }
+      return
+    }
     turn.resume(options.signal)
     // 续轮仍在同一个 ACP prompt 内：先确保 park 订阅在位——回喂之后 agent
     // 可能马上发起第二批 tools/call，若此处没有订阅，那些 MCP 请求会永久挂起。
@@ -494,7 +647,14 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     try {
       // 续轮不重发 prompt：结果交给桥 resolve 上轮 park 的 MCP 调用，agent 在
       // **同一个 ACP prompt** 内继续产出后续 session/update。
-      await turn.deliverToolResults(results)
+      try {
+        await turn.deliverToolResults(results)
+      } catch (error) {
+        // 回喂期间回合被并发终止（如权限拒绝超限触发 resetPending）时，回合自身
+        // 的失败才是主因：改为 drain 出它的 finish，而不是让回喂的次要错误
+        // （AGY_NO_PENDING_TOOL_CALL）掩盖原始失败。
+        if (!turn.terminated) throw error
+      }
       yield* drainTurn(turn)
     } finally {
       this.#releaseTurnSubscriptionIfClosed(turn)
@@ -525,7 +685,9 @@ export class AntigravityAcpAdapter extends LlmAdapter {
 
   /** 回合已收尾（prompt 已应答且不再等待回喂）时才退订。 */
   #releaseTurnSubscriptionIfClosed(turn: PromptTurn): void {
-    if (this.#isTurnClosed(turn)) this.#releaseTurnSubscription(turn)
+    if (!this.#isTurnClosed(turn)) return
+    this.#releaseTurnSubscription(turn)
+    if (this.#turn === turn) this.#bridge.invalidateRound('ACP 回合已结束')
   }
 
   /**
@@ -545,7 +707,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
 
   #isTurnClosed(turn: PromptTurn): boolean {
     // finished 的判定：回合已结束且不再等待工具结果。
-    return turn.promptSettled && !turn.awaitingToolResults
+    return turn.terminated || (turn.promptSettled && !turn.awaitingToolResults)
   }
 
   #handleUnexpectedRequest(method: string, _request: AnyRequest): void {
@@ -561,6 +723,10 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   #observeUsageUpdate(notification: SessionNotification): void {
     const update = notification.update
     if (update.sessionUpdate !== 'usage_update') return
+    // 只认当前回合的 ACP 会话：被放弃的旧会话仍可能继续发通知，不能把它的
+    // 容量记到新回合的路由键上。
+    const turn = this.#turn
+    if (turn !== undefined && notification.sessionId !== turn.sessionId) return
     const size = update.size
     if (typeof size !== 'number' || !Number.isFinite(size) || size <= 0) return
     const model = this.#routeModelId
@@ -569,6 +735,20 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     this.#contextWindows.set(model, size)
     // 容量随目录一起落盘，重启后压缩引擎不必等下一次 usage_update。
     this.#persistCatalog()
+  }
+
+  /**
+   * 记一条实测容量，并同时挂到它的家族 id 上。
+   *
+   * `usage_update` 归属的是 DSH 路由键（家族 id），而目录/缓存里的条目是 ACP
+   * 的档位 id；两个 key 都写，落盘与重启后读回才能对得上。
+   */
+  #rememberContextWindow(id: string, size: number): void {
+    this.#contextWindows.set(id, size)
+    const family = modelFamilyId(id)
+    if (family !== id && this.#contextWindows.get(family) === undefined) {
+      this.#contextWindows.set(family, size)
+    }
   }
 
   /**
@@ -590,14 +770,18 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   /** 把当前目录（含实测上下文容量）落盘；写失败不影响功能。 */
   #persistCatalog(): void {
     if (!this.#saveCatalog || this.#catalog.length === 0) return
-    const payload = this.#catalog.map((model) => ({
-      id: model.id,
-      name: model.name,
-      ...(model.description === undefined ? {} : { description: model.description }),
-      ...(this.#contextWindows.get(model.id) === undefined
-        ? {}
-        : { contextWindow: this.#contextWindows.get(model.id) }),
-    }))
+    const payload = this.#catalog.map((model) => {
+      // `usage_update` 归属的是 DSH 路由键（家族 id），而目录条目是 ACP 的档位
+      // id；按家族 id 兜底查询，否则折叠目录永远落盘不到 contextWindow。
+      const contextWindow = this.#contextWindows.get(model.id)
+        ?? this.#contextWindows.get(modelFamilyId(model.id))
+      return {
+        id: model.id,
+        name: model.name,
+        ...(model.description === undefined ? {} : { description: model.description }),
+        ...(contextWindow === undefined ? {} : { contextWindow }),
+      }
+    })
     void Promise.resolve(this.#saveCatalog(payload)).catch(() => undefined)
   }
 
