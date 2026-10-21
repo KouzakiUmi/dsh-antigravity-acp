@@ -30,6 +30,7 @@ describe('权限请求诊断不参与授权', () => {
     expect(diagnostic).toEqual({
       sessionMatches: true, programmaticName: 'mcp-wrapper', kind: 'other',
       titlePresent: true, metaPresent: true,
+      mcpMeta: { marked: false, serverMatches: false, toolAdvertised: false },
       input: { shape: 'object', fields: ['ServerName', 'ToolName', 'Arguments'], serverMatches: true, toolAdvertised: true },
       nested: [], options: ['allow_once', 'reject_once'],
     })
@@ -82,19 +83,25 @@ describe('权限请求诊断不参与授权', () => {
   })
 })
 
-import { isBridgeToolRequest } from '../src/adapter/permission-diagnostic.js'
-
-describe('桥工具调用放行判定', () => {
-  it('放行发往桥且工具已公布的 call_mcp_tool', () => {
-    expect(isBridgeToolRequest(describePermissionRequest(request(), context))).toBe(true)
+describe('官方 MCP 元数据仅用于诊断', () => {
+  it('识别已解包参数的 MCP 元数据关系，不复制任何原值', () => {
+    const value = request()
+    delete value.toolCall.name
+    value.toolCall.rawInput = { arguments: { secret: 'SECRET_INPUT' } }
+    value.toolCall._meta = { is_mcp_tool_call: true, mcp: { server: 'dsh-tools', tool: 'read' }, prompt: 'SECRET_PROMPT' }
+    const diagnostic = describePermissionRequest(value, context)
+    expect(diagnostic.mcpMeta).toEqual({ marked: true, serverMatches: true, toolAdvertised: true })
+    expect(diagnostic.programmaticName).toBe('absent')
+    expect(JSON.stringify(diagnostic)).not.toContain('SECRET_')
   })
-  it('拒绝原生 execute、未公布工具、他会话与他服务器', () => {
-    const native = request(); (native.toolCall as any).kind = 'execute'
-    const unknownTool = request(); (unknownTool.toolCall.rawInput as any).ToolName = 'rm'
-    const otherServer = request(); (otherServer.toolCall.rawInput as any).ServerName = 'evil'
-    const otherSession = { ...request(), sessionId: 'other' }
-    for (const r of [native, unknownTool, otherServer, otherSession]) {
-      expect(isBridgeToolRequest(describePermissionRequest(r, context))).toBe(false)
+
+  it('任意其他 metadata 形状不能伪造目录匹配', () => {
+    for (const mcp of [null, [], 'SECRET_META', { server: 'other', tool: 'other' }]) {
+      const value = request()
+      value.toolCall._meta = { mcp }
+      const diagnostic = describePermissionRequest(value, context)
+      expect(diagnostic.mcpMeta).toEqual({ marked: false, serverMatches: false, toolAdvertised: false })
+      expect(JSON.stringify(diagnostic)).not.toContain('SECRET_')
     }
   })
 })

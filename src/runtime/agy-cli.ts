@@ -1,6 +1,6 @@
 /**
- * 官方 `agy` CLI 的**只读取数**通道：套餐额度（`-p /usage`）与官方模型清单
- * （`models`）。
+ * 官方 `agy` CLI 的**只读取数**通道：套餐额度（`-p /usage`）与模型清单
+ * （`models`）；AI Credits（`-p /credits`）复用本模块 CliRun，见 credits.ts。
  *
  * 授权边界（2026-10-16 用户明确批准）：放宽「不 wrap agy CLI」，**仅限只读取数
  * 用途**。本模块只做两件事：

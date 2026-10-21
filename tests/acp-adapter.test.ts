@@ -81,6 +81,7 @@ afterEach(async () => {
 function createHarness(
   options: {
     parkSettleMs?: number
+    preferredModel?: string
     log?: AdapterLog
     configOptions?: SessionConfigOption[] | null
     promptTimeoutMs?: number
@@ -123,6 +124,7 @@ function createHarness(
   let inflight: Promise<AgentLink> | undefined
   let bridgeTeardown: (() => Promise<void>) | undefined
   const adapter = new AntigravityAcpAdapter({
+    preferredModel: options.preferredModel,
     getLink: async (handlers) => {
       if (link) return link
       // 与生产 ensureAcpRuntime 一样 single-flight，让并发测试覆盖 adapter 而非假连接抢锁。
@@ -250,6 +252,22 @@ async function connectAgentMcpClient(harness: Harness): Promise<Client> {
 }
 
 describe('模型目录来自 ACP 会话配置', () => {
+  it('用户自定义模型加入目录且不伪称已验证，旧默认路由仍兼容', async () => {
+    const harness = createHarness({ preferredModel: 'custom-model-v1' })
+    expect(await harness.adapter.listModels(AGY_PROVIDER_ID)).toEqual([
+      expect.objectContaining({ id: 'custom-model-v1', description: expect.stringContaining('尚未验证') }),
+    ])
+    expect(harness.agent.requests).toHaveLength(0)
+    expect(await harness.adapter.resolveModel(AGY_PROVIDER_ID, AGY_PLACEHOLDER_MODEL_ID)).toMatchObject({ id: AGY_PLACEHOLDER_MODEL_ID })
+  })
+
+  it('目录中的默认模型优先列出，不制造重复项', async () => {
+    const harness = createHarness({ preferredModel: 'claude-test', loadCliCatalog: async () => [
+      { id: 'gemini-test', name: 'Gemini' }, { id: 'claude-test', name: 'Claude' },
+    ] })
+    expect((await harness.adapter.listModels(AGY_PROVIDER_ID)).map((row) => row.id)).toEqual(['claude-test', 'gemini-test'])
+  })
+
   it('session/new 的 model select 配置项被映射为 LlmModelInfo 目录', async () => {
     const harness = createHarness()
     const streaming = collect(harness.adapter.stream(baseOptions()))
@@ -258,31 +276,16 @@ describe('模型目录来自 ACP 会话配置', () => {
     await streaming
 
     expect(harness.adapter.catalogObserved).toBe(true)
-    // 占位项始终排在首位且保留：用户多半在登录前就选了 server-default，
-    // 真实目录出现后把它挤掉会造成「当前模型不在列表里」的语义断裂。
+    // 只展示真实目录；旧 server-default 会话仍可路由，但不再广告首次登录占位项。
     expect(await harness.adapter.listModels(AGY_PROVIDER_ID)).toEqual([
-      {
-        provider: AGY_PROVIDER_ID,
-        id: AGY_PLACEHOLDER_MODEL_ID,
-        name: 'Antigravity 默认（首次对话登录）',
-        description: '使用官方 ACP 会话的默认模型；第一次发消息时会下载/登录',
-        inputModalities: ['text'],
-      },
       { provider: AGY_PROVIDER_ID, id: 'gemini-3-pro', name: 'Gemini 3 Pro', description: '质量优先', inputModalities: ['text'] },
       { provider: AGY_PROVIDER_ID, id: 'gemini-3-flash', name: 'Gemini 3 Flash', inputModalities: ['text'] },
     ])
   })
 
-  it('listModels 不为列目录启动运行时（未观测时广告占位模型，且零 ACP 交互）', async () => {
+  it('listModels 不为列目录启动运行时（未观测时为空，且零 ACP 交互）', async () => {
     const harness = createHarness()
     expect(await harness.adapter.listModels(AGY_PROVIDER_ID)).toEqual([
-      {
-        provider: AGY_PROVIDER_ID,
-        id: AGY_PLACEHOLDER_MODEL_ID,
-        name: 'Antigravity 默认（首次对话登录）',
-        description: '使用官方 ACP 会话的默认模型；第一次发消息时会下载/登录',
-        inputModalities: ['text'],
-      },
     ])
     expect(harness.agent.requests).toHaveLength(0)
   })
@@ -296,8 +299,8 @@ describe('模型目录来自 ACP 会话配置', () => {
       },
     })
     const models = await harness.adapter.listModels(AGY_PROVIDER_ID)
-    expect(models[0]?.id).toBe(AGY_PLACEHOLDER_MODEL_ID)
-    expect(models[1]).toEqual({
+    expect(models).toHaveLength(1)
+    expect(models[0]).toEqual({
       provider: AGY_PROVIDER_ID,
       id: 'gemini-3-flash-cached',
       name: 'Gemini 3 Flash (缓存)',
@@ -311,15 +314,14 @@ describe('模型目录来自 ACP 会话配置', () => {
     expect(reads).toHaveLength(1)
   })
 
-  it('缓存读取抛错时静默降级为只留占位模型', async () => {
+  it('缓存读取抛错时返回空目录，不编造占位模型', async () => {
     const harness = createHarness({
       loadCachedCatalog: async () => {
         throw new Error('cache unreadable')
       },
     })
     const models = await harness.adapter.listModels(AGY_PROVIDER_ID)
-    expect(models).toHaveLength(1)
-    expect(models[0]?.id).toBe(AGY_PLACEHOLDER_MODEL_ID)
+    expect(models).toHaveLength(0)
   })
 
   it('观测到真实目录后写入缓存，且写入失败不影响本轮', async () => {
@@ -402,7 +404,7 @@ describe('模型目录来自 ACP 会话配置', () => {
     ])
     const models = await harness.adapter.listModels(AGY_PROVIDER_ID)
     const ids = models.map((model) => model.id)
-    expect(ids).toEqual([AGY_PLACEHOLDER_MODEL_ID, 'gemini-3-flash'])
+    expect(ids).toEqual(['gemini-3-flash'])
     expect(new Set(ids).size).toBe(ids.length)
   })
 
@@ -444,13 +446,6 @@ describe('模型目录来自 ACP 会话配置', () => {
     await harness.agent.reply('session/prompt', { stopReason: 'end_turn' })
     await streaming
     expect(await harness.adapter.listModels(AGY_PROVIDER_ID)).toEqual([
-      {
-        provider: AGY_PROVIDER_ID,
-        id: AGY_PLACEHOLDER_MODEL_ID,
-        name: 'Antigravity 默认（首次对话登录）',
-        description: '使用官方 ACP 会话的默认模型；第一次发消息时会下载/登录',
-        inputModalities: ['text'],
-      },
       { provider: AGY_PROVIDER_ID, id: 'gemini-3-flash', name: 'Gemini 3 Flash', inputModalities: ['text'] },
     ])
   })
@@ -482,7 +477,7 @@ describe('模型目录来自 ACP 会话配置', () => {
     })
     const models = await harness.adapter.listModels(AGY_PROVIDER_ID)
     const ids = models.map((model) => model.id)
-    expect(ids[0]).toBe(AGY_PLACEHOLDER_MODEL_ID)
+    expect(ids).not.toContain(AGY_PLACEHOLDER_MODEL_ID)
     expect(ids).toContain('claude-opus-5-5')
     expect(ids).toContain('gemini-4-argon')
     expect(ids).toContain('claude-sonnet-5-5')
@@ -502,7 +497,7 @@ describe('模型目录来自 ACP 会话配置', () => {
       },
     })
     const models = await harness.adapter.listModels(AGY_PROVIDER_ID)
-    expect(models.map((model) => model.id)).toEqual([AGY_PLACEHOLDER_MODEL_ID, 'gemini-3-pro'])
+    expect(models.map((model) => model.id)).toEqual(['gemini-3-pro'])
   })
 
   it('resolveModel 声明思考强度菜单（低/中/高），默认档位 medium', async () => {
@@ -1167,12 +1162,14 @@ describe('权限与原生活动策略', () => {
       { sessionId: SESSION_1, name: 'call_mcp_tool', kind: 'other' },
       { sessionId: SESSION_1, name: 'run_command', kind: 'execute' },
       { sessionId: 'SECRET_FOREIGN_SESSION', name: 'call_mcp_tool', kind: 'other' },
+      { sessionId: SESSION_1, name: undefined, kind: 'other' },
     ]
     for (const call of calls) {
       const response = await harness.agent.callClient('session/request_permission', {
         sessionId: call.sessionId,
         toolCall: {
           toolCallId: 'SECRET_ID', name: call.name, kind: call.kind,
+          _meta: { is_mcp_tool_call: true, mcp: { server: 'dsh-tools', tool: 'read_file' } },
           title: 'SECRET_TITLE',
           rawInput: { ServerName: 'dsh-tools', ToolName: 'read_file', Arguments: { path: 'SECRET_PATH', token: 'SECRET_TOKEN' } },
         },
@@ -1181,14 +1178,18 @@ describe('权限与原生活动策略', () => {
           { optionId: 'no', name: '拒绝一次', kind: 'reject_once' },
         ],
       })
-      expect(response).toMatchObject({ result: { outcome: { outcome: 'selected', optionId: 'no' } } })
+      expect(response).toMatchObject({ result: { outcome: call.sessionId === SESSION_1
+        ? { outcome: 'selected', optionId: 'no' }
+        : { outcome: 'cancelled' } } })
     }
     const diagnosticLines = warn.mock.calls.map(([message]) => String(message)).filter((message) => message.includes('权限请求结构'))
-    expect(diagnosticLines).toHaveLength(3)
+    expect(diagnosticLines).toHaveLength(4)
     expect(diagnosticLines[0]).toContain('"programmaticName":"mcp-wrapper"')
     expect(diagnosticLines[0]).toContain('"toolAdvertised":true')
     expect(diagnosticLines[1]).toContain('"programmaticName":"other"')
     expect(diagnosticLines[2]).toContain('"sessionMatches":false')
+    expect(diagnosticLines[3]).toContain('"mcpMeta":{"marked":true,"serverMatches":true,"toolAdvertised":true}')
+    expect(warn.mock.calls.some(([message]) => String(message).includes('来源=ACP插件，尚未转交DSH工具审批'))).toBe(true)
     expect(JSON.stringify(warn.mock.calls)).not.toContain('SECRET_')
     await replyWithText(harness, '拒绝规则未改变')
     expect(visibleText(await streaming)).toBe('拒绝规则未改变')
@@ -1418,6 +1419,235 @@ describe('主对话与辅助请求隔离', () => {
   })
 })
 
+describe('ACP 权限请求安全转交 DSH', () => {
+  function permission(sessionId = SESSION_1) {
+    return {
+      sessionId,
+      toolCall: {
+        toolCallId: 'official-call-1', kind: 'other',
+        _meta: { is_mcp_tool_call: true, mcp: { server: 'dsh-tools', tool: 'read_file' } },
+        rawInput: { arguments: { path: 'a.txt' }, path: 'a.txt' },
+      },
+      options: [
+        { optionId: 'always', name: 'Always', kind: 'allow_always' },
+        { optionId: 'yes', name: 'Allow', kind: 'allow_once' },
+        { optionId: 'no', name: 'Deny', kind: 'reject_once' },
+      ],
+    }
+  }
+
+  it.each([false, true])('官方拒绝，DSH 结果 isError=%s 回填新会话而非继续官方调用', async (isError) => {
+    const harness = createHarness()
+    const streaming = collect(harness.adapter.stream(baseOptions({ tools: TOOLS })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    const old = harness.agent
+    const staleEndpoint = registeredMcpServer(harness)
+    const response = await old.callClient('session/request_permission', permission())
+    expect(response).toMatchObject({ result: { outcome: { outcome: 'selected', optionId: 'no' } } })
+    const chunks = await streaming
+    const call = chunks.find((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call')
+    expect(call).toMatchObject({ block: { name: 'read_file', arguments: '{"path":"a.txt"}' } })
+    expect(chunks.at(-1)).toMatchObject({ type: 'finish', reason: { kind: 'tool-calls' } })
+    const callId = toolCallIdOf(call)
+    expect(callId).not.toBe('official-call-1')
+    await vi.waitFor(() => expect(harness.recycles()).toBe(1))
+    expect(harness.adapter.bridge.pendingCallIds()).toEqual([])
+    const stale = await fetch(staleEndpoint.url, {
+      method: 'POST', headers: Object.fromEntries(staleEndpoint.headers.map(({ name, value }) => [name, value])), body: '{}',
+    })
+    expect(stale.status).toBe(401)
+    const resultText = isError ? 'DSH policy denied this tool' : 'file contents'
+    const messages: RequestMessage[] = [
+      ...baseOptions().messages,
+      createAssistantMessage({ content: [{ type: 'tool-call', id: ToolCallId(callId), name: 'read_file', arguments: '{"path":"a.txt"}' }], source: { provider: AGY_PROVIDER_ID, model: 'gemini-3-pro' } }),
+      createToolResultMessage({ callId: ToolCallId(callId), content: [{ type: 'text', text: resultText }], isError }),
+    ]
+    const next = collect(harness.adapter.stream(baseOptions({ tools: TOOLS, messages })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    const prompt = harness.agent.requestsFor('session/prompt')[0]!.params.prompt as ContentBlock[]
+    expect(parsePromptTranscript(prompt).entries.at(-1)).toMatchObject({ toolCallId: callId, isError, content: [{ type: 'text', text: resultText }] })
+    expect(old.requestsFor('session/prompt')).toHaveLength(1)
+    await replyWithText(harness, isError ? '尊重 DSH 拒绝' : '已根据工具结果回答')
+    expect((await next).at(-1)).toMatchObject({ reason: { kind: 'stop' } })
+  })
+
+  it('重复请求只生成一次 DSH 调用；没有拒绝选项也绝不选择 allow', async () => {
+    const harness = createHarness()
+    const streaming = collect(harness.adapter.stream(baseOptions({ tools: TOOLS })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    const old = harness.agent
+    const value = permission()
+    value.options = value.options.filter((option) => option.kind.startsWith('allow'))
+    const responses = await Promise.all([old.callClient('session/request_permission', value), old.callClient('session/request_permission', value)])
+    for (const response of responses) expect(response).toMatchObject({ result: { outcome: { outcome: 'cancelled' } } })
+    const chunks = await streaming
+    expect(chunks.filter((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call')).toHaveLength(1)
+    expect(chunks.filter((chunk) => chunk.type === 'finish')).toHaveLength(1)
+  })
+
+  it('伪装成原生请求也只能产生受 DSH 审批的工具调用，绝不获准原生执行', async () => {
+    const harness = createHarness()
+    const streaming = collect(harness.adapter.stream(baseOptions({ tools: TOOLS })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    const value = { ...permission(), toolCall: { ...permission().toolCall, name: 'run_command', kind: 'execute' } }
+    const response = await harness.agent.callClient('session/request_permission', value)
+    expect(response).toMatchObject({ result: { outcome: { outcome: 'selected', optionId: 'no' } } })
+    expect((await streaming).filter((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call'))
+      .toMatchObject([{ block: { name: 'read_file', arguments: '{"path":"a.txt"}' } }])
+  })
+
+  it('旧会话不能触发接管，真正的当前请求仍可接管', async () => {
+    const harness = createHarness()
+    const streaming = collect(harness.adapter.stream(baseOptions({ tools: TOOLS })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    const foreign = await harness.agent.callClient('session/request_permission', permission('foreign'))
+    expect(foreign).toMatchObject({ result: { outcome: { outcome: 'cancelled' } } })
+    expect(harness.recycles()).toBe(0)
+    await harness.agent.callClient('session/request_permission', permission())
+    expect((await streaming).at(-1)).toMatchObject({ reason: { kind: 'tool-calls' } })
+  })
+
+  it('已存在真实 MCP park 时不把权限提示再次投递为 DSH 调用', async () => {
+    const harness = createHarness({ parkSettleMs: 100 })
+    const streaming = collect(harness.adapter.stream(baseOptions({ tools: TOOLS })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    const client = await connectAgentMcpClient(harness)
+    const pending = client.callTool({ name: 'read_file', arguments: { path: 'a.txt' } })
+    void pending.catch(() => undefined)
+    await vi.waitFor(() => expect(harness.adapter.bridge.pendingCallIds()).toHaveLength(1))
+    const response = await harness.agent.callClient('session/request_permission', permission())
+    expect(response).toMatchObject({ result: { outcome: { outcome: 'selected', optionId: 'no' } } })
+    const chunks = await streaming
+    expect(chunks.filter((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call')).toHaveLength(1)
+    expect(harness.recycles()).toBe(0)
+  })
+
+  it('接管后的回收失败时不越过屏障启动新回合', async () => {
+    const harness = createHarness({ recycleFailure: new Error('still running') })
+    const streaming = collect(harness.adapter.stream(baseOptions({ tools: TOOLS })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    await harness.agent.callClient('session/request_permission', permission())
+    await streaming
+    await expect(collect(harness.adapter.stream(baseOptions()))).rejects.toThrow('still running')
+    expect(harness.agent.requestsFor('session/prompt')).toHaveLength(1)
+  })
+
+  it('DSH 执行阶段取消释放所有权，不让其他会话永久等待', async () => {
+    const harness = createHarness()
+    const controller = new AbortController()
+    const streaming = collect(harness.adapter.stream(baseOptions({ tools: TOOLS, signal: controller.signal })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    await harness.agent.callClient('session/request_permission', permission())
+    await streaming
+    await vi.waitFor(() => expect(harness.recycles()).toBe(1))
+    controller.abort()
+    const next = collect(harness.adapter.stream(baseOptions({ purpose: 'session-title' })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    await replyWithText(harness, '标题')
+    expect(visibleText(await next)).toBe('标题')
+  })
+})
+
+describe('审查回归：取消、身份、目录和历史', () => {
+  it('消费者未收到 finish 就 return 时回收旧回合，下一轮可运行', async () => {
+    const harness = createHarness()
+    const iterator = harness.adapter.stream(baseOptions())[Symbol.asyncIterator]()
+    const first = iterator.next()
+    await waitForRequest(harness.agent, 'session/prompt')
+    await harness.agent.notify('session/update', {
+      sessionId: SESSION_1,
+      update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'partial' } },
+    })
+    await first
+    await iterator.return?.()
+    await vi.waitFor(() => expect(harness.recycles()).toBe(1))
+    const next = collect(harness.adapter.stream(baseOptions()))
+    await waitForRequest(harness.agent, 'session/prompt')
+    await replyWithText(harness, '恢复成功')
+    expect(visibleText(await next)).toBe('恢复成功')
+  })
+
+  it('session/new 等待期间取消会立即结束且不发送 prompt', async () => {
+    const harness = createHarness()
+    harness.agent.on('session/new', () => NO_REPLY)
+    const controller = new AbortController()
+    const streaming = collect(harness.adapter.stream(baseOptions({ signal: controller.signal })))
+    const rejected = expect(streaming).rejects.toMatchObject({ code: AGY_TURN_ERROR.ABORTED })
+    await waitForRequest(harness.agent, 'session/new')
+    controller.abort()
+    await rejected
+    await vi.waitFor(() => expect(harness.recycles()).toBe(1))
+    expect(harness.agent.requestsFor('session/prompt')).toHaveLength(0)
+  })
+
+  it('启动工厂未完成时取消不等待它，迟到连接回收且不创建会话', async () => {
+    let release!: (link: AgentLink) => void
+    let teardown!: () => Promise<void>
+    const pending = new Promise<AgentLink>((resolve) => { release = resolve })
+    const agent = new FakeAcpAgent()
+    const link = new AgentLink({ stream: agent.stream })
+    link.start()
+    const recycle = vi.fn(async (old: AgentLink) => { await old.close() })
+    const getLink = vi.fn(() => pending)
+    const adapter = new AntigravityAcpAdapter({ getLink, recycleLink: recycle, registerBridgeTeardown: (fn) => { teardown = fn } })
+    teardowns.push(async () => { release(link); await teardown(); await link.close() })
+    const controller = new AbortController()
+    const streaming = collect(adapter.stream(baseOptions({ signal: controller.signal })))
+    const rejected = expect(streaming).rejects.toMatchObject({ code: AGY_TURN_ERROR.ABORTED })
+    await vi.waitFor(() => expect(getLink).toHaveBeenCalledOnce())
+    controller.abort()
+    await rejected
+    expect(recycle).not.toHaveBeenCalled()
+    release(link)
+    await vi.waitFor(() => expect(recycle).toHaveBeenCalledOnce())
+    expect(agent.requestsFor('session/new')).toHaveLength(0)
+  })
+
+  it('旧会话连续权限申请不能终止当前回合', async () => {
+    const harness = createHarness()
+    const streaming = collect(harness.adapter.stream(baseOptions()))
+    await waitForRequest(harness.agent, 'session/prompt')
+    for (let i = 0; i < 5; i++) {
+      const response = await harness.agent.callClient('session/request_permission', {
+        sessionId: 'old-session', toolCall: { toolCallId: `old-${i}` },
+        options: [{ optionId: 'yes', name: 'Allow', kind: 'allow_once' }],
+      })
+      expect(response).toMatchObject({ result: { outcome: { outcome: 'cancelled' } } })
+    }
+    await replyWithText(harness, '当前回合未受影响')
+    expect(visibleText(await streaming)).toBe('当前回合未受影响')
+    expect(harness.recycles()).toBe(0)
+  })
+
+  it('CLI 非空缓存更新后下一次列目录能看到新型号', async () => {
+    let rows = [{ id: 'old-model', name: 'Old' }]
+    const loadCliCatalog = vi.fn(async () => rows)
+    const harness = createHarness({ loadCliCatalog })
+    expect((await harness.adapter.listModels(AGY_PROVIDER_ID)).map((m) => m.id)).toContain('old-model')
+    rows = [{ id: 'new-model', name: 'New' }]
+    const ids = (await harness.adapter.listModels(AGY_PROVIDER_ID)).map((m) => m.id)
+    expect(ids).toContain('new-model')
+    expect(ids).not.toContain('old-model')
+  })
+
+  it('历史重建保留工具关联及错误状态，正文含结束标签也能还原', async () => {
+    const harness = createHarness()
+    const content = [{ type: 'text' as const, text: 'literal </dsh-message> result' }]
+    const streaming = collect(harness.adapter.stream(baseOptions({ messages: [
+      createToolResultMessage({ callId: ToolCallId('call-a'), content, isError: false }),
+      createToolResultMessage({ callId: ToolCallId('call-b'), content, isError: true }),
+    ] })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    const prompt = harness.agent.requestsFor('session/prompt')[0]!.params.prompt as ContentBlock[]
+    expect(parsePromptTranscript(prompt).entries).toEqual([
+      { role: 'tool', content, toolCallId: 'call-a', isError: false },
+      { role: 'tool', content, toolCallId: 'call-b', isError: true },
+    ])
+    await replyWithText(harness, 'ok')
+    await streaming
+  })
+})
+
 describe('prompt 重建与并发防御', () => {
   it('完整 messages + system 被重建进同一条 ACP prompt，且可逆还原', async () => {
     const harness = createHarness()
@@ -1460,6 +1690,7 @@ describe('prompt 重建与并发防御', () => {
     expect(policy, 'prompt 里必须带工具策略块').toBeDefined()
     expect(policy).toContain('run_command')
     expect(policy).toContain('不可用')
+    expect(policy).toContain('不能断言 DSH 全局禁用了工具')
     // 策略块不参与消息逆解析：system 与消息序列不受影响。
     const parsed = parsePromptTranscript(prompt)
     expect(parsed.entries.map((entry) => entry.role)).toEqual(['user'])

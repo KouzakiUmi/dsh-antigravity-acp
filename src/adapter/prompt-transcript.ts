@@ -47,6 +47,8 @@ export const TOOL_POLICY_TEXT = [
   '- 随本会话提供的工具列表就是你的工具入口；读写文件、执行命令、搜索代码请一律使用它们，它们与 DSH 的权限与审计一致。',
   '- agy 的原生工具（read_file / write_file / edit_file / run_command / view_file / list_dir / grep_search / find_by_name 等）在本集成中不可用：客户端未声明 fs/terminal 能力，相关请求会被拒绝。',
   '- 不要反复索要原生能力；直接改用等价的随会话工具完成。',
+  '- 集成可能取消官方工具调用并转交给 DSH 执行；重建后的历史中的 tool 结果是权威结果（包括 isError=true 的拒绝/失败），不要仅因官方调用被取消而重复执行。',
+  '- ACP 权限拒绝可能发生在插件转交 DSH 之前。仅凭 Denied by user 或 pre-tool hook 文本，不能断言 DSH 全局禁用了工具，也不能建议关闭沙箱或审批。请明确报告拒绝来源尚未核实。',
 ].join('\n')
 
 /** 解析出的单条消息信封。 */
@@ -55,6 +57,8 @@ export interface TranscriptEntry {
   role: string
   /** 该消息的 content 块（JSON 还原，形状与 DSH ContentBlock 一致）。 */
   content: unknown[]
+  toolCallId?: string
+  isError?: boolean
 }
 
 function textBlock(text: string): TextContent & { type: 'text' } {
@@ -63,7 +67,9 @@ function textBlock(text: string): TextContent & { type: 'text' } {
 
 /** 把一条 DSH 请求消息编码成信封文本。 */
 export function encodeMessage(message: RequestMessage): string {
-  const payload = JSON.stringify(message.content)
+  const payload = JSON.stringify(message.role === 'tool'
+    ? { content: message.content, toolCallId: message.toolCallId, isError: message.isError === true }
+    : message.content).replaceAll('<', '\\u003c')
   return `${MESSAGE_OPEN_PREFIX}${message.role}${MESSAGE_OPEN_SUFFIX}${payload}${MESSAGE_CLOSE}`
 }
 
@@ -119,6 +125,11 @@ function parseMessageEnvelopes(text: string): TranscriptEntry[] {
       const content = JSON.parse(body) as unknown
       if (Array.isArray(content)) {
         entries.push({ role, content: content as unknown[] })
+      } else if (role === 'tool' && content !== null && typeof content === 'object') {
+        const payload = content as Record<string, unknown>
+        if (Array.isArray(payload.content) && typeof payload.toolCallId === 'string' && typeof payload.isError === 'boolean') {
+          entries.push({ role, content: payload.content, toolCallId: payload.toolCallId, isError: payload.isError })
+        }
       }
     } catch {
       // 不是本模块产生的信封（非本 adapter 生成的内容）——按原文跳过，

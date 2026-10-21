@@ -14,7 +14,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
-import { disposeAcpRuntime, recycleAcpRuntime, ensureAcpRuntime as startAcpRuntimeRaw } from '../src/index.js'
+import { connectAcpAccount, disposeAcpRuntime, recycleAcpRuntime, ensureAcpRuntime as startAcpRuntimeRaw } from '../src/index.js'
 import type { ActiveAcpRuntime, AcpRuntimeDeps } from '../src/index.js'
 import { AGY_LINK_ERROR } from '../src/protocol/agent-link.js'
 import { AGY_BINARY_ERROR } from '../src/runtime/binary.js'
@@ -120,6 +120,76 @@ function acceptHandshake(agent: FakeAcpAgent): void {
   agent.on('authenticate', () => ({}))
   agent.on('session/new', () => ({ sessionId: 'acp-session-1', configOptions: [] }))
 }
+
+describe('设置 GUI 独立 ACP 连接', () => {
+  it('只认证和建立空工具会话，不发 prompt，并回收独立进程', async () => {
+    const harness = await createRuntimeHarness(acceptHandshake)
+    const session = await connectAcpAccount(harness.ctx, harness.config, new AbortController().signal, TEST_DEPS)
+    expect(session.sessionId).toBe('acp-session-1')
+    const agent = harness.agents[0]!
+    expect(agent.requestsFor('authenticate')).toHaveLength(1)
+    expect(agent.requestsFor('session/new')[0]?.params.mcpServers).toEqual([])
+    expect(agent.requestsFor('session/prompt')).toHaveLength(0)
+    expect(harness.active.link).toBeUndefined()
+    expect(harness.spawns[0]?.terminated()).toBe(true)
+  })
+
+  it('取消 GUI 登录不会遗留挂起的官方认证进程', async () => {
+    const harness = await createRuntimeHarness((agent) => {
+      agent.on('initialize', () => ({ protocolVersion: 1, agentCapabilities: {} }))
+    })
+    const controller = new AbortController()
+    const pending = connectAcpAccount(harness.ctx, harness.config, controller.signal, TEST_DEPS)
+    await waitFor(() => Boolean(harness.agents[0]?.requestsFor('authenticate').length))
+    controller.abort()
+    await expect(pending).rejects.toThrow()
+    expect(harness.spawns[0]?.terminated()).toBe(true)
+  })
+})
+
+describe('启动取消回归', () => {
+  it('认证挂起时取消启动会终止进程，随后可重新启动', async () => {
+    const harness = await createRuntimeHarness((agent, index) => {
+      agent.on('initialize', () => ({ protocolVersion: 1, agentCapabilities: {} }))
+      if (index > 0) agent.on('authenticate', () => ({}))
+    })
+    const controller = new AbortController()
+    const pending = startAcpRuntimeRaw(harness.ctx, harness.config, handlers, harness.active, {
+      ...TEST_DEPS, signal: controller.signal,
+    })
+    const rejected = expect(pending).rejects.toBeDefined()
+    await waitFor(() => (harness.agents[0]?.requestsFor('authenticate').length ?? 0) === 1)
+    controller.abort()
+    await rejected
+    expect(harness.spawns[0]?.terminated()).toBe(true)
+    expect(harness.active.inflight).toBeUndefined()
+    const link = await ensureAcpRuntime(harness.ctx, harness.config, handlers, harness.active)
+    expect(link.closed).toBe(false)
+    expect(harness.spawns).toHaveLength(2)
+  })
+
+  it('凭据准备期间取消后不得继续 spawn', async () => {
+    const harness = await createRuntimeHarness(acceptHandshake)
+    let release!: () => void
+    let entered = false
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const controller = new AbortController()
+    const pending = startAcpRuntimeRaw(harness.ctx, harness.config, handlers, harness.active, {
+      ...TEST_DEPS, signal: controller.signal,
+      ensureCredentials: async () => {
+        entered = true
+        await gate
+        return TEST_DEPS.ensureCredentials!()
+      },
+    })
+    const rejected = expect(pending).rejects.toBeDefined()
+    await waitFor(() => entered)
+    controller.abort()
+    release()
+    await rejected
+    expect(harness.spawns).toHaveLength(0)
+  })
+})
 
 describe('ensureAcpRuntime 失败清理（S2）', () => {
   it('回收当前连接会终止受管进程且不卸载插件，下一次调用创建新进程', async () => {

@@ -12,6 +12,7 @@
  * 关键性质：**finish 之后队列不再追加任何 chunk**，因此 `nextChunk()` 返回
  * undefined 时消费者已经拿全了本轮的全部内容（含 usage 与最后的 finish）。
  */
+import { randomUUID } from 'node:crypto'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { LlmFailure, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import type {
@@ -30,6 +31,7 @@ import type { AgentLink } from '../protocol/agent-link.js'
 import type { BridgeParkedCall, BridgeToolResult, McpToolBridge } from '../bridge/mcp-bridge.js'
 import { BRIDGE_MCP_SERVER_NAME } from '../bridge/mcp-bridge.js'
 import { describePermissionRequest } from './permission-diagnostic.js'
+import { parsePermissionHandoff } from './permission-handoff.js'
 import type { PermissionDiagnostic } from './permission-diagnostic.js'
 
 /** 本文件使用的原创错误码（AGY_* 体系，与 agent-link / mcp-bridge 同族）。 */
@@ -84,6 +86,8 @@ export interface PromptTurnOptions {
   onNativeRefusal?(info: { kind: 'permission' | 'request'; detail: string; count: number }): void
   /** 固定词表的权限结构摘要；仅诊断，不作为放行依据。 */
   onPermissionDiagnostic?(diagnostic: PermissionDiagnostic): void
+  /** 接管请求后停掉官方生产者；不清除等待 DSH 工具结果的所有权。 */
+  onHandoff?(): void
 }
 
 /**
@@ -122,6 +126,8 @@ export class PromptTurn {
   #abortCleanup: (() => void) | undefined
   #terminated = false
   #hasOutput = false
+  #handoff = false
+  readonly #onHandoff: PromptTurnOptions['onHandoff']
   readonly #onTerminate: PromptTurnOptions['onTerminate']
   /** 本轮封口不等于 ACP prompt 结束；封口后的事件留给下一次 stream 消费。 */
   #deferred: Array<{ kind: 'call'; call: BridgeParkedCall } | { kind: 'update'; update: SessionUpdate }> = []
@@ -136,6 +142,12 @@ export class PromptTurn {
     this.#onNativeRefusal = options.onNativeRefusal
     this.#onPermissionDiagnostic = options.onPermissionDiagnostic
     this.#onTerminate = options.onTerminate
+    this.#onHandoff = options.onHandoff
+  }
+
+  /** 官方调用已拒绝，工具改由 DSH 执行；下一轮必须重建，不能回喂官方调用。 */
+  get requiresRebuild(): boolean {
+    return this.#handoff
   }
 
   /** 本回合的 ACP prompt 是否已有应答；应答后无法再「在同一 prompt 内续轮」。 */
@@ -155,12 +167,12 @@ export class PromptTurn {
 
   /** 本回合是否停在「等待 DSH 回喂工具结果」的续轮状态。 */
   get awaitingToolResults(): boolean {
-    return !this.#terminated && this.#roundEnded && this.#parked.some((call) => this.#bridge.hasPending(call.callId))
+    return !this.#terminated && this.#roundEnded && (this.#handoff || this.#parked.some((call) => this.#bridge.hasPending(call.callId)))
   }
 
   /** 把 session/update 交给当前回合（由 adapter 的稳定 handler 转发）。 */
   handleSessionUpdate(notification: SessionNotification): void {
-    if (notification.sessionId !== this.sessionId || this.#terminated || this.#promptSettled) return
+    if (notification.sessionId !== this.sessionId || this.#terminated || this.#promptSettled || this.#handoff) return
     if (this.#roundEnded) {
       this.#deferred.push({ kind: 'update', update: notification.update })
       return
@@ -172,8 +184,8 @@ export class PromptTurn {
    * 权限询问一律拒绝（无人值守）：优先回绝选项，无可选项时回 cancelled。
    *
    * ACP 权限询问也可能来自 MCP 包装调用，不能一概称为原生 fs/terminal 请求。
-   * 尚缺实际请求的可信身份采样：本轮仅增加脱敏诊断，不按 title 或 rawInput 猜测放行。
-   * 拒绝本身不立即终止回合；保留既有的重复拒绝上限。
+   * 可解析的 MCP 描述可转换成新的 DSH 工具请求，但原始 ACP 调用仍被拒绝。
+   * 不按 title/rawInput/_meta 授予官方执行权。其余请求保留重复拒绝上限。
    */
   handleRequestPermission(request: RequestPermissionRequest): RequestPermissionResponse {
     this.#onPermissionDiagnostic?.(describePermissionRequest(request, {
@@ -181,8 +193,31 @@ export class PromptTurn {
       serverName: BRIDGE_MCP_SERVER_NAME,
       toolNames: this.#bridge.toolNames(),
     }))
+    // 迟到/外来会话的请求不能消耗当前回合的拒绝预算，也不能获准继续。
+    if (request.sessionId !== this.sessionId || this.#terminated || this.#promptSettled || this.#handoff) {
+      return { outcome: { outcome: 'cancelled' } }
+    }
     const rejection = request.options.find((option) => option.kind === 'reject_once')
       ?? request.options.find((option) => option.kind === 'reject_always')
+    // 仅在本轮尚未交付其他工具时接管一个请求；随即封口和撤销 MCP 通道，
+    // 重复权限请求及迟到 HTTP 调用不能导致同一操作执行两次。
+    const handoff = !this.#roundEnded && !this.#parked.some((call) => this.#bridge.hasPending(call.callId))
+      ? parsePermissionHandoff(request, {
+          sessionId: this.sessionId, serverName: BRIDGE_MCP_SERVER_NAME, tools: this.#bridge.toolSchemas(),
+        })
+      : undefined
+    if (handoff && this.#onHandoff) {
+      this.#handoff = true
+      const call = { callId: `dsh-permission-${randomUUID()}`, ...handoff }
+      this.#parked.push(call)
+      this.#emitToolCallBlock(call)
+      this.finishRound()
+      this.#onHandoff()
+      // 绝不返回 allow_once/allow_always；官方原始调用不获得执行权。
+      return rejection
+        ? { outcome: { outcome: 'selected', optionId: rejection.optionId } }
+        : { outcome: { outcome: 'cancelled' } }
+    }
     // 调用 id 同样是不可信字符串，不进入日志或错误正文。
     this.#recordNativeRefusal('permission', 'session/request_permission')
     return rejection
@@ -195,7 +230,7 @@ export class PromptTurn {
    * 与权限询问同样处理：响应照旧由 AgentLink 回 method-not-found，本回合先继续。
    */
   handleUnexpectedAgentRequest(method: string): void {
-    this.#recordNativeRefusal('request', method)
+    if (!this.#handoff) this.#recordNativeRefusal('request', method)
   }
 
   /** 计数并在超过上限时终止回合；未超限只记录（回合继续跑）。 */
@@ -234,14 +269,14 @@ export class PromptTurn {
 
   /** 收到 abort 信号：取消 ACP 会话当前回合并以 aborted 结束。 */
   abort(reason: string): void {
-    if (this.#terminated || this.#promptSettled) return
+    if (this.#terminated || (this.#promptSettled && !this.#handoff)) return
     this.#aborted = true
     this.#fail({ code: AGY_TURN_ERROR.ABORTED, message: `Antigravity ACP 回合被调用方中止：${reason}` })
   }
 
   /** 桥 park 了新调用：进入当前回合。 */
   handleParked(call: BridgeParkedCall): void {
-    if (this.#terminated) return
+    if (this.#terminated || this.#handoff) return
     if (this.#roundEnded) {
       this.#deferred.push({ kind: 'call', call })
       return
@@ -324,9 +359,10 @@ export class PromptTurn {
     try {
       const response = await prompt
       this.#markPromptSettled()
-      this.#finishWith(response)
+      if (!this.#handoff) this.#finishWith(response)
     } catch (error) {
       this.#markPromptSettled()
+      if (this.#handoff) return
       this.#fail({
         code: readErrorCode(error),
         message: error instanceof Error ? error.message : String(error),
@@ -336,7 +372,7 @@ export class PromptTurn {
 
   #markPromptSettled(): void {
     this.#promptSettled = true
-    this.dispose()
+    if (!this.#handoff) this.dispose()
     const waiters = this.#settledWaiters
     this.#settledWaiters = []
     for (const resolve of waiters) resolve()
@@ -424,7 +460,7 @@ export class PromptTurn {
     }
     // 只在**仍有未回喂的 park** 时才是 tool-calls：续轮把结果交付后，同一批
     // park 已经结算，本轮的结束原因回到 stop/max-tokens。
-    if (this.#parked.some((call) => this.#bridge.hasPending(call.callId))) return { kind: 'tool-calls' }
+    if (this.#handoff || this.#parked.some((call) => this.#bridge.hasPending(call.callId))) return { kind: 'tool-calls' }
     if (this.#truncated) return { kind: 'max-tokens' }
     return { kind: 'stop' }
   }

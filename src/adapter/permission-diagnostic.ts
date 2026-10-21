@@ -43,12 +43,20 @@ export function describePermissionRequest(
 ) {
   const call = request.toolCall
   const input = record(call.rawInput)
+  const meta = record(call._meta)
+  const mcp = record(meta?.mcp)
   return {
     sessionMatches: request.sessionId === context.sessionId,
     programmaticName: call.name === 'call_mcp_tool' ? 'mcp-wrapper' : call.name == null ? 'absent' : 'other',
     kind: call.kind == null ? 'absent' : TOOL_KINDS.has(call.kind) ? call.kind : 'unrecognized',
     titlePresent: typeof call.title === 'string',
     metaPresent: request._meta != null || call._meta != null,
+    // 官方 server 1.4.0 从参数信封生成这些字段；只能诊断，不能据此授权。
+    mcpMeta: {
+      marked: meta?.is_mcp_tool_call === true,
+      serverMatches: mcp?.server === context.serverName,
+      toolAdvertised: typeof mcp?.tool === 'string' && context.toolNames.includes(mcp.tool),
+    },
     input: inputSummary(call.rawInput, context.serverName, context.toolNames),
     // 有界检查固定包装层，避免依赖尚未实测的 rawInput 结构，也不遍历任意正文。
     nested: ['args', 'input', 'arguments', 'parameters', 'tool_input', 'toolInput']
@@ -59,16 +67,3 @@ export function describePermissionRequest(
 }
 
 export type PermissionDiagnostic = ReturnType<typeof describePermissionRequest>
-
-/**
- * 判定是否为发往本插件私有 MCP 桥的工具调用授权请求。
- * 桥只暴露 DSH 自己的工具（DSH 侧仍有工具策略），因此放行它是安全的；
- * 原生 shell/文件类请求（kind 为 execute/edit/delete/move 等）或未命中桥目录的请求一律不放行。
- */
-export function isBridgeToolRequest(diagnostic: PermissionDiagnostic): boolean {
-  if (!diagnostic.sessionMatches) return false
-  if (diagnostic.kind !== 'absent' && diagnostic.kind !== 'other' && diagnostic.kind !== 'fetch') return false
-  if (diagnostic.programmaticName === 'other') return false
-  const hit = (s: { serverMatches: boolean; toolAdvertised: boolean }) => s.serverMatches && s.toolAdvertised
-  return hit(diagnostic.input) || diagnostic.nested.some(hit)
-}

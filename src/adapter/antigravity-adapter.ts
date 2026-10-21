@@ -73,7 +73,7 @@ export interface AntigravityAcpAdapterOptions {
    * handlers 必须在整个 adapter 生命周期内保持**同一对象**——index.ts 会把
    * 首个 handler 集合固化到被缓存的 AgentLink 上，后续回合只更换其内部状态。
    */
-  getLink: (handlers: AgentLinkHandlers) => Promise<AgentLink>
+  getLink: (handlers: AgentLinkHandlers, signal?: AbortSignal) => Promise<AgentLink>
   /** 回收指定连接及其受管子进程；完成前禁止开启下一个回合。 */
   recycleLink: (link: AgentLink) => Promise<void>
   /** 登记桥的关闭钩子（index.ts 把它挂到 ActiveAcpRuntime.bridgeTeardown）。 */
@@ -159,7 +159,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   readonly #saveCatalog?: AntigravityAcpAdapterOptions['saveCatalog']
   readonly #loadCliCatalog?: AntigravityAcpAdapterOptions['loadCliCatalog']
   readonly #log?: AdapterLog
-  /** 官方 CLI 清单的进程内一次性结果。 */
+  /** 官方 CLI 清单的在途读取；完成即释放，底层负责缓存和后台刷新。 */
   #cliCatalog?: Promise<readonly { id: string; name: string }[]>
   /** 家族 → 支持的思考强度档位（由 listModels 折叠得到）。 */
   #familyTiers = new Map<string, ReadonlySet<AgyReasoningEffort>>()
@@ -231,6 +231,11 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     }
   }
 
+  /** 设置页连接不能与正在进行的对话/工具回合竞争同一登录态。 */
+  get busy(): boolean {
+    return this.#streamActive || Boolean(this.#turn && !this.#isTurnClosed(this.#turn))
+  }
+
   /** 私有 MCP 桥（诊断与测试可见；agent 侧只经 ACP mcpServers 访问它）。 */
   get bridge(): McpToolBridge {
     return this.#bridge
@@ -250,12 +255,11 @@ export class AntigravityAcpAdapter extends LlmAdapter {
    * 「无副作用即可读到模型目录」的方法；而启动运行时必然走
    * `authenticate`（官方进程会自行弹浏览器）。
    *
-   * 因此本实现在无真实目录时广告一条占位模型（见 AGY_PLACEHOLDER_MODEL_ID），
-   * 让 GUI 能选出本 provider；真实目录会在第一次 `stream` 建立会话后由
-   * `observeSessionConfigOptions` 写入缓存。
+   * 无真实目录时不再广告首次登录占位项；可在设置页显式连接 ACP 或拉取 CLI
+   * 目录。真实目录经 `observeSessionConfigOptions` 观测并缓存。
    */
   /**
-   * 本 provider 的模型目录：占位项恒在首位，其余是**家族**条目。
+   * 本 provider 的模型目录：官方**家族**条目与用户配置的自定义 ID。
    *
    * 家族折叠（2026-10-16 用户指示）：官方把思考强度编码进模型 id
    * （`claude-opus-5-5-{low,medium,high}`），但模型选择只出家族一行，强度由
@@ -263,17 +267,18 @@ export class AntigravityAcpAdapter extends LlmAdapter {
    * 一并折叠，同 id 去重；被排除的家族（gpt-oss-120b 临近下架）不出现。
    */
   override async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
-    const placeholder: LlmModelInfo = {
-      provider: _provider,
-      id: AGY_PLACEHOLDER_MODEL_ID,
-      name: 'Antigravity 默认（首次对话登录）',
-      description: '使用官方 ACP 会话的默认模型；第一次发消息时会下载/登录',
-      inputModalities: ['text'],
-    }
     const folded = await this.#foldCatalog(_provider)
+    const models = [...folded.models]
+    // 不再广告「首次对话登录」占位项；旧会话的 server-default 路由仍兼容。
+    // 自定义 ID 由用户明确配置，加入目录但不伪称已经过官方验证。
+    const preferred = this.#preferredModel
+    if (preferred && preferred !== AGY_PLACEHOLDER_MODEL_ID && !models.some((model) => model.id === preferred)) {
+      models.unshift({ id: preferred, name: preferred, description: '用户配置的模型 ID，尚未验证可用性' })
+    } else if (preferred) {
+      models.sort((a, b) => Number(b.id === preferred) - Number(a.id === preferred))
+    }
     return [
-      placeholder,
-      ...folded.models.map((model) => ({
+      ...models.map((model) => ({
         provider: _provider,
         id: model.id,
         name: model.name,
@@ -311,10 +316,8 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   }
 
   /**
-   * 官方 CLI 模型清单的原始行（进程内只取一次；失败返回空，不影响目录主体）。
-   *
-   * 空结果不永久记忆：首次调用时 CLI 取数可能被设计成后台刷新（避免拖慢
-   * 模型选择器），下次列目录要能重新拿到刷新后的清单。
+   * 官方 CLI 模型清单的原始行（并发 single-flight；失败返回空）。
+   * 每次读取底层缓存的最新快照，不永久记忆非空旧结果，后台刷新才能可见。
    */
   async #cliRawRows(): Promise<readonly { id: string; name: string }[]> {
     const load = this.#loadCliCatalog
@@ -326,9 +329,13 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         return []
       }
     })()
-    const rows = await this.#cliCatalog
-    if (rows.length === 0) this.#cliCatalog = undefined
-    return rows
+    const inflight = this.#cliCatalog
+    try {
+      return await inflight
+    } finally {
+      // 只合并并发读取；底层目录可能已完成后台刷新，不能永久记住旧快照。
+      if (this.#cliCatalog === inflight) this.#cliCatalog = undefined
+    }
   }
 
   /** 读一次目录缓存（结果记忆在实例上，避免每次列目录都碰文件系统）。 */
@@ -434,9 +441,17 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       return
     }
     await this.#acquireStream(options)
+    let handedOff = false
     try {
-      yield* this.#streamExclusive(options)
+      for await (const chunk of this.#streamExclusive(options)) {
+        // 消费者在收到 finish 后 return 是合法的（尤其是工具续轮）。
+        if (chunk.type === 'finish') handedOff = true
+        yield chunk
+      }
     } finally {
+      if (!handedOff && this.#turn && !this.#isTurnClosed(this.#turn)) {
+        this.#abandonTurn('消费者提前关闭流，取消未完成回合')
+      }
       this.#streamActive = false
       this.#wakeAccessWaiters()
     }
@@ -462,6 +477,18 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     }
   }
 
+  /** 先允许当前拒绝响应出站，再回收；同一连接的接管/取消不得重复覆盖屏障。 */
+  #scheduleRecycle(link: AgentLink): void {
+    if (this.#unrecycledLink === link) return
+    this.#unrecycledLink = link
+    this.#cleanup = new Promise<void>((resolve) => setTimeout(resolve, 0))
+      .then(() => this.#recycleLink(link))
+      .then(() => {
+        if (this.#unrecycledLink === link) this.#unrecycledLink = undefined
+      })
+    void this.#cleanup.catch((error: unknown) => this.#log?.warn('antigravity-acp: 回合回收失败', error))
+  }
+
   /** 同一时刻只有一个 stream 能创建/切换会话或消费回合队列。 */
   async *#streamExclusive(options: GenerateOptions): AsyncGenerator<StreamChunk> {
     const tail = trailingToolResults(options.messages)
@@ -469,7 +496,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     if (turn?.awaitingToolResults) {
       // 能续轮的前提有两个：ACP prompt 尚未应答（同一 prompt 内才能继续
       // 产出），且尾部 tool 结果与 park 表按顺序一一匹配。
-      if (!turn.promptSettled && matchesParkedCalls(turn, tail, this.#bridge)) {
+      if (!turn.requiresRebuild && !turn.promptSettled && matchesParkedCalls(turn, tail, this.#bridge)) {
         yield* this.#runContinuation(turn, options, tail)
         return
       }
@@ -526,8 +553,52 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     }
   }
 
+  /** 启动阶段也响应取消；迟到资源先回收，后续回合不能越过清理屏障。 */
+  async #prepareRound(options: GenerateOptions) {
+    let link: AgentLink | undefined
+    const check = (): void => {
+      if (this.#disposed) throw new LlmError('Antigravity ACP adapter 已卸载', 'AGY_LINK_CLOSED')
+      throwIfAborted(options.signal)
+    }
+    const setup = (async () => {
+      check()
+      link = await this.#getLink(this.#handlers, options.signal)
+      check()
+      const tools = options.tools ?? []
+      this.#bridge.beginRound(tools)
+      let mcpServers: AcpMcpServer[] = []
+      if (tools.length > 0) {
+        if (!this.#bridge.listening) await this.#bridge.start()
+        check()
+        mcpServers = this.#bridge.acpRegistration()
+      }
+      const session = await link.newSession({ cwd: this.#cwd, mcpServers }, { signal: options.signal })
+      check()
+      this.observeSessionConfigOptions(session.configOptions)
+      await this.#applyModelSelection(link, session.sessionId, options.model, options.reasoningEffort, options.signal)
+      check()
+      return { link, session, tools }
+    })()
+    try {
+      return await withAbort(setup, options.signal)
+    } catch (error) {
+      if (options.signal?.aborted || this.#disposed) {
+        this.#bridge.invalidateRound('启动阶段取消')
+        this.#cleanup = setup.catch(() => undefined).then(async () => {
+          if (!link) return
+          this.#unrecycledLink = link
+          await this.#recycleLink(link)
+          if (this.#unrecycledLink === link) this.#unrecycledLink = undefined
+        })
+        void this.#cleanup.catch(() => undefined)
+      }
+      throwIfAborted(options.signal)
+      throw error
+    }
+  }
+
   async *#runNewRound(options: GenerateOptions): AsyncGenerator<StreamChunk> {
-    await this.#settleRecycle()
+    await withAbort(this.#settleRecycle(), options.signal)
     if (this.#disposed) throw new LlmError('Antigravity ACP adapter 已卸载', 'AGY_LINK_CLOSED')
     this.#turnOwner = {
       ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
@@ -535,22 +606,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     }
     // usage_update 的上下文容量归属到本次请求的 DSH 路由键。
     this.#routeModelId = options.model
-    const link = await this.#getLink(this.#handlers)
-    const tools = options.tools ?? []
-    this.#bridge.beginRound(tools)
-    let mcpServers: AcpMcpServer[] = []
-    if (tools.length > 0) {
-      // 端口跨回合复用；token 与授权代次每个新 ACP 回合轮换。register/teardown
-      // 已在构造时挂到 ActiveAcpRuntime.bridgeTeardown。
-      if (!this.#bridge.listening) await this.#bridge.start()
-      mcpServers = this.#bridge.acpRegistration()
-    } else {
-      this.#bridge.resetPending('本轮未向 agent 暴露工具')
-    }
-
-    const session = await link.newSession({ cwd: this.#cwd, mcpServers })
-    this.observeSessionConfigOptions(session.configOptions)
-    await this.#applyModelSelection(link, session.sessionId, options.model, options.reasoningEffort)
+    const { link, session, tools } = await this.#prepareRound(options)
 
     const turn = new PromptTurn(session.sessionId, {
       link,
@@ -567,13 +623,16 @@ export class AntigravityAcpAdapter extends LlmAdapter {
           return
         }
         // 让本次入站权限/fs 请求先完成拒绝响应，再拆连接；下一回合必须等回收。
-        this.#unrecycledLink = link
-        this.#cleanup = new Promise<void>((resolve) => setTimeout(resolve, 0))
-          .then(() => this.#recycleLink(link))
-          .then(() => {
-            if (this.#unrecycledLink === link) this.#unrecycledLink = undefined
-          })
-        void this.#cleanup.catch((error: unknown) => this.#log?.warn('antigravity-acp: 回合回收失败', error))
+        this.#scheduleRecycle(link)
+        this.#wakeAccessWaiters()
+      },
+      onHandoff: () => {
+        // 已把请求作为普通 tool-call 发给 DSH；官方原始调用仍被拒绝。
+        // 撤销整个旧桥代次，禁止 agent 绕过拒绝再次投递同一调用。
+        this.#bridge.invalidateRound('工具请求已转交 DSH，官方调用被拒绝')
+        this.#releaseTurnSubscription(turn)
+        this.#scheduleRecycle(link)
+        this.#log?.info('antigravity-acp: ACP 请求已转换为 DSH 工具调用；等待 DSH 审批/执行，未授予官方执行权限')
         this.#wakeAccessWaiters()
       },
       onConfigOptions: (observed) => this.observeSessionConfigOptions(observed),
@@ -582,7 +641,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       onNativeRefusal: (info) =>
         this.#log?.warn(
           `antigravity-acp: 已拒绝${info.kind === 'permission' ? ' ACP 工具权限申请' : '原生客户端请求'}` +
-            `（${info.detail}，本回合第 ${info.count} 次）`,
+            `（${info.detail}，本回合第 ${info.count} 次；来源=ACP插件，尚未转交DSH工具审批）`,
         ),
     })
     this.#turn = turn
@@ -807,11 +866,13 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     sessionId: string,
     model: string,
     effort?: { toString(): string },
+    signal?: AbortSignal,
   ): Promise<void> {
     const base = model === AGY_PLACEHOLDER_MODEL_ID ? this.#preferredModel : model
     if (!base) return
     // 档位表可能尚未建立（API 直调时选择器还没列过目录）：先折叠一次再路由。
-    await this.#foldCatalog(AGY_PROVIDER_ID)
+    await withAbort(this.#foldCatalog(AGY_PROVIDER_ID), signal)
+    throwIfAborted(signal)
     const family = modelFamilyId(base)
     const pinnedTier = tierForModelId(base)
     const effortTier = normalizeEffort(effort)
@@ -841,7 +902,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     // agent 自己判定是否接受，而不是在这里静默改写成别的模型。
     let response: { configOptions?: readonly SessionConfigOption[] }
     try {
-      response = await link.setConfigOption({ sessionId, configId: selector.configId, value: requested })
+      response = await link.setConfigOption({ sessionId, configId: selector.configId, value: requested }, { signal })
     } catch (error) {
       this.#log?.warn(
         `antigravity-acp: session/set_config_option 失败（configId=${selector.configId} value=${requested}）`,
@@ -851,6 +912,24 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     }
     this.observeSessionConfigOptions(response.configOptions)
   }
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new LlmError('Antigravity ACP 请求已取消', AGY_TURN_ERROR.ABORTED)
+}
+
+/** 不丢失原 promise 的拒绝处理；取消只停止等待，资源所有者负责清理。 */
+function withAbort<T>(pending: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return pending
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => {
+      signal.removeEventListener('abort', onAbort)
+      reject(new LlmError('Antigravity ACP 请求已取消', AGY_TURN_ERROR.ABORTED))
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    pending.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort))
+    if (signal.aborted) onAbort()
+  })
 }
 
 /** 把回合的 chunk 队列逐个交给调用方；undefined 表示本轮已取尽。 */

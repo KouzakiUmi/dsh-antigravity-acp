@@ -158,13 +158,15 @@ describe('ensureAcpCredentials 换发回退', () => {
 })
 
 describe('额度失败保留旧值', () => {
+  const CREDITS = JSON.stringify({ status: 'SUCCESS', num_turns: 0, command: { name: 'credits', data: { remaining_credits: 100 } } })
   const USAGE = JSON.stringify({
     command: { data: { groups: [{ name: 'Gemini', buckets: [{ name: '5h', window: '5h', remaining_fraction: 0.62 }] }] } },
   })
 
   it('先成功后失败：返回上次数据并标记 stale，且下次调用立刻重试而不是被缓存挡住', async () => {
     let call = 0
-    const run: CliRun = async () => {
+    const run: CliRun = async (request) => {
+      if (request.argv.includes('/credits')) return { exitCode: 0, stdout: CREDITS, stderr: '' }
       call += 1
       if (call === 1) return { exitCode: 0, stdout: USAGE, stderr: '' }
       if (call === 2) return { exitCode: 1, stdout: '', stderr: 'network down' }
@@ -227,7 +229,8 @@ describe('额度失败保留旧值', () => {
 
   it('force 刷新不并入「命中缓存」的在途读取：同一 tick 的刷新必须真正重新取数', async () => {
     let call = 0
-    const run: CliRun = async () => {
+    const run: CliRun = async (request) => {
+      if (request.argv.includes('/credits')) return { exitCode: 0, stdout: CREDITS, stderr: '' }
       call += 1
       return { exitCode: 0, stdout: USAGE, stderr: '' }
     }

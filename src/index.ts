@@ -35,6 +35,7 @@ import { describeAuthWait, redactSensitiveText } from './runtime/redact.js'
 import { readCachedCatalog, writeCachedCatalog } from './runtime/catalog-cache.js'
 import { agyCliCandidates, createSubprocessCliRun, fetchAgyModels } from './runtime/agy-cli.js'
 import { AgYQuotaService, registerAgYQuotaRemote } from './quota/quota-remote.js'
+import { SettingsControl } from './quota/control.js'
 import type { AntigravityHostConfig } from './settings.js'
 
 export { AGY_PROVIDER_ID } from './adapter/antigravity-adapter.js'
@@ -121,6 +122,8 @@ export async function recycleAcpRuntime(active: ActiveAcpRuntime, link: AgentLin
  * 它不认识的 icacls 进程。
  */
 export interface AcpRuntimeDeps {
+  /** 当前启动请求的取消信号，不改变宿主权限。 */
+  signal?: AbortSignal
   /** 插件自身 HTTPS 请求（下载、换发）所用的 fetch；默认按配置的代理构造。 */
   fetchImpl?: typeof fetch
   /** 备好官方登录态（acp_token.json + settings.json）；默认导入本机官方 CLI 凭据。 */
@@ -197,12 +200,18 @@ async function startAcpRuntime(
     // 地址非法由后面的 AGY_INVALID_PROXY 明确报错；这里直连即可。
     downloadProxy = undefined
   }
-  const pluginFetch = deps.fetchImpl ?? createProxiedFetch(downloadProxy)
+  const startupSignal = AbortSignal.any([active.abort.signal, ...(deps.signal ? [deps.signal] : [])])
+  startupSignal.throwIfAborted()
+  const baseFetch = deps.fetchImpl ?? createProxiedFetch(downloadProxy)
+  const pluginFetch: typeof fetch = (input, init) => baseFetch(input, {
+    ...init,
+    signal: AbortSignal.any([startupSignal, ...(init?.signal ? [init.signal] : [])]),
+  })
   const resolution = await ensureAgentBinary({
     binaryPath: config.binaryPath,
     autoDownload: config.autoDownload,
     version: config.acpVersion,
-    signal: active.abort.signal,
+    signal: startupSignal,
     // 下载只允许 dl.google.com 且不跟随重定向：包一层只换传输，不放宽这两条。
     fetchImpl: (url, init) => pluginFetch(url, init) as Promise<Response>,
   })
@@ -225,12 +234,14 @@ async function startAcpRuntime(
   if (active.disposed) {
     throw new LlmError('Antigravity ACP 插件已卸载，取消启动 ACP 链路', AGY_LINK_ERROR.LINK_CLOSED)
   }
+  startupSignal.throwIfAborted()
   // 登录态在 spawn 前备好：优先导入本机官方 CLI 的已登录凭据（用户要求不弹浏览器
   // 登录页）。备好 acp_token.json + settings.json 后，官方 server 启动时自行完成
   // 认证，因此可以跳过 authenticate —— 该请求在没有交互式浏览器时会一直挂着。
   // 传入 acpVersion：OAuth client 元数据要从对应版本的缓存二进制里提取。
   const credentials = await (deps.ensureCredentials
     ?? (() => ensureAcpCredentials({ acpVersion: config.acpVersion, fetchImpl: pluginFetch })))()
+  startupSignal.throwIfAborted()
   // 代理在 spawn 前解析：地址非法就当场失败，不要等到官方进程出网才报连接错误。
   let proxy: ResolvedProxy | undefined
   try {
@@ -254,8 +265,14 @@ async function startAcpRuntime(
     // 认证需要人工在浏览器里点授权，走独立的更长超时（默认 5 分钟）。
     authTimeoutMs: config.authTimeoutMs,
   })
+  const cancelStartup = (): void => {
+    handle.terminate()
+    void link.close().catch(() => undefined)
+  }
+  startupSignal.addEventListener('abort', cancelStartup, { once: true })
   link.start()
   try {
+    startupSignal.throwIfAborted()
     // initialize 上报关闭全部本地能力的 clientCapabilities（ACP v1 的
     // ClientCapabilities 属于 initialize 请求，session/new 没有这个字段）。
     await link.initialize({ clientCapabilities: AGY_CLIENT_CAPABILITIES })
@@ -263,12 +280,15 @@ async function startAcpRuntime(
     // 官方 server 已从 settings.json 推断出 oauth-personal 并自行完成认证，
     // 而 authenticate 在没有交互式浏览器时会一直挂着（旧行为会白等 5 分钟）。
     if (!credentials.ready) await link.authenticate()
+    startupSignal.throwIfAborted()
   } catch (error) {
     // active.link 尚未被写入（只有认证成功才写），这里只需摘掉 handle 指向。
     if (active.handle === handle) active.handle = undefined
     await link.close().catch(() => undefined)
     handle.terminate()
     throw toLaunchError(error, readStderr(handle), credentials.ready ? undefined : credentials.note)
+  } finally {
+    startupSignal.removeEventListener('abort', cancelStartup)
   }
   // 认证成功后才登记链接：`active.link` 可复用就等于「链路已认证」，因此复用它
   // 的调用方不需要、也不应该看到认证窗口内的中间状态。
@@ -339,6 +359,19 @@ function toLaunchError(error: unknown, stderr: string, credentialsNote?: string)
   )
 }
 
+/** 设置页显式连接：独立运行时，只建空工具会话验证认证，不发送模型 prompt。 */
+export async function connectAcpAccount(ctx: Context, config: AntigravityHostConfig, signal: AbortSignal, deps: AcpRuntimeDeps = {}) {
+  const runtime: ActiveAcpRuntime = {}
+  try {
+    const link = await ensureAcpRuntime(ctx, config, {
+      onRequestPermission: () => ({ outcome: { outcome: 'cancelled' } }),
+    }, runtime, { ...deps, signal })
+    return await link.newSession({ cwd: process.cwd(), mcpServers: [] }, { signal })
+  } finally {
+    await disposeAcpRuntime(runtime)
+  }
+}
+
 export function apply(ctx: Context, config: AntigravityHostConfig): void {
   const active: ActiveAcpRuntime = {}
   const cacheDir = resolveCacheDir()
@@ -376,30 +409,37 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
   let cliDiskRead = false
   let cliRefresh: Promise<void> | undefined
   let cliRefreshDone = false
-  const loadCliModels = async (): Promise<readonly { id: string; name: string }[]> => {
+  const loadCliModels = async (force = false): Promise<readonly { id: string; name: string }[]> => {
+    if (force && !cliPath) throw new Error('未找到官方 agy CLI，无法拉取模型；请先安装并登录官方 CLI')
     if (!cliDiskRead) {
       cliDiskRead = true
       const cached = await readCachedCatalog({ cacheDir, acpVersion, fileName: 'cli-models.json' })
       if (cached) cliModelRows = cached.map((row) => ({ id: row.id, name: row.name }))
     }
-    if (cliPath && cliRefresh === undefined && !cliRefreshDone) {
+    if (cliPath && cliRefresh === undefined && (force || !cliRefreshDone)) {
       cliRefresh = (async () => {
         const models = await fetchAgyModels(cliRun, cliPath)
         if (models.length === 0) return
         await writeCachedCatalog({ cacheDir, acpVersion, fileName: 'cli-models.json', models })
         cliModelRows = models
-      })().catch(() => undefined).finally(() => {
+      })().finally(() => {
         cliRefresh = undefined
         cliRefreshDone = true
       })
+      void cliRefresh.catch(() => ctx.logger?.warn?.('antigravity-acp: 模型目录刷新失败，保留已有目录'))
     }
+    if (force) await cliRefresh
     return cliModelRows ?? []
   }
 
   const adapter = new AntigravityAcpAdapter({
     // handler 对象由 adapter 构造时创建且身份稳定：AgentLink 只在构造时取一次
     // handlers，后续回合只更换 adapter 内部的当前回合。
-    getLink: (handlers) => ensureAcpRuntime(ctx, config, handlers, active),
+    getLink: (handlers, signal) => {
+      const state = control.account().state
+      if (state === 'connecting' || state === 'cancelling') throw new Error('设置页正在连接 ACP，请完成或取消后再发消息')
+      return ensureAcpRuntime(ctx, config, handlers, active, { signal })
+    },
     recycleLink: (link) => recycleAcpRuntime(active, link),
     registerBridgeTeardown: (teardown) => {
       active.bridgeTeardown = teardown
@@ -419,6 +459,19 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
       warn: (message: string, error?: unknown) => ctx.logger?.warn?.(message, error),
     },
   })
+  const control = new SettingsControl({
+    connect: async (signal) => {
+      if (adapter.busy || active.inflight) throw new Error('正在进行对话或启动，请结束当前操作后再连接账户')
+      if (active.link) await recycleAcpRuntime(active, active.link)
+      signal.throwIfAborted()
+      const session = await connectAcpAccount(ctx, config, signal)
+      adapter.observeSessionConfigOptions(session.configOptions)
+    },
+    models: async (force) => {
+      if (force) await loadCliModels(true)
+      return adapter.listModels(AGY_PROVIDER_ID)
+    },
+  })
   const registration = ctx.llm.registerAdapter([AGY_PROVIDER_ID], adapter)
 
   // 额度监控：套餐额度取数服务 + Typert remote（供浏览器端药丸读取）。
@@ -427,6 +480,7 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
   // 凭据不写回、不进日志。
   registerAgYQuotaRemote(ctx)
   ctx.plugin(AgYQuotaService, {
+    control,
     // HTTP 回退路径要从对应版本的缓存二进制里提取 OAuth client 元数据。
     deps: { cacheDir, acpVersion, fetchImpl: createProxiedFetch(cliProxy) },
     ...(cliPath ? { cli: { run: cliRun, cliPath } } : {}),
@@ -451,6 +505,7 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
   // cordis 4.x 的规范 dispose 挂点：generator effect，卸载时逆序执行。
   ctx.effect(function* () {
     yield () => registration()
+    yield async () => control.dispose()
     yield async () => disposeAcpRuntime(active)
   }, 'antigravity-acp 生命周期清理')
 }

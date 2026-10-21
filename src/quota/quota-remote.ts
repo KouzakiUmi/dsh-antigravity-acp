@@ -16,9 +16,11 @@ import type { Context } from '@deepseek-ai/cordis'
 import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import type { InvocationDescriptor, TypertCodec, TypertSchema } from '@deepseek-ai/dsh-typert-protocol'
 import { fetchQuotaSnapshot, QuotaError, QUOTA_CACHE_MS } from '../runtime/quota.js'
-import type { QuotaDeps, QuotaSnapshot } from '../runtime/quota.js'
+import type { CreditsSnapshot, QuotaDeps, QuotaSnapshot } from '../runtime/quota.js'
+import { fetchAgyCredits } from '../runtime/credits.js'
 import { fetchAgyUsage } from '../runtime/agy-cli.js'
 import type { CliRun } from '../runtime/agy-cli.js'
+import type { SettingsControl, AccountSnapshot, ModelSnapshot } from './control.js'
 import { redactSensitiveText } from '../runtime/redact.js'
 
 export const PACKAGE_NAME = 'dsh-bundle-antigravity-host'
@@ -57,6 +59,24 @@ function strictCodec(typeSymbol: string, parse: (value: unknown) => unknown): Ty
 const requestCodec = strictCodec(`${PACKAGE_NAME}#AgYQuotaRequest`, parseRequest)
 const resultCodec = strictCodec(`${PACKAGE_NAME}#AgYQuotaResult`, parseResult)
 
+function parseAccountRequest(value: unknown): { action: 'status' | 'login' | 'cancel' } {
+  if (value === undefined) return { action: 'status' }
+  if (!value || typeof value !== 'object' || !('action' in value)
+    || !['status', 'login', 'cancel'].includes(String(value.action))) throw new TypeError('Invalid AgYAccountRequest')
+  return { action: value.action as 'status' | 'login' | 'cancel' }
+}
+function parseAccount(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || !('state' in value) || !('message' in value)
+    || !['idle', 'connecting', 'cancelling', 'connected', 'cancelled', 'error'].includes(String(value.state))
+    || typeof value.message !== 'string') throw new TypeError('Invalid AgYAccountResult')
+  return value
+}
+function parseModels(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || !('models' in value) || !Array.isArray(value.models)
+    || !('status' in value) || !['ok', 'error'].includes(String(value.status))) throw new TypeError('Invalid AgYModelsResult')
+  return value
+}
+
 /** 本包贡献的 invocation 描述符（直连一元调用）。 */
 export const AGY_QUOTA_INVOCATIONS: readonly InvocationDescriptor[] = [
   {
@@ -70,6 +90,14 @@ export const AGY_QUOTA_INVOCATIONS: readonly InvocationDescriptor[] = [
     ],
     result: resultCodec,
   },
+  ...(['account', 'models'] as const).map((method): InvocationDescriptor => ({
+    id: `${PACKAGE_NAME}#${AGY_QUOTA_SERVICE}/${method}`,
+    service: AGY_QUOTA_SERVICE, namespace: AGY_QUOTA_SERVICE, method,
+    invocation: { kind: 'direct' },
+    parameters: [{ name: 'request', wire: 'request', source: 'json', acceptsUndefined: true,
+      codec: method === 'account' ? strictCodec(`${PACKAGE_NAME}#AgYAccountRequest`, parseAccountRequest) : requestCodec }],
+    result: method === 'account' ? strictCodec(`${PACKAGE_NAME}#AgYAccountResult`, parseAccount) : strictCodec(`${PACKAGE_NAME}#AgYModelsResult`, parseModels),
+  })),
 ]
 
 /** 宿主 typert 注册面（对准已安装壳的 TypertContribution 形态）。 */
@@ -127,10 +155,12 @@ export function registerAgYQuotaRemote(ctx: Context): void {
 }
 
 export interface AgYQuotaServiceOptions {
+  control?: SettingsControl
+
   /** 测试注入面（fetch/文件/时钟等），生产不传。 */
   deps?: QuotaDeps
   /**
-   * 官方 CLI 只读取数通道（`agy -p /usage`，2026-10-16 授权仅限只读取数用途）。
+   * 官方 CLI 只读取数通道（`agy -p /usage` 与 `agy -p /credits`）。
    * 给了就优先用它：本账户上 Cloud Code Assist 是企业授权产品（403 #3501），
    * 官方 CLI 是套餐额度的唯一可用来源。
    */
@@ -148,9 +178,11 @@ export interface AgYQuotaServiceOptions {
  */
 export class AgYQuotaService extends TypertRemoteService {
   private readonly _cache: { value?: QuotaSnapshot; at?: number } = {}
+  private readonly _creditsCache: { value?: CreditsSnapshot; at?: number } = {}
   private readonly _deps: QuotaDeps
   private readonly _cli: { run: CliRun; cliPath: string } | undefined
   private readonly _log: AgYQuotaServiceOptions['log']
+  private readonly _control: SettingsControl | undefined
   /** 在途取数：并发调用（多会话药丸 / 定时器 + 手动刷新）共享同一次取数，而不是各起一个进程。 */
   private _inflight: Promise<QuotaSnapshot> | undefined
   /** 在途取数是否真的绕过了缓存（而非「命中缓存」的即时返回）；force 的合并判定依据。 */
@@ -161,6 +193,17 @@ export class AgYQuotaService extends TypertRemoteService {
     this._deps = options.deps ?? {}
     this._cli = options.cli
     this._log = options.log
+    this._control = options.control
+  }
+
+  account(request?: { action: 'status' | 'login' | 'cancel' }): AccountSnapshot {
+    if (!this._control) throw new Error('账户控制服务未就绪')
+    return this._control.account(parseAccountRequest(request).action)
+  }
+
+  async models(request?: AgYQuotaRequest): Promise<ModelSnapshot> {
+    if (!this._control) throw new Error('模型管理服务未就绪')
+    return this._control.models(parseRequest(request)?.force === true)
   }
 
   /** 客户端药丸的取数入口；并发调用合并为同一次取数。 */
@@ -188,6 +231,7 @@ export class AgYQuotaService extends TypertRemoteService {
     if (request?.force === true) {
       // 只让缓存失效（清时间戳），保留上一次成功的数据：刷新失败时还能以 stale 形式展示。
       delete this._cache.at
+      delete this._creditsCache.at
     }
     // 这条日志让「药丸到底有没有把请求发到 Host」可证：浏览器侧完全无法写宿主日志。
     const source = this._cli ? `cli=${this._cli.cliPath}` : 'http（未找到 agy CLI）'
@@ -195,18 +239,34 @@ export class AgYQuotaService extends TypertRemoteService {
     try {
       const now = Date.now()
       const cached = this._cache.value
-      if (cached && this._cache.at !== undefined && now - this._cache.at < QUOTA_CACHE_MS && cached.status === 'ok' && cached.stale !== true) {
-        this._log?.info(`antigravity-acp: 额度取数命中缓存（${cached.groups.length} 组）`)
-        return cached
+      const previousCredits = this._creditsCache.value
+      const quotaCached = Boolean(cached && this._cache.at !== undefined && now - this._cache.at < QUOTA_CACHE_MS && cached.status === 'ok' && cached.stale !== true)
+      const creditsCached = Boolean(previousCredits && this._creditsCache.at !== undefined && now - this._creditsCache.at < QUOTA_CACHE_MS && previousCredits.status !== 'error' && !previousCredits.stale)
+      if (quotaCached && creditsCached) {
+        this._log?.info('antigravity-acp: 套餐额度与余额命中独立缓存')
+        return { ...cached!, credits: previousCredits }
       }
-      this._inflightBypassed = true
+      // force 只能加入两路均取新数据的请求，不能把局部刷新误认成全部刷新。
+      this._inflightBypassed = !quotaCached && !creditsCached
       // 上一次成功数据必须在取数**前**捕获：HTTP 回退实现（fetchQuotaSnapshot）
       // 会把失败快照写进同一个缓存对象，取完再读就只剩失败结果了。
       const previous = this._cache.value
       const cli = this._cli
-      const fresh = cli
-        ? await fetchAgyUsage(cli.run, cli.cliPath)
-        : await fetchQuotaSnapshot(this._cache, this._deps)
+      // 两个只读命令并发且各有超时，不把 45s + 45s 串成超过客户端 60s 的请求。
+      const [fresh, freshCredits] = await Promise.all([
+        quotaCached ? Promise.resolve(cached!) : cli
+          ? fetchAgyUsage(cli.run, cli.cliPath)
+          : fetchQuotaSnapshot(this._cache, this._deps),
+        creditsCached ? Promise.resolve(previousCredits!) : cli
+          ? fetchAgyCredits(cli.run, cli.cliPath)
+          : Promise.resolve<CreditsSnapshot>({ status: 'unavailable', updatedAt: new Date().toISOString(), error: { code: 'cli-unavailable', message: '未找到官方 agy CLI，无法查询 AI Credits' } }),
+      ])
+      const credits: CreditsSnapshot = freshCredits.status === 'error' && previousCredits?.status === 'ok'
+        ? { ...previousCredits, stale: true, staleReason: freshCredits.error?.message ?? '余额刷新失败' }
+        : freshCredits
+      this._creditsCache.value = credits
+      if (credits.stale || credits.status === 'error') delete this._creditsCache.at
+      else if (!creditsCached) this._creditsCache.at = now
       // 刷新失败但手里有上一次成功的数据：继续展示它并标记 stale，而不是让药丸
       // 因为一次网络抖动就从「剩余 62%」变成「额度读取失败」。CLI 与 HTTP 回退
       // 共用同一条 stale 保留语义。
@@ -216,12 +276,12 @@ export class AgYQuotaService extends TypertRemoteService {
       this._cache.value = snapshot
       // stale 不算新鲜：不刷新时间戳，也不被缓存命中分支当作可复用结果，下次调用立刻重试。
       if (snapshot.stale === true) delete this._cache.at
-      else this._cache.at = now
+      else if (!quotaCached) this._cache.at = now
       this._log?.info(
         `antigravity-acp: 额度取数结果 status=${snapshot.status} 组数=${snapshot.groups.length}` +
           (snapshot.error ? ` 错误=${snapshot.error.code}:${snapshot.error.message.slice(0, 160)}` : ''),
       )
-      return snapshot
+      return { ...snapshot, credits }
     } catch (error) {
       // 取数实现自身已折叠错误；这里兜住意外异常，绝不让原始错误穿到客户端。
       // 脱敏与快照内其它错误一致：token / URL userinfo 等不能进 UI 或宿主日志。

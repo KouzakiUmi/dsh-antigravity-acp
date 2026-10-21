@@ -438,17 +438,17 @@ export class AgentLink {
   }
 
   /** 创建会话并保存会话 id。 */
-  async newSession(request: NewSessionRequest): Promise<NewSessionResponse> {
+  async newSession(request: NewSessionRequest, options?: AgentLinkRequestOptions): Promise<NewSessionResponse> {
     this.#requireInitialized('session/new')
-    const response = await this.request<NewSessionResponse>('session/new', request)
+    const response = await this.request<NewSessionResponse>('session/new', request, options)
     this.#boundSessionId = response.sessionId
     return response
   }
 
   /** 设置会话配置选项（configId/value 形状按 ACP v1 schema）。 */
-  async setConfigOption(params: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
+  async setConfigOption(params: SetSessionConfigOptionRequest, options?: AgentLinkRequestOptions): Promise<SetSessionConfigOptionResponse> {
     this.#requireInitialized('session/set_config_option')
-    return this.request<SetSessionConfigOptionResponse>('session/set_config_option', params)
+    return this.request<SetSessionConfigOptionResponse>('session/set_config_option', params, options)
   }
 
   /** 发送一轮用户 prompt；响应只含 stopReason，流式内容走 session/update。 */

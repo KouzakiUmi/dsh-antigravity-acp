@@ -12,6 +12,10 @@ DeepSeek Harness (DSH) host bundle：把 Google 官方 Antigravity ACP server
 - 工具执行留在 DSH 侧：进程内私有 `127.0.0.1` loopback MCP 桥把当前
   DSH 工具 schema 交给官方 agent；`tools/call` 被 park 后以 DSH
   `tool-call` 结束本轮，下一轮带着 tool result 续同一 ACP prompt。
+- 若官方在 MCP 调用之前要求 ACP 授权，插件可把可解析的当前目录工具请求
+  转为普通 DSH `tool-call`；**官方原始调用仍被拒绝**，工具审批、参数校验和
+  沙箱执行由 DSH 负责。该路径每回合只接管一个请求，回收旧官方进程，收到
+  DSH 结果后按完整历史重建 ACP 回合，不在旧 prompt 上继续执行。
 - 登录态由本包**导入**：读本机官方 CLI 已登录的
   `~/.gemini/antigravity-cli/antigravity-oauth-token`（只读），换发一颗
   access token 后落成官方 server 认的 `~/.gemini/antigravity-acp/acp_token.json`，
@@ -57,7 +61,8 @@ LOW 运行，受 MIC「禁止向上写」约束，写不进中等完整性的 `~
 `subprocess` 会 scrub 父进程环境，所以代理只能由本包显式注入子进程：
 
 - `proxyUrl`：如 `http://127.0.0.1:7890`；缺 scheme 按 `http` 处理，
-  支持 `http`/`https`/`socks5`/`socks5h`/`socks4`。留空即直连。
+  支持 `http`/`https`/`socks5`/`socks5h`/`socks4`。留空继承宿主代理环境变量，
+  宿主也未配置时才直连；清空此项不等于强制关闭宿主代理。
 - `proxyBypass`：逗号分隔的排除列表，用户条目会与本机地址合并。
 - 注入 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 与对应小写键，
   Windows 上运行的 Python 栈读大写，小写键覆盖 POSIX 风格读取者。
@@ -72,14 +77,15 @@ ACP v1 没有「不建会话、不认证」就能读到模型目录的方法：`
 只带 `protocolVersion` / `agentCapabilities` / `authMethods` / `agentInfo`，
 `configOptions` 只出现在会话响应与 `config_option_update` 里。因此：
 
-- 未观测到真实目录时，本包广告一条占位模型 `server-default`，让模型选择器能
-  列出本 provider；选中它不会调用 `session/set_config_option`，而是映射到
-  配置项 `preferredModel`（留空则用官方会话默认模型）。
-- 占位项**始终保留在列表首位**，即使真实目录已经出现 —— 用户往往在登录前就选了
-  `server-default`，把它挤掉会造成「当前模型不在列表里」。
+- 不再展示「首次对话登录」占位模型。没有缓存时目录可以为空，通过设置页显式
+  连接 ACP 或「一键拉取模型」获得目录，不必先发送聊天消息。
+- `preferredModel` 可从目录选择或手填自定义 ID，保存后优先列出；目录外 ID 明确
+  标记为用户配置、尚未验证。不会自动替换当前会话的已选模型。
+- 旧会话的 `server-default` 路由仍兼容：映射到 `preferredModel`，留空沿用官方默认，
+  但不再广告为新选择项。
 - 观测到的目录会写入 `$DSH_HOME/cache/antigravity-acp/catalog.json`（只含
   id/name/description/contextWindow，不含任何凭据），重启后用它兜住选择器；ACP server 版本变化
-  或文件损坏即失效，回落为占位项。
+  或文件损坏即失效；没有其它来源时目录为空。
 - **家族折叠 + 思考强度路由**（2026-10-16 用户指示）：官方把思考强度编码进
   模型 id（`claude-opus-5-5-{low,medium,high}`），但模型选择**只出家族一行**
   （`claude-opus-5-5`「Claude Opus 5.5」），强度由 DSH 的思考强度菜单（低/中/高）
@@ -107,11 +113,16 @@ ACP v1 没有采样参数通道，以下请求项的处理是明确的：
 
 ## 稳定性与诊断
 
-- **当前权限限制**：ACP `session/request_permission` 尚未可靠区分原生与桥接调用，
-  因此仍按现有规则拒绝。官方 `call_mcp_tool` 也可能在到达 DSH 之前被拒绝；
-  纯文本回复成功不代表工具执行已验收，不能靠扩大目录白名单或全局自动批准来掩盖。
-  权限诊断只记录固定字段是否存在、会话/桥目录匹配关系和选项种类；不记录标题、调用 id、
-  参数正文、路径值或令牌，也不据此自动授权。可信身份不足时继续拒绝。
+- **ACP 权限与 DSH 审批分层**：插件从不选择 ACP 的 `allow_once` 或 `allow_always`。
+  官方 1.4.0 的 `_meta.mcp` 来自参数信封，并非可靠执行身份；插件只用它解析一个
+  **不可信的 DSH 工具请求**，且必须命中当前会话、当前桥名与当前工具目录，参数包装一致。
+  请求交给 DSH 后，官方原始调用被拒绝，旧桥凭证撤销、进程回收；重复或迟到请求不能
+  重复投递。DSH 工具结果的调用 id 和 `isError` 随完整历史进入新 ACP 会话，DSH 的拒绝
+  不会变成 ACP 自动放行。代价是这类调用每次重建回合，有额外启动开销。
+  无法解析的请求仍拒绝，不按标题或原始参数猜测授权，也不使用全局自动批准模式。
+  权限诊断只记录固定字段存在性、匹配关系与选项种类，不记录标题、调用 id、参数正文、
+  路径值或令牌。`Denied by user`/`pre-tool hook` 单独出现不能证明是 DSH 沙箱拒绝；
+  日志会区分插件拒绝与已转交 DSH。纯文本回复成功不代表真实工具链路已验收。
 - 主对话与后台标题可以并发调用同一个 provider。适配器在首次异步启动前占位、
   串行调度；工具 park 期间保留主回合所有权，标题等待，不能覆盖当前回合或撤销工具桥。
   同会话同步压缩则走放弃旧 prompt、按完整历史重建的兜底，避免等待自身工具结果而死锁。
@@ -145,7 +156,18 @@ ACP v1 没有采样参数通道，以下请求项的处理是明确的：
 
 卡片走宿主真实存在的通道：`remote.settings.describe()` 读取、`remote.settings.mutate()`
 写入（改 `preferredModel` / `proxyUrl` / `proxyBypass`），`remote.llm.listProviders()`
-确认路由是否注册。宿主**没有** `remote.llm.listModels`，所以模型目录不在卡片里展示。
+确认路由是否注册。宿主没有 `remote.llm.listModels`，本包通过自有
+`remote.agyQuota.models` 提供目录；强制刷新走官方 `agy models`，失败保留旧目录并显示错误。
+
+- **连接 / 登录 ACP**：需用户确认，复用本机官方登录态，必要时由官方进程打开浏览器
+  授权。只创建空工具会话验证连接，不发送模型 prompt；支持取消，结束后回收独立进程。
+  对话/工具回合进行中拒绝登录，不抢占当前聊天。状态只是最近一次连接验证，不代表
+  CLI 已登录，也不展示任何令牌或账号凭据。
+- **CLI 登录独立**：额度与 CLI 模型目录仍需在官方 `agy` 中完成登录；不假装 ACP
+  登录同时解决两份登录态，不实现未经核实的 CLI 无头登录。
+- **额度手动刷新**：设置页与药丸共用读取器，刷新结果同步；失败、缓存及未知有明确标记。
+- **模型选择**：目录下拉框与手填 ID 共用 `preferredModel`，点击保存生效。不提供模型
+  删除、禁用或账户切换，也不自动开启 AI Credits 付费。
 
 客户端插件的 `inject` 必须逐个声明用到的 remote 命名空间
 （`remote`、`remote.settings`、`remote.llm`）：宿主把每个命名空间做成独立服务，
@@ -157,8 +179,31 @@ ACP v1 没有采样参数通道，以下请求项的处理是明确的：
 
 选中 `antigravity-acp` 的模型时，输入区模型选择器**左侧**出现用量药丸
 （`conversation.input.right` 槽，宿主 InputBar 把它渲染在模型选择器之前；
-实现手法参考 dsh-subusage 的同位置药丸）。点开可见各组额度窗的剩余百分比、
-重置倒计时与订阅档位；读取失败会显示可读原因，不把未知当充足。
+实现手法参考 dsh-subusage 的同位置药丸）。药丸本身只有当前模型所属额度组的
+迷你条（每个窗口一条），悬浮与无障碍标签提供窗口和百分比，不再显示服务商文字摘要。
+Gemini、Claude/GPT、Gemini 4 Argon 分开匹配，同 provider 切换模型也立即切换额度条。
+未知自定义型号或旧 `server-default` 不借用其它模型的数字，而显示未知符号。
+
+展开面板固定展示三个额度组，缺少的数据标为未提供；展示每窗剩余百分比、重置时间、
+当前模型标记、缓存状态、更新时间和刷新按钮。适配深浅主题，支持 Escape / 外部点击关闭。
+AI Credits 余额通过官方 `agy -p /credits --output-format json` 读取，取
+`command.data.remaining_credits`，可选套餐名为 `plan_name`。只接受成功的 credits
+本地报告与非负安全整数；真实零余额显示 0，缺字段/非法数字不转成零。
+
+余额与套餐额度分别缓存、分别标记失败和更新时间，共用刷新按钮。暂时查询失败可显示
+旧余额并明确标为缓存；官方明确不提供账户信息时撤下旧值。余额失败不影响正常模型
+额度，额度失败也不掩盖有效余额。没有 CLI 时余额标为未提供，不从 HTTP 配额推算。
+不会展示未经核验的升级链接，也不会开启 `useG1Credits` 付费回退。
+
+2026-10-22 已用本机官方 CLI 实测 `/credits`：退出码 0、`status: SUCCESS`、
+`command.name: credits`，金额为 number，`num_turns: 0`、`usage.total_tokens: 0`。
+该无头契约由本机实现与真实回包补充核验，官方 TUI 文档本身不完整覆盖其 JSON 接口；
+不据此保证所有旧版 CLI 都支持，旧版本/无信息/请求失败会显式显示状态。
+
+UI 使用宿主 React 18.3.1，生命周期依照 [React 18 文档](https://18.react.dev/reference/react/useEffect)。
+CLI 登录与余额限制参见官方 [安装与认证](https://antigravity.google/docs/cli/install.md)、
+[无头模式](https://antigravity.google/docs/cli/headless.md) 和 [AI Credits](https://antigravity.google/docs/cli/commands/credits.md)。
+可运行 `node scripts/preview-ui.mjs` 生成离线模拟预览；它不访问宿主页面、不执行登录，不能替代真实 GUI 验收。
 
 取数链路（Host 侧 `remote.agyQuota.read`）：
 
@@ -167,15 +212,17 @@ ACP v1 没有采样参数通道，以下请求项的处理是明确的：
    结果取 `command.data.groups[].buckets[]`（`window`/`remaining_fraction`/
    `reset_time`）。CLI 路径可用 `AGY_CLI_BIN` 覆盖，缺省按
    `%LOCALAPPDATA%\agy\bin\agy.exe` 等默认位置探测。
-2. 无官方 CLI 时退回 Cloud Code Assist HTTP 线（读 `antigravity-oauth-token`
-   → 过期时内存内换发 → `loadCodeAssist` → `retrieveUserQuotaSummary`）。
+2. 余额独立执行 `agy -p /credits --output-format json`，与套餐额度并发取数，各有
+   45 秒超时。多视图并发刷新合并为一轮，每个命令各执行一次；有效缓存不重复取数。
+3. 无官方 CLI 时仅套餐额度退回 Cloud Code Assist HTTP 线（读 `antigravity-oauth-token`
+   → 过期时内存内换发 → `loadCodeAssist` → `retrieveUserQuotaSummary`）；余额不猜测回退接口。
 
-边界（2026-10-16 经用户明确授权）：
+取数边界：
 
-- 「不 wrap agy CLI」放宽为**仅限只读取数用途**：只跑 `/usage` 与 `models` 两个
-  只读命令，不发对话、不写文件；子进程一律经 DSH 的 `ctx.subprocess`。
-- 「bundle 不读 OAuth 凭据」放宽为额度取数只读：登录态**只读不写**，换发出的
-  access token 只在内存里用，绝不改官方登录文件；
+- CLI 取数仅使用 `/usage`、`/credits` 和 `models`，不发送聊天或修改付费设置；
+  子进程一律经 DSH 的 `ctx.subprocess`，环境和超时沿用同一套受管通道。
+- HTTP 额度回退对登录态只读，换发出的 access token 仅在内存里用；
+  CLI 通道不由插件直接读写凭据，官方 CLI 自行管理其认证状态；
 - token 材料不进快照、不进错误文本、不进日志（错误统一过 `redactSensitiveText`，
   含 `Bearer <token>` 打码）；
 - 取数失败折叠成 `status: 'error'` 的可读快照，不把异常抛穿到界面。

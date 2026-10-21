@@ -205,6 +205,11 @@ export class McpToolBridge {
     return this.#tools.map((tool) => tool.name)
   }
 
+  /** 当前目录的只读快照，供权限请求转交 DSH 时匹配工具 schema。 */
+  toolSchemas(): readonly ToolSchema[] {
+    return [...this.#tools]
+  }
+
   /** ACP `session/new` 用的 mcpServers 条目；仅 127.0.0.1 loopback。 */
   acpRegistration(): AcpMcpServer[] {
     if (!this.#address) return []

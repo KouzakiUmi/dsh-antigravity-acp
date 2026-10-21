@@ -64,7 +64,18 @@ export interface QuotaGroup {
   buckets: QuotaBucket[]
 }
 
-/** 额度快照：成功带 groups/plan，失败带 error，二者不混用。 */
+/** 官方 AI Credits 独立快照；未知或失败绝不伪装成零余额。 */
+export interface CreditsSnapshot {
+  status: 'ok' | 'unavailable' | 'error'
+  updatedAt: string
+  remainingCredits?: number
+  planName?: string
+  stale?: boolean
+  staleReason?: string
+  error?: { code: 'cli-unavailable' | 'no-credit-info' | 'unsupported' | 'request-failed' | 'bad-response'; message: string }
+}
+
+/** 额度快照：成功带 groups/plan，失败带 error；credits 有独立状态。 */
 export interface QuotaSnapshot {
   status: 'ok' | 'error'
   /** 取数时间（ISO 8601）。 */
@@ -75,6 +86,7 @@ export interface QuotaSnapshot {
   /** 订阅档位名（loadCodeAssist 的 paidTier/currentTier.name）。 */
   plan?: string
   groups: QuotaGroup[]
+  credits?: CreditsSnapshot
   error?: { code: QuotaErrorCode; message: string }
 }
 
