@@ -40,7 +40,7 @@ describe('resolveInstallRoot', () => {
   })
 
   it('数据缓存仍留在 DSH home（只有可执行文件必须搬走）', () => {
-    expect(resolveCacheDir({ DSH_HOME: 'C:\\Users\\tester\\.dsh' }, homedir)).toBe(
+    expect(resolveCacheDir({ DSH_HOME: 'C:\\Users\\tester\\.dsh' }, homedir).replaceAll('/', '\\')).toBe(
       ['C:\\Users\\tester\\.dsh', ...CACHE_SUBPATH].join('\\'),
     )
   })

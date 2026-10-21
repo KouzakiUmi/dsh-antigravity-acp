@@ -8,9 +8,8 @@
  */
 import { createWriteStream } from 'node:fs'
 import { access, chmod, mkdir, mkdtemp, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
-import { dirname } from 'node:path'
 import { homedir as osHomedir, tmpdir } from 'node:os'
-import { join, normalize, resolve, sep } from 'node:path'
+import { dirname, join, normalize, resolve, sep, win32 } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import yauzl from 'yauzl'
 
@@ -258,10 +257,10 @@ export function resolveInstallRoot(
   if (override && override.trim().length > 0) return override.trim()
   if (platform === 'win32') {
     const localAppData = env.LOCALAPPDATA?.trim()
-    if (localAppData) return join(localAppData, INSTALL_DIR_NAME)
+    if (localAppData) return win32.join(localAppData, INSTALL_DIR_NAME)
     const profile = env.USERPROFILE?.trim()
-    if (profile) return join(profile, 'AppData', 'Local', INSTALL_DIR_NAME)
-    return join(tmpdir(), INSTALL_DIR_NAME)
+    if (profile) return win32.join(profile, 'AppData', 'Local', INSTALL_DIR_NAME)
+    return win32.join(tmpdir(), INSTALL_DIR_NAME)
   }
   const xdgCache = env.XDG_CACHE_HOME?.trim()
   if (xdgCache) return join(xdgCache, INSTALL_DIR_NAME)

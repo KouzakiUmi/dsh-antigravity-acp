@@ -12,7 +12,7 @@
  * （本模块通过 {@link CliRun} 注入，不碰 child_process），失败折叠为可读错误。
  */
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, join, win32 } from 'node:path'
 import type { SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import { redactSensitiveText } from './redact.js'
 import { ambientProxyEnv, buildProxyEnv } from './proxy-env.js'
@@ -45,8 +45,8 @@ export function agyCliCandidates(
   if (override) return [override]
   const localAppData = env.LOCALAPPDATA?.trim()
   return [
-    ...(localAppData ? [join(localAppData, 'agy', 'bin', 'agy.exe')] : []),
-    join(home, 'AppData', 'Local', 'agy', 'bin', 'agy.exe'),
+    ...(localAppData ? [win32.join(localAppData, 'agy', 'bin', 'agy.exe')] : []),
+    win32.join(home, 'AppData', 'Local', 'agy', 'bin', 'agy.exe'),
     join(home, '.local', 'bin', 'agy'),
     join(home, 'bin', 'agy'),
   ]

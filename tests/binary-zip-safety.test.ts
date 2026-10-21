@@ -238,11 +238,14 @@ describe('ensureAgentBinary 临时文件清理', () => {
   it('含目录条目的官方式 zip 能整链下载解压并挑出可执行文件', async () => {
     const cacheDir = await mkdtemp(join(tmpdir(), 'agy-cache-'))
     try {
+      const platform = process.platform === 'win32' ? 'windows' : process.platform === 'darwin' ? 'darwin' : 'linux'
+      const executableName = process.platform === 'win32' ? 'agy-acp-server.exe' : 'agy-acp-server'
+      const archiveRoot = `agy-acp-server-1.4.0-${platform}-x86_64`
       const archive = zip([
-        { name: 'agy-acp-server-1.4.0-windows-x86_64/', data: Buffer.alloc(0) },
-        { name: 'agy-acp-server-1.4.0-windows-x86_64/bin/', data: Buffer.alloc(0) },
-        { name: 'agy-acp-server-1.4.0-windows-x86_64/bin/agy-acp-server.exe', data: Buffer.from('MZ fake exe') },
-        { name: 'agy-acp-server-1.4.0-windows-x86_64/README.txt', data: Buffer.from('hi') },
+        { name: `${archiveRoot}/`, data: Buffer.alloc(0) },
+        { name: `${archiveRoot}/bin/`, data: Buffer.alloc(0) },
+        { name: `${archiveRoot}/bin/${executableName}`, data: Buffer.from('fake executable') },
+        { name: `${archiveRoot}/README.txt`, data: Buffer.from('hi') },
       ])
       const resolution = await ensureAgentBinary({
         autoDownload: true,
@@ -252,7 +255,7 @@ describe('ensureAgentBinary 临时文件清理', () => {
       })
       expect(resolution.source).toBe('download')
       expect(resolution.executablePath.replaceAll('\\', '/')).toContain(
-        '1.4.0/extract-1.4.0/agy-acp-server-1.4.0-windows-x86_64/bin/agy-acp-server.exe',
+        `1.4.0/extract-1.4.0/${archiveRoot}/bin/${executableName}`,
       )
     } finally {
       await rm(cacheDir, { recursive: true, force: true })
