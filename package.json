@@ -1,6 +1,6 @@
 {
   "name": "dsh-bundle-antigravity-host",
-  "version": "0.1.22",
+  "version": "0.1.23",
   "description": "DeepSeek Harness host bundle that talks to the official Antigravity ACP server over stdio (Agent Client Protocol v1).",
   "repository": {
     "type": "git",
