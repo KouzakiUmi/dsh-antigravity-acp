@@ -289,7 +289,7 @@ describe('CLI 调用面', () => {
 
   it('候选路径：AGY_CLI_BIN 覆盖优先', () => {
     expect(agyCliCandidates({ AGY_CLI_BIN: 'D:\\custom\\agy.exe' })).toEqual(['D:\\custom\\agy.exe'])
-    const candidates = agyCliCandidates({ LOCALAPPDATA: 'C:\\Users\\x\\AppData\\Local' }, 'C:\\Users\\x')
+    const candidates = agyCliCandidates({ LOCALAPPDATA: 'C:\\Users\\x\\AppData\\Local' }, 'C:\\Users\\x', undefined, 'win32')
     expect(candidates[0]).toContain('AppData\\Local\\agy\\bin\\agy.exe')
   })
 
