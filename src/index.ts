@@ -21,9 +21,11 @@ import type { AgentLinkHandlers } from './protocol/agent-link.js'
 import {
   AGY_BINARY_ERROR,
   cleanupStalePyiTempDirs,
+  cleanupStaleStagingDirs,
   DEFAULT_ACP_SERVER_VERSION,
   ensureAgentBinary,
   resolveCacheDir,
+  resolveInstallRoot,
 } from './runtime/binary.js'
 import { resolveProxy } from './runtime/proxy-env.js'
 import { createProxiedFetch } from './runtime/proxied-fetch.js'
@@ -380,6 +382,7 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
   // onefile 解压目录在进程被强杀后不会自清理，实测会累积到数十 GB。挂在装载期做
   // 一次尽力而为的清理（只删超过 1 小时的陈旧目录），不阻塞任何请求路径。
   void cleanupStalePyiTempDirs(join(cacheDir, 'pyi-tmp')).catch(() => 0)
+  void cleanupStaleStagingDirs(resolveInstallRoot()).catch(() => 0)
 
   // 官方 agy CLI 的只读取数通道（额度 /usage 与模型清单 models）。2026-10-16
   // 用户授权「不 wrap agy CLI」**仅限只读取数用途**：只跑这两个只读命令，

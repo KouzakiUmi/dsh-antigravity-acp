@@ -10,6 +10,7 @@ import { createWriteStream } from 'node:fs'
 import { access, chmod, mkdir, mkdtemp, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir as osHomedir, tmpdir } from 'node:os'
 import { dirname, join, normalize, resolve, sep, win32 } from 'node:path'
+import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import yauzl from 'yauzl'
 
@@ -107,6 +108,7 @@ export interface HttpResponseLike {
   ok: boolean
   status: number
   arrayBuffer(): Promise<ArrayBuffer>
+  body?: unknown
 }
 
 export type FetchLike = (
@@ -114,14 +116,11 @@ export type FetchLike = (
   init: { redirect: 'manual'; signal?: AbortSignal },
 ) => Promise<HttpResponseLike>
 
-/**
- * 下载二进制。redirect 显式设为 'manual'，任何 3xx 都视为错误——
- * 官方分发应直链；重定向意味着 URL 失效或被劫持，不跟随。
- */
-export async function downloadBinary(
+/** 执行下载请求并校验安全策略（白名单域名、https、拒绝 3xx 重定向、2xx 状态）。 */
+async function fetchDownloadResponse(
   url: string,
   options: { fetchImpl?: FetchLike; signal?: AbortSignal; timeoutMs?: number } = {},
-): Promise<Uint8Array> {
+): Promise<HttpResponseLike> {
   assertDownloadUrl(url)
   const doFetch: FetchLike = options.fetchImpl ?? ((url2, init) => fetch(url2, init))
   // 整体超时：无超时的 fetch 在网络挂住时会让首轮对话永远等下去（连同 single-flight
@@ -138,7 +137,43 @@ export async function downloadBinary(
   if (!response.ok) {
     throw new AgyBinaryError(AGY_BINARY_ERROR.BAD_STATUS, `下载失败，HTTP ${response.status}: ${url}`)
   }
+  return response
+}
+
+/**
+ * 下载二进制到内存。redirect 显式设为 'manual'，任何 3xx 都视为错误——
+ * 官方分发应直链；重定向意味着 URL 失效或被劫持，不跟随。
+ */
+export async function downloadBinary(
+  url: string,
+  options: { fetchImpl?: FetchLike; signal?: AbortSignal; timeoutMs?: number } = {},
+): Promise<Uint8Array> {
+  const response = await fetchDownloadResponse(url, options)
   return new Uint8Array(await response.arrayBuffer())
+}
+
+/**
+ * 流式下载二进制并直接写入指定文件路径。
+ * 若 response.body 提供可读流则以管道直写，避免将 ~100MB 的 zip 整包载入 V8 堆内存；
+ * 若未提供流（如测试用 arrayBuffer 替身）则回退到 arrayBuffer 写入。
+ */
+export async function downloadBinaryToFile(
+  url: string,
+  destPath: string,
+  options: { fetchImpl?: FetchLike; signal?: AbortSignal; timeoutMs?: number } = {},
+): Promise<void> {
+  const response = await fetchDownloadResponse(url, options)
+  if (response.body && typeof Readable.fromWeb === 'function') {
+    try {
+      const nodeStream = Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0])
+      await pipeline(nodeStream, createWriteStream(destPath))
+      return
+    } catch {
+      // 流管道异常时回退到 arrayBuffer
+    }
+  }
+  const bytes = new Uint8Array(await response.arrayBuffer())
+  await writeFile(destPath, bytes)
 }
 
 /**
@@ -311,6 +346,60 @@ export async function cleanupStalePyiTempDirs(
       removed += 1
     } catch {
       // 目录正被占用（并发实例）或权限不足：跳过，不影响启动。
+    }
+  }
+  return removed
+}
+
+/** 下载解压暂存目录前缀。 */
+export const STAGING_DIR_PREFIX = '.staging-'
+/** 判定暂存目录「陈旧」的默认阈值（1 小时）。 */
+export const STAGING_MAX_AGE_MS = 3_600_000
+
+/**
+ * 清理下载或解压过程中因强杀/异常中断而残留的陈旧 `.staging-*` 目录。
+ * 遍历指定目录自身及其直接子目录（如 `<installRoot>/<version>/.staging-*`）。
+ * 仅删除 mtime 超过阈值的目录，避免干扰正在进行的并发安装。
+ */
+export async function cleanupStaleStagingDirs(
+  dir: string,
+  options: { maxAgeMs?: number; now?: () => number } = {},
+): Promise<number> {
+  const maxAgeMs = options.maxAgeMs ?? STAGING_MAX_AGE_MS
+  const now = (options.now ?? Date.now)()
+  let removed = 0
+  const entries = await readdir(dir, { withFileTypes: true }).catch(() => undefined)
+  if (!entries) return 0
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue
+    if (entry.name.startsWith(STAGING_DIR_PREFIX)) {
+      const target = join(dir, entry.name)
+      try {
+        const info = await stat(target)
+        if (now - info.mtimeMs >= maxAgeMs) {
+          await rm(target, { recursive: true, force: true, maxRetries: 2 })
+          removed += 1
+        }
+      } catch {
+        // 忽略删除失败
+      }
+    } else {
+      const subdir = join(dir, entry.name)
+      const subentries = await readdir(subdir, { withFileTypes: true }).catch(() => undefined)
+      if (!subentries) continue
+      for (const sub of subentries) {
+        if (!sub.isDirectory() || !sub.name.startsWith(STAGING_DIR_PREFIX)) continue
+        const subtarget = join(subdir, sub.name)
+        try {
+          const info = await stat(subtarget)
+          if (now - info.mtimeMs >= maxAgeMs) {
+            await rm(subtarget, { recursive: true, force: true, maxRetries: 2 })
+            removed += 1
+          }
+        } catch {
+          // 忽略删除失败
+        }
+      }
     }
   }
   return removed
@@ -531,8 +620,7 @@ export async function ensureAgentBinary(options: AgentBinaryOptions = {}): Promi
   const staging = await mkdtemp(join(versionDir, '.staging-'))
   const zipTmp = join(staging, 'agy-acp-server.zip.tmp')
   try {
-    const bytes = await downloadBinary(url, { fetchImpl: options.fetchImpl, signal: options.signal })
-    await writeFile(zipTmp, bytes)
+    await downloadBinaryToFile(url, zipTmp, { fetchImpl: options.fetchImpl, signal: options.signal })
     const stagingExtract = join(staging, 'extract')
     await mkdir(stagingExtract, { recursive: true })
     const entries = await extractZipSafely(zipTmp, stagingExtract)

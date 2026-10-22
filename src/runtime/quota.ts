@@ -163,14 +163,14 @@ export function isTokenUsable(state: QuotaTokenState, nowMs: number, marginMs = 
   return expiresAt - nowMs > marginMs
 }
 
-/** 官方二进制里内嵌的安装型 OAuth 客户端元数据（公开标识）。 */
-const CLIENT_ID_PATTERN = /\d+-[a-z0-9]+\.apps\.googleusercontent\.com/g
-const CLIENT_SECRET_PATTERN = /GOCSPX-[A-Za-z0-9_-]{28}/g
 
-/** 从官方二进制文本里提取 client 元数据；取不到返回 undefined（不猜值）。 */
+
+
+
+/** 从官方二进制文本里提取 client 元数据（正则即时编译匹配，不留模块级全局状态）；取不到返回 undefined（不猜值）。 */
 export function parseOAuthClientFromBinary(text: string): OAuthClientMeta | undefined {
-  const ids = text.match(CLIENT_ID_PATTERN) ?? []
-  const secrets = text.match(CLIENT_SECRET_PATTERN) ?? []
+  const ids = text.match(/\d+-[a-z0-9]+\.apps\.googleusercontent\.com/g) ?? []
+  const secrets = text.match(/GOCSPX-[A-Za-z0-9_-]{28}/g) ?? []
   // 与官方 CLI 同源的最后一条 client id 最可能是当前在用的；secret 只有一个候选即用。
   for (const clientId of [...ids].reverse()) {
     for (const clientSecret of secrets) return { clientId, clientSecret }

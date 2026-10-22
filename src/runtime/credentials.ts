@@ -176,11 +176,28 @@ const DEFAULT_FRESHNESS_MARGIN_MS = 60_000
  * 中途崩溃也不能留下半截 JSON 让官方 server 读到坏文件。Windows 忽略 mode，
  * 继承用户目录 ACL。
  */
+async function renameWithRetry(source: string, target: string, maxRetries = 3, delayMs = 50): Promise<void> {
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    try {
+      await rename(source, target)
+      return
+    } catch (error) {
+      const code = (error as { code?: string })?.code
+      const isLockError = code === 'EPERM' || code === 'EBUSY' || code === 'EACCES'
+      if (attempt < maxRetries && isLockError) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs * (attempt + 1)))
+        continue
+      }
+      throw error
+    }
+  }
+}
+
 async function writeFileAtomic(path: string, data: string): Promise<void> {
   const temp = `${path}.${process.pid}.${Date.now()}.tmp`
   try {
     await writeFile(temp, data, { encoding: 'utf8', mode: 0o600 })
-    await rename(temp, path)
+    await renameWithRetry(temp, path)
   } catch (error) {
     await rm(temp, { force: true }).catch(() => undefined)
     throw error

@@ -3,13 +3,14 @@
  * 临时文件失败清理。全部使用注入的 fake fetch / 真实临时目录，无网络。
  */
 import { describe, expect, it } from 'vitest'
-import { mkdtemp, readdir, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   AgyBinaryError,
   AGY_BINARY_ERROR,
   downloadBinary,
+  downloadBinaryToFile,
   ensureAgentBinary,
   extractZipSafely,
   pickExecutablePath,
@@ -55,6 +56,45 @@ describe('downloadBinary', () => {
     await expect(downloadBinary('https://evil.example.com/a.zip', { fetchImpl: fakeFetch(200) })).rejects.toMatchObject({
       code: AGY_BINARY_ERROR.BLOCKED_URL,
     })
+  })
+
+  it('downloadBinaryToFile 支持流式下载直接写入文件', async () => {
+    const tmp = join(tmpdir(), `test-dl-${Date.now()}.bin`)
+    try {
+      const data = new Uint8Array([1, 2, 3, 4, 5])
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(data)
+          controller.close()
+        },
+      })
+      await downloadBinaryToFile('https://dl.google.com/test.zip', tmp, {
+        fetchImpl: async () => ({
+          ok: true,
+          status: 200,
+          body: stream,
+          arrayBuffer: async () => data.buffer,
+        }),
+      })
+      const saved = await readFile(tmp)
+      expect(Array.from(saved)).toEqual([1, 2, 3, 4, 5])
+    } finally {
+      await rm(tmp, { force: true }).catch(() => undefined)
+    }
+  })
+
+  it('downloadBinaryToFile 在未提供 stream body 时回退写入 arrayBuffer', async () => {
+    const tmp = join(tmpdir(), `test-dl-fb-${Date.now()}.bin`)
+    try {
+      const data = new Uint8Array([6, 7, 8])
+      await downloadBinaryToFile('https://dl.google.com/test.zip', tmp, {
+        fetchImpl: fakeFetch(200, data),
+      })
+      const saved = await readFile(tmp)
+      expect(Array.from(saved)).toEqual([6, 7, 8])
+    } finally {
+      await rm(tmp, { force: true }).catch(() => undefined)
+    }
   })
 })
 

@@ -68,6 +68,8 @@ describe('createProxiedFetch', () => {
 
   it('排除列表匹配：精确主机与通配后缀', () => {
     expect(matchesBypass('localhost', 'localhost,127.0.0.1')).toBe(true)
+    expect(matchesBypass('localhost', 'localhost:8080,127.0.0.1:7890')).toBe(true)
+    expect(matchesBypass('127.0.0.1', '127.0.0.1:7890')).toBe(true)
     expect(matchesBypass('a.internal', '*.internal')).toBe(true)
     expect(matchesBypass('a.internal', '.internal')).toBe(true)
     expect(matchesBypass('example.com', '*.internal,localhost')).toBe(false)

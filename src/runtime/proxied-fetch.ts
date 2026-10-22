@@ -51,8 +51,13 @@ function isHttpProxy(url: string): boolean {
 export function matchesBypass(hostname: string, bypass: string): boolean {
   const host = hostname.toLowerCase().replace(/^\[|\]$/g, '')
   for (const raw of bypass.split(',')) {
-    const entry = raw.trim().toLowerCase()
+    let entry = raw.trim().toLowerCase().replace(/^\[|\]$/g, '')
     if (!entry) continue
+    // 若用户填写的排除条目包含端口（如 127.0.0.1:8080），剥离端口部分以便与 hostname 对齐
+    const colonIdx = entry.lastIndexOf(':')
+    if (colonIdx > 0 && /^\d+$/.test(entry.slice(colonIdx + 1))) {
+      entry = entry.slice(0, colonIdx)
+    }
     if (entry === host) return true
     if (entry.startsWith('*.') && host.endsWith(entry.slice(1))) return true
     if (entry.startsWith('.') && host.endsWith(entry)) return true
