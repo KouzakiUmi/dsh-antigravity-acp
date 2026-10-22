@@ -4,8 +4,8 @@
  * 形态：官方 ACP server（Gemini 主模型）走 stdio，工具留在 DSH 侧，经插件
  * 进程内的私有 loopback MCP 桥暴露给 agent（见 ../bridge/mcp-bridge.ts）。
  *
- * 历史权威是 DSH：**本文件不建任何会话存储/数据库/文件**。每次 `stream` 都
- * 用完整的 `options.messages` + `options.system` 重建一条 ACP prompt
+ * 历史权威是 DSH：**本文件不建任何会话存储/数据库/文件**。新轮用
+ * 完整的 `options.messages` + `options.system` 建立 ACP prompt，工具结果续轮复用该 prompt
  * （见 prompt-transcript.ts）；唯一的跨回合内存态是「当前 ACP 回合」与
  * 「park 中的 MCP tools/call」，它们都随回合结束而释放。
  *
@@ -25,7 +25,7 @@ import type {
 } from '@deepseek-ai/dsh-llm'
 import type { AnyRequest, McpServer as AcpMcpServer, SessionConfigOption, SessionNotification } from '@agentclientprotocol/sdk'
 import type { AgentLink, AgentLinkHandlers } from '../protocol/agent-link.js'
-import { McpToolBridge } from '../bridge/mcp-bridge.js'
+import { BRIDGE_MCP_SERVER_NAME, McpToolBridge } from '../bridge/mcp-bridge.js'
 import type { BridgeToolResult } from '../bridge/mcp-bridge.js'
 import {
   AGY_REASONING_EFFORTS,
@@ -39,8 +39,11 @@ import {
 import type { AgyReasoningEffort } from '../runtime/agy-cli.js'
 import { findModelSelector, toModelCatalog } from './model-catalog.js'
 import type { ModelSelector } from './model-catalog.js'
-import { buildPromptContent, renderToolResultText } from './prompt-transcript.js'
+import { buildPromptWithImages, buildToolResultContent } from './image-content.js'
+import type { ImageReader } from './image-content.js'
 import { AGY_TURN_ERROR, PromptTurn } from './prompt-turn.js'
+import type { AcpLifecycle } from '../runtime/lifecycle.js'
+import { ContinuationState } from './continuation-state.js'
 
 /** DSH 侧 provider 标识符；与 cordis.patch.yml 的 id 及文档保持一致。 */
 export const AGY_PROVIDER_ID = 'antigravity-acp'
@@ -68,12 +71,13 @@ export const AGY_ADAPTER_ERROR = {
 
 /** MCP 桥与回合的可调参数（由 index.ts 从插件配置注入）。 */
 export interface AntigravityAcpAdapterOptions {
+  lifecycle?: AcpLifecycle
   /**
    * 惰性启动工厂：返回完成 initialize + authenticate 的 AgentLink。传入的
    * handlers 必须在整个 adapter 生命周期内保持**同一对象**——index.ts 会把
    * 首个 handler 集合固化到被缓存的 AgentLink 上，后续回合只更换其内部状态。
    */
-  getLink: (handlers: AgentLinkHandlers, signal?: AbortSignal) => Promise<AgentLink>
+  getLink: (handlers: AgentLinkHandlers, signal?: AbortSignal, purpose?: 'warmup') => Promise<AgentLink>
   /** 回收指定连接及其受管子进程；完成前禁止开启下一个回合。 */
   recycleLink: (link: AgentLink) => Promise<void>
   /** 登记桥的关闭钩子（index.ts 把它挂到 ActiveAcpRuntime.bridgeTeardown）。 */
@@ -93,6 +97,10 @@ export interface AntigravityAcpAdapterOptions {
   loadCachedCatalog?: () => Promise<CachedModel[] | undefined>
   /** 观测到真实目录后的落盘回调；失败由实现方自行吞掉。 */
   saveCatalog?: (models: readonly CachedModel[]) => Promise<void> | void
+  /** Metadata only, for sharing catalog/context observations across isolated workers. */
+  onMetadataChanged?: (metadata: AdapterMetadata) => void
+  readImage?: ImageReader
+  canReadImages?: () => boolean
   /**
    * 官方 CLI 模型清单（`agy models` 的只读取数，2026-10-16 授权仅限只读取数
    * 用途）。用于补齐会话观测之外的官方型号；失败由 adapter 吞掉。
@@ -120,6 +128,12 @@ export interface CachedModel {
   contextWindow?: number
 }
 
+export interface AdapterMetadata {
+  catalog: CachedModel[]
+  contextWindows: Array<[string, number]>
+  imageSupported?: boolean
+}
+
 /*
  * 关于失败重试：**刻意不 override `providerRetryPolicy`**。
  *
@@ -142,6 +156,7 @@ const DEFAULT_PROMPT_TIMEOUT_MS = 30 * 60_000
 const DEFAULT_PARK_SETTLE_MS = 50
 
 export class AntigravityAcpAdapter extends LlmAdapter {
+  readonly #lifecycle: AcpLifecycle | undefined
   readonly #getLink: AntigravityAcpAdapterOptions['getLink']
   readonly #recycleLink: AntigravityAcpAdapterOptions['recycleLink']
   #cleanup: Promise<void> = Promise.resolve()
@@ -159,6 +174,11 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   readonly #saveCatalog?: AntigravityAcpAdapterOptions['saveCatalog']
   readonly #loadCliCatalog?: AntigravityAcpAdapterOptions['loadCliCatalog']
   readonly #log?: AdapterLog
+  readonly #onMetadataChanged?: AntigravityAcpAdapterOptions['onMetadataChanged']
+  #continuationState: ContinuationState | undefined
+  readonly #readImage?: ImageReader
+  readonly #canReadImages?: () => boolean
+  #imageSupported: boolean | undefined
   /** 官方 CLI 清单的在途读取；完成即释放，底层负责缓存和后台刷新。 */
   #cliCatalog?: Promise<readonly { id: string; name: string }[]>
   /** 家族 → 支持的思考强度档位（由 listModels 折叠得到）。 */
@@ -201,6 +221,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
 
   constructor(options: AntigravityAcpAdapterOptions) {
     super()
+    this.#lifecycle = options.lifecycle
     this.#getLink = options.getLink
     this.#recycleLink = options.recycleLink
     this.#registerBridgeTeardown = options.registerBridgeTeardown
@@ -212,7 +233,14 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     this.#saveCatalog = options.saveCatalog
     this.#loadCliCatalog = options.loadCliCatalog
     this.#log = options.log
-    this.#bridge = new McpToolBridge()
+    this.#onMetadataChanged = options.onMetadataChanged
+    this.#readImage = options.readImage
+    this.#canReadImages = options.canReadImages
+    this.#bridge = new McpToolBridge({
+      onArgumentsNormalized: (tool, renamed) => this.#log?.info(
+        `antigravity-acp: 工具参数别名已修正 tool=${tool} ${renamed.map(({ from, to }) => `${from}->${to}`).join(',')}（仅键名）`,
+      ),
+    })
     this.#registerBridgeTeardown(async () => {
       this.#disposed = true
       this.#wakeAccessWaiters()
@@ -234,6 +262,84 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   /** 设置页连接不能与正在进行的对话/工具回合竞争同一登录态。 */
   get busy(): boolean {
     return this.#streamActive || Boolean(this.#turn && !this.#isTurnClosed(this.#turn))
+  }
+
+  get streamActive(): boolean { return this.#streamActive }
+  get awaitingToolResults(): boolean { return this.#turn?.awaitingToolResults === true }
+  ownsRequest(options: Pick<GenerateOptions, 'sessionId' | 'purpose'>): boolean {
+    return this.#turnOwner !== undefined && this.#turnOwner.sessionId === options.sessionId && this.#turnOwner.purpose === options.purpose
+  }
+
+  exportMetadata(): AdapterMetadata {
+    return {
+      catalog: this.#catalog.map(({ id, name, description }) => ({ id, name, ...(description === undefined ? {} : { description }) })),
+      contextWindows: [...this.#contextWindows],
+      ...(this.#imageSupported === undefined ? {} : { imageSupported: this.#imageSupported }),
+    }
+  }
+
+  importMetadata(metadata: AdapterMetadata): void {
+    if (metadata.imageSupported !== undefined) this.#imageSupported = metadata.imageSupported
+    if (metadata.catalog.length) {
+      this.#catalog = metadata.catalog.map((model) => ({ ...model, provider: AGY_PROVIDER_ID, inputModalities: ['text'] }))
+      this.#catalogObserved = true
+      this.#cacheLoad = undefined
+    }
+    for (const [model, size] of metadata.contextWindows) {
+      if (Number.isFinite(size) && size > 0) this.#rememberContextWindow(model, size)
+    }
+  }
+
+  /** Explicit discovery is allowed to authenticate, but never sends a model prompt. */
+  async discoverModels(signal?: AbortSignal, interactive = true): Promise<readonly LlmModelInfo[]> {
+    if (this.busy) throw new LlmError('ACP 正在处理对话，请在空闲时连接并读取模型目录', AGY_ADAPTER_ERROR.BUSY)
+    if (this.#disposed) throw new LlmError('Antigravity ACP adapter 已卸载', 'AGY_LINK_CLOSED')
+    this.#streamActive = true
+    let link: AgentLink | undefined
+    try {
+      await withAbort(this.#settleRecycle(), signal)
+      link = await this.#getLink(this.#handlers, signal, interactive ? undefined : 'warmup')
+      this.#observeCapabilities(link)
+      throwIfAborted(signal)
+      const session = await link.newSession({
+        cwd: this.#cwd, mcpServers: [],
+        _meta: { antigravity: { enabledTools: [], eagerMcpServers: [] } },
+      }, { signal })
+      throwIfAborted(signal)
+      if (!findModelSelector(session.configOptions)) throw new LlmError('ACP 会话未提供模型目录', AGY_ADAPTER_ERROR.NO_MODEL_SELECTOR)
+      this.observeSessionConfigOptions(session.configOptions)
+      return await this.listModels(AGY_PROVIDER_ID)
+    } catch (error) {
+      if (link) this.#scheduleRecycle(link)
+      throw error
+    } finally {
+      this.#streamActive = false
+      this.#wakeAccessWaiters()
+    }
+  }
+
+  /** 预热复用聊天的同一组 handlers 和运行时；不建临时会话、不消耗模型请求。 */
+  async warmup(signal?: AbortSignal, interactive = false): Promise<void> {
+    if (this.#disposed) throw new LlmError('Antigravity ACP adapter 已卸载', 'AGY_LINK_CLOSED')
+    if (this.busy) throw new LlmError('ACP 正在处理对话，无需再次预热', AGY_ADAPTER_ERROR.BUSY)
+    await withAbort(this.#settleRecycle(), signal)
+    const link = await this.#getLink(this.#handlers, signal, interactive ? undefined : 'warmup')
+    this.#observeCapabilities(link)
+  }
+
+  #observeCapabilities(link: AgentLink): void {
+    const supported = link.initializeResponse?.agentCapabilities?.promptCapabilities?.image === true
+    if (supported === this.#imageSupported) return
+    this.#imageSupported = supported
+    this.#onMetadataChanged?.(this.exportMetadata())
+  }
+
+  #imageOptions(signal?: AbortSignal) {
+    return { readImage: this.#readImage, supported: this.#imageSupported === true && (this.#canReadImages?.() ?? true), signal }
+  }
+
+  #inputModalities(): readonly ('text' | 'image')[] {
+    return this.#readImage && this.#imageSupported === true && (this.#canReadImages?.() ?? true) ? ['text', 'image'] : ['text']
   }
 
   /** 私有 MCP 桥（诊断与测试可见；agent 侧只经 ACP mcpServers 访问它）。 */
@@ -283,7 +389,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         id: model.id,
         name: model.name,
         ...(model.description === undefined ? {} : { description: model.description }),
-        inputModalities: ['text'] as const,
+        inputModalities: this.#inputModalities(),
       })),
     ]
   }
@@ -391,7 +497,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       provider,
       id: model,
       name: known?.name ?? model,
-      inputModalities: ['text'],
+      inputModalities: this.#inputModalities(),
       ...(known?.description === undefined ? {} : { description: known.description }),
       ...(contextWindow === undefined ? {} : { context: { contextWindow } }),
       // 思考强度菜单：官方把强度编码进模型 id 后缀，本 provider 只出家族条目，
@@ -415,6 +521,9 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   }
 
   override async prepareCall(provider: string, model: string, signal?: AbortSignal): Promise<PreparedAdapterCall> {
+    // Request preparation runs before DSH projects image blocks. Discovery here only
+    // handshakes; passive listModels/resolveModel remain free of connection I/O.
+    if (this.#readImage && (this.#canReadImages?.() ?? true) && this.#imageSupported === undefined) await this.warmup(signal, true)
     const modelInfo = await this.resolveModel(provider, model, signal)
     return {
       model: modelInfo,
@@ -444,6 +553,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     let handedOff = false
     try {
       for await (const chunk of this.#streamExclusive(options)) {
+        if (chunk.type === 'block-end') this.#continuationState?.emitted(chunk.block)
         // 消费者在收到 finish 后 return 是合法的（尤其是工具续轮）。
         if (chunk.type === 'finish') handedOff = true
         yield chunk
@@ -495,14 +605,15 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     let turn = this.#turn
     if (turn?.awaitingToolResults) {
       // 能续轮的前提有两个：ACP prompt 尚未应答（同一 prompt 内才能继续
-      // 产出），且尾部 tool 结果与 park 表按顺序一一匹配。
-      if (!turn.requiresRebuild && !turn.promptSettled && matchesParkedCalls(turn, tail, this.#bridge)) {
+      // 产出），且尾部 tool 结果与 park 表按调用 id 一一匹配。
+      if (!turn.promptSettled && matchesParkedCalls(turn, tail, this.#bridge) && this.#continuationState?.accepts(options, tail.length)) {
+        this.#continuationState = new ContinuationState(options)
         yield* this.#runContinuation(turn, options, tail)
         return
       }
       // 不匹配（或 agent 已经收尾）→ 按 brief 的兜底规则放弃旧回合、回到
       // W4 的「重建新 prompt」路径；历史权威仍是 DSH 的完整 messages。
-      this.#abandonTurn('续轮条件不满足（工具结果与 park 表不匹配，或 ACP prompt 已应答），按新轮重建')
+      this.#abandonTurn('续轮条件不满足（工具结果、路由、上下文或工具定义已变化，或 ACP prompt 已应答），按新轮重建')
       turn = undefined
     }
     if (turn && !this.#isTurnClosed(turn)) {
@@ -563,6 +674,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     const setup = (async () => {
       check()
       link = await this.#getLink(this.#handlers, options.signal)
+      this.#observeCapabilities(link)
       check()
       const tools = options.tools ?? []
       this.#bridge.beginRound(tools)
@@ -572,9 +684,17 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         check()
         mcpServers = this.#bridge.acpRegistration()
       }
-      const session = await link.newSession({ cwd: this.#cwd, mcpServers }, { signal: options.signal })
+      // 官方 1.4.0 tool_filter.py / mcp_servers.py 的会话扩展：禁用内置工具
+      // （仅关闭 ACP clientCapabilities 不够），直接向模型加载完整 MCP schema。
+      this.#lifecycle?.roundPhase('session')
+      const session = await link.newSession({
+        cwd: this.#cwd,
+        mcpServers,
+        _meta: { antigravity: { enabledTools: [], eagerMcpServers: tools.length > 0 ? [BRIDGE_MCP_SERVER_NAME] : [] } },
+      }, { signal: options.signal })
       check()
       this.observeSessionConfigOptions(session.configOptions)
+      this.#lifecycle?.roundPhase('model')
       await this.#applyModelSelection(link, session.sessionId, options.model, options.reasoningEffort, options.signal)
       check()
       return { link, session, tools }
@@ -591,6 +711,9 @@ export class AntigravityAcpAdapter extends LlmAdapter {
           if (this.#unrecycledLink === link) this.#unrecycledLink = undefined
         })
         void this.#cleanup.catch(() => undefined)
+      } else {
+        this.#bridge.invalidateRound('ACP 回合准备失败')
+        if (link) this.#scheduleRecycle(link)
       }
       throwIfAborted(options.signal)
       throw error
@@ -604,9 +727,14 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
       ...(options.purpose === undefined ? {} : { purpose: options.purpose }),
     }
+    this.#continuationState = new ContinuationState(options)
     // usage_update 的上下文容量归属到本次请求的 DSH 路由键。
     this.#routeModelId = options.model
-    const { link, session, tools } = await this.#prepareRound(options)
+    this.#lifecycle?.beginRound(options.model)
+    const { link, session, tools } = await this.#prepareRound(options).catch((error: unknown) => {
+      this.#lifecycle?.failed(error)
+      throw error
+    })
 
     const turn = new PromptTurn(session.sessionId, {
       link,
@@ -614,6 +742,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       promptTimeoutMs: this.#promptTimeoutMs,
       parkSettleMs: this.#parkSettleMs,
       onTerminate: (reason, info) => {
+        this.#lifecycle?.failed(reason)
         this.#bridge.invalidateRound(reason)
         this.#releaseTurnSubscription(turn)
         if (info?.clean === true) {
@@ -626,15 +755,14 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         this.#scheduleRecycle(link)
         this.#wakeAccessWaiters()
       },
-      onHandoff: () => {
-        // 已把请求作为普通 tool-call 发给 DSH；官方原始调用仍被拒绝。
-        // 撤销整个旧桥代次，禁止 agent 绕过拒绝再次投递同一调用。
-        this.#bridge.invalidateRound('工具请求已转交 DSH，官方调用被拒绝')
-        this.#releaseTurnSubscription(turn)
-        this.#scheduleRecycle(link)
-        this.#log?.info('antigravity-acp: ACP 请求已转换为 DSH 工具调用；等待 DSH 审批/执行，未授予官方执行权限')
-        this.#wakeAccessWaiters()
-      },
+      onBridgePermission: (tool) => this.#log?.info(
+        `antigravity-acp: 已允许私有 MCP 桥单次调用 tool=${tool}；执行与审批仍由 DSH 负责，复用当前 ACP prompt`,
+      ),
+      onArgumentIssues: (info) =>
+        this.#log?.warn(
+          `antigravity-acp: 转交的工具调用参数与 schema 不符 tool=${info.tool}` +
+            `（缺少必填=[${info.missing.join(',')}] 未声明键=${info.unknownCount}个[${info.unknown.join(',')}]；仅键名，入桥后修正别名并预检）`,
+        ),
       onConfigOptions: (observed) => this.observeSessionConfigOptions(observed),
       onPermissionDiagnostic: (diagnostic) =>
         this.#log?.warn(`antigravity-acp: 权限请求结构（仅诊断，不代表授权） ${JSON.stringify(diagnostic)}`),
@@ -652,7 +780,9 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       `antigravity-acp: 回合开始 model=${options.model} purpose=${options.purpose ?? 'chat'} session=${session.sessionId} tools=${tools.length}` +
         `${options.reasoningEffort === undefined ? '' : ` effort=${String(options.reasoningEffort)}`}`,
     )
-    turn.startPrompt(buildPromptContent(options.system, options.messages), options.signal)
+    const content = await buildPromptWithImages(options.system, options.messages, tools, this.#imageOptions(options.signal))
+    this.#lifecycle?.promptSent()
+    turn.startPrompt(content, options.signal)
     try {
       let chunks = 0
       let textChars = 0
@@ -663,6 +793,8 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         if (chunk.type === 'reasoning-delta') reasoningChars += chunk.text.length
         if (chunk.type === 'finish') finish = chunk.reason.kind
         if (chunks === 0) this.#log?.info(`antigravity-acp: 回合首块到达（type=${chunk.type}）`)
+        if (chunk.type !== 'finish') this.#lifecycle?.firstOutput(chunk.type === 'block-end' && chunk.block.type === 'tool-call')
+        else this.#lifecycle?.finish(chunk.reason.kind)
         chunks += 1
         yield chunk
       }
@@ -670,6 +802,8 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         `antigravity-acp: 回合结束 model=${options.model} purpose=${options.purpose ?? 'chat'}` +
           ` 块数=${chunks} textChars=${textChars} reasoningChars=${reasoningChars} finish=${finish}`,
       )
+      const timing = this.#lifecycle?.read().round
+      if (timing) this.#log?.info(`antigravity-acp: 回合计时 elapsedMs=${Math.round(timing.elapsedMs)} firstChunkMs=${timing.firstChunkMs === undefined ? '-' : Math.round(timing.firstChunkMs)} firstToolMs=${timing.firstToolMs === undefined ? '-' : Math.round(timing.firstToolMs)} setup=${JSON.stringify(timing.timings)}`)
     } catch (error) {
       this.#log?.warn(`antigravity-acp: 回合失败 model=${options.model}`, error)
       throw error
@@ -691,18 +825,20 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       return
     }
     turn.resume(options.signal)
+    this.#lifecycle?.continuing()
     // 续轮仍在同一个 ACP prompt 内：先确保 park 订阅在位——回喂之后 agent
     // 可能马上发起第二批 tools/call，若此处没有订阅，那些 MCP 请求会永久挂起。
     // 同回合重复调用是幂等的，不会叠加监听器。
     this.#subscribeTurn(turn)
-    const results: BridgeToolResult[] = tail.map((message) => {
+    const results: BridgeToolResult[] = await Promise.all(tail.map(async (message) => {
       if (message.role !== 'tool') throw new LlmError('续轮内部错误：非 tool 角色进入工具回喂', AGY_ADAPTER_ERROR.BUSY)
       return {
         callId: message.toolCallId,
-        text: renderToolResultText(message.content as readonly { type: string }[]),
+        text: '',
+        content: await buildToolResultContent(message.content, this.#imageOptions(options.signal)),
         isError: message.isError === true,
       }
-    })
+    }))
     try {
       // 续轮不重发 prompt：结果交给桥 resolve 上轮 park 的 MCP 调用，agent 在
       // **同一个 ACP prompt** 内继续产出后续 session/update。
@@ -714,7 +850,11 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         // （AGY_NO_PENDING_TOOL_CALL）掩盖原始失败。
         if (!turn.terminated) throw error
       }
-      yield* drainTurn(turn)
+      for await (const chunk of drainTurn(turn)) {
+        if (chunk.type !== 'finish') this.#lifecycle?.firstOutput(chunk.type === 'block-end' && chunk.block.type === 'tool-call')
+        else this.#lifecycle?.finish(chunk.reason.kind)
+        yield chunk
+      }
     } finally {
       this.#releaseTurnSubscriptionIfClosed(turn)
     }
@@ -771,6 +911,8 @@ export class AntigravityAcpAdapter extends LlmAdapter {
 
   #handleUnexpectedRequest(method: string, _request: AnyRequest): void {
     if (!this.#turn) return
+    const params = _request.params as { sessionId?: unknown } | undefined
+    if (params?.sessionId !== undefined && params.sessionId !== this.#turn.sessionId) return
     this.#turn.handleUnexpectedAgentRequest(method)
   }
 
@@ -785,13 +927,14 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     // 只认当前回合的 ACP 会话：被放弃的旧会话仍可能继续发通知，不能把它的
     // 容量记到新回合的路由键上。
     const turn = this.#turn
-    if (turn !== undefined && notification.sessionId !== turn.sessionId) return
+    if (!turn || turn.terminated || notification.sessionId !== turn.sessionId) return
     const size = update.size
     if (typeof size !== 'number' || !Number.isFinite(size) || size <= 0) return
     const model = this.#routeModelId
     if (!model) return
     if (this.#contextWindows.get(model) === size) return
     this.#contextWindows.set(model, size)
+    this.#onMetadataChanged?.(this.exportMetadata())
     // 容量随目录一起落盘，重启后压缩引擎不必等下一次 usage_update。
     this.#persistCatalog()
   }
@@ -819,6 +962,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     this.#catalogObserved = true
     this.#modelSelector = selector
     this.#catalog = toModelCatalog(AGY_PROVIDER_ID, selector)
+    this.#onMetadataChanged?.(this.exportMetadata())
     // 观测到真实目录后缓存不再参与 listModels，避免配置变更后仍读到旧磁盘目录。
     this.#cacheLoad = undefined
     // 真实目录只在会话建立后才能观测到；落盘后重启不必退化成占位模型。
@@ -841,7 +985,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         ...(contextWindow === undefined ? {} : { contextWindow }),
       }
     })
-    void Promise.resolve(this.#saveCatalog(payload)).catch(() => undefined)
+    void Promise.resolve().then(() => this.#saveCatalog?.(payload)).catch(() => undefined)
   }
 
   /** 是否已经从真实 ACP 会话观测到过配置（listModels 空目录时的诊断依据）。 */
@@ -978,7 +1122,8 @@ function trailingToolResults(messages: readonly RequestMessage[]): RequestMessag
 }
 
 /**
- * 续轮匹配：尾部 tool 结果与**仍在等待回喂**的 park 调用按顺序一一对应。
+ * 续轮匹配：尾部 tool 结果与**仍在等待回喂**的 park 调用按 id 一一对应。
+ * 并行工具的完成顺序可以与发起顺序不同。
  *
  * 只统计尚未回喂的 park：同一个 ACP prompt 内可以有多批工具调用，早先批次
  * 交付后仍留在 `parkedCalls` 里作为回合账本；若把它们一并计入长度比较，
@@ -988,8 +1133,6 @@ function matchesParkedCalls(turn: PromptTurn, tail: readonly RequestMessage[], b
   if (tail.length === 0) return false
   const parked = turn.parkedCalls.filter((call) => bridge.hasPending(call.callId))
   if (parked.length !== tail.length) return false
-  return tail.every((message, index) => {
-    const call = parked[index]
-    return message.role === 'tool' && call !== undefined && call.callId === message.toolCallId
-  })
+  const remaining = new Set(parked.map((call) => call.callId))
+  return tail.every((message) => message.role === 'tool' && remaining.delete(message.toolCallId))
 }

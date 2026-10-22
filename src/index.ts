@@ -4,10 +4,9 @@
  * 注入 'llm'（adapter 注册表）与 'subprocess'（生命周期受管子进程服务）。
  * 子进程一律经 ctx.subprocess 创建，绝不 import child_process。
  *
- * 生命周期闭环：dispose 时按顺序——关闭所有 AgentLink → 终止所有由本插件
- * 经 ctx.subprocess 启动的 ACP 子进程 → 关闭插件进程内的私有 loopback MCP 桥。
+ * 生命周期闭环：dispose 时终止受管进程并关闭 AgentLink，确认退出后释放运行目录，
+ * 最后关闭插件进程内的私有 loopback MCP 桥。
  */
-import { mkdir } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
@@ -15,18 +14,25 @@ import { LlmError } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-llm'
 import type { ClientCapabilities } from '@agentclientprotocol/sdk'
 import type { SubprocessHandle, SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
+import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
 import { AntigravityAcpAdapter, AGY_PROVIDER_ID } from './adapter/antigravity-adapter.js'
+import type { AdapterMetadata } from './adapter/antigravity-adapter.js'
+import { PooledAcpAdapter } from './pool/pooled-adapter.js'
 import { AgentLink, agentStreamFromSubprocess, AGY_CLIENT_INFO, AGY_LINK_ERROR, launchAcpAgent } from './protocol/agent-link.js'
 import type { AgentLinkHandlers } from './protocol/agent-link.js'
 import {
   AGY_BINARY_ERROR,
-  cleanupStalePyiTempDirs,
+  cleanupStaleRuntimeDirectories,
   cleanupStaleStagingDirs,
   DEFAULT_ACP_SERVER_VERSION,
   ensureAgentBinary,
   resolveCacheDir,
   resolveInstallRoot,
+  createRuntimeDirectory,
+  releaseRuntimeDirectory,
+  defaultAgentArgs,
 } from './runtime/binary.js'
+import type { RuntimeDirectoryLease } from './runtime/binary.js'
 import { resolveProxy } from './runtime/proxy-env.js'
 import { createProxiedFetch } from './runtime/proxied-fetch.js'
 import type { ResolvedProxy } from './runtime/proxy-env.js'
@@ -38,6 +44,7 @@ import { readCachedCatalog, writeCachedCatalog } from './runtime/catalog-cache.j
 import { agyCliCandidates, createSubprocessCliRun, fetchAgyModels } from './runtime/agy-cli.js'
 import { AgYQuotaService, registerAgYQuotaRemote } from './quota/quota-remote.js'
 import { SettingsControl } from './quota/control.js'
+import { AcpLifecycle } from './runtime/lifecycle.js'
 import type { AntigravityHostConfig } from './settings.js'
 
 export { AGY_PROVIDER_ID } from './adapter/antigravity-adapter.js'
@@ -64,6 +71,8 @@ export const AGY_CLIENT_CAPABILITIES: ClientCapabilities = {
 
 /** 本插件持有并需在 dispose 时清理的活动 ACP 资源。 */
 export interface ActiveAcpRuntime {
+  directory?: RuntimeDirectoryLease
+  lifecycle?: AcpLifecycle
   link?: AgentLink
   handle?: SubprocessHandle
   /**
@@ -96,10 +105,17 @@ export interface ActiveAcpRuntime {
 export async function disposeAcpRuntime(active: ActiveAcpRuntime): Promise<void> {
   active.disposed = true
   active.abort?.abort(new Error('插件已卸载'))
-  await active.link?.close().catch(() => undefined)
   active.handle?.terminate()
+  await active.link?.close().catch(() => undefined)
   await active.inflight?.catch(() => undefined)
+  const handle = active.handle
+  handle?.terminate()
+  if (active.directory && (!handle || await handle.waitForExit(AbortSignal.timeout(10_000)).catch(() => false))) {
+    await releaseRuntimeDirectory(active.directory).catch(() => undefined)
+    active.directory = undefined
+  }
   await active.bridgeTeardown?.()
+  active.lifecycle?.stopped('disposed')
 }
 
 export type { AgentLinkHandlers }
@@ -107,12 +123,17 @@ export type { AgentLinkHandlers }
 /** 回收失败/取消的连接与其受管进程，不卸载插件；旧连接不能终止后来者。 */
 export async function recycleAcpRuntime(active: ActiveAcpRuntime, link: AgentLink): Promise<void> {
   const handle = active.link === link ? active.handle : undefined
+  if (active.link === link) active.lifecycle?.recycling()
   handle?.terminate()
   await link.close()
   if (handle && !await handle.waitForExit(AbortSignal.timeout(10_000))) {
     throw new LlmError('Antigravity ACP 受管进程未能在回收期限内退出，拒绝开启新回合', AGY_LINK_ERROR.LINK_CLOSED)
   }
-  if (active.link === link) active.link = undefined
+  if (active.link === link && active.directory) {
+    await releaseRuntimeDirectory(active.directory).catch(() => undefined)
+    active.directory = undefined
+  }
+  if (active.link === link) { active.link = undefined; active.lifecycle?.stopped() }
   if (handle && active.handle === handle) active.handle = undefined
 }
 
@@ -124,6 +145,8 @@ export async function recycleAcpRuntime(active: ActiveAcpRuntime, link: AgentLin
  * 它不认识的 icacls 进程。
  */
 export interface AcpRuntimeDeps {
+  /** 预热只使用已有登录态，不触发浏览器登录。 */
+  allowInteractiveAuth?: boolean
   /** 当前启动请求的取消信号，不改变宿主权限。 */
   signal?: AbortSignal
   /** 插件自身 HTTPS 请求（下载、换发）所用的 fetch；默认按配置的代理构造。 */
@@ -165,19 +188,23 @@ export async function ensureAcpRuntime(
   }
   if (active.inflight) return active.inflight
   if (active.link) {
-    if (!active.link.closed) return active.link
+    if (!active.link.closed) { active.lifecycle?.reused(); return active.link }
     // 链路自己关了（协议违规 / 流读取失败 / 回收中途失败）但子进程可能仍活着、
     // handle.done 不会触发：不能把这条死链永久交给调用方，否则之后每个回合都会
     // 在 session/new 上报「ACP 链路已关闭」直到重启。终止旧进程并全新启动。
-    active.handle?.terminate()
-    active.link = undefined
-    active.handle = undefined
   }
   // 同步赋值：startAcpRuntime 内部第一个 await 之前不会有别的调用者插进来。
+  active.lifecycle?.starting()
   const inflight = startAcpRuntime(ctx, config, handlers, active, deps)
   active.inflight = inflight
   try {
     return await inflight
+  } catch (error) {
+    if (!active.disposed) {
+      active.lifecycle?.stopped()
+      if (!deps.signal?.aborted) active.lifecycle?.failed(error)
+    }
+    throw error
   } finally {
     // 成功路径下 link 已就位；失败路径下这里清掉 inflight，让下次能全新重试。
     // 只有仍是本次这一个 promise 时才清，避免误删后来者的。
@@ -193,118 +220,155 @@ async function startAcpRuntime(
   active: ActiveAcpRuntime,
   deps: AcpRuntimeDeps,
 ): Promise<AgentLink> {
+  // Recovery belongs to the same single-flight operation as creation.
+  if (active.link) await recycleAcpRuntime(active, active.link)
+  if (active.handle) {
+    active.handle.terminate()
+    if (!await active.handle.waitForExit(AbortSignal.timeout(10_000)).catch(() => false)) {
+      throw new LlmError('前一个 ACP 进程尚未确认退出，无法安全启动新连接', AGY_LINK_ERROR.LINK_CLOSED)
+    }
+    active.handle = undefined
+    if (active.directory) {
+      await releaseRuntimeDirectory(active.directory).catch(() => undefined)
+      active.directory = undefined
+    }
+  }
   const subprocess: SubprocessRuntime = ctx.subprocess
   active.abort ??= new AbortController()
-  let downloadProxy: ResolvedProxy | undefined
-  try {
-    downloadProxy = resolveProxy({ url: config.proxyUrl, bypass: config.proxyBypass })
-  } catch {
-    // 地址非法由后面的 AGY_INVALID_PROXY 明确报错；这里直连即可。
-    downloadProxy = undefined
-  }
+  const downloadProxy = resolveProxy({ url: config.proxyUrl, bypass: config.proxyBypass })
   const startupSignal = AbortSignal.any([active.abort.signal, ...(deps.signal ? [deps.signal] : [])])
   startupSignal.throwIfAborted()
-  const baseFetch = deps.fetchImpl ?? createProxiedFetch(downloadProxy)
+  const ownedFetch = deps.fetchImpl ? undefined : createProxiedFetch(downloadProxy)
+  const baseFetch = deps.fetchImpl ?? ownedFetch!
   const pluginFetch: typeof fetch = (input, init) => baseFetch(input, {
     ...init,
     signal: AbortSignal.any([startupSignal, ...(init?.signal ? [init.signal] : [])]),
   })
-  const resolution = await ensureAgentBinary({
-    binaryPath: config.binaryPath,
-    autoDownload: config.autoDownload,
-    version: config.acpVersion,
-    signal: startupSignal,
-    // 下载只允许 dl.google.com 且不跟随重定向：包一层只换传输，不放宽这两条。
-    fetchImpl: (url, init) => pluginFetch(url, init) as Promise<Response>,
-  })
-  // Windows：映像文件若带 Low 强制完整性标签（例如装在带该标签的 DSH home 下），
-  // 官方进程会被降成 LOW，受 MIC「禁止向上写」约束而写不进 ~/.gemini/antigravity-acp，
-  // 表现为 session/new 永久挂起。这里只读探测一次并显式报错，不把挂死留给用户。
-  const probeLowIntegrity =
-    deps.probeLowIntegrity ?? ((path: string, sp: SubprocessRuntime) => isLowIntegrityTarget(path, (target) => runIcacls(sp, target)))
-  if (await probeLowIntegrity(resolution.executablePath, subprocess)) {
-    throw new LlmError(describeLowIntegrity(resolution.executablePath), AGY_BINARY_ERROR.LOW_INTEGRITY)
-  }
-  // 下载可能耗时数分钟，期间插件可能被卸载：这时不再 spawn，避免出现一个
-  // dispose 之后才出生、无人终止的进程。
-  if (active.disposed) {
-    throw new LlmError('Antigravity ACP 插件已卸载，取消启动 ACP 链路', AGY_LINK_ERROR.LINK_CLOSED)
-  }
-  const tmpDir = join(resolveCacheDir(), 'pyi-tmp')
-  await mkdir(tmpDir, { recursive: true })
-  // mkdir 之后、spawn 之前再查一次：上面两次 await 期间插件可能已被卸载。
-  if (active.disposed) {
-    throw new LlmError('Antigravity ACP 插件已卸载，取消启动 ACP 链路', AGY_LINK_ERROR.LINK_CLOSED)
-  }
-  startupSignal.throwIfAborted()
-  // 登录态在 spawn 前备好：优先导入本机官方 CLI 的已登录凭据（用户要求不弹浏览器
-  // 登录页）。备好 acp_token.json + settings.json 后，官方 server 启动时自行完成
-  // 认证，因此可以跳过 authenticate —— 该请求在没有交互式浏览器时会一直挂着。
-  // 传入 acpVersion：OAuth client 元数据要从对应版本的缓存二进制里提取。
-  const credentials = await (deps.ensureCredentials
-    ?? (() => ensureAcpCredentials({ acpVersion: config.acpVersion, fetchImpl: pluginFetch })))()
-  startupSignal.throwIfAborted()
-  // 代理在 spawn 前解析：地址非法就当场失败，不要等到官方进程出网才报连接错误。
-  let proxy: ResolvedProxy | undefined
   try {
-    proxy = resolveProxy({ url: config.proxyUrl, bypass: config.proxyBypass })
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    throw new LlmError(`Antigravity ACP 代理配置无效：${message}`, 'AGY_INVALID_PROXY', { cause: error })
-  }
-  const handle = launchAcpAgent(subprocess, {
-    executable: resolution.executablePath,
-    extraArgs: config.extraArgs,
-    tmpDir,
-    proxy,
-  })
-  active.handle = handle
-  const link = new AgentLink({
-    stream: agentStreamFromSubprocess(handle),
-    clientInfo: AGY_CLIENT_INFO,
-    handlers,
-    requestTimeoutMs: config.requestTimeoutMs,
-    // 认证需要人工在浏览器里点授权，走独立的更长超时（默认 5 分钟）。
-    authTimeoutMs: config.authTimeoutMs,
-  })
-  const cancelStartup = (): void => {
-    handle.terminate()
-    void link.close().catch(() => undefined)
-  }
-  startupSignal.addEventListener('abort', cancelStartup, { once: true })
-  link.start()
-  try {
-    startupSignal.throwIfAborted()
-    // initialize 上报关闭全部本地能力的 clientCapabilities（ACP v1 的
-    // ClientCapabilities 属于 initialize 请求，session/new 没有这个字段）。
-    await link.initialize({ clientCapabilities: AGY_CLIENT_CAPABILITIES })
-    // 登录态已就绪（acp_token.json + settings.json 齐备）时跳过 authenticate：
-    // 官方 server 已从 settings.json 推断出 oauth-personal 并自行完成认证，
-    // 而 authenticate 在没有交互式浏览器时会一直挂着（旧行为会白等 5 分钟）。
-    if (!credentials.ready) await link.authenticate()
-    startupSignal.throwIfAborted()
-  } catch (error) {
-    // active.link 尚未被写入（只有认证成功才写），这里只需摘掉 handle 指向。
-    if (active.handle === handle) active.handle = undefined
-    await link.close().catch(() => undefined)
-    handle.terminate()
-    throw toLaunchError(error, readStderr(handle), credentials.ready ? undefined : credentials.note)
-  } finally {
-    startupSignal.removeEventListener('abort', cancelStartup)
-  }
-  // 认证成功后才登记链接：`active.link` 可复用就等于「链路已认证」，因此复用它
-  // 的调用方不需要、也不应该看到认证窗口内的中间状态。
-  active.link = link
-  // 子进程意外退出：清掉 active 上的指向，否则下次 ensureAcpRuntime 会因
-  // `if (active.link) return active.link` 永久复用死链（S2 的姊妹场景）。
-  void handle.done
-    .catch(() => undefined)
-    .then(async () => {
-      if (active.link === link) active.link = undefined
-      if (active.handle === handle) active.handle = undefined
-      await link.close().catch(() => undefined)
+    const resolution = await ensureAgentBinary({
+      binaryPath: config.binaryPath,
+      autoDownload: config.autoDownload,
+      version: config.acpVersion,
+      signal: startupSignal,
+      // 下载只允许 dl.google.com 且不跟随重定向：包一层只换传输，不放宽这两条。
+      fetchImpl: (url, init) => pluginFetch(url, init) as Promise<Response>,
     })
-  return link
+    // Windows：映像文件若带 Low 强制完整性标签（例如装在带该标签的 DSH home 下），
+    // 官方进程会被降成 LOW，受 MIC「禁止向上写」约束而写不进 ~/.gemini/antigravity-acp，
+    // 表现为 session/new 永久挂起。这里只读探测一次并显式报错，不把挂死留给用户。
+    const probeLowIntegrity =
+      deps.probeLowIntegrity ?? ((path: string, sp: SubprocessRuntime) => isLowIntegrityTarget(path, (target) => runIcacls(sp, target)))
+    if (await probeLowIntegrity(resolution.executablePath, subprocess)) {
+      throw new LlmError(describeLowIntegrity(resolution.executablePath), AGY_BINARY_ERROR.LOW_INTEGRITY)
+    }
+    // 下载可能耗时数分钟，期间插件可能被卸载：这时不再 spawn，避免出现一个
+    // dispose 之后才出生、无人终止的进程。
+    if (active.disposed) {
+      throw new LlmError('Antigravity ACP 插件已卸载，取消启动 ACP 链路', AGY_LINK_ERROR.LINK_CLOSED)
+    }
+    startupSignal.throwIfAborted()
+    // 登录态在 spawn 前备好：优先导入本机官方 CLI 的已登录凭据（用户要求不弹浏览器
+    // 登录页）。备好 acp_token.json + settings.json 后，官方 server 启动时自行完成
+    // 认证，因此可以跳过 authenticate —— 该请求在没有交互式浏览器时会一直挂着。
+    // 传入 acpVersion：OAuth client 元数据要从对应版本的缓存二进制里提取。
+    active.lifecycle?.startupPhase('credentials')
+    const credentials = await (deps.ensureCredentials
+      ?? (() => ensureAcpCredentials({ acpVersion: config.acpVersion, cliPath: config.agyCliPath, fetchImpl: pluginFetch })))()
+    startupSignal.throwIfAborted()
+    if (!credentials.ready && deps.allowInteractiveAuth === false) {
+      throw new LlmError('未找到可用的 ACP 登录态，请先使用“连接 / 登录 ACP”，然后再预热', 'AGY_AUTH_REQUIRED')
+    }
+    const proxy = downloadProxy
+    active.lifecycle?.startupPhase('spawn')
+    const directory = await createRuntimeDirectory()
+    active.directory = directory
+    let handle: SubprocessHandle
+    try {
+      startupSignal.throwIfAborted()
+      if (await probeLowIntegrity(directory.path, subprocess)) {
+        throw new LlmError(describeLowIntegrity(directory.path), AGY_BINARY_ERROR.LOW_INTEGRITY)
+      }
+      startupSignal.throwIfAborted()
+      handle = launchAcpAgent(subprocess, {
+        executable: resolution.executablePath,
+        extraArgs: [...defaultAgentArgs(), ...(config.extraArgs ?? [])],
+        tmpDir: directory.path,
+        proxy,
+      })
+    } catch (error) {
+      await releaseRuntimeDirectory(directory).catch(() => undefined)
+      active.directory = undefined
+      throw error
+    }
+    active.handle = handle
+    active.lifecycle?.spawned()
+    let link: AgentLink | undefined
+    const cancelStartup = (): void => {
+      handle.terminate()
+      void link?.close().catch(() => undefined)
+    }
+    try {
+      link = new AgentLink({
+        stream: agentStreamFromSubprocess(handle),
+        clientInfo: AGY_CLIENT_INFO,
+        handlers,
+        requestTimeoutMs: config.requestTimeoutMs,
+        // 认证需要人工在浏览器里点授权，走独立的更长超时（默认 5 分钟）。
+        authTimeoutMs: config.authTimeoutMs,
+      })
+      startupSignal.addEventListener('abort', cancelStartup, { once: true })
+      link.start()
+      startupSignal.throwIfAborted()
+      // initialize 上报关闭全部本地能力的 clientCapabilities（ACP v1 的
+      // ClientCapabilities 属于 initialize 请求，session/new 没有这个字段）。
+      active.lifecycle?.startupPhase('initialize')
+      await link.initialize({ clientCapabilities: AGY_CLIENT_CAPABILITIES })
+      // 登录态已就绪（acp_token.json + settings.json 齐备）时跳过 authenticate：
+      // 官方 server 已从 settings.json 推断出 oauth-personal 并自行完成认证，
+      // 而 authenticate 在没有交互式浏览器时会一直挂着（旧行为会白等 5 分钟）。
+      if (!credentials.ready) {
+        active.lifecycle?.startupPhase('authenticate')
+        await link.authenticate()
+      }
+      startupSignal.throwIfAborted()
+    } catch (error) {
+      // active.link 尚未被写入（只有认证成功才写），这里只需摘掉 handle 指向。
+      handle.terminate()
+      await link?.close().catch(() => undefined)
+      if (await handle.waitForExit(AbortSignal.timeout(10_000)).catch(() => false)) {
+        await releaseRuntimeDirectory(directory).catch(() => undefined)
+        if (active.directory === directory) active.directory = undefined
+        if (active.handle === handle) active.handle = undefined
+      }
+      throw toLaunchError(error, readStderr(handle), credentials.ready ? undefined : credentials.note)
+    } finally {
+      startupSignal.removeEventListener('abort', cancelStartup)
+    }
+    // 认证成功后才登记链接：`active.link` 可复用就等于「链路已认证」，因此复用它
+    // 的调用方不需要、也不应该看到认证窗口内的中间状态。
+    active.link = link
+    const readyLink = link
+    active.lifecycle?.ready()
+    const startup = active.lifecycle?.read().startup
+    if (startup) ctx.logger?.info?.(`antigravity-acp: ACP 连接就绪 startupMs=${Math.round(startup.elapsedMs)} timings=${JSON.stringify(startup.timings)}`)
+    // 子进程意外退出：清掉 active 上的指向，否则下次 ensureAcpRuntime 会因
+    // `if (active.link) return active.link` 永久复用死链（S2 的姊妹场景）。
+    void handle.done
+      .catch(() => undefined)
+      .then(async () => {
+        const exited = await handle.waitForExit(AbortSignal.timeout(10_000)).catch(() => false)
+        if (exited) {
+          await releaseRuntimeDirectory(directory).catch(() => undefined)
+          if (active.directory === directory) active.directory = undefined
+        }
+        if (active.link === readyLink && exited) { active.link = undefined; active.lifecycle?.stopped() }
+        if (active.handle === handle && exited) active.handle = undefined
+        await readyLink.close().catch(() => undefined)
+      })
+    return link
+  } finally {
+    await ownedFetch?.close().catch(() => undefined)
+  }
 }
 
 /**
@@ -375,13 +439,11 @@ export async function connectAcpAccount(ctx: Context, config: AntigravityHostCon
 }
 
 export function apply(ctx: Context, config: AntigravityHostConfig): void {
-  const active: ActiveAcpRuntime = {}
   const cacheDir = resolveCacheDir()
   const acpVersion = config.acpVersion ?? DEFAULT_ACP_SERVER_VERSION
 
-  // onefile 解压目录在进程被强杀后不会自清理，实测会累积到数十 GB。挂在装载期做
-  // 一次尽力而为的清理（只删超过 1 小时的陈旧目录），不阻塞任何请求路径。
-  void cleanupStalePyiTempDirs(join(cacheDir, 'pyi-tmp')).catch(() => 0)
+  // 只回收带本插件所有权且已确认退出的运行目录；未知 / 活跃目录不按年龄删除。
+  void cleanupStaleRuntimeDirectories().catch(() => 0)
   void cleanupStaleStagingDirs(resolveInstallRoot()).catch(() => 0)
 
   // 官方 agy CLI 的只读取数通道（额度 /usage 与模型清单 models）。2026-10-16
@@ -390,16 +452,18 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
   //
   // 代理规则与官方 ACP 进程一致：**配置的 proxyUrl 优先，其次宿主环境自身导出的
   // 代理**。CLI 每次启动都会做登录/配置刷新，缺代理会一直挂在网络上（实测），
-  // 表现为额度药丸永远停在「额度…」。地址非法时这里不报错——首次启动 ACP 链路时
-  // 会以 AGY_INVALID_PROXY 明确失败。
-  let cliProxy: ResolvedProxy | undefined
-  try {
-    cliProxy = resolveProxy({ url: config.proxyUrl, bypass: config.proxyBypass })
-  } catch {
-    cliProxy = undefined
-  }
+  // 表现为额度药丸永远停在「额度…」。地址非法时以 AGY_INVALID_PROXY 明确失败。
+  const cliProxy = resolveProxy({ url: config.proxyUrl, bypass: config.proxyBypass })
+  const pluginFetch = createProxiedFetch(cliProxy)
   const cliRun = createSubprocessCliRun(ctx.subprocess, cliProxy)
-  const cliPath = agyCliCandidates().find((candidate) => existsSync(candidate))
+  const findCli = () => agyCliCandidates(process.env, undefined, config.agyCliPath).find((candidate) => existsSync(candidate))
+  let modelCatalogRevision = 0
+  const catalogChanged = (): void => {
+    modelCatalogRevision++
+    // The host model picker subscribes to this existing registry notification.
+    try { ctx.emit('llm/adapters-updated') } catch { /* Observers cannot veto catalog updates. */ }
+  }
+  let attachmentStore: AttachmentStore | undefined
 
   /**
    * 官方模型清单：缓存先行（选择器即时可用），并在**后台**刷新一遍供下次生效。
@@ -413,6 +477,7 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
   let cliRefresh: Promise<void> | undefined
   let cliRefreshDone = false
   const loadCliModels = async (force = false): Promise<readonly { id: string; name: string }[]> => {
+    const cliPath = findCli()
     if (force && !cliPath) throw new Error('未找到官方 agy CLI，无法拉取模型；请先安装并登录官方 CLI')
     if (!cliDiskRead) {
       cliDiskRead = true
@@ -425,6 +490,7 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
         if (models.length === 0) return
         await writeCachedCatalog({ cacheDir, acpVersion, fileName: 'cli-models.json', models })
         cliModelRows = models
+        catalogChanged()
       })().finally(() => {
         cliRefresh = undefined
         cliRefreshDone = true
@@ -435,43 +501,83 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
     return cliModelRows ?? []
   }
 
-  const adapter = new AntigravityAcpAdapter({
-    // handler 对象由 adapter 构造时创建且身份稳定：AgentLink 只在构造时取一次
-    // handlers，后续回合只更换 adapter 内部的当前回合。
-    getLink: (handlers, signal) => {
-      const state = control.account().state
-      if (state === 'connecting' || state === 'cancelling') throw new Error('设置页正在连接 ACP，请完成或取消后再发消息')
-      return ensureAcpRuntime(ctx, config, handlers, active, { signal })
-    },
-    recycleLink: (link) => recycleAcpRuntime(active, link),
-    registerBridgeTeardown: (teardown) => {
-      active.bridgeTeardown = teardown
-    },
-    promptTimeoutMs: config.promptTimeoutMs,
-    parkSettleMs: config.bridgeParkSettleMs,
-    preferredModel: config.preferredModel,
-    // 冷启动目录：真实目录只能观测到之后才有，先用磁盘缓存兜住模型选择器。
-    loadCachedCatalog: () => readCachedCatalog({ cacheDir, acpVersion }),
-    saveCatalog: (models) => writeCachedCatalog({ cacheDir, acpVersion, models }),
-    // 官方清单补齐会话观测之外的型号（Opus 5.5 / Sonnet 5.5 / Argon 等）。
-    loadCliCatalog: () => loadCliModels(),
-    // 自诊断：模型路由与 set_config_option 失败会写进宿主日志（宿主对 typert /
-    // 适配器内部一律不记日志，出问题时这是唯一的现场）。
-    log: {
-      info: (message: string) => ctx.logger?.info?.(message),
-      warn: (message: string, error?: unknown) => ctx.logger?.warn?.(message, error),
-    },
+  const workers: AntigravityAcpAdapter[] = []
+  let metadata: AdapterMetadata | undefined
+  // Serialize startup/credential preparation, not inference. This avoids competing OAuth imports.
+  let startupBarrier: Promise<unknown> = Promise.resolve()
+  const adapter = new PooledAcpAdapter(() => {
+    const lifecycle = new AcpLifecycle()
+    const active: ActiveAcpRuntime = { lifecycle }
+    const workerIndex = workers.length
+    const worker = new AntigravityAcpAdapter({
+      lifecycle,
+      // handler 对象由 adapter 构造时创建且身份稳定：AgentLink 只在构造时取一次
+      // handlers，后续回合只更换 adapter 内部的当前回合。
+      getLink: (handlers, signal, purpose) => {
+        const launch = startupBarrier.catch(() => undefined).then(() => {
+          signal?.throwIfAborted()
+          return ensureAcpRuntime(ctx, config, handlers, active, { signal, fetchImpl: pluginFetch, allowInteractiveAuth: purpose !== 'warmup' && workerIndex === 0 })
+        })
+        startupBarrier = launch.then(() => undefined, () => undefined)
+        return launch
+      },
+      recycleLink: (link) => recycleAcpRuntime(active, link),
+      registerBridgeTeardown: (teardown) => {
+        active.bridgeTeardown = teardown
+      },
+      promptTimeoutMs: config.promptTimeoutMs,
+      parkSettleMs: config.bridgeParkSettleMs,
+      preferredModel: config.preferredModel,
+      canReadImages: () => attachmentStore !== undefined,
+      readImage: (ref, signal) => {
+        if (!attachmentStore) throw new LlmError('宿主附件服务不可用，无法读取图片', 'AGY_IMAGE_UNAVAILABLE')
+        return attachmentStore.readImage(ref, signal)
+      },
+      onMetadataChanged: (snapshot) => {
+        metadata = snapshot
+        for (const peer of workers) if (peer !== worker) peer.importMetadata(snapshot)
+        catalogChanged()
+      },
+      // 冷启动目录：真实目录只能观测到之后才有，先用磁盘缓存兜住模型选择器。
+      loadCachedCatalog: () => readCachedCatalog({ cacheDir, acpVersion }),
+      saveCatalog: (models) => writeCachedCatalog({ cacheDir, acpVersion, models }),
+      // 官方清单补齐会话观测之外的型号（Opus 5.5 / Sonnet 5.5 / Argon 等）。
+      loadCliCatalog: () => loadCliModels(),
+      // 自诊断：模型路由与 set_config_option 失败会写进宿主日志（宿主对 typert /
+      // 适配器内部一律不记日志，出问题时这是唯一的现场）。
+      log: {
+        info: (message: string) => ctx.logger?.info?.(message),
+        warn: (message: string, error?: unknown) => ctx.logger?.warn?.(redactSensitiveText(`${message}${error ? `: ${error instanceof Error ? error.message : String(error)}` : ''}`)),
+      },
+    })
+    if (metadata) worker.importMetadata(metadata)
+    workers.push(worker)
+    return { adapter: worker, read: () => lifecycle.read(), dispose: () => disposeAcpRuntime(active) }
+  }, { capacity: config.maxConcurrentSessions, queueTimeoutMs: config.queueTimeoutMs })
+  ctx.inject(['attachments'], (scope) => {
+    const store = scope.attachments
+    attachmentStore = store
+    adapter.invalidatePreparation()
+    catalogChanged()
+    scope.effect(() => () => {
+      if (attachmentStore === store) {
+        attachmentStore = undefined
+        adapter.invalidatePreparation()
+        catalogChanged()
+      }
+    })
   })
   const control = new SettingsControl({
+    runtime: () => ({ ...adapter.read(), modelCatalogRevision }),
+    warmup: (signal) => adapter.warmup(signal),
     connect: async (signal) => {
-      if (adapter.busy || active.inflight) throw new Error('正在进行对话或启动，请结束当前操作后再连接账户')
-      if (active.link) await recycleAcpRuntime(active, active.link)
-      signal.throwIfAborted()
-      const session = await connectAcpAccount(ctx, config, signal)
-      adapter.observeSessionConfigOptions(session.configOptions)
+      await adapter.discoverModels(signal)
     },
     models: async (force) => {
-      if (force) await loadCliModels(true)
+      if (force) {
+        if (findCli()) await loadCliModels(true)
+        else await adapter.discoverModels(AbortSignal.timeout(Math.min(config.requestTimeoutMs ?? 30_000, 45_000)), false)
+      }
       return adapter.listModels(AGY_PROVIDER_ID)
     },
   })
@@ -485,12 +591,12 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
   ctx.plugin(AgYQuotaService, {
     control,
     // HTTP 回退路径要从对应版本的缓存二进制里提取 OAuth client 元数据。
-    deps: { cacheDir, acpVersion, fetchImpl: createProxiedFetch(cliProxy) },
-    ...(cliPath ? { cli: { run: cliRun, cliPath } } : {}),
+    deps: { cacheDir, acpVersion, cliPath: config.agyCliPath, fetchImpl: pluginFetch },
+    resolveCli: () => { const cliPath = findCli(); return cliPath ? { run: cliRun, cliPath } : undefined },
     // 取数打点：浏览器侧无法写宿主日志，这条是「药丸有没有真的发请求、结果如何」的唯一现场。
     log: {
       info: (message: string) => ctx.logger?.info?.(message),
-      warn: (message: string, error?: unknown) => ctx.logger?.warn?.(message, error),
+      warn: (message: string, error?: unknown) => ctx.logger?.warn?.(redactSensitiveText(`${message}${error ? `: ${error instanceof Error ? error.message : String(error)}` : ''}`)),
     },
   })
 
@@ -509,6 +615,7 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
   ctx.effect(function* () {
     yield () => registration()
     yield async () => control.dispose()
-    yield async () => disposeAcpRuntime(active)
+    yield async () => { try { await adapter.dispose() } finally { await pluginFetch.close() } }
   }, 'antigravity-acp 生命周期清理')
+  if (config.autoWarmup) control.account('warmup')
 }

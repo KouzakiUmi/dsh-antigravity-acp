@@ -12,7 +12,6 @@
  * 关键性质：**finish 之后队列不再追加任何 chunk**，因此 `nextChunk()` 返回
  * undefined 时消费者已经拿全了本轮的全部内容（含 usage 与最后的 finish）。
  */
-import { randomUUID } from 'node:crypto'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { LlmFailure, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import type {
@@ -33,6 +32,7 @@ import { BRIDGE_MCP_SERVER_NAME } from '../bridge/mcp-bridge.js'
 import { describePermissionRequest } from './permission-diagnostic.js'
 import { parsePermissionHandoff } from './permission-handoff.js'
 import type { PermissionDiagnostic } from './permission-diagnostic.js'
+import { inspectToolArguments, normalizeToolArguments, safeKeyNames } from './tool-args.js'
 
 /** 本文件使用的原创错误码（AGY_* 体系，与 agent-link / mcp-bridge 同族）。 */
 export const AGY_TURN_ERROR = {
@@ -86,8 +86,13 @@ export interface PromptTurnOptions {
   onNativeRefusal?(info: { kind: 'permission' | 'request'; detail: string; count: number }): void
   /** 固定词表的权限结构摘要；仅诊断，不作为放行依据。 */
   onPermissionDiagnostic?(diagnostic: PermissionDiagnostic): void
-  /** 接管请求后停掉官方生产者；不清除等待 DSH 工具结果的所有权。 */
-  onHandoff?(): void
+  /** 仅允许私有 MCP 请求进入桥；不代表 DSH 已批准执行。 */
+  onBridgePermission?(tool: string): void
+  /**
+   * MCP 权限提示中的参数与目录 schema 不符（缺必填 / 出现未声明键）。仅诊断：
+   * 实际入桥时再修正别名与预检，DSH 负责最终校验；这里只含可安全回显的键名。
+   */
+  onArgumentIssues?(info: { tool: string; missing: string[]; unknown: string[]; unknownCount: number }): void
 }
 
 /**
@@ -126,8 +131,9 @@ export class PromptTurn {
   #abortCleanup: (() => void) | undefined
   #terminated = false
   #hasOutput = false
-  #handoff = false
-  readonly #onHandoff: PromptTurnOptions['onHandoff']
+  readonly #permissionIds = new Set<string>()
+  readonly #onBridgePermission: PromptTurnOptions['onBridgePermission']
+  readonly #onArgumentIssues: PromptTurnOptions['onArgumentIssues']
   readonly #onTerminate: PromptTurnOptions['onTerminate']
   /** 本轮封口不等于 ACP prompt 结束；封口后的事件留给下一次 stream 消费。 */
   #deferred: Array<{ kind: 'call'; call: BridgeParkedCall } | { kind: 'update'; update: SessionUpdate }> = []
@@ -142,12 +148,8 @@ export class PromptTurn {
     this.#onNativeRefusal = options.onNativeRefusal
     this.#onPermissionDiagnostic = options.onPermissionDiagnostic
     this.#onTerminate = options.onTerminate
-    this.#onHandoff = options.onHandoff
-  }
-
-  /** 官方调用已拒绝，工具改由 DSH 执行；下一轮必须重建，不能回喂官方调用。 */
-  get requiresRebuild(): boolean {
-    return this.#handoff
+    this.#onBridgePermission = options.onBridgePermission
+    this.#onArgumentIssues = options.onArgumentIssues
   }
 
   /** 本回合的 ACP prompt 是否已有应答；应答后无法再「在同一 prompt 内续轮」。 */
@@ -167,12 +169,12 @@ export class PromptTurn {
 
   /** 本回合是否停在「等待 DSH 回喂工具结果」的续轮状态。 */
   get awaitingToolResults(): boolean {
-    return !this.#terminated && this.#roundEnded && (this.#handoff || this.#parked.some((call) => this.#bridge.hasPending(call.callId)))
+    return !this.#terminated && this.#roundEnded && this.#parked.some((call) => this.#bridge.hasPending(call.callId))
   }
 
   /** 把 session/update 交给当前回合（由 adapter 的稳定 handler 转发）。 */
   handleSessionUpdate(notification: SessionNotification): void {
-    if (notification.sessionId !== this.sessionId || this.#terminated || this.#promptSettled || this.#handoff) return
+    if (notification.sessionId !== this.sessionId || this.#terminated || this.#promptSettled) return
     if (this.#roundEnded) {
       this.#deferred.push({ kind: 'update', update: notification.update })
       return
@@ -181,43 +183,31 @@ export class PromptTurn {
   }
 
   /**
-   * 权限询问一律拒绝（无人值守）：优先回绝选项，无可选项时回 cancelled。
-   *
-   * ACP 权限询问也可能来自 MCP 包装调用，不能一概称为原生 fs/terminal 请求。
-   * 可解析的 MCP 描述可转换成新的 DSH 工具请求，但原始 ACP 调用仍被拒绝。
-   * 不按 title/rawInput/_meta 授予官方执行权。其余请求保留重复拒绝上限。
+   * 仅私有 MCP 路由选择 allow_once，让实际 tools/call 在桥上 park；
+   * 不从权限提示合成第二次工具执行，不在这里封口或回收进程。
+   * 前提是 session/new 已移除 AGY 内置工具，且客户端 fs/terminal 已关闭。
+   * eager 工具按官方固定标题匹配目录；allow_always 从不选择。
    */
   handleRequestPermission(request: RequestPermissionRequest): RequestPermissionResponse {
-    this.#onPermissionDiagnostic?.(describePermissionRequest(request, {
-      sessionId: this.sessionId,
-      serverName: BRIDGE_MCP_SERVER_NAME,
-      toolNames: this.#bridge.toolNames(),
-    }))
     // 迟到/外来会话的请求不能消耗当前回合的拒绝预算，也不能获准继续。
-    if (request.sessionId !== this.sessionId || this.#terminated || this.#promptSettled || this.#handoff) {
+    if (request.sessionId !== this.sessionId || this.#terminated || this.#promptSettled) {
+      this.#reportPermissionDiagnostic(request)
       return { outcome: { outcome: 'cancelled' } }
     }
     const rejection = request.options.find((option) => option.kind === 'reject_once')
       ?? request.options.find((option) => option.kind === 'reject_always')
-    // 仅在本轮尚未交付其他工具时接管一个请求；随即封口和撤销 MCP 通道，
-    // 重复权限请求及迟到 HTTP 调用不能导致同一操作执行两次。
-    const handoff = !this.#roundEnded && !this.#parked.some((call) => this.#bridge.hasPending(call.callId))
-      ? parsePermissionHandoff(request, {
-          sessionId: this.sessionId, serverName: BRIDGE_MCP_SERVER_NAME, tools: this.#bridge.toolSchemas(),
-        })
-      : undefined
-    if (handoff && this.#onHandoff) {
-      this.#handoff = true
-      const call = { callId: `dsh-permission-${randomUUID()}`, ...handoff }
-      this.#parked.push(call)
-      this.#emitToolCallBlock(call)
-      this.finishRound()
-      this.#onHandoff()
-      // 绝不返回 allow_once/allow_always；官方原始调用不获得执行权。
-      return rejection
-        ? { outcome: { outcome: 'selected', optionId: rejection.optionId } }
-        : { outcome: { outcome: 'cancelled' } }
+    const handoff = parsePermissionHandoff(request, {
+      sessionId: this.sessionId, serverName: BRIDGE_MCP_SERVER_NAME, tools: this.#bridge.toolSchemas(),
+    })
+    const allowance = request.options.find((option) => option.kind === 'allow_once')
+    if (handoff && allowance) {
+      if (this.#permissionIds.has(request.toolCall.toolCallId)) return { outcome: { outcome: 'cancelled' } }
+      this.#permissionIds.add(request.toolCall.toolCallId)
+      this.#reportArgumentIssues(handoff)
+      this.#onBridgePermission?.(handoff.name)
+      return { outcome: { outcome: 'selected', optionId: allowance.optionId } }
     }
+    this.#reportPermissionDiagnostic(request)
     // 调用 id 同样是不可信字符串，不进入日志或错误正文。
     this.#recordNativeRefusal('permission', 'session/request_permission')
     return rejection
@@ -225,12 +215,41 @@ export class PromptTurn {
       : { outcome: { outcome: 'cancelled' } }
   }
 
+  #reportPermissionDiagnostic(request: RequestPermissionRequest): void {
+    this.#onPermissionDiagnostic?.(describePermissionRequest(request, {
+      sessionId: this.sessionId,
+      serverName: BRIDGE_MCP_SERVER_NAME,
+      toolNames: this.#bridge.toolNames(),
+    }))
+  }
+
+  /** 对照当前目录 schema 预检转交调用的参数键（只诊断，不改写、不拦截）。 */
+  #reportArgumentIssues(handoff: { name: string; arguments: string }): void {
+    if (!this.#onArgumentIssues) return
+    const tool = this.#bridge.toolSchemas().find((item) => item.name === handoff.name)
+    if (!tool) return
+    let args: unknown
+    try {
+      args = JSON.parse(handoff.arguments)
+    } catch {
+      return
+    }
+    const { missing, unknown } = inspectToolArguments(tool, normalizeToolArguments(tool, args).arguments)
+    if (missing.length === 0 && unknown.length === 0) return
+    this.#onArgumentIssues({
+      tool: tool.name,
+      missing: safeKeyNames(missing),
+      unknown: safeKeyNames(unknown),
+      unknownCount: unknown.length,
+    })
+  }
+
   /**
    * clientCapabilities 已全部关闭，因此这里出现的任何 agent→client 请求都是非预期的。
    * 与权限询问同样处理：响应照旧由 AgentLink 回 method-not-found，本回合先继续。
    */
   handleUnexpectedAgentRequest(method: string): void {
-    if (!this.#handoff) this.#recordNativeRefusal('request', method)
+    this.#recordNativeRefusal('request', method)
   }
 
   /** 计数并在超过上限时终止回合；未超限只记录（回合继续跑）。 */
@@ -269,14 +288,14 @@ export class PromptTurn {
 
   /** 收到 abort 信号：取消 ACP 会话当前回合并以 aborted 结束。 */
   abort(reason: string): void {
-    if (this.#terminated || (this.#promptSettled && !this.#handoff)) return
+    if (this.#terminated || this.#promptSettled) return
     this.#aborted = true
     this.#fail({ code: AGY_TURN_ERROR.ABORTED, message: `Antigravity ACP 回合被调用方中止：${reason}` })
   }
 
   /** 桥 park 了新调用：进入当前回合。 */
   handleParked(call: BridgeParkedCall): void {
-    if (this.#terminated || this.#handoff) return
+    if (this.#terminated) return
     if (this.#roundEnded) {
       this.#deferred.push({ kind: 'call', call })
       return
@@ -359,10 +378,9 @@ export class PromptTurn {
     try {
       const response = await prompt
       this.#markPromptSettled()
-      if (!this.#handoff) this.#finishWith(response)
+      this.#finishWith(response)
     } catch (error) {
       this.#markPromptSettled()
-      if (this.#handoff) return
       this.#fail({
         code: readErrorCode(error),
         message: error instanceof Error ? error.message : String(error),
@@ -372,7 +390,7 @@ export class PromptTurn {
 
   #markPromptSettled(): void {
     this.#promptSettled = true
-    if (!this.#handoff) this.dispose()
+    this.dispose()
     const waiters = this.#settledWaiters
     this.#settledWaiters = []
     for (const resolve of waiters) resolve()
@@ -460,7 +478,7 @@ export class PromptTurn {
     }
     // 只在**仍有未回喂的 park** 时才是 tool-calls：续轮把结果交付后，同一批
     // park 已经结算，本轮的结束原因回到 stop/max-tokens。
-    if (this.#handoff || this.#parked.some((call) => this.#bridge.hasPending(call.callId))) return { kind: 'tool-calls' }
+    if (this.#parked.some((call) => this.#bridge.hasPending(call.callId))) return { kind: 'tool-calls' }
     if (this.#truncated) return { kind: 'max-tokens' }
     return { kind: 'stop' }
   }
@@ -487,6 +505,10 @@ export class PromptTurn {
   }
 
   #appendText(blockType: 'text' | 'reasoning', messageId: string | undefined, content: unknown): void {
+    if (content && typeof content === 'object' && 'type' in content && content.type !== 'text') {
+      this.#fail({ code: 'AGY_UNSUPPORTED_CONTENT', message: 'ACP 返回了当前 DSH 输出通道尚不能保存的非文本内容，未将二进制数据作为文字显示' })
+      return
+    }
     const text = renderContentText(content)
     if (text === undefined) return
     if (blockType === 'text' && text.trim().length > 0) this.#hasOutput = true
@@ -555,15 +577,14 @@ function readErrorCode(error: unknown): string {
 
 /**
  * 把一个 ACP ContentBlock 渲染为纯文本。
- * 本 provider 只声明 text 输出模态，因此非文本内容（图片/资源链接/音频）
- * 按其 JSON 原样作为文本传递，保留信息而不是静默丢弃。
+ * 输入图像通过附件服务传递；输出当前只有文本通道，非文本输出由调用方明确拒绝。
  */
 function renderContentText(content: unknown): string | undefined {
   if (typeof content === 'string') return content
   if (content && typeof content === 'object' && 'type' in content) {
     const block = content as { type: string; text?: unknown }
     if (block.type === 'text' && typeof block.text === 'string') return block.text
-    return JSON.stringify(content)
+    return undefined
   }
   return undefined
 }

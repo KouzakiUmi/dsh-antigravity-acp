@@ -50,6 +50,12 @@ const BARE_SENSITIVE_PAIR = new RegExp(
   'gi',
 )
 
+/** JSON/Python 字典形式的敏感字段；保留键与引号，兼容转义字符。 */
+const QUOTED_SENSITIVE_PAIR = new RegExp(
+  `(["'](?:${[...SENSITIVE_QUERY_KEYS].join('|')})["']\\s*:\\s*)("(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|[^\\s,}\\]]+)`,
+  'gi',
+)
+
 /** `Authorization: Bearer <token>` / `Bearer <token>` 形态的凭据值。 */
 const BEARER_TOKEN = /\b(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi
 
@@ -61,6 +67,7 @@ export function redactSensitiveText(text: string | undefined | null): string {
   if (!text) return ''
   return text
     .replace(URL_USERINFO, `$1${MASK}@`)
+    .replace(QUOTED_SENSITIVE_PAIR, `$1"${MASK}"`)
     .replace(SENSITIVE_QUERY_PARAM, `$1${MASK}`)
     .replace(BARE_SENSITIVE_PAIR, `$1$2${MASK}`)
     .replace(BEARER_TOKEN, `$1${MASK}`)

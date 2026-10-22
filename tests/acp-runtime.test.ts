@@ -11,6 +11,7 @@
  */
 import { afterEach, describe, expect, it } from 'vitest'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
@@ -21,6 +22,7 @@ import { AGY_BINARY_ERROR } from '../src/runtime/binary.js'
 import type { AgentLinkHandlers } from '../src/protocol/agent-link.js'
 import type { AntigravityHostConfig } from '../src/settings.js'
 import { FakeAcpAgent } from './helpers/fake-acp-agent.js'
+import { AcpLifecycle } from '../src/runtime/lifecycle.js'
 import { createFakeSubprocessRuntime } from './helpers/fake-subprocess.js'
 import type { FakeAgentProcess } from './helpers/fake-subprocess.js'
 
@@ -96,8 +98,7 @@ async function createRuntimeHarness(
     spawns: subprocess.spawns,
     config: baseConfig(binaryPath),
     dispose: async () => {
-      await active.link?.close().catch(() => undefined)
-      active.handle?.terminate()
+      await disposeAcpRuntime(active)
       await rm(dir, { recursive: true, force: true })
     },
   }
@@ -122,6 +123,32 @@ function acceptHandshake(agent: FakeAcpAgent): void {
 }
 
 describe('设置 GUI 独立 ACP 连接', () => {
+  it('预热缺少登录态时不弹浏览器、不启动进程，状态可供重试', async () => {
+    const harness = await createRuntimeHarness(acceptHandshake)
+    harness.active.lifecycle = new AcpLifecycle()
+    await expect(startAcpRuntimeRaw(harness.ctx, harness.config, handlers, harness.active, {
+      ...TEST_DEPS, allowInteractiveAuth: false,
+    })).rejects.toMatchObject({ code: 'AGY_AUTH_REQUIRED' })
+    expect(harness.spawns).toHaveLength(0)
+    expect(harness.active.lifecycle.read()).toMatchObject({ phase: 'error', processRunning: false, starts: 1 })
+  })
+
+  it('已登录预热保留进程，后续复用不重新握手，退出后清除存活状态', async () => {
+    const harness = await createRuntimeHarness(acceptHandshake)
+    harness.active.lifecycle = new AcpLifecycle()
+    const deps = { ...TEST_DEPS, allowInteractiveAuth: false, ensureCredentials: async () => ({
+      ...await TEST_DEPS.ensureCredentials!(), ready: true,
+    }) }
+    const link = await startAcpRuntimeRaw(harness.ctx, harness.config, handlers, harness.active, deps)
+    expect(harness.active.lifecycle.read()).toMatchObject({ phase: 'ready', processRunning: true, starts: 1 })
+    expect(harness.agents[0]!.requestsFor('session/prompt')).toHaveLength(0)
+    expect(harness.agents[0]!.requestsFor('authenticate')).toHaveLength(0)
+    expect(await startAcpRuntimeRaw(harness.ctx, harness.config, handlers, harness.active, deps)).toBe(link)
+    expect(harness.active.lifecycle.read().reuses).toBe(1)
+    harness.spawns[0]!.crash()
+    await waitFor(() => !harness.active.lifecycle!.read().processRunning)
+    expect(harness.active.lifecycle.read().phase).toBe('stopped')
+  })
   it('只认证和建立空工具会话，不发 prompt，并回收独立进程', async () => {
     const harness = await createRuntimeHarness(acceptHandshake)
     const session = await connectAcpAccount(harness.ctx, harness.config, new AbortController().signal, TEST_DEPS)
@@ -192,6 +219,17 @@ describe('启动取消回归', () => {
 })
 
 describe('ensureAcpRuntime 失败清理（S2）', () => {
+  it('spawn 后缺少管道导致 stream 构造失败时也必须终止进程并释放目录', async () => {
+    const harness = await createRuntimeHarness((_agent, _index, process) => {
+      Object.defineProperty(process.handle, 'stdout', { value: undefined })
+    })
+    await expect(ensureAcpRuntime(harness.ctx, harness.config, handlers, harness.active)).rejects.toThrow()
+    expect(harness.spawns).toHaveLength(1)
+    expect(harness.spawns[0]!.terminated()).toBe(true)
+    expect(harness.active.handle).toBeUndefined()
+    expect(harness.active.directory).toBeUndefined()
+  })
+
   it('回收当前连接会终止受管进程且不卸载插件，下一次调用创建新进程', async () => {
     const harness = await createRuntimeHarness((agent) => acceptHandshake(agent))
     const first = await ensureAcpRuntime(harness.ctx, harness.config, handlers, harness.active)
@@ -296,8 +334,7 @@ describe('ensureAcpRuntime 成功后子进程意外退出（R1）', () => {
     expect(harness.active.link).toBe(first)
 
     harness.spawns[0]?.crash()
-    await Promise.resolve()
-    await Promise.resolve()
+    await waitFor(() => harness.active.link === undefined && harness.active.handle === undefined)
 
     expect(harness.active.link).toBeUndefined()
     expect(harness.active.handle).toBeUndefined()
@@ -311,6 +348,23 @@ describe('ensureAcpRuntime 成功后子进程意外退出（R1）', () => {
 })
 
 describe('ensureAcpRuntime 并发 single-flight', () => {
+  it('死链回收也属于 single-flight，并发恢复只产生一条新进程', async () => {
+    const harness = await createRuntimeHarness(acceptHandshake)
+    const first = await ensureAcpRuntime(harness.ctx, harness.config, handlers, harness.active)
+    let releaseExit!: () => void
+    const exited = new Promise<boolean>((resolve) => { releaseExit = () => resolve(true) })
+    harness.spawns[0]!.handle.waitForExit = () => exited
+    await first.close()
+    const second = ensureAcpRuntime(harness.ctx, harness.config, handlers, harness.active)
+    const third = ensureAcpRuntime(harness.ctx, harness.config, handlers, harness.active)
+    releaseExit()
+    const [a, b] = await Promise.all([second, third])
+    expect(a).toBe(b)
+    expect(a).not.toBe(first)
+    expect(harness.spawns).toHaveLength(2)
+    expect(harness.active.handle).toBe(harness.spawns[1]!.handle)
+  })
+
   it('并发调用只 spawn 一条进程、只握手一次，且不留下被孤儿掉的 handle', async () => {
     const harness = await createRuntimeHarness((agent) => acceptHandshake(agent))
 
@@ -506,6 +560,71 @@ describe('启动失败的诊断文本脱敏', () => {
 })
 
 describe('启动路径的新增前置检查', () => {
+  it('运行目录也必须通过完整性检查，Low 目录不得启动官方进程', async () => {
+    const harness = await createRuntimeHarness(acceptHandshake)
+    let runtimePath: string | undefined
+    await expect(startAcpRuntimeRaw(harness.ctx, harness.config, handlers, harness.active, {
+      ...TEST_DEPS,
+      probeLowIntegrity: async (path) => {
+        if (path.includes('instance-')) { runtimePath = path; return true }
+        return false
+      },
+    })).rejects.toMatchObject({ code: AGY_BINARY_ERROR.LOW_INTEGRITY })
+    expect(runtimePath).toBeDefined()
+    expect(harness.spawns).toHaveLength(0)
+    expect(existsSync(runtimePath!)).toBe(false)
+    expect(harness.active.directory).toBeUndefined()
+  })
+
+  it('检查运行目录期间取消：回收尚未使用的目录且不再 spawn', async () => {
+    const harness = await createRuntimeHarness(acceptHandshake)
+    const controller = new AbortController()
+    let runtimePath: string | undefined
+    let releaseCheck!: () => void
+    const checked = new Promise<void>((resolve) => { releaseCheck = resolve })
+    const pending = startAcpRuntimeRaw(harness.ctx, harness.config, handlers, harness.active, {
+      ...TEST_DEPS, signal: controller.signal,
+      probeLowIntegrity: async (path) => {
+        if (path.includes('instance-')) { runtimePath = path; await checked }
+        return false
+      },
+    })
+    const rejected = expect(pending).rejects.toBeDefined()
+    await waitFor(() => runtimePath !== undefined)
+    controller.abort()
+    releaseCheck()
+    await rejected
+    expect(harness.spawns).toHaveLength(0)
+    expect(existsSync(runtimePath!)).toBe(false)
+    expect(harness.active.directory).toBeUndefined()
+  })
+
+  it('握手失败但尚不能证明受管进程退出时，保留目录和句柄并阻止新启动', async () => {
+    let canConfirmExit = false
+    const harness = await createRuntimeHarness((agent, index, process) => {
+      if (index === 0) {
+        process.handle.waitForExit = async () => canConfirmExit
+        agent.on('initialize', () => Promise.reject(new Error('握手失败')))
+      } else acceptHandshake(agent)
+    })
+    try {
+      await expect(ensureAcpRuntime(harness.ctx, harness.config, handlers, harness.active)).rejects.toThrow()
+      const directory = harness.active.directory
+      expect(directory).toBeDefined()
+      expect(existsSync(directory!.path)).toBe(true)
+      expect(harness.active.handle).toBe(harness.spawns[0]!.handle)
+      await expect(ensureAcpRuntime(harness.ctx, harness.config, handlers, harness.active)).rejects.toMatchObject({ code: AGY_LINK_ERROR.LINK_CLOSED })
+      expect(harness.spawns).toHaveLength(1)
+      expect(existsSync(directory!.path)).toBe(true)
+      canConfirmExit = true
+      await ensureAcpRuntime(harness.ctx, harness.config, handlers, harness.active)
+      expect(harness.spawns).toHaveLength(2)
+      expect(existsSync(directory!.path)).toBe(false)
+    } finally {
+      canConfirmExit = true
+    }
+  })
+
   it('登录态已就绪时跳过 authenticate（无交互浏览器时会白等 5 分钟）', async () => {
     const harness = await createRuntimeHarness((agent) => {
       agent.on('initialize', () => ({ protocolVersion: 1, agentCapabilities: {} }))

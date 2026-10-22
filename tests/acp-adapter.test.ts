@@ -19,6 +19,8 @@ import type { GenerateOptions, RequestMessage, StreamChunk, ToolSchema } from '@
 import type { ContentBlock, SessionConfigOption } from '@agentclientprotocol/sdk'
 import { AntigravityAcpAdapter, AGY_PROVIDER_ID, AGY_PLACEHOLDER_MODEL_ID, AGY_UNSUPPORTED_OPTION, AGY_ADAPTER_ERROR } from '../src/adapter/antigravity-adapter.js'
 import type { AdapterLog } from '../src/adapter/antigravity-adapter.js'
+import type { ImageReader } from '../src/adapter/image-content.js'
+import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { NATIVE_REFUSAL_LIMIT } from '../src/adapter/prompt-turn.js'
 import { AGY_TURN_ERROR } from '../src/adapter/prompt-turn.js'
 import { AGY_BRIDGE_ERROR } from '../src/bridge/mcp-bridge.js'
@@ -91,6 +93,10 @@ function createHarness(
     loadCachedCatalog?: () => Promise<{ id: string; name: string; description?: string }[] | undefined>
     saveCatalog?: (models: readonly { id: string; name: string; description?: string }[]) => Promise<void> | void
     loadCliCatalog?: () => Promise<readonly { id: string; name: string }[]>
+    readImage?: ImageReader
+    canReadImages?: () => boolean
+    imageCapability?: boolean
+    onGetLink?: (purpose?: 'warmup') => void
   } = {},
 ): Harness {
   let agent = new FakeAcpAgent()
@@ -102,7 +108,7 @@ function createHarness(
   const configureAgent = (): void => {
     agent.on('initialize', () => ({
       protocolVersion: 1,
-      agentCapabilities: { promptCapabilities: { embeddedContext: false, image: false, audio: false } },
+      agentCapabilities: { promptCapabilities: { embeddedContext: false, image: options.imageCapability === true, audio: false }, mcpCapabilities: { http: true } },
     }))
     agent.on('authenticate', () => ({}))
     agent.on('session/new', () => ({
@@ -125,7 +131,8 @@ function createHarness(
   let bridgeTeardown: (() => Promise<void>) | undefined
   const adapter = new AntigravityAcpAdapter({
     preferredModel: options.preferredModel,
-    getLink: async (handlers) => {
+    getLink: async (handlers, _signal, purpose) => {
+      options.onGetLink?.(purpose)
       if (link) return link
       // 与生产 ensureAcpRuntime 一样 single-flight，让并发测试覆盖 adapter 而非假连接抢锁。
       inflight ??= (async () => {
@@ -162,6 +169,8 @@ function createHarness(
     loadCachedCatalog: options.loadCachedCatalog,
     saveCatalog: options.saveCatalog,
     loadCliCatalog: options.loadCliCatalog,
+    readImage: options.readImage,
+    canReadImages: options.canReadImages,
   })
   teardowns.push(async () => {
     await bridgeTeardown?.()
@@ -227,6 +236,14 @@ function toolHistory(entries: ReadonlyArray<{ callId: string; path: string; resu
   ]
 }
 
+/** Preserve the actual emitted assistant blocks; a continuation cannot rewrite their arguments or text. */
+function emittedAssistant(chunks: readonly StreamChunk[]): RequestMessage {
+  return createAssistantMessage({
+    content: chunks.flatMap((chunk) => chunk.type === 'block-end' ? [chunk.block] : []),
+    source: { provider: AGY_PROVIDER_ID, model: 'gemini-3-pro' },
+  })
+}
+
 /** 取出最近一次 session/new 向 agent 注册的 loopback MCP server。 */
 function registeredMcpServer(harness: Harness): McpRegistration {
   const params = harness.agent.requestsFor('session/new').at(-1)?.params
@@ -252,6 +269,113 @@ async function connectAgentMcpClient(harness: Harness): Promise<Client> {
 }
 
 describe('模型目录来自 ACP 会话配置', () => {
+  it('显式发现模型通过无工具 session/new，首次无 CLI 也能取得目录且不发 prompt', async () => {
+    const harness = createHarness()
+    expect(await harness.adapter.listModels(AGY_PROVIDER_ID)).toEqual([])
+    const models = await harness.adapter.discoverModels()
+    expect(models.length).toBeGreaterThan(0)
+    expect(harness.agent.requestsFor('session/new')[0]?.params).toMatchObject({
+      mcpServers: [], _meta: { antigravity: { enabledTools: [], eagerMcpServers: [] } },
+    })
+    expect(harness.agent.requestsFor('session/prompt')).toEqual([])
+    expect(harness.adapter.busy).toBe(false)
+  })
+
+  it.each([true, false])('发现目录 interactive=%s 原样决定是否允许交互认证', async (interactive) => {
+    const onGetLink = vi.fn()
+    const harness = createHarness({ onGetLink })
+    if (interactive) await harness.adapter.discoverModels()
+    else await harness.adapter.discoverModels(undefined, false)
+    expect(onGetLink).toHaveBeenCalledWith(interactive ? undefined : 'warmup')
+    expect(harness.agent.requestsFor('session/prompt')).toEqual([])
+  })
+
+  it('发现目录期间取消会回收连接并释放调度位', async () => {
+    const harness = createHarness()
+    harness.agent.on('session/new', () => NO_REPLY)
+    const controller = new AbortController()
+    const pending = harness.adapter.discoverModels(controller.signal)
+    await waitForRequest(harness.agent, 'session/new')
+    controller.abort()
+    await expect(pending).rejects.toBeDefined()
+    await vi.waitFor(() => expect(harness.recycles()).toBe(1))
+    expect(harness.adapter.busy).toBe(false)
+  })
+
+  it('准备首次图像请求前协商能力，实际发送原生图像并可广播元数据', async () => {
+    const data = Uint8Array.from([137, 80, 78, 71])
+    const ref = { attachmentId: 'sha256:test', mediaType: 'image/png', bytes: data.length, width: 1, height: 1 } as ImageAttachmentRef
+    const readImage = vi.fn(async () => ({ ref, data }))
+    const harness = createHarness({ readImage, imageCapability: true })
+    expect((await harness.adapter.resolveModel(AGY_PROVIDER_ID, 'gemini-3-pro')).inputModalities).toEqual(['text'])
+    expect(harness.agent.requests).toEqual([])
+    const prepared = await harness.adapter.prepareCall(AGY_PROVIDER_ID, 'gemini-3-pro')
+    expect(prepared.model.inputModalities).toEqual(['text', 'image'])
+    expect(harness.agent.requestsFor('session/new')).toEqual([])
+    const result = collect(prepared.stream(baseOptions({ messages: [createUserMessage({ content: [{ type: 'image', attachment: ref }], source: { kind: 'user' } })] })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    expect(harness.agent.requestsFor('session/prompt')[0]?.params.prompt).toContainEqual({ type: 'image', mimeType: 'image/png', data: Buffer.from(data).toString('base64') })
+    await replyWithText(harness, '已读图')
+    await result
+    const follower = createHarness({ readImage })
+    follower.adapter.importMetadata(harness.adapter.exportMetadata())
+    expect((await follower.adapter.resolveModel(AGY_PROVIDER_ID, 'gemini-3-pro')).inputModalities).toEqual(['text', 'image'])
+    expect(follower.agent.requests).toEqual([])
+  })
+
+  it('工具图像结果在原 prompt 中以 MCP image 回填', async () => {
+    const data = Uint8Array.from([137, 80, 78, 71])
+    const ref = { attachmentId: 'sha256:tool', mediaType: 'image/png', bytes: data.length, width: 1, height: 1 } as ImageAttachmentRef
+    const harness = createHarness({ readImage: async () => ({ ref, data }), imageCapability: true })
+    const first = collect(harness.adapter.stream(baseOptions({ tools: TOOLS })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    const client = await connectAgentMcpClient(harness)
+    const pending = client.callTool({ name: 'read_file', arguments: { path: 'image.png' } })
+    const chunks = await first
+    const callId = toolCallIdOf(chunks.find((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call'))
+    const next = collect(harness.adapter.stream(baseOptions({ tools: TOOLS, messages: [
+      ...baseOptions().messages, emittedAssistant(chunks),
+      createToolResultMessage({ callId: ToolCallId(callId), content: [{ type: 'image', attachment: ref }], isError: false }),
+    ] })))
+    expect(await pending).toMatchObject({ content: [{ type: 'image', mimeType: 'image/png', data: Buffer.from(data).toString('base64') }], isError: false })
+    await replyWithText(harness, '截图已读')
+    await next
+    expect(harness.agent.requestsFor('session/prompt')).toHaveLength(1)
+  })
+
+  it('未协商图像能力时直接请求不会把图片 JSON 冒充图像发送', async () => {
+    const ref = { attachmentId: 'sha256:test', mediaType: 'image/png', bytes: 1, width: 1, height: 1 } as ImageAttachmentRef
+    const harness = createHarness({ readImage: async () => ({ ref, data: Uint8Array.of(1) }) })
+    await expect(collect(harness.adapter.stream(baseOptions({ messages: [createUserMessage({ content: [{ type: 'image', attachment: ref }], source: { kind: 'user' } })] })))).rejects.toMatchObject({ code: 'AGY_IMAGE_UNAVAILABLE' })
+    expect(harness.agent.requestsFor('session/prompt')).toEqual([])
+  })
+
+  it('尚未支持的非文本模型输出明确失败，不把base64作为回复文字显示', async () => {
+    const harness = createHarness()
+    const pending = collect(harness.adapter.stream(baseOptions()))
+    await waitForRequest(harness.agent, 'session/prompt')
+    await harness.agent.notify('session/update', {
+      sessionId: SESSION_1,
+      update: { sessionUpdate: 'agent_message_chunk', content: { type: 'image', data: 'PRIVATE_IMAGE_BYTES', mimeType: 'image/png' } },
+    })
+    const result = await pending
+    expect(result.at(-1)).toMatchObject({ type: 'finish', reason: { kind: 'error', failure: { code: 'AGY_UNSUPPORTED_CONTENT' } } })
+    expect(JSON.stringify(result)).not.toContain('PRIVATE_IMAGE_BYTES')
+  })
+  it('预热保留同一连接与事件 handlers；聊天复用它且预热不发 prompt', async () => {
+    const harness = createHarness()
+    await harness.adapter.warmup()
+    const agent = harness.agent
+    expect(agent.requestsFor('initialize')).toHaveLength(1)
+    expect(agent.requestsFor('session/new')).toHaveLength(0)
+    expect(agent.requestsFor('session/prompt')).toHaveLength(0)
+    const first = collect(harness.adapter.stream(baseOptions()))
+    await waitForRequest(agent, 'session/prompt')
+    await replyWithText(harness, '预热后回复')
+    expect(visibleText(await first)).toBe('预热后回复')
+    expect(agent.requestsFor('initialize')).toHaveLength(1)
+    expect(harness.recycles()).toBe(0)
+  })
   it('用户自定义模型加入目录且不伪称已验证，旧默认路由仍兼容', async () => {
     const harness = createHarness({ preferredModel: 'custom-model-v1' })
     expect(await harness.adapter.listModels(AGY_PROVIDER_ID)).toEqual([
@@ -324,11 +448,12 @@ describe('模型目录来自 ACP 会话配置', () => {
     expect(models).toHaveLength(0)
   })
 
-  it('观测到真实目录后写入缓存，且写入失败不影响本轮', async () => {
+  it.each([false, true])('观测目录后缓存写入失败不影响本轮（同步抛错=%s）', async (synchronous) => {
     const saved: { id: string; name: string; description?: string }[][] = []
     const harness = createHarness({
       saveCatalog: (models) => {
         saved.push([...models])
+        if (synchronous) throw new Error('disk full')
         return Promise.reject(new Error('disk full'))
       },
     })
@@ -882,6 +1007,28 @@ describe('abort 语义', () => {
 })
 
 describe('MCP 工具桥：park 与续轮', () => {
+  it('工具 ID 仍匹配但系统提示改变时取消旧 prompt 并按新上下文重建', async () => {
+    const harness = createHarness()
+    const first = collect(harness.adapter.stream(baseOptions({ tools: TOOLS, system: 'old system' })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    const client = await connectAgentMcpClient(harness)
+    const pending = client.callTool({ name: 'read_file', arguments: { path: 'a.txt' } })
+    const chunks = await first
+    const callId = toolCallIdOf(chunks.find((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call'))
+    const next = collect(harness.adapter.stream(baseOptions({ tools: TOOLS, system: 'new system', messages: [
+      ...baseOptions().messages, emittedAssistant(chunks),
+      createToolResultMessage({ callId: ToolCallId(callId), content: [{ type: 'text', text: 'already executed' }], isError: false }),
+    ] })))
+    expect((await pending).isError).toBe(true)
+    await vi.waitFor(() => expect(harness.recycles()).toBe(1))
+    await waitForRequest(harness.agent, 'session/prompt')
+    const transcript = parsePromptTranscript(harness.agent.requestsFor('session/prompt')[0]!.params.prompt as ContentBlock[])
+    expect(transcript.system).toBe('new system')
+    expect(transcript.entries.at(-1)).toMatchObject({ role: 'tool', toolCallId: callId, content: [{ type: 'text', text: 'already executed' }] })
+    await replyWithText(harness, '使用新上下文继续')
+    expect(visibleText(await next)).toBe('使用新上下文继续')
+  })
+
   it('tools/call park → tool-call block → finish tool-calls → 续轮回喂 → 同一 prompt 内续流 → finish stop', async () => {
     const harness = createHarness({ parkSettleMs: 60 })
     let mcpResultText: string | undefined
@@ -1048,10 +1195,11 @@ describe('MCP 工具桥：park 与续轮', () => {
     expect(toolResultText(await firstResult)).toBe('first')
     const thirdRound = collect(harness.adapter.stream(baseOptions({
       tools: TOOLS,
-      messages: toolHistory([
-        { callId: firstId, path: 'first.txt', result: 'first' },
-        { callId: lateId, path: 'late.txt', result: 'late' },
-      ]),
+      messages: [
+        ...toolHistory([{ callId: firstId, path: 'first.txt', result: 'first' }]),
+        emittedAssistant(secondChunks),
+        createToolResultMessage({ callId: ToolCallId(lateId), content: [{ type: 'text', text: 'late' }], isError: false }),
+      ],
     })))
     expect(toolResultText(await lateResult)).toBe('late')
     await harness.agent.reply('session/prompt', { stopReason: 'end_turn' })
@@ -1314,6 +1462,7 @@ describe('主对话与辅助请求隔离', () => {
     const failed = collect(harness.adapter.stream(baseOptions()))
     const queued = collect(harness.adapter.stream(baseOptions({ model: AGY_PLACEHOLDER_MODEL_ID, purpose: 'session-title' })))
     await expect(failed).rejects.toMatchObject({ code: AGY_ADAPTER_ERROR.NO_MODEL_SELECTOR })
+    await vi.waitFor(() => expect(harness.recycles()).toBe(1))
     await waitForRequest(harness.agent, 'session/prompt')
     await replyWithText(harness, '后续请求正常')
     expect(visibleText(await queued)).toBe('后续请求正常')
@@ -1419,14 +1568,14 @@ describe('主对话与辅助请求隔离', () => {
   })
 })
 
-describe('ACP 权限请求安全转交 DSH', () => {
-  function permission(sessionId = SESSION_1) {
+describe('ACP 私有 MCP 权限与原 prompt 续轮', () => {
+  function permission(sessionId = SESSION_1, id = 'official-call-1', args = { path: 'a.txt' }) {
     return {
       sessionId,
       toolCall: {
-        toolCallId: 'official-call-1', kind: 'other',
+        toolCallId: id, kind: 'other',
         _meta: { is_mcp_tool_call: true, mcp: { server: 'dsh-tools', tool: 'read_file' } },
-        rawInput: { arguments: { path: 'a.txt' }, path: 'a.txt' },
+        rawInput: { arguments: args, ...args },
       },
       options: [
         { optionId: 'always', name: 'Always', kind: 'allow_always' },
@@ -1436,111 +1585,180 @@ describe('ACP 权限请求安全转交 DSH', () => {
     }
   }
 
-  it.each([false, true])('官方拒绝，DSH 结果 isError=%s 回填新会话而非继续官方调用', async (isError) => {
+  it.each([false, true])('DSH 结果 isError=%s 经 MCP 回原 prompt；无进程重启或历史重放', async (isError) => {
     const harness = createHarness()
     const streaming = collect(harness.adapter.stream(baseOptions({ tools: TOOLS })))
     await waitForRequest(harness.agent, 'session/prompt')
-    const old = harness.agent
-    const staleEndpoint = registeredMcpServer(harness)
-    const response = await old.callClient('session/request_permission', permission())
-    expect(response).toMatchObject({ result: { outcome: { outcome: 'selected', optionId: 'no' } } })
-    const chunks = await streaming
-    const call = chunks.find((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call')
-    expect(call).toMatchObject({ block: { name: 'read_file', arguments: '{"path":"a.txt"}' } })
-    expect(chunks.at(-1)).toMatchObject({ type: 'finish', reason: { kind: 'tool-calls' } })
-    const callId = toolCallIdOf(call)
-    expect(callId).not.toBe('official-call-1')
-    await vi.waitFor(() => expect(harness.recycles()).toBe(1))
-    expect(harness.adapter.bridge.pendingCallIds()).toEqual([])
-    const stale = await fetch(staleEndpoint.url, {
-      method: 'POST', headers: Object.fromEntries(staleEndpoint.headers.map(({ name, value }) => [name, value])), body: '{}',
+    expect(harness.agent.requestsFor('session/new')[0]!.params._meta).toEqual({
+      antigravity: { enabledTools: [], eagerMcpServers: ['dsh-tools'] },
     })
-    expect(stale.status).toBe(401)
-    const resultText = isError ? 'DSH policy denied this tool' : 'file contents'
-    const messages: RequestMessage[] = [
-      ...baseOptions().messages,
-      createAssistantMessage({ content: [{ type: 'tool-call', id: ToolCallId(callId), name: 'read_file', arguments: '{"path":"a.txt"}' }], source: { provider: AGY_PROVIDER_ID, model: 'gemini-3-pro' } }),
-      createToolResultMessage({ callId: ToolCallId(callId), content: [{ type: 'text', text: resultText }], isError }),
-    ]
-    const next = collect(harness.adapter.stream(baseOptions({ tools: TOOLS, messages })))
-    await waitForRequest(harness.agent, 'session/prompt')
-    const prompt = harness.agent.requestsFor('session/prompt')[0]!.params.prompt as ContentBlock[]
-    expect(parsePromptTranscript(prompt).entries.at(-1)).toMatchObject({ toolCallId: callId, isError, content: [{ type: 'text', text: resultText }] })
-    expect(old.requestsFor('session/prompt')).toHaveLength(1)
-    await replyWithText(harness, isError ? '尊重 DSH 拒绝' : '已根据工具结果回答')
-    expect((await next).at(-1)).toMatchObject({ reason: { kind: 'stop' } })
-  })
-
-  it('重复请求只生成一次 DSH 调用；没有拒绝选项也绝不选择 allow', async () => {
-    const harness = createHarness()
-    const streaming = collect(harness.adapter.stream(baseOptions({ tools: TOOLS })))
-    await waitForRequest(harness.agent, 'session/prompt')
-    const old = harness.agent
-    const value = permission()
-    value.options = value.options.filter((option) => option.kind.startsWith('allow'))
-    const responses = await Promise.all([old.callClient('session/request_permission', value), old.callClient('session/request_permission', value)])
-    for (const response of responses) expect(response).toMatchObject({ result: { outcome: { outcome: 'cancelled' } } })
-    const chunks = await streaming
-    expect(chunks.filter((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call')).toHaveLength(1)
-    expect(chunks.filter((chunk) => chunk.type === 'finish')).toHaveLength(1)
-  })
-
-  it('伪装成原生请求也只能产生受 DSH 审批的工具调用，绝不获准原生执行', async () => {
-    const harness = createHarness()
-    const streaming = collect(harness.adapter.stream(baseOptions({ tools: TOOLS })))
-    await waitForRequest(harness.agent, 'session/prompt')
-    const value = { ...permission(), toolCall: { ...permission().toolCall, name: 'run_command', kind: 'execute' } }
-    const response = await harness.agent.callClient('session/request_permission', value)
-    expect(response).toMatchObject({ result: { outcome: { outcome: 'selected', optionId: 'no' } } })
-    expect((await streaming).filter((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call'))
-      .toMatchObject([{ block: { name: 'read_file', arguments: '{"path":"a.txt"}' } }])
-  })
-
-  it('旧会话不能触发接管，真正的当前请求仍可接管', async () => {
-    const harness = createHarness()
-    const streaming = collect(harness.adapter.stream(baseOptions({ tools: TOOLS })))
-    await waitForRequest(harness.agent, 'session/prompt')
-    const foreign = await harness.agent.callClient('session/request_permission', permission('foreign'))
-    expect(foreign).toMatchObject({ result: { outcome: { outcome: 'cancelled' } } })
-    expect(harness.recycles()).toBe(0)
-    await harness.agent.callClient('session/request_permission', permission())
-    expect((await streaming).at(-1)).toMatchObject({ reason: { kind: 'tool-calls' } })
-  })
-
-  it('已存在真实 MCP park 时不把权限提示再次投递为 DSH 调用', async () => {
-    const harness = createHarness({ parkSettleMs: 100 })
-    const streaming = collect(harness.adapter.stream(baseOptions({ tools: TOOLS })))
-    await waitForRequest(harness.agent, 'session/prompt')
+    const response = await harness.agent.callClient('session/request_permission', permission())
+    expect(response).toMatchObject({ result: { outcome: { outcome: 'selected', optionId: 'yes' } } })
+    // 权限应答本身不合成工具调用。只有实际 tools/call 到桥才交给 DSH。
+    expect(harness.adapter.bridge.pendingCallIds()).toEqual([])
     const client = await connectAgentMcpClient(harness)
     const pending = client.callTool({ name: 'read_file', arguments: { path: 'a.txt' } })
-    void pending.catch(() => undefined)
-    await vi.waitFor(() => expect(harness.adapter.bridge.pendingCallIds()).toHaveLength(1))
-    const response = await harness.agent.callClient('session/request_permission', permission())
-    expect(response).toMatchObject({ result: { outcome: { outcome: 'selected', optionId: 'no' } } })
     const chunks = await streaming
-    expect(chunks.filter((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call')).toHaveLength(1)
+    const callId = toolCallIdOf(chunks.find((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call'))
+    expect(chunks.at(-1)).toMatchObject({ reason: { kind: 'tool-calls' } })
+    const text = isError ? 'DSH denied this operation' : 'file contents'
+    const messages = toolHistory([{ callId, path: 'a.txt', result: text }])
+    messages[messages.length - 1] = createToolResultMessage({
+      callId: ToolCallId(callId), content: [{ type: 'text', text }], isError,
+    })
+    const next = collect(harness.adapter.stream(baseOptions({ tools: TOOLS, messages })))
+    expect(await pending).toMatchObject({ isError, content: [{ type: 'text', text }] })
+    await replyWithText(harness, '继续回答')
+    expect(visibleText(await next)).toBe('继续回答')
     expect(harness.recycles()).toBe(0)
-  })
-
-  it('接管后的回收失败时不越过屏障启动新回合', async () => {
-    const harness = createHarness({ recycleFailure: new Error('still running') })
-    const streaming = collect(harness.adapter.stream(baseOptions({ tools: TOOLS })))
-    await waitForRequest(harness.agent, 'session/prompt')
-    await harness.agent.callClient('session/request_permission', permission())
-    await streaming
-    await expect(collect(harness.adapter.stream(baseOptions()))).rejects.toThrow('still running')
+    expect(harness.agent.requestsFor('session/new')).toHaveLength(1)
     expect(harness.agent.requestsFor('session/prompt')).toHaveLength(1)
   })
 
-  it('DSH 执行阶段取消释放所有权，不让其他会话永久等待', async () => {
+  it('同批并行权限与 MCP 调用全部交给 DSH；第二批仍复用原 prompt', async () => {
+    const harness = createHarness({ parkSettleMs: 30 })
+    const options = baseOptions({ tools: TOOLS })
+    const first = collect(harness.adapter.stream(options))
+    await waitForRequest(harness.agent, 'session/prompt')
+    const client = await connectAgentMcpClient(harness)
+    const responses = await Promise.all(['a', 'b', 'c'].map((path, index) =>
+      harness.agent.callClient('session/request_permission', permission(SESSION_1, `parallel-${index}`, { path }))))
+    for (const response of responses) expect(response).toMatchObject({ result: { outcome: { optionId: 'yes' } } })
+    const pending = ['a', 'b', 'c'].map((path) => client.callTool({ name: 'read_file', arguments: { path } }))
+    const calls = (await first).filter((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call')
+    expect(calls).toHaveLength(3)
+    const entries = calls.map((call, index) => ({ callId: toolCallIdOf(call), path: ['a', 'b', 'c'][index]!, result: `result-${index}` }))
+    const messages = [
+      ...baseOptions().messages,
+      createAssistantMessage({
+        content: calls.map((call) => {
+          if (call.type !== 'block-end' || call.block.type !== 'tool-call') throw new Error('Expected tool call')
+          return call.block
+        }),
+        source: { provider: AGY_PROVIDER_ID, model: 'gemini-3-pro' },
+      }),
+      // DSH 并行完成顺序与发起顺序相反时仍应在同 prompt 内回喂。
+      ...[...entries].reverse().map(({ callId, result }) => createToolResultMessage({
+        callId: ToolCallId(callId), content: [{ type: 'text', text: result }], isError: false,
+      })),
+    ]
+    const second = collect(harness.adapter.stream(baseOptions({ tools: TOOLS, messages })))
+    expect((await Promise.all(pending)).map(toolResultText)).toEqual(['result-0', 'result-1', 'result-2'])
+    await harness.agent.callClient('session/request_permission', permission(SESSION_1, 'next-batch'))
+    const nextPending = client.callTool({ name: 'read_file', arguments: { path: 'a.txt' } })
+    const nextCalls = (await second).filter((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call')
+    expect(nextCalls).toHaveLength(1)
+    const third = collect(harness.adapter.stream(baseOptions({ tools: TOOLS, messages: [
+      ...messages, emittedAssistant(nextCalls),
+      createToolResultMessage({ callId: ToolCallId(toolCallIdOf(nextCalls[0])), content: [{ type: 'text', text: 'last' }], isError: false }),
+    ] })))
+    expect(toolResultText(await nextPending)).toBe('last')
+    await replyWithText(harness, '全部完成')
+    expect(visibleText(await third)).toBe('全部完成')
+    expect(harness.recycles()).toBe(0)
+    expect(harness.agent.requestsFor('session/prompt')).toHaveLength(1)
+  })
+
+  it('缺参在桥内立即返回签名；修正后同 prompt 继续，DSH 不收到无效调用', async () => {
+    const warn = vi.fn()
+    const harness = createHarness({ log: { info: vi.fn(), warn } })
+    const tools: ToolSchema[] = [{ ...TOOLS[0]!, parameters: {
+      type: 'object', properties: { path: { type: 'string' }, description: { type: 'string' } }, required: ['path', 'description'],
+    } }]
+    const first = collect(harness.adapter.stream(baseOptions({ tools })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    const prompt = harness.agent.requestsFor('session/prompt')[0]!.params.prompt as ContentBlock[]
+    expect(prompt.some((block) => block.type === 'text' && block.text.includes('read_file(path: string, description: string)'))).toBe(true)
+    await harness.agent.callClient('session/request_permission', permission())
+    const client = await connectAgentMcpClient(harness)
+    const bad = await client.callTool({ name: 'read_file', arguments: { path: 'SECRET_VALUE.txt' } })
+    expect(bad.isError).toBe(true)
+    expect(toolResultText(bad)).toContain('description')
+    expect(harness.adapter.bridge.pendingCallIds()).toEqual([])
+    expect(warn.mock.calls.map(([text]) => String(text)).join(' ')).toContain('缺少必填=[description]')
+    expect(warn.mock.calls.map(([text]) => String(text)).join(' ')).not.toContain('SECRET_VALUE')
+    await harness.agent.callClient('session/request_permission', permission(SESSION_1, 'corrected'))
+    const pending = client.callTool({ name: 'read_file', arguments: { path: 'a.txt', description: 'Read file' } })
+    const calls = (await first).filter((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call')
+    expect(calls).toHaveLength(1)
+    const next = collect(harness.adapter.stream(baseOptions({ tools, messages: [
+      ...baseOptions().messages, emittedAssistant(calls),
+      createToolResultMessage({ callId: ToolCallId(toolCallIdOf(calls[0])), content: [{ type: 'text', text: 'ok' }], isError: false }),
+    ] })))
+    await pending
+    await replyWithText(harness, '参数已修正')
+    await next
+    expect(harness.recycles()).toBe(0)
+    expect(harness.agent.requestsFor('session/prompt')).toHaveLength(1)
+  })
+
+  it('常见参数别名在入桥后修正并记录键名', async () => {
+    const info = vi.fn()
+    const harness = createHarness({ log: { info, warn: vi.fn() } })
+    const first = collect(harness.adapter.stream(baseOptions({ tools: TOOLS })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    const response = await harness.agent.callClient('session/request_permission', {
+      ...permission(), toolCall: {
+        toolCallId: 'eager-tool', kind: 'other', title: 'Run read_file?',
+        rawInput: { AbsolutePath: 'SECRET_VALUE.txt' },
+      },
+    })
+    expect(response).toMatchObject({ result: { outcome: { optionId: 'yes' } } })
+    const client = await connectAgentMcpClient(harness)
+    const pending = client.callTool({ name: 'read_file', arguments: { AbsolutePath: 'SECRET_VALUE.txt' } })
+    void pending.catch(() => undefined)
+    const chunks = await first
+    expect(chunks.find((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call'))
+      .toMatchObject({ block: { arguments: '{"path":"SECRET_VALUE.txt"}' } })
+    const logs = info.mock.calls.map(([text]) => String(text)).join(' ')
+    expect(logs).toContain('AbsolutePath->path')
+    expect(logs).not.toContain('SECRET_VALUE')
+  })
+
+  it('旧会话、伪装原生请求、无 allow_once 选项不放行，也不合成 DSH 调用', async () => {
+    const harness = createHarness()
+    const first = collect(harness.adapter.stream(baseOptions({ tools: TOOLS })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    const foreign = await harness.agent.callClient('session/request_permission', permission('foreign'))
+    expect(foreign).toMatchObject({ result: { outcome: { outcome: 'cancelled' } } })
+    const native = permission()
+    const rejected = await harness.agent.callClient('session/request_permission', {
+      ...native, toolCall: { ...native.toolCall, name: 'run_command', kind: 'execute' },
+    })
+    expect(rejected).toMatchObject({ result: { outcome: { optionId: 'no' } } })
+    const noOnce = permission()
+    noOnce.options = noOnce.options.filter((option) => option.kind === 'allow_always')
+    expect(await harness.agent.callClient('session/request_permission', noOnce))
+      .toMatchObject({ result: { outcome: { outcome: 'cancelled' } } })
+    await replyWithText(harness, '继续')
+    expect((await first).some((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call')).toBe(false)
+    expect(harness.recycles()).toBe(0)
+  })
+
+  it('重复权限 id 不产生第二次授权，正常工具调用仍可继续', async () => {
+    const harness = createHarness()
+    const first = collect(harness.adapter.stream(baseOptions({ tools: TOOLS })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    const responses = await Promise.all([1, 2].map(() => harness.agent.callClient('session/request_permission', permission())))
+    expect(responses[0]).toMatchObject({ result: { outcome: { optionId: 'yes' } } })
+    expect(responses[1]).toMatchObject({ result: { outcome: { outcome: 'cancelled' } } })
+    await replyWithText(harness, '继续')
+    await first
+    expect(harness.recycles()).toBe(0)
+  })
+
+  it('DSH 执行阶段取消仍释放所有权，后台请求不会永久等待', async () => {
     const harness = createHarness()
     const controller = new AbortController()
-    const streaming = collect(harness.adapter.stream(baseOptions({ tools: TOOLS, signal: controller.signal })))
+    const first = collect(harness.adapter.stream(baseOptions({ tools: TOOLS, signal: controller.signal })))
     await waitForRequest(harness.agent, 'session/prompt')
     await harness.agent.callClient('session/request_permission', permission())
-    await streaming
-    await vi.waitFor(() => expect(harness.recycles()).toBe(1))
+    const client = await connectAgentMcpClient(harness)
+    const pending = client.callTool({ name: 'read_file', arguments: { path: 'a.txt' } })
+    void pending.catch(() => undefined)
+    await first
     controller.abort()
+    await vi.waitFor(() => expect(harness.recycles()).toBe(1))
     const next = collect(harness.adapter.stream(baseOptions({ purpose: 'session-title' })))
     await waitForRequest(harness.agent, 'session/prompt')
     await replyWithText(harness, '标题')

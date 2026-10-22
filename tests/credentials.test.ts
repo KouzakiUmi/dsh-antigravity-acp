@@ -267,11 +267,12 @@ describe('ensureAcpCredentials', () => {
     const result = await ensureAcpCredentials(
       makeDeps(fs, {
         refresh: async () => {
-          throw new Error('boom')
+          throw new Error(`refresh rejected {"refresh_token":"${EXISTING_DOC.refresh_token}","access_token":"ya29.SENSITIVE_TEST_VALUE"}`)
         },
       }),
     )
     expect(result.note ?? '').not.toContain('ya29.')
     expect(result.note ?? '').not.toContain(EXISTING_DOC.refresh_token)
+    expect(result.note).toContain('***')
   })
 })

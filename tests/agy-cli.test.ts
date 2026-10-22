@@ -292,6 +292,14 @@ describe('CLI 调用面', () => {
     const candidates = agyCliCandidates({ LOCALAPPDATA: 'C:\\Users\\x\\AppData\\Local' }, 'C:\\Users\\x')
     expect(candidates[0]).toContain('AppData\\Local\\agy\\bin\\agy.exe')
   })
+
+  it('显式配置优先于环境变量；PATH 支持 Homebrew、系统目录，排除工作区相对项', () => {
+    expect(agyCliCandidates({ AGY_CLI_BIN: '/env/agy' }, '/home/u', '/configured/agy', 'linux')).toEqual(['/configured/agy'])
+    expect(agyCliCandidates({ PATH: '/opt/homebrew/bin:/usr/local/bin:.:relative:' }, '/home/u', undefined, 'darwin')).toEqual([
+      '/opt/homebrew/bin/agy', '/usr/local/bin/agy', '/home/u/.local/bin/agy', '/home/u/bin/agy',
+    ])
+    expect(agyCliCandidates({ Path: '"C:\\Tools";.;C:\\Windows' }, 'C:\\Users\\u', undefined, 'win32').slice(0, 2)).toEqual(['C:\\Tools\\agy.exe', 'C:\\Windows\\agy.exe'])
+  })
 })
 
 /**

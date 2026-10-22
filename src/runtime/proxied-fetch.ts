@@ -6,19 +6,20 @@
  * 给全局 undici dispatcher 装代理；插件设置页里填的 `proxyUrl` 此前只传给了子进程，
  * 插件自身的 `fetch` 完全没用上——直连不通 Google 的机器上，下载与换发会一直挂着。
  *
- * 做法：运行时按需加载 `undici`（它是 `dsh-subprocess → dsh-http-proxy` 的传递依赖，
- * 不是本包声明的依赖，所以不静态 import、不改 package.json），用 `ProxyAgent` 发请求。
- * 以下任一情况都回退到全局 `fetch`（即宿主按环境变量装的那套路由），绝不因此让
- * 请求失败：未配置代理 / 代理是 socks 等 undici ProxyAgent 不支持的协议 /
- * 目标命中排除列表 / undici 加载失败。
+ * 显式配置代理时，依赖加载、协议或连接失败均报错，不退回其它出口。
+ * 只有未配置代理或目标明确在 bypass 列表时使用宿主 fetch。
  */
 import type { ResolvedProxy } from './proxy-env.js'
+import { ProxyConfigError } from './proxy-env.js'
 
 /** 只描述用到的 undici 面，避免依赖其类型。 */
 export interface UndiciLike {
-  ProxyAgent: new (options: { uri: string }) => unknown
+  ProxyAgent: new (options: { uri: string; token?: string; username?: string; password?: string }) => { close?(): Promise<void>; destroy?(): Promise<void> }
   fetch: (input: string, init?: Record<string, unknown>) => Promise<Response>
 }
+
+export type ManagedFetch = typeof fetch & { close(): Promise<void> }
+export const PROXY_CLOSE_TIMEOUT_MS = 2_000
 
 export interface ProxiedFetchDeps {
   /** 加载 undici；失败返回 undefined。测试注入替身。 */
@@ -29,9 +30,7 @@ export interface ProxiedFetchDeps {
 
 async function defaultLoadUndici(): Promise<UndiciLike | undefined> {
   try {
-    // 变量说明符：不让打包器/类型检查把它当成静态依赖。
-    const specifier = 'undici'
-    const module = (await import(specifier)) as Partial<UndiciLike>
+    const module = (await import('undici')) as unknown as Partial<UndiciLike>
     if (typeof module.ProxyAgent === 'function' && typeof module.fetch === 'function') return module as UndiciLike
     return undefined
   } catch {
@@ -39,9 +38,9 @@ async function defaultLoadUndici(): Promise<UndiciLike | undefined> {
   }
 }
 
-/** undici ProxyAgent 能用的代理协议（socks 不在其中）。 */
-function isHttpProxy(url: string): boolean {
-  return /^https?:\/\//i.test(url)
+/** undici 8 支持 SOCKS5，域名由代理解析，因此 socks5h 可映射到 socks5。 */
+function isSupportedProxy(url: string): boolean {
+  return /^(https?|socks5h?):\/\//i.test(url)
 }
 
 /**
@@ -51,13 +50,12 @@ function isHttpProxy(url: string): boolean {
 export function matchesBypass(hostname: string, bypass: string): boolean {
   const host = hostname.toLowerCase().replace(/^\[|\]$/g, '')
   for (const raw of bypass.split(',')) {
-    let entry = raw.trim().toLowerCase().replace(/^\[|\]$/g, '')
+    let entry = raw.trim().toLowerCase()
     if (!entry) continue
-    // 若用户填写的排除条目包含端口（如 127.0.0.1:8080），剥离端口部分以便与 hostname 对齐
-    const colonIdx = entry.lastIndexOf(':')
-    if (colonIdx > 0 && /^\d+$/.test(entry.slice(colonIdx + 1))) {
-      entry = entry.slice(0, colonIdx)
-    }
+    if (entry === '*') return true
+    // 不把 IPv6 的最后一段误当成端口；有端口的 IPv6 必须带方括号。
+    if (entry.startsWith('[')) entry = /^\[([^\]]+)\](?::\d+)?$/.exec(entry)?.[1] ?? entry
+    else if (entry.split(':').length === 2) entry = entry.replace(/:\d+$/, '')
     if (entry === host) return true
     if (entry.startsWith('*.') && host.endsWith(entry.slice(1))) return true
     if (entry.startsWith('.') && host.endsWith(entry)) return true
@@ -65,33 +63,77 @@ export function matchesBypass(hostname: string, bypass: string): boolean {
   return false
 }
 
-export function createProxiedFetch(proxy: ResolvedProxy | undefined, deps: ProxiedFetchDeps = {}): typeof fetch {
+export function createProxiedFetch(proxy: ResolvedProxy | undefined, deps: ProxiedFetchDeps = {}): ManagedFetch {
   const fallback = deps.fallback ?? ((input, init) => globalThis.fetch(input, init))
-  if (!proxy || !isHttpProxy(proxy.url)) return fallback
+  if (!proxy) return Object.assign(((input, init) => fallback(input, init)) as typeof fetch, { close: async () => undefined })
+  if (!isSupportedProxy(proxy.url)) throw new ProxyConfigError('插件请求支持 HTTP、HTTPS、SOCKS5 代理；不支持 SOCKS4')
   const load = deps.loadUndici ?? defaultLoadUndici
-  let prepared: Promise<{ undici: UndiciLike; agent: unknown } | undefined> | undefined
-  const prepare = (): Promise<{ undici: UndiciLike; agent: unknown } | undefined> => {
-    prepared ??= load().then((undici) => {
-      if (!undici) return undefined
+  let closed = false
+  let prepared: Promise<{ undici: UndiciLike; agent: { close?(): Promise<void>; destroy?(): Promise<void> } }> | undefined
+  const prepare = (): NonNullable<typeof prepared> => {
+    prepared ??= load().catch(() => undefined).then((undici) => {
+      if (!undici) throw new ProxyConfigError('无法加载代理传输依赖 undici；请求未发送，请重新安装插件')
       try {
-        return { undici, agent: new undici.ProxyAgent({ uri: proxy.url }) }
+        const uri = new URL(proxy.url)
+        if (uri.protocol === 'socks5h:') uri.protocol = 'socks5:'
+        // SOCKS5 认证由 undici 从 URL 中读取，不使用 HTTP Proxy-Authorization。
+        if (uri.protocol === 'socks5:') return { undici, agent: new undici.ProxyAgent({
+          uri: uri.href, username: decodeURIComponent(uri.username), password: decodeURIComponent(uri.password),
+        }) }
+        const token = uri.username || uri.password
+          ? `Basic ${Buffer.from(`${decodeURIComponent(uri.username)}:${decodeURIComponent(uri.password)}`).toString('base64')}`
+          : undefined
+        uri.username = ''
+        uri.password = ''
+        return { undici, agent: new undici.ProxyAgent({ uri: uri.href, ...(token ? { token } : {}) }) }
       } catch {
-        return undefined
+        throw new ProxyConfigError('无法初始化代理传输；请求未发送，请检查代理设置')
       }
     })
     return prepared
   }
-  return async (input, init) => {
+  const doFetch: typeof fetch = async (input, init) => {
+    if (closed) throw new ProxyConfigError('代理传输已关闭；请求未发送')
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
     let hostname = ''
     try {
       hostname = new URL(url).hostname
     } catch {
-      return fallback(input, init)
+      throw new ProxyConfigError('请求地址无效；请求未发送')
     }
     if (matchesBypass(hostname, proxy.bypass)) return fallback(input, init)
     const route = await prepare()
-    if (!route) return fallback(input, init)
-    return route.undici.fetch(url, { ...(init as Record<string, unknown> | undefined), dispatcher: route.agent })
+    if (closed) throw new ProxyConfigError('代理传输已关闭；请求未发送')
+    const requestInit = input instanceof Request ? {
+      method: input.method, headers: input.headers, body: input.body,
+      signal: input.signal, redirect: input.redirect, credentials: input.credentials,
+      cache: input.cache, integrity: input.integrity, keepalive: input.keepalive,
+      referrer: input.referrer, referrerPolicy: input.referrerPolicy, duplex: 'half',
+    } : {}
+    return route.undici.fetch(url, { ...requestInit, ...(init as Record<string, unknown> | undefined), dispatcher: route.agent })
   }
+  let closing: Promise<void> | undefined
+  return Object.assign(doFetch, { close: () => {
+    closed = true
+    closing ??= (async () => {
+      const stop = (async () => {
+        const route = await prepared?.catch(() => undefined)
+        if (!route) return
+        // close() 等待消费完响应体；错误状态响应通常尚未消费，必须主动销毁连接。
+        await (route.agent.destroy ? route.agent.destroy() : route.agent.close?.())
+      })()
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        await Promise.race([
+          stop,
+          new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(() => reject(new ProxyConfigError('代理连接回收超时')), PROXY_CLOSE_TIMEOUT_MS)
+          }),
+        ])
+      } finally {
+        if (timer) clearTimeout(timer)
+      }
+    })()
+    return closing
+  } })
 }

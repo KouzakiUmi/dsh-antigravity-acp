@@ -2,8 +2,8 @@
  * DSH 请求历史 → ACP `session/prompt` 内容的序列化（原创实现）。
  *
  * 设计前提（硬约束）：**DSH 是历史权威**。本文件不建任何会话存储、数据库
- * 或文件——每次 `stream` 都把 `GenerateOptions.messages` + `options.system`
- * 完整重放进一条 ACP prompt。
+ * 或文件——新轮把 `GenerateOptions.messages` + `options.system` 完整编码进
+ * ACP prompt，工具续轮则直接通过 MCP 返回结果，不重复发送历史。
  *
  * 载体格式：ACP 的 `PromptRequest.prompt` 是 `ContentBlock[]`，本实现把每条
  * DSH 消息编码成一个 `TextContent` 信封块：
@@ -13,13 +13,15 @@
  * 信封用尖括号标签（与 JSON 字符串正文互不干扰：标签本身不是合法 JSON），
  * role 属性保留了角色边界，正文是该消息 content 块的 JSON 数组。
  * `parsePromptTranscript` 可无损还原 role 与 content，因此映射是**可逆**的；
- * 工具续轮时（见 antigravity-adapter.ts）历史里的 tool-call / tool result
- * 同样以信封进入 prompt，agent 得以看到完整的 DSH 侧工具轨迹。
+ * 需要建立新轮时，历史里的 tool-call / tool result 同样以信封进入 prompt，
+ * agent 得以看到完整的 DSH 侧工具轨迹。
  *
  * `options.system` 单独编码为一个 `<dsh-system>` 块放在最前。
  */
 import type { ContentBlock, TextContent } from '@agentclientprotocol/sdk'
-import type { RequestMessage } from '@deepseek-ai/dsh-llm'
+import type { RequestMessage, ToolSchema } from '@deepseek-ai/dsh-llm'
+import { LlmError } from '@deepseek-ai/dsh-llm'
+import { renderToolSignatures } from './tool-args.js'
 
 /** 消息信封的起始标签前缀（后跟 `role="…"` 与 `>`）。 */
 const MESSAGE_OPEN_PREFIX = '<dsh-message role="'
@@ -30,24 +32,22 @@ const SYSTEM_CLOSE = '</dsh-system>'
 /** 工具策略说明块的哨兵（固定文本，不参与消息逆解析）。 */
 const POLICY_OPEN = '<dsh-tool-policy>'
 const POLICY_CLOSE = '</dsh-tool-policy>'
+/** 工具参数签名块的哨兵（固定文本，不参与消息逆解析）。 */
+const SIGNATURES_OPEN = '<dsh-tool-signatures>'
+const SIGNATURES_CLOSE = '</dsh-tool-signatures>'
 
 /**
  * 每次 prompt 都会附带的一段工具策略说明。
  *
- * 为什么必须有：官方 agent 自带一整套原生工具（`read_file` / `write_file` /
- * `edit_file` / `run_command` / `view_file` / `list_dir` / `grep_search` /
- * `find_by_name`…），而本集成**不声明** fs/terminal 客户端能力，这些原生步骤在这里
- * 必然拿不到权限。**只拒绝不告知**时，偏好原生工具的型号会反复索要原生权限——实测
- * 2026-10-17 表现为「默认占位模型能对话，选具体型号就没反应」。明确告诉模型「用随会话
- * 提供的工具」后，它会改用桥过去的 DSH 工具。
- * 同类做法见 `@estebanforge/pi-antigravity-bridge` 的 tool-priority note（MIT）。
+ * 会话同时关闭 AGY 内置工具和 ACP fs/terminal，并加载 DSH 的 MCP schema。
+ * 此处说明工具入口与结果语义，避免模型沿用原生工具习惯或误解 DSH 的拒绝。
  */
 export const TOOL_POLICY_TEXT = [
   '本会话运行在 DSH（DeepSeek Harness）集成中，工具与 DSH 对齐：',
   '- 随本会话提供的工具列表就是你的工具入口；读写文件、执行命令、搜索代码请一律使用它们，它们与 DSH 的权限与审计一致。',
-  '- agy 的原生工具（read_file / write_file / edit_file / run_command / view_file / list_dir / grep_search / find_by_name 等）在本集成中不可用：客户端未声明 fs/terminal 能力，相关请求会被拒绝。',
+  '- agy 的原生工具（read_file / write_file / edit_file / run_command / view_file / list_dir / grep_search / find_by_name 等）在本集成中不可用：会话已关闭内置工具与客户端 fs/terminal 能力。',
   '- 不要反复索要原生能力；直接改用等价的随会话工具完成。',
-  '- 集成可能取消官方工具调用并转交给 DSH 执行；重建后的历史中的 tool 结果是权威结果（包括 isError=true 的拒绝/失败），不要仅因官方调用被取消而重复执行。',
+  '- 随会话 MCP 工具由 DSH 审批和执行，结果会在当前 ACP prompt 内返回；isError=true 的拒绝/失败是权威结果，不要绕过审批或重复执行。',
   '- ACP 权限拒绝可能发生在插件转交 DSH 之前。仅凭 Denied by user 或 pre-tool hook 文本，不能断言 DSH 全局禁用了工具，也不能建议关闭沙箱或审批。请明确报告拒绝来源尚未核实。',
 ].join('\n')
 
@@ -78,11 +78,19 @@ export function encodeMessage(message: RequestMessage): string {
  * DSH 消息一个信封块。空 system 文本不产生块（ACP 的 TextContent.text 为空串
  * 没有语义价值）。
  */
-export function buildPromptContent(system: string | undefined, messages: readonly RequestMessage[]): ContentBlock[] {
+export function buildPromptContent(
+  system: string | undefined,
+  messages: readonly RequestMessage[],
+  tools: readonly ToolSchema[] = [],
+): ContentBlock[] {
   const blocks: ContentBlock[] = []
   if (system !== undefined && system !== '') blocks.push(textBlock(`${SYSTEM_OPEN}${system}${SYSTEM_CLOSE}`))
   // 工具策略紧随 system：告诉模型原生 fs/terminal 在这里拿不到权限，请用随会话工具。
   blocks.push(textBlock(`${POLICY_OPEN}${TOOL_POLICY_TEXT}${POLICY_CLOSE}`))
+  // 官方只把 MCP 工具 schema 落成磁盘文件，模型常常不读就猜参数；把紧凑签名直接放进
+  // prompt，让必填项与参数名在调用时就可见。
+  const signatures = renderToolSignatures(tools)
+  if (signatures !== undefined) blocks.push(textBlock(`${SIGNATURES_OPEN}${signatures}${SIGNATURES_CLOSE}`))
   for (const message of messages) blocks.push(textBlock(encodeMessage(message)))
   return blocks
 }
@@ -140,7 +148,7 @@ function parseMessageEnvelopes(text: string): TranscriptEntry[] {
   return entries
 }
 
-/** 把一条 DSH tool 结果消息的内容块渲染成回喂给 MCP tools/call 的文本。 */
+/** Legacy text-only helper; native image results use buildToolResultContent. */
 export function renderToolResultText(blocks: readonly { type: string; [key: string]: unknown }[]): string {
   const parts: string[] = []
   for (const block of blocks) {
@@ -148,9 +156,7 @@ export function renderToolResultText(blocks: readonly { type: string; [key: stri
       parts.push(block.text)
       continue
     }
-    // 非文本块（image/file 等）不进入 MCP 文本通道：DSH 侧对本 provider 只
-    // 声明 text 输入模态，这里按 JSON 原样保留形状而不是丢弃信息。
-    parts.push(JSON.stringify(block))
+    throw new LlmError('非文本工具结果必须使用原生内容通道，不能序列化为 JSON 文本', 'AGY_UNSUPPORTED_CONTENT')
   }
   return parts.join('\n')
 }

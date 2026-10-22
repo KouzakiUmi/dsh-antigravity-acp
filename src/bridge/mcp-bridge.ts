@@ -32,6 +32,7 @@ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js'
 import type { McpServer as AcpMcpServer } from '@agentclientprotocol/sdk'
 import type { ToolSchema } from '@deepseek-ai/dsh-llm'
+import { inspectToolArguments, normalizeToolArguments, renderToolSignature, safeKeyNames } from '../adapter/tool-args.js'
 
 /** 本模块原创错误码（AGY_BRIDGE_*）。 */
 export const AGY_BRIDGE_ERROR = {
@@ -47,6 +48,8 @@ export const AGY_BRIDGE_ERROR = {
   UNKNOWN_SESSION: 'AGY_BRIDGE_UNKNOWN_SESSION',
   /** 桥已绑定一条 transport 后再次 attach。 */
   ALREADY_ATTACHED: 'AGY_BRIDGE_ALREADY_ATTACHED',
+  /** tools/call 缺少 schema 声明的必填参数；不入 park，立即把可操作的错误还给模型。 */
+  INVALID_ARGUMENTS: 'AGY_BRIDGE_INVALID_ARGUMENTS',
 } as const
 
 /** 桥为 agent 暴露的 MCP server 名称（ACP 侧注册名）。 */
@@ -72,6 +75,8 @@ export interface BridgeToolResult {
   callId: string
   /** 结果文本（MCP text content）。 */
   text: string
+  /** Native image and text blocks, prepared through the host attachment service. */
+  content?: CallToolResult['content']
   /** 工具是否失败（映射到 MCP `isError`，且让 agent 自行决定重试/放弃）。 */
   isError: boolean
 }
@@ -108,6 +113,8 @@ export interface McpToolBridgeOptions {
   port?: number
   /** 固定 token（仅测试用）；缺省随机 32 字节 hex。 */
   token?: string
+  /** 只包含目录工具名与固定别名，不记录参数值。 */
+  onArgumentsNormalized?(tool: string, renamed: Array<{ from: string; to: string }>): void
 }
 
 /**
@@ -133,10 +140,12 @@ export class McpToolBridge {
   #callSeq = 0
   /** HTTP 监听器的最近一次运行期错误（诊断用；listen 阶段的错误走 spawn 的 reject）。 */
   #httpError: Error | undefined
+  readonly #onArgumentsNormalized: McpToolBridgeOptions['onArgumentsNormalized']
 
   constructor(options: McpToolBridgeOptions = {}) {
     this.#token = options.token ?? randomBytes(32).toString('hex')
     this.#requestedPort = options.port ?? 0
+    this.#onArgumentsNormalized = options.onArgumentsNormalized
   }
 
   /** 本桥的随机访问 token（注册进 ACP mcpServers 的 header 值即 `Bearer ${token}`）。 */
@@ -244,7 +253,7 @@ export class McpToolBridge {
       if (!entry) throw new Error(`${AGY_BRIDGE_ERROR.UNKNOWN_TOOL}: 未登记的 park 调用 ${result.callId}`)
       this.#pending.delete(result.callId)
       entry.settle({
-        content: [{ type: 'text', text: result.text }],
+        content: result.content ?? [{ type: 'text', text: result.text }],
         isError: result.isError,
       })
     }
@@ -436,8 +445,24 @@ export class McpToolBridge {
         isError: true,
       })
     }
+    // 修正无歧义的常见别名后再预检。缺必填参数的调用不进 DSH 队列，
+    // 这里只检查 required 键是否存在（不比 DSH 更严格），并把期望签名一并
+    // 返回，模型可在同一个 ACP prompt 内立即改正重试。
+    const tool = this.#tools.find((item) => item.name === name)
+    const normalized = tool ? normalizeToolArguments(tool, args) : { arguments: args ?? {}, renamed: [] }
+    if (normalized.renamed.length > 0) this.#onArgumentsNormalized?.(name, normalized.renamed)
+    const { missing } = tool ? inspectToolArguments(tool, normalized.arguments) : { missing: [] }
+    if (tool && missing.length > 0) {
+      return Promise.resolve({
+        content: [{
+          type: 'text',
+          text: `${AGY_BRIDGE_ERROR.INVALID_ARGUMENTS}: ${name} 缺少必填参数 ${safeKeyNames(missing).join(', ')}。正确签名：${renderToolSignature(tool)}。请补齐后重新调用。`,
+        }],
+        isError: true,
+      })
+    }
     const callId = `${BRIDGE_MCP_SERVER_NAME}-${++this.#callSeq}`
-    const call: BridgeParkedCall = { callId, name, arguments: JSON.stringify(args ?? {}) }
+    const call: BridgeParkedCall = { callId, name, arguments: JSON.stringify(normalized.arguments) }
     return new Promise<CallToolResult>((resolve) => {
       this.#pending.set(callId, { call, settle: resolve })
       for (const listener of this.#listeners) listener(call)

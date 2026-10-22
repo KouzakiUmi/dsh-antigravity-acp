@@ -38,16 +38,8 @@ export class ProxyConfigError extends Error {
 /** 始终绕过代理的本机地址：私有 MCP 桥在 127.0.0.1，且官方进程也要连本机 OAuth 回调。 */
 const ALWAYS_BYPASS = ['localhost', '127.0.0.1', '::1'] as const
 
-/** 支持的协议前缀；其余按 http 处理（多数本地代理默认是 http 混合端口）。 */
-const KNOWN_PROTOCOLS = ['http:', 'https:', 'socks5:', 'socks5h:', 'socks4:'] as const
-
-/**
- * 错误信息里不能出现代理密码：把 `scheme://user:pass@host` 的 userinfo 替换掉。
- * 凭据仍按用户填写原样写入子进程环境变量，只是不进日志/错误回显。
- */
-function redactUserInfo(value: string): string {
-  return value.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/@]*@/i, '$1***@')
-}
+/** 插件的下载、OAuth 与子进程必须共同支持同一协议；不支持时不静默直连。 */
+const KNOWN_PROTOCOLS = ['http:', 'https:', 'socks5:', 'socks5h:'] as const
 
 /**
  * 规范化用户填写的代理地址：去空白、补全缺失的 scheme、校验协议、保留认证信息。
@@ -61,14 +53,14 @@ export function normalizeProxyUrl(raw: string | undefined): string | undefined {
   try {
     parsed = new URL(candidate)
   } catch {
-    throw new ProxyConfigError(`代理地址无法解析：${redactUserInfo(trimmed)}（示例：http://127.0.0.1:7890）`)
+    throw new ProxyConfigError('代理地址无法解析（示例：http://127.0.0.1:7890）；请检查主机名和端口')
   }
   const protocol = parsed.protocol.toLowerCase()
   if (!KNOWN_PROTOCOLS.includes(protocol as (typeof KNOWN_PROTOCOLS)[number])) {
     throw new ProxyConfigError(`不支持的代理协议 ${parsed.protocol}（支持 ${KNOWN_PROTOCOLS.map((item) => item.replace(':', '')).join('、')}）`)
   }
   if (!parsed.hostname) {
-    throw new ProxyConfigError(`代理地址缺少主机名：${redactUserInfo(trimmed)}（示例：http://127.0.0.1:7890）`)
+    throw new ProxyConfigError('代理地址缺少主机名（示例：http://127.0.0.1:7890）')
   }
   // host 含端口、不含 userinfo，因此认证部分要自己拼回去。
   const credentials = parsed.username

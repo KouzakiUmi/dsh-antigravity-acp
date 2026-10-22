@@ -48,22 +48,35 @@ describe('createProxiedFetch', () => {
     })
     expect(await (await doFetch('https://oauth2.googleapis.com/token')).text()).toBe('via-proxy')
     await doFetch('https://dl.google.com/x')
-    expect(fake.agents).toEqual(['http://127.0.0.1:7890'])
+    expect(fake.agents).toEqual(['http://127.0.0.1:7890/'])
     expect(fake.calls).toHaveLength(2)
     expect(fake.calls[0]!.dispatcher).toBeDefined()
     expect(direct).toEqual([])
   })
 
-  it('未配置代理、socks 代理、命中排除列表、undici 加载失败：都回退到直连 fetch', async () => {
+  it('只有未配置代理或显式排除才使用宿主出口；依赖失败不得直连', async () => {
     const direct: string[] = []
     const fallback = async (input: string | URL | Request): Promise<Response> => { direct.push(String(input)); return new Response('direct') }
     const fake = fakeUndici()
     await createProxiedFetch(undefined, { fallback })('https://a.test/')
-    await createProxiedFetch({ url: 'socks5://127.0.0.1:1080', bypass: '' }, { loadUndici: async () => fake.undici, fallback })('https://b.test/')
     await createProxiedFetch(proxy, { loadUndici: async () => fake.undici, fallback })('http://127.0.0.1:9/mcp')
-    await createProxiedFetch(proxy, { loadUndici: async () => undefined, fallback })('https://c.test/')
-    expect(direct).toEqual(['https://a.test/', 'https://b.test/', 'http://127.0.0.1:9/mcp', 'https://c.test/'])
+    await expect(createProxiedFetch(proxy, { loadUndici: async () => undefined, fallback })('https://c.test/')).rejects.toThrow(/undici/)
+    expect(direct).toEqual(['https://a.test/', 'http://127.0.0.1:9/mcp'])
     expect(fake.calls).toEqual([])
+  })
+
+  it('SOCKS5 和 SOCKS5H 都走代理，并保留 SOCKS 用户名密码', async () => {
+    const fake = fakeUndici()
+    const doFetch = createProxiedFetch({ url: 'socks5h://alice:pass@127.0.0.1:1080', bypass: '' }, { loadUndici: async () => fake.undici, fallback: async () => { throw new Error('must not connect directly') } })
+    await doFetch('https://example.com')
+    expect(fake.agents).toEqual(['socks5://alice:pass@127.0.0.1:1080'])
+    expect(fake.calls).toHaveLength(1)
+    await doFetch.close()
+    await expect(doFetch('https://example.com')).rejects.toThrow(/已关闭/)
+  })
+
+  it('不支持的 SOCKS4 在任何请求发出前失败', () => {
+    expect(() => createProxiedFetch({ url: 'socks4://localhost:1080', bypass: '' })).toThrow(/SOCKS4/)
   })
 
   it('排除列表匹配：精确主机与通配后缀', () => {
@@ -73,6 +86,8 @@ describe('createProxiedFetch', () => {
     expect(matchesBypass('a.internal', '*.internal')).toBe(true)
     expect(matchesBypass('a.internal', '.internal')).toBe(true)
     expect(matchesBypass('example.com', '*.internal,localhost')).toBe(false)
+    expect(matchesBypass('::1', '::1')).toBe(true)
+    expect(matchesBypass('::1', '[::1]:8080')).toBe(true)
   })
 })
 

@@ -29,6 +29,7 @@ import { homedir as osHomedir } from 'node:os'
 import { join } from 'node:path'
 import { parseTokenState, refreshAccessToken, resolveOAuthClient } from './quota.js'
 import type { OAuthClientMeta, QuotaTokenState } from './quota.js'
+import { redactSensitiveText } from './redact.js'
 
 /** 凭据目录（相对 home）。 */
 export const ACP_HOME_SUBPATH = ['.gemini', 'antigravity-acp'] as const
@@ -155,6 +156,8 @@ export interface AcpCredentialDeps {
   resolveClient?: (env: Readonly<Record<string, string | undefined>>) => Promise<OAuthClientMeta | undefined>
   /** 目标 ACP server 版本（定位缓存里已解压的官方二进制）；缺省用默认版本。 */
   acpVersion?: string
+  /** 插件设置里选定的官方 CLI 路径，用于一致地发现 OAuth client 元数据。 */
+  cliPath?: string
   /** 解析项目 id；默认不解析（省略 project_id，由 server 自行解析）。 */
   resolveProjectId?: (accessToken: string) => Promise<string | undefined>
   /** 换发所用的 fetch（插件代理在 index.ts 装好）；缺省为全局 fetch。 */
@@ -351,6 +354,7 @@ export async function ensureAcpCredentials(deps: AcpCredentialDeps = {}): Promis
       ? await deps.resolveClient(env)
       : await resolveOAuthClient({
         env,
+        cliPath: deps.cliPath,
         ...(deps.acpVersion === undefined ? {} : { acpVersion: deps.acpVersion }),
       })
   } catch {
@@ -420,6 +424,5 @@ async function refreshWithDefaults(
 
 /** 错误文案只保留类型与消息，绝不回显任何 token 片段。 */
 function describeFsError(error: unknown): string {
-  if (error instanceof Error) return `${error.name}: ${error.message.slice(0, 200)}`
-  return String(error).slice(0, 200)
+  return redactSensitiveText(error instanceof Error ? `${error.name}: ${error.message}` : String(error)).slice(0, 200)
 }

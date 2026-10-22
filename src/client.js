@@ -27,9 +27,11 @@ window.__ModuleLoader__.load({
     const ENTRY_ID = 'llm-antigravity-acp'
     /** Editable fields surfaced in this card; everything else stays in the host form. */
     const FIELDS = [
+      { key: 'autoWarmup', checkbox: true, label: '启动时自动预热 ACP', hint: '提前启动并保留连接，不发送模型消息。保存后下次启用插件生效；本次可点击“立即预热”。' },
       { key: 'preferredModel', label: '默认 / 自定义模型 ID', placeholder: '选择目录中的模型，或输入自定义 ID', hint: '保存后优先列出此模型；目录之外的 ID 标为自定义、未验证。不会替换当前会话已选模型。留空不指定默认项。' },
       { key: 'proxyUrl', label: '出网代理', placeholder: 'http://127.0.0.1:7890', hint: '此处配置优先；留空则继承宿主代理环境变量，宿主也未配置时才直连。' },
       { key: 'proxyBypass', label: '代理排除列表', placeholder: '10.0.0.0/8,*.internal', hint: 'localhost/127.0.0.1/::1 始终自动排除（私有 MCP 桥在 loopback）。' },
+      { key: 'agyCliPath', label: '官方 CLI 路径（可选）', placeholder: '留空自动查找 agy', hint: '用于模型目录、套餐额度和 AI Credits。自定义安装位置可填写完整可执行文件路径；CLI 登录与 ACP 登录独立。' },
     ]
 
     function unwrap(result) {
@@ -40,6 +42,45 @@ window.__ModuleLoader__.load({
       return result
     }
 
+    const RUNTIME_PHASES = {
+      idle: '尚未启动', binary: '准备运行文件', credentials: '准备登录态', spawn: '启动进程',
+      initialize: '等待握手', authenticate: '等待登录', ready: '连接就绪', connection: '准备连接',
+      session: '建立会话', model: '选择模型', prompt: '等待模型首块', streaming: '正在输出',
+      'waiting-tools': '等待 DSH 工具结果', continuing: '等待工具后的回复', recycling: '回收进程',
+      stopped: '已停止', error: '连接异常', disposed: '插件已卸载',
+    }
+    function runtimeBusy(runtime) {
+      if (runtime?.queue && (runtime.queue.active > 0 || runtime.queue.parked > 0 || runtime.queue.waiting > 0)) return true
+      return runtime && !['idle', 'ready', 'stopped', 'error', 'disposed'].includes(runtime.phase)
+    }
+    function duration(ms) {
+      if (!Number.isFinite(ms)) return '—'
+      if (ms < 1000) return Math.round(ms) + ' ms'
+      if (ms < 60000) return (ms / 1000).toFixed(2) + ' s'
+      return Math.floor(ms / 60000) + ' 分 ' + Math.floor(ms % 60000 / 1000) + ' 秒'
+    }
+    function RuntimeDetails({ runtime }) {
+      if (!runtime) return null
+      const row = (label, value) => h('div', { key: label, style: { display: 'flex', justifyContent: 'space-between', gap: '12px' } },
+        h('span', { style: { opacity: .65 } }, label), h('span', { style: { fontVariantNumeric: 'tabular-nums', overflowWrap: 'anywhere' } }, value))
+      const round = runtime.round
+      const queue = runtime.queue
+      return h('div', { 'aria-label': 'ACP 生命周期与计时', style: { marginTop: '12px', paddingTop: '10px', borderTop: '1px solid #8883', display: 'grid', gap: '6px', fontSize: '12px' } },
+        row('当前状态', (RUNTIME_PHASES[runtime.phase] ?? runtime.phase) + ' · ' + duration(runtime.phaseElapsedMs)),
+        queue ? row('会话调度', '运行 ' + queue.active + ' · 等待工具 ' + queue.parked + ' · 排队 ' + queue.waiting) : null,
+        queue ? row('并发连接', queue.workers + ' / ' + queue.capacity) : null,
+        runtime.processRunning ? row('进程已运行', duration(runtime.uptimeMs)) : null,
+        row('进程统计', '启动 ' + runtime.starts + ' · 复用 ' + runtime.reuses + ' · 回收 ' + runtime.recycles),
+        runtime.startup ? row('最近启动总耗时', duration(runtime.startup.elapsedMs)) : null,
+        ...Object.entries(runtime.startup?.timings ?? {}).map(([name, ms]) => row(RUNTIME_PHASES[name] ?? name, duration(ms))),
+        round ? row('当前 / 最近回合', round.model + ' · ' + duration(round.elapsedMs)) : null,
+        ...Object.entries(round?.timings ?? {}).map(([name, ms]) => row(RUNTIME_PHASES[name] ?? name, duration(ms))),
+        round?.firstChunkMs !== undefined ? row('发送 prompt → 首块', duration(round.firstChunkMs)) : null,
+        round?.firstToolMs !== undefined ? row('发送 prompt → 首个工具', duration(round.firstToolMs)) : null,
+        round?.continuations ? row('工具续轮', round.continuations + ' 次 · 最近 ' + duration(round.lastContinuationMs)) : null,
+        runtime.error ? h('p', { role: 'alert', style: { margin: '4px 0 0', color: '#e5534b', overflowWrap: 'anywhere' } }, runtime.error) : null)
+    }
+
     function AntigravitySettingsCard(props) {
       const remote = props.remote
       const quota = useQuota(props.readQuota)
@@ -47,10 +88,10 @@ window.__ModuleLoader__.load({
       const [models, setModels] = React.useState([])
       const [modelBusy, setModelBusy] = React.useState(false)
       const [modelMessage, setModelMessage] = React.useState('')
-      const [confirmLogin, setConfirmLogin] = React.useState(false)
       const alive = React.useRef(true)
       const modelVersion = React.useRef(0)
       const accountVersion = React.useRef(0)
+      const polling = React.useRef(false)
       const pullModels = React.useCallback(async (force = false) => {
         if (!props.control) return
         const version = ++modelVersion.current
@@ -59,17 +100,20 @@ window.__ModuleLoader__.load({
           const value = unwrap(await props.control('models', force ? { force: true } : undefined))
           if (!alive.current || version !== modelVersion.current) return
           setModels(value.models ?? [])
-          setModelMessage(value.status === 'error' ? value.message : (value.models?.length ? '目录已更新；不会自动替换当前会话的已选模型。' : '暂无模型目录，请点击一键拉取或连接 ACP。'))
+          setModelMessage(value.status === 'error' ? value.message : (value.models?.length ? '目录已更新；不会自动替换当前会话的已选模型。' : '暂无模型目录。连接 / 登录 ACP 可验证会话并读取目录；也可从已登录的官方 CLI 拉取。'))
         } catch (error) { if (alive.current && version === modelVersion.current) setModelMessage(error instanceof Error ? error.message : String(error)) }
         finally { if (alive.current && version === modelVersion.current) setModelBusy(false) }
       }, [props.control])
       const accountAction = React.useCallback(async (action = 'status') => {
         if (!props.control) return
+        if (action === 'status' && polling.current) return
+        polling.current = true
         const version = ++accountVersion.current
         try {
           const value = unwrap(await props.control('account', { action }))
           if (alive.current && version === accountVersion.current) setAccount(value)
         } catch (error) { if (alive.current && version === accountVersion.current) setAccount({ state: 'error', message: error instanceof Error ? error.message : String(error) }) }
+        finally { polling.current = false }
       }, [props.control])
       React.useEffect(() => {
         alive.current = true
@@ -78,18 +122,44 @@ window.__ModuleLoader__.load({
         return () => { alive.current = false; ++modelVersion.current; ++accountVersion.current }
       }, [accountAction, pullModels])
       React.useEffect(() => {
-        if (!['connecting', 'cancelling'].includes(account?.state)) return undefined
-        const timer = setInterval(() => void accountAction('status'), 2000)
+        const timer = setInterval(() => {
+          if (typeof document === 'undefined' || document.visibilityState !== 'hidden') void accountAction('status')
+        }, 2000)
         return () => clearInterval(timer)
-      }, [account?.state, accountAction])
-      React.useEffect(() => { if (account?.state === 'connected') void pullModels(false) }, [account?.state, pullModels])
+      }, [accountAction])
+      React.useEffect(() => {
+        if (account?.state === 'connected' || account?.runtime?.modelCatalogRevision !== undefined) void pullModels(false)
+      }, [account?.state, account?.runtime?.modelCatalogRevision, pullModels])
       const [view, setView] = React.useState(undefined)
       const [registered, setRegistered] = React.useState(undefined)
       const [draft, setDraft] = React.useState({})
       const [status, setStatus] = React.useState(null)
       const [loading, setLoading] = React.useState(true)
+      const [writable, setWritable] = React.useState(false)
+      const [saving, setSaving] = React.useState(false)
+      const [dirtyKeys, setDirtyKeys] = React.useState([])
+      const [conflicts, setConflicts] = React.useState([])
+      const settingsVersion = React.useRef(0)
+      const savingRef = React.useRef(false)
+      const refreshAfterSave = React.useRef(false)
+      const baseline = React.useRef({})
+      const dirty = React.useRef(new Set())
+      const draftRef = React.useRef(draft)
+      draftRef.current = draft
 
-      const reload = React.useCallback(() => {
+      const editField = React.useCallback((key, value) => {
+        if (savingRef.current) return
+        const next = { ...draftRef.current, [key]: value }
+        draftRef.current = next
+        if (value === baseline.current[key]) dirty.current.delete(key)
+        else dirty.current.add(key)
+        setDirtyKeys([...dirty.current])
+        setConflicts((previous) => previous.filter((field) => field !== key))
+        setDraft(next)
+      }, [])
+
+      const reload = React.useCallback(async (preserveStatus = false) => {
+        const version = ++settingsVersion.current
         // 同步段整体兜底：remote.<ns> 是代理属性，缺 inject 时连「读属性」都会抛；
         // 这里降级为卡片内可读错误，绝不让异常穿出组件击穿 settings.section。
         try {
@@ -104,65 +174,98 @@ window.__ModuleLoader__.load({
             .then((value) => unwrap(value))
             .catch(() => [])
             .then((rows) => (Array.isArray(rows) ? rows : []))
-          Promise.all([described, providers])
-            .then(([settings, rows]) => {
-              const namespaces = Array.isArray(settings?.namespaces) ? settings.namespaces : []
-              // 只按精确 namespace 匹配：按字段回退会命中别人的配置，而保存用的
-              // revision 也必须来自同一份文档（同 profile 的 dsh-proxy 即如此）。
-              const found = namespaces.find((item) => item?.ns === ENTRY_ID)
-              setView(found ?? null)
-              const current = found?.value && typeof found.value === 'object' ? found.value : {}
-              setDraft(Object.fromEntries(FIELDS.map((field) => [field.key, current[field.key] ?? ''])))
-              setRegistered(rows.some((row) => row?.id === PROVIDER))
-              setStatus(null)
-            })
-            .catch((cause) => {
-              setStatus({ kind: 'error', text: cause instanceof Error ? cause.message : String(cause) })
-            })
-            .finally(() => setLoading(false))
+          const [settings, rows] = await Promise.all([described, providers])
+          if (!alive.current || version !== settingsVersion.current) return
+          const namespaces = Array.isArray(settings?.namespaces) ? settings.namespaces : []
+          // 只按精确 namespace 匹配：按字段回退会命中别人的配置，而保存用的
+          // revision 也必须来自同一份文档（同 profile 的 dsh-proxy 即如此）。
+          const found = namespaces.find((item) => item?.ns === ENTRY_ID)
+          setView(found ?? null)
+          const current = found?.value && typeof found.value === 'object' ? found.value : {}
+          const server = Object.fromEntries(FIELDS.map((field) => [field.key, field.checkbox ? current[field.key] === true : current[field.key] ?? '']))
+          const changed = []
+          const next = { ...server }
+          for (const key of dirty.current) {
+            if (draftRef.current[key] === server[key]) dirty.current.delete(key)
+            else {
+              next[key] = draftRef.current[key]
+              if (baseline.current[key] !== server[key]) changed.push(key)
+            }
+          }
+          baseline.current = server
+          draftRef.current = next
+          setDraft(next)
+          setDirtyKeys([...dirty.current])
+          setConflicts((previous) => [...new Set([...previous.filter((key) => dirty.current.has(key)), ...changed])])
+          setWritable(settings?.writable === true)
+          setRegistered(rows.some((row) => row?.id === PROVIDER))
+          if (!preserveStatus) setStatus(null)
         } catch (cause) {
-          setLoading(false)
-          setStatus({ kind: 'error', text: cause instanceof Error ? cause.message : String(cause) })
+          if (alive.current && version === settingsVersion.current) setStatus({ kind: 'error', text: cause instanceof Error ? cause.message : String(cause) })
+        } finally {
+          if (alive.current && version === settingsVersion.current) setLoading(false)
         }
       }, [remote])
 
-      const save = React.useCallback(() => {
-        if (!view) return
+      const save = React.useCallback(async () => {
+        if (!view || !writable || loading || savingRef.current || dirty.current.size === 0) return
+        savingRef.current = true
+        setSaving(true)
         setStatus({ kind: 'busy', text: '保存中…' })
-        // 所有字段都写回（含空串），否则用户无法清掉已保存的 proxyUrl / preferredModel。
-        // 宿主侧把空串视为未配置：normalizeProxyUrl 与 preferredModel?.trim() 都会
-        // 把它折叠成「用默认值」。
-        const ops = FIELDS.map((field) => ({ op: 'set', path: [field.key], value: draft[field.key] ?? '' }))
-        let pending
+        // 只提交用户改动过的字段，空串也是有效改动；未编辑字段遵循最新服务端值。
+        const ops = FIELDS.filter((field) => dirty.current.has(field.key)).map((field) => ({ op: 'set', path: [field.key], value: draftRef.current[field.key] }))
         try {
-          pending = Promise.resolve(remote.settings.mutate(ENTRY_ID, ops, view.revision))
+          unwrap(await remote.settings.mutate(ENTRY_ID, ops, view.revision))
+          if (!alive.current) return
+          for (const operation of ops) {
+            const key = operation.path[0]
+            if (draftRef.current[key] === operation.value) dirty.current.delete(key)
+          }
+          setDirtyKeys([...dirty.current])
+          setConflicts([])
+          setStatus({ kind: 'ok', text: '已保存。重新加载插件可应用运行配置；当前对话中的已选模型保持不变。' })
+          await reload(true)
         } catch (cause) {
+          if (!alive.current) return
           setStatus({ kind: 'error', text: cause instanceof Error ? cause.message : String(cause) })
-          return
+          // 修订号冲突时同步新基线，仍保留本地草稿，供用户检查后再次保存。
+          await reload(true)
+        } finally {
+          savingRef.current = false
+          if (alive.current) {
+            setSaving(false)
+            if (refreshAfterSave.current) { refreshAfterSave.current = false; void reload(true) }
+          }
         }
-        pending
-          .then((result) => {
-            unwrap(result)
-            setStatus({
-              kind: 'ok',
-              text: '已保存。代理类改动需要完全退出并重开 Desktop 才会生效（环境变量在官方进程启动时读取）。',
-            })
-            reload()
-          })
-          .catch((cause) => {
-            setStatus({ kind: 'error', text: cause instanceof Error ? cause.message : String(cause) })
-          })
-      }, [draft, remote, reload, view])
+      }, [loading, writable, remote, reload, view])
 
       React.useEffect(() => {
         reload()
         const off = remote?.$on?.('settings/document-updated', (ns) => {
-          if (!ns || ns === ENTRY_ID) reload()
+          if (!ns || ns === ENTRY_ID) {
+            if (savingRef.current) refreshAfterSave.current = true
+            else void reload()
+          }
         })
         return () => {
+          ++settingsVersion.current
           if (typeof off === 'function') off()
         }
       }, [reload, remote])
+
+      const selectedModel = models.find((model) => model.id === draft.preferredModel)
+      const modalityLabels = { text: '文本', image: '图片', audio: '音频', video: '视频', file: '文件' }
+      const selectedModalities = selectedModel?.inputModalities
+      const editingDisabled = loading || saving || !view || !writable
+      const discardDraft = () => {
+        if (savingRef.current) return
+        dirty.current.clear()
+        draftRef.current = { ...baseline.current }
+        setDraft(draftRef.current)
+        setDirtyKeys([])
+        setConflicts([])
+        setStatus({ kind: 'ok', text: '已撤销未保存的修改，恢复为当前宿主设置。' })
+      }
 
       return h(
         'div',
@@ -180,45 +283,52 @@ window.__ModuleLoader__.load({
         ),
         h('section', { style: CARD, 'aria-label': '账户连接' },
           h('h3', { style: { margin: '0 0 8px', fontSize: '14px' } }, '账户 · ACP 连接'),
-          h('p', { role: 'status', style: { fontSize: '12px', margin: '0 0 10px' } }, account?.message ?? '尚未验证 ACP 连接'),
+          h('p', { role: 'status', style: { fontSize: '12px', margin: '0 0 10px' } }, account?.runtime?.phase === 'stopped'
+            ? 'ACP 连接已停止，可以重新预热。' : account?.runtime?.phase === 'error'
+              ? account.runtime.error ?? account?.message ?? 'ACP 连接异常，请重试。' : account?.message ?? '尚未验证 ACP 连接'),
           h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '8px' } },
-            h('button', { type: 'button', style: ACTION, disabled: !props.control || ['connecting', 'cancelling'].includes(account?.state), onClick: () => setConfirmLogin(true) }, '连接 / 登录 ACP'),
+            h('button', { type: 'button', style: ACTION, disabled: !props.control || ['connecting', 'cancelling'].includes(account?.state) || runtimeBusy(account?.runtime) || account?.runtime?.phase === 'ready', onClick: () => accountAction('warmup') }, account?.runtime?.phase === 'ready' ? '连接已预热' : '立即预热'),
+            h('button', { type: 'button', style: ACTION, disabled: !props.control || ['connecting', 'cancelling'].includes(account?.state) || runtimeBusy(account?.runtime), onClick: () => accountAction('login') }, '连接 / 登录 ACP'),
             ['connecting', 'cancelling'].includes(account?.state) ? h('button', { type: 'button', style: ACTION, disabled: account?.state === 'cancelling', onClick: () => accountAction('cancel') }, '取消连接') : null),
-          confirmLogin ? h('div', { style: { ...CARD, marginTop: '10px' } },
-            h('p', { style: { margin: '0 0 8px', fontSize: '12px' } }, '将复用本机官方登录态；必要时打开官方浏览器授权并更新 ACP 登录文件。不发送聊天消息，不切换 CLI 账户。'),
-            h('button', { type: 'button', style: ACTION, onClick: () => { setConfirmLogin(false); void accountAction('login') } }, '确认连接'),
-            h('button', { type: 'button', style: ACTION, onClick: () => setConfirmLogin(false) }, '返回')) : null,
-          h('p', { style: { opacity: .6, fontSize: '11px', margin: '10px 0 0' } }, 'ACP 登录与 CLI 额度登录态分开。额度和一键拉取需在官方 agy 中完成 CLI 登录；这里不展示令牌、不管理多账户。')),
+          h('p', { style: { opacity: .6, fontSize: '11px', margin: '10px 0 0' } }, '预热准备连接；连接 / 登录 ACP 还会验证会话并读取模型目录。两者均不发送聊天消息，仅登录按钮会在需要时打开官方授权页面。'),
+          RuntimeDetails({ runtime: account?.runtime })),
         h('section', { style: CARD, 'aria-label': '模型管理' },
           h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
             h('h3', { style: { fontSize: '14px', margin: 0, flex: 1 } }, '模型管理'),
             h('button', { type: 'button', style: ACTION, disabled: modelBusy || !props.control, onClick: () => pullModels(true) }, modelBusy ? '拉取中…' : '一键拉取模型')),
-          h('p', { role: 'status', style: { fontSize: '12px', opacity: .7 } }, modelMessage || '从官方 CLI 拉取目录，或通过 ACP 连接获取会话声明。'),
+          h('p', { role: 'status', style: { fontSize: '12px', opacity: .7 } }, modelMessage || '可通过 ACP 会话验证读取目录，也可从官方 CLI 拉取。'),
           h('label', { style: { display: 'grid', gap: '6px' } }, '从目录选择默认模型',
-            h('select', { 'aria-label': '从目录选择默认模型', value: models.some((m) => m.id === draft.preferredModel) ? draft.preferredModel : '', onChange: (event) => { if (event.target.value) setDraft((previous) => ({ ...previous, preferredModel: event.target.value })) }, style: { ...ACTION, width: '100%' } },
+            h('select', { 'aria-label': '从目录选择默认模型', disabled: editingDisabled, value: models.some((m) => m.id === draft.preferredModel) ? draft.preferredModel : '', onChange: (event) => { if (event.target.value) editField('preferredModel', event.target.value) }, style: { ...ACTION, width: '100%' } },
               h('option', { value: '' }, models.length ? '选择一个模型，或在下方手填 ID' : '暂无目录，可手填模型 ID'),
               ...models.map((model) => h('option', { key: model.id, value: model.id }, model.name + ' · ' + model.id)))),
-          h('small', { style: { display: 'block', marginTop: '8px', opacity: .6 } }, models.length + ' 个模型 · 选择后点击保存。思考强度仍由会话菜单设置。')),
+          h('small', { style: { display: 'block', marginTop: '8px', opacity: .6 } }, models.length + ' 个模型 · 选择后点击保存。思考强度仍由会话菜单设置。'),
+          Array.isArray(selectedModalities) && selectedModalities.length ? h('small', { style: { display: 'block', marginTop: '6px', opacity: .6 } }, '当前目录支持的输入：' + selectedModalities.map((modality) => modalityLabels[modality] ?? modality).join('、')) : null),
         ...FIELDS.map((field) => h(
           'label',
           { key: field.key, style: { display: 'flex', flexDirection: 'column', gap: '4px' } },
           h('span', null, field.label),
           h('input', {
-            type: 'text',
-            value: draft[field.key] ?? '',
+            name: field.key,
+            type: field.checkbox ? 'checkbox' : 'text',
+            disabled: editingDisabled,
+            ...(field.checkbox ? { checked: draft[field.key] === true } : { value: draft[field.key] ?? '' }),
             placeholder: field.placeholder,
-            style: { ...ACTION, cursor: 'text', width: '100%', boxSizing: 'border-box' },
-            onChange: (event) => setDraft((previous) => ({ ...previous, [field.key]: event.target.value })),
+            style: field.checkbox ? { alignSelf: 'flex-start' } : { ...ACTION, cursor: 'text', width: '100%', boxSizing: 'border-box' },
+            onChange: (event) => editField(field.key, field.checkbox ? event.target.checked : event.target.value),
           }),
           h('small', { style: { opacity: 0.7 } }, field.hint),
         )),
         h(
           'div',
-          { style: { display: 'flex', gap: '8px', alignItems: 'center' } },
-          h('button', { type: 'button', onClick: save, disabled: loading || !view, style: ACTION }, '保存'),
-          h('button', { type: 'button', onClick: reload, style: ACTION }, loading ? '刷新中…' : '刷新配置'),
+          { style: { display: 'flex', flexWrap: 'wrap', gap: '8px', alignItems: 'center' } },
+          h('button', { type: 'button', onClick: save, disabled: editingDisabled || dirtyKeys.length === 0, style: ACTION }, saving ? '保存中…' : '保存'),
+          h('button', { type: 'button', disabled: loading || saving, onClick: () => reload(), style: ACTION }, loading ? '刷新中…' : '刷新配置'),
+          dirtyKeys.length ? h('button', { type: 'button', disabled: loading || saving, onClick: discardDraft, style: ACTION }, '撤销未保存修改') : null,
         ),
-        status ? h('p', { style: { margin: 0, color: status.kind === 'error' ? '#e5534b' : undefined } }, status.text) : null,
+        !loading && view && !writable ? h('p', { role: 'status', style: { margin: 0, fontSize: '12px', opacity: .7 } }, '当前设置为只读，请在有写入权限的宿主中修改。') : null,
+        dirtyKeys.length ? h('p', { role: 'status', style: { margin: 0, fontSize: '12px', opacity: .7 } }, '有 ' + dirtyKeys.length + ' 项未保存的修改；刷新会保留这些输入。') : null,
+        conflicts.length ? h('p', { role: 'alert', style: { margin: 0, fontSize: '12px', color: '#d99b28' } }, '其他位置更新了以下设置，已保留你的输入：' + conflicts.map((key) => FIELDS.find((field) => field.key === key)?.label ?? key).join('、') + '。请核对后再保存。') : null,
+        status ? h('p', { role: status.kind === 'error' ? 'alert' : 'status', style: { margin: 0, color: status.kind === 'error' ? '#e5534b' : undefined } }, status.text) : null,
         h('section', { style: { marginTop: '8px' }, 'aria-label': '套餐额度管理' }, QuotaDetails({ ...quota, model: draft.preferredModel })),
 
       )
@@ -319,8 +429,7 @@ window.__ModuleLoader__.load({
         credits?.planName ? h('div', { style: { fontSize: '11px', opacity: .7, marginTop: '6px' } }, '套餐：' + credits.planName) : null,
         credits?.stale ? h('p', { role: 'status', style: { margin: '6px 0 0', fontSize: '11px', color: '#d99b28' } }, '余额缓存 · ' + (credits.staleReason ?? '余额刷新失败')) : null,
         credits?.error?.message ? h('p', { role: credits.status === 'error' ? 'alert' : 'status', style: { margin: '6px 0 0', fontSize: '11px', overflowWrap: 'anywhere' } }, credits.error.message) : null,
-        credits?.updatedAt ? h('div', { style: { marginTop: '6px', fontSize: '10px', opacity: .55 } }, (valid ? '余额更新于 ' : '最近查询 ') + new Date(credits.updatedAt).toLocaleString()) : null,
-        h('p', { style: { margin: '6px 0 0', opacity: .55, fontSize: '11px' } }, '由官方 /credits 查询，与套餐额度独立；不会开启 AI Credits 付费。'))
+        credits?.updatedAt ? h('div', { style: { marginTop: '6px', fontSize: '10px', opacity: .55 } }, (valid ? '余额更新于 ' : '最近查询 ') + new Date(credits.updatedAt).toLocaleString()) : null)
     }
     function QuotaDetails({ data, refreshing, load, model }) {
       return h('div', { style: { display: 'grid', gap: '12px' } },
@@ -347,7 +456,39 @@ window.__ModuleLoader__.load({
           h('small', { style: { flex: 1, opacity: .55, minWidth: 0 } }, data?.updatedAt ? '更新于 ' + new Date(data.updatedAt).toLocaleString() : '尚无成功快照'),
           h('button', { type: 'button', disabled: refreshing || !load, onClick: () => load(true), style: ACTION }, refreshing ? '刷新中…' : '刷新额度')))
     }
-    function AgYQuotaPill({ store, readQuota }) {
+    function useAcpWarmup(control, enabled) {
+      const [account, setAccount] = React.useState(undefined)
+      const [pending, setPending] = React.useState(false)
+      const alive = React.useRef(false)
+      const version = React.useRef(0)
+      const polling = React.useRef(false)
+      const run = React.useCallback(async (action = 'status') => {
+        if (!control || !enabled || (action === 'status' && polling.current)) return
+        const current = ++version.current
+        polling.current = true
+        if (action === 'warmup') setPending(true)
+        try {
+          const value = unwrap(await control('account', { action }))
+          if (alive.current && current === version.current) setAccount(value)
+        } catch (error) {
+          if (alive.current && current === version.current) setAccount({ state: 'error', message: error instanceof Error ? error.message : String(error) })
+        } finally {
+          polling.current = false
+          if (alive.current && action === 'warmup') setPending(false)
+        }
+      }, [control, enabled])
+      React.useEffect(() => {
+        alive.current = true
+        if (!enabled) return () => { alive.current = false; ++version.current }
+        void run()
+        const timer = setInterval(() => {
+          if (typeof document === 'undefined' || document.visibilityState !== 'hidden') void run()
+        }, 2000)
+        return () => { alive.current = false; ++version.current; clearInterval(timer) }
+      }, [run, enabled])
+      return { account, pending, run }
+    }
+    function AgYQuotaPill({ store, readQuota, control }) {
       const state = React.useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot)
       const enabled = state?.current?.provider === PROVIDER
       const model = state?.current?.model
@@ -356,6 +497,7 @@ window.__ModuleLoader__.load({
       const [position, setPosition] = React.useState(null)
       const root = React.useRef(null)
       const button = React.useRef(null)
+      const warmup = useAcpWarmup(control, enabled && Boolean(control))
       React.useEffect(() => { setExpanded(false) }, [enabled])
       React.useEffect(() => {
         if (!expanded) { setPosition(null); return undefined }
@@ -388,10 +530,26 @@ window.__ModuleLoader__.load({
       const buckets = group?.buckets ?? []
       const label = quota.data?.status === 'error' ? '额度读取失败' : !quota.data ? '正在读取额度' : !group ? '额度未匹配，请选择具体模型' : !buckets.length ? '额度未知' : buckets.map((b) => windowName(b) + ' ' + (b.disabled ? '已停用' : percentage(b) === undefined ? '额度未知' : Math.round(percentage(b)) + '% 剩余')).join(' · ')
       const title = String(model ?? '未选择模型') + ' · ' + label + (quota.data?.stale ? ' · 缓存数据' : '')
-      return h('span', { ref: root, style: { position: 'relative', display: 'inline-flex', alignItems: 'center' } },
+      const runtime = warmup.account?.runtime
+      const warming = warmup.pending || ['connecting', 'cancelling'].includes(warmup.account?.state)
+        || ['binary', 'credentials', 'spawn', 'initialize', 'authenticate'].includes(runtime?.phase)
+      const working = !warming && runtimeBusy(runtime)
+      const ready = runtime?.phase === 'ready'
+      const failed = warmup.account?.state === 'error' || runtime?.phase === 'error'
+      const warmupLabel = warming ? '预热中…' : runtime?.queue?.waiting > 0 ? '排队 ' + runtime.queue.waiting : working ? '运行中' : ready ? '已预热' : failed ? '重试预热' : '预热'
+      const warmupTitle = runtime ? (RUNTIME_PHASES[runtime.phase] ?? runtime.phase) + ' · ' + duration(runtime.phaseElapsedMs)
+        + (runtime.queue ? ' · 运行 ' + runtime.queue.active + ' · 等待工具 ' + runtime.queue.parked + ' · 排队 ' + runtime.queue.waiting : '')
+        + (runtime.error ? ' · ' + runtime.error : '') : warmup.account?.message ?? '提前启动 ACP 连接，不发送模型消息'
+      return h('span', { ref: root, style: { position: 'relative', display: 'inline-flex', alignItems: 'center', gap: '6px' } },
         h('button', { ref: button, type: 'button', title, 'aria-label': title, 'aria-expanded': expanded, 'aria-haspopup': 'dialog', onClick: () => setExpanded((value) => !value),
           style: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', padding: '6px 10px', minHeight: '26px', borderRadius: '99px', border: '1px solid rgba(128,128,128,.28)', background: 'transparent', color: 'inherit', cursor: 'pointer' } },
           buckets.length ? h('span', { style: { display: 'grid', gap: '3px' } }, ...buckets.map((b, i) => h('span', { key: i }, remainingBar(b, true, quota.data?.stale, group.name + ' ' + windowName(b) + '剩余额度')))) : h('span', { 'aria-hidden': true }, quota.data?.status === 'error' ? '!' : quota.data ? '?' : '…')),
+        control ? h('button', {
+          type: 'button', title: warmupTitle, 'aria-label': '预热 ACP', 'aria-busy': warming,
+          disabled: Boolean(warming || working || ready), onClick: () => warmup.run('warmup'),
+          style: { ...ACTION, padding: '4px 9px', minHeight: '26px', borderRadius: '99px', fontSize: '11px', whiteSpace: 'nowrap',
+            color: ready ? '#25b879' : failed ? '#e5534b' : 'inherit', cursor: warming || working || ready ? 'default' : 'pointer' },
+        }, warmupLabel) : null,
         expanded ? h('div', { role: 'dialog', 'aria-label': 'Antigravity 额度详情', style: { position: 'absolute', bottom: 'calc(100% + 8px)', right: 0, zIndex: 50, width: 'min(340px, calc(100vw - 48px))', maxHeight: 'min(75vh, calc(100vh - 72px))', overflowY: 'auto', boxSizing: 'border-box', overflowWrap: 'anywhere', padding: '16px', borderRadius: '16px', background: 'var(--dsh-surface, Canvas)', color: 'var(--dsh-text, CanvasText)', border: '1px solid rgba(128,128,128,.25)', boxShadow: '0 14px 40px rgba(0,0,0,.22)', fontSize: '12px', ...position } },
           QuotaDetails({ ...quota, model })) : null)
     }
@@ -515,7 +673,7 @@ window.__ModuleLoader__.load({
             codec: method === 'models' ? strictCodec(`${AGY_QUOTA_PACKAGE}#AgYQuotaRequest`, parseQuotaRequest)
               : strictCodec(`${AGY_QUOTA_PACKAGE}#AgYAccountRequest`, (value) => {
                 if (value === undefined) return { action: 'status' }
-                if (!value || typeof value !== 'object' || !['status', 'login', 'cancel'].includes(value.action)) throw new TypeError('Invalid AgYAccountRequest')
+                if (!value || typeof value !== 'object' || !['status', 'login', 'warmup', 'cancel'].includes(value.action)) throw new TypeError('Invalid AgYAccountRequest')
                 return value
               }) }],
           result: strictCodec(`${AGY_QUOTA_PACKAGE}#${method === 'models' ? 'AgYModelsResult' : 'AgYAccountResult'}`, (value) => {
@@ -581,6 +739,7 @@ window.__ModuleLoader__.load({
                     inject: (sessionId) => ({
                       store: scope.modelDirectories.directoryFor(sessionId).store,
                       readQuota,
+                      control,
                     }),
                   },
                   AgYQuotaPill,

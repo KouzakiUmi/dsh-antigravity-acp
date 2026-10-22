@@ -42,15 +42,15 @@ async function makeMeiDir(root: string, name: string, ageMs: number, nowMs: numb
 }
 
 describe('cleanupStalePyiTempDirs', () => {
-  it('删除陈旧的 _MEI* 目录，保留新鲜的与无关目录', async () => {
+  it('没有进程所有权记录的旧 _MEI* 目录无论年龄均保留', async () => {
     const now = Date.parse('2026-10-16T12:00:00.000Z')
     const root = await makeTempRoot()
     const stale = await makeMeiDir(root, `${PYI_TEMP_PREFIX}00000aaaa`, PYI_TEMP_MAX_AGE_MS + 60_000, now)
     const fresh = await makeMeiDir(root, `${PYI_TEMP_PREFIX}00000bbbb`, 1_000, now)
     const unrelated = await makeMeiDir(root, 'not-ours', PYI_TEMP_MAX_AGE_MS * 10, now)
 
-    expect(await cleanupStalePyiTempDirs(root, { now: () => now })).toBe(1)
-    expect(existsSync(stale)).toBe(false)
+    expect(await cleanupStalePyiTempDirs(root, { now: () => now })).toBe(0)
+    expect(existsSync(stale)).toBe(true)
     expect(existsSync(fresh)).toBe(true)
     expect(existsSync(unrelated)).toBe(true)
   })
@@ -81,12 +81,30 @@ describe('cleanupStaleStagingDirs', () => {
     const nestedStale = await makeMeiDir(versionSubdir, `${STAGING_DIR_PREFIX}333`, STAGING_MAX_AGE_MS + 20_000, now)
     const nestedFresh = await makeMeiDir(versionSubdir, `${STAGING_DIR_PREFIX}444`, 2_000, now)
 
-    const removed = await cleanupStaleStagingDirs(root, { now: () => now })
+    for (const path of [directStale, directFresh, nestedStale, nestedFresh]) {
+      await writeFile(join(path, 'dsh-owner.json'), JSON.stringify({ version: 1, pid: 12345, id: 'test', startedAt: '2026-01-01', state: 'active' }))
+      // Writing the marker updates mtime; restore the fixture's age afterwards.
+      const age = path === directStale || path === nestedStale ? STAGING_MAX_AGE_MS + 60_000 : 1_000
+      await utimes(path, new Date(now - age), new Date(now - age))
+    }
+    const removed = await cleanupStaleStagingDirs(root, { now: () => now, isProcessAlive: () => false })
     expect(removed).toBe(2)
     expect(existsSync(directStale)).toBe(false)
     expect(existsSync(directFresh)).toBe(true)
     expect(existsSync(nestedStale)).toBe(false)
     expect(existsSync(nestedFresh)).toBe(true)
+  })
+
+  it('即使很旧也保留活跃、状态未知以及无所有权标记的 staging', async () => {
+    const root = await makeTempRoot()
+    const now = Date.now()
+    const path = await makeMeiDir(root, `${STAGING_DIR_PREFIX}live`, STAGING_MAX_AGE_MS * 2, now)
+    expect(await cleanupStaleStagingDirs(root, { now: () => now, isProcessAlive: () => false })).toBe(0)
+    await writeFile(join(path, 'dsh-owner.json'), JSON.stringify({ version: 1, pid: 12345, id: 'test', startedAt: '2026-01-01' }))
+    await utimes(path, new Date(now - STAGING_MAX_AGE_MS * 2), new Date(now - STAGING_MAX_AGE_MS * 2))
+    expect(await cleanupStaleStagingDirs(root, { now: () => now, isProcessAlive: () => true })).toBe(0)
+    expect(await cleanupStaleStagingDirs(root, { now: () => now, isProcessAlive: () => undefined })).toBe(0)
+    expect(existsSync(path)).toBe(true)
   })
 
   it('不存在的目录返回 0', async () => {

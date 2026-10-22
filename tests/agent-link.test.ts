@@ -125,6 +125,32 @@ describe('AgentLink 握手', () => {
 })
 
 describe('AgentLink 超时与取消', () => {
+  it('写入被 backpressure 永久阻塞时，deadline 仍结束请求并封闭连接', async () => {
+    const link = new AgentLink({
+      stream: { writable: new WritableStream({ write: () => new Promise(() => {}) }), readable: new ReadableStream() },
+      requestTimeoutMs: 20, closeTimeoutMs: 20,
+    })
+    const result = await Promise.race([
+      link.request('test', {}).then(() => 'unexpected', (error: AgentLinkError) => error.code),
+      new Promise<string>((resolve) => setTimeout(() => resolve('hung'), 200)),
+    ])
+    expect(result).toBe(AGY_LINK_ERROR.REQUEST_TIMEOUT)
+    expect(link.closed).toBe(true)
+    await link.close()
+  })
+
+  it('写入阻塞期间 abort 仍立即结束；close 不等永远不完成的底层流', async () => {
+    const link = new AgentLink({
+      stream: { writable: new WritableStream({ write: () => new Promise(() => {}) }), readable: new ReadableStream({ cancel: () => new Promise(() => {}) }) },
+      requestTimeoutMs: 10_000, closeTimeoutMs: 20,
+    })
+    link.start()
+    const controller = new AbortController()
+    const pending = link.request('test', {}, { signal: controller.signal })
+    controller.abort()
+    await expect(pending).rejects.toMatchObject({ code: AGY_LINK_ERROR.REQUEST_TIMEOUT })
+    expect(await Promise.race([link.close().then(() => 'closed'), new Promise((resolve) => setTimeout(() => resolve('hung'), 200))])).toBe('closed')
+  })
   it('握手超时触发 AGY_HANDSHAKE_TIMEOUT', async () => {
     const pair = fakePair()
     // fake agent 对 initialize 装聋。
@@ -211,6 +237,36 @@ describe('AgentLink 超时与取消', () => {
     controller.abort()
     await expect(pending).rejects.toMatchObject({ code: AGY_LINK_ERROR.REQUEST_TIMEOUT })
     await vi.waitFor(() => expect(cancelNotifications).toEqual([{ requestId: 2 }]))
+    await link.close()
+  })
+})
+
+describe('AgentLink v1 能力协商', () => {
+  it.each([0, 2, undefined])('拒绝不匹配或缺失的协议版本 %s', async (protocolVersion) => {
+    const pair = fakePair()
+    pumpAgent(pair, async (message, reply) => {
+      await reply({ jsonrpc: '2.0', id: message.id!, result: { protocolVersion, agentCapabilities: {} } })
+    })
+    const link = new AgentLink({ stream: pair.stream })
+    link.start()
+    await expect(link.initialize()).rejects.toMatchObject({ code: AGY_LINK_ERROR.INCOMPATIBLE_PROTOCOL })
+    expect(link.initialized).toBe(false)
+    await link.close()
+  })
+
+  it('未声明 HTTP MCP 或图像能力时在发请求之前明确拒绝', async () => {
+    const pair = fakePair()
+    const methods: string[] = []
+    pumpAgent(pair, async (message, reply) => {
+      methods.push(message.method!)
+      await reply({ jsonrpc: '2.0', id: message.id!, result: { protocolVersion: 1, agentCapabilities: {} } })
+    })
+    const link = new AgentLink({ stream: pair.stream })
+    link.start()
+    await link.initialize()
+    await expect(link.newSession({ cwd: '/tmp', mcpServers: [{ type: 'http', name: 'tools', url: 'http://127.0.0.1:1/mcp', headers: [] }] })).rejects.toMatchObject({ code: AGY_LINK_ERROR.UNSUPPORTED_CAPABILITY })
+    await expect(link.prompt({ sessionId: 'test', prompt: [{ type: 'image', data: 'AA==', mimeType: 'image/png' }] })).rejects.toMatchObject({ code: AGY_LINK_ERROR.UNSUPPORTED_CAPABILITY })
+    expect(methods).toEqual(['initialize'])
     await link.close()
   })
 })

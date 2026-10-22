@@ -1,7 +1,7 @@
 /**
- * 把官方 ACP 权限提示中的 MCP 描述解析为新的 DSH 工具请求。
- * 这些字段全部不可信：这里只做请求转换，绝不据此授予 ACP 执行权限。
- * 最终参数校验、审批、沙箱与执行仍由 DSH 工具管线负责。
+ * 识别官方 ACP 权限提示中的私有 MCP 路由。元数据不是独立身份证明：
+ * 调用方必须同时通过 session/new 禁用 AGY 内置工具和 ACP fs/terminal 能力。
+ * 此处只允许进入私有桥，最终参数校验、审批、沙箱与执行仍由 DSH 负责。
  */
 import { isDeepStrictEqual } from 'node:util'
 import type { RequestPermissionRequest } from '@agentclientprotocol/sdk'
@@ -20,10 +20,22 @@ export function parsePermissionHandoff(
   if (request.sessionId !== context.sessionId || !request.toolCall.toolCallId) return undefined
   const meta = record(request.toolCall._meta)
   const mcp = record(meta?.mcp)
-  if (meta?.is_mcp_tool_call !== true || mcp?.server !== context.serverName || typeof mcp?.tool !== 'string') return undefined
-  const tool = context.tools.find((item) => item.name === mcp.tool)
   const input = record(request.toolCall.rawInput)
-  if (!tool || !input) return undefined
+  if (!input) return undefined
+  // eager MCP 工具在官方 1.4.0 的权限请求中没有 _meta.mcp，也没有 name；
+  // server.py 从实际工具名生成固定的 "Run <name>?" 标题。会话已关闭内置工具，
+  // 因此这里可用当前目录精确匹配该形式，不从任意描述中猜测工具名。
+  const wrappedMcp = meta?.is_mcp_tool_call === true
+  const tool = wrappedMcp
+    ? mcp?.server === context.serverName ? context.tools.find((item) => item.name === mcp?.tool) : undefined
+    : context.tools.find((item) => request.toolCall.title === `Run ${item.name}?`
+      || request.toolCall.title === `Run ${context.serverName}_${item.name}?`)
+  if (!tool) return undefined
+  // 明确的原生名称/种类不能仅凭伪造的 MCP 参数信封获得授权。
+  const name = request.toolCall.name
+  if ((name != null && name !== 'call_mcp_tool' && name !== tool.name)
+    || (request.toolCall.kind != null && request.toolCall.kind !== 'other')) return undefined
+  if (!wrappedMcp) return { name: tool.name, arguments: JSON.stringify(input) }
 
   // server 1.4.0：rawInput = { arguments: 原参数, ...原参数 }。
   // 工具自己声明 arguments 时该字段属于工具，不能把它误当包装层剥掉。

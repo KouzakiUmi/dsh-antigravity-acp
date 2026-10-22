@@ -7,7 +7,8 @@
  * 便于单元测试。
  */
 import { createWriteStream } from 'node:fs'
-import { access, chmod, mkdir, mkdtemp, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { access, chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
 import { homedir as osHomedir, tmpdir } from 'node:os'
 import { dirname, join, normalize, resolve, sep, win32 } from 'node:path'
 import { Readable } from 'node:stream'
@@ -68,22 +69,31 @@ export type AcpArch = 'x86_64' | 'aarch64'
 /** posix = darwin / linux（可执行文件挑选规则一致）。 */
 export type ExecutableFlavor = 'windows' | 'posix'
 
-/**
- * 拼接官方下载 URL。
- *
- * 平台与架构都用 hyphen 分隔。已实测验证的组合仅有一组：
- * windows / x86_64 / 1.4.0 → HTTP 200（`agy-acp-server-1.4.0-windows-x86_64.zip`）。
- * 曾经实测 underscore 变体（`windows_x86_64`）为 404，禁止使用。
- * darwin / linux 目录按同一 hyphen 模式拼接，但属于【未验证】组合——
- * 实际可用性未经确认，不能当作事实引用；此类平台应优先用 binaryPath /
- * AGY_ACP_BIN / AGY_ACP_URL 覆盖。
+/** 发行布局取自官方 ACP registry 的 antigravity-acp/agent.json（1.4.1）。
+ * 默认版本仍是 1.4.0；该表描述命名与入口，不宣称旧版所有平台均已实机验证。
  */
+export const ACP_DISTRIBUTIONS = {
+  windows: { directory: 'windows', executable: 'agy_acp_server.exe', defaultArgs: [] },
+  darwin: { directory: 'macos', executable: 'agy_acp_server.par', defaultArgs: [] },
+  linux: { directory: 'linux', executable: 'agy_acp_server.par', defaultArgs: ['--uid='] },
+} as const
+
+export function defaultAgentArgs(platform: NodeJS.Platform = process.platform): readonly string[] {
+  return platform === 'linux' ? [...ACP_DISTRIBUTIONS.linux.defaultArgs] : []
+}
+
+/** 拼接官方下载 URL，架构命名与本地 Node 架构名称分开处理。 */
 export function resolveDownloadUrl(
   platform: AcpPlatform,
   arch: AcpArch,
   version: string = DEFAULT_ACP_SERVER_VERSION,
 ): string {
-  return `https://${DOWNLOAD_HOST_WHITELIST}/agy-extensions/releases/${platform}/agy-acp-server-${version}-${platform}-${arch}.zip`
+  if (!/^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) {
+    throw new AgyBinaryError(AGY_BINARY_ERROR.BLOCKED_URL, 'ACP 版本号格式无效')
+  }
+  const distribution = ACP_DISTRIBUTIONS[platform]
+  const publishedArch = arch === 'aarch64' ? 'arm64' : 'x86_64'
+  return `https://${DOWNLOAD_HOST_WHITELIST}/agy-extensions/releases/${distribution.directory}/agy-acp-server-${version}-${platform}-${publishedArch}.zip`
 }
 
 /** 校验下载 URL：仅 https + 白名单域名，其余一律拒绝。 */
@@ -213,16 +223,15 @@ export function validateZipEntryPath(entryName: string): string {
 
 /**
  * 从已校验的相对条目列表里挑出 ACP server 可执行文件。
- * windows：找 `.exe`（官方 zip 通常恰好一个）；posix：找无扩展名且名为
- * agy-acp-server（或以其为前缀）的文件。挑选必须确定性：取路径深度最小、
+ * 优先只接受官方入口名，兼容旧版 hyphen 拼写。挑选必须确定性：取路径深度最小、
  * 同深度取字典序最小。找不到抛 AGY_ARCHIVE_LAYOUT。
  */
 export function pickExecutablePath(entries: readonly string[], flavor: ExecutableFlavor): string {
   const candidates = entries.filter((entry) => {
     if (entry.endsWith('/')) return false
     const base = entry.split('/').at(-1) ?? ''
-    if (flavor === 'windows') return base.toLowerCase().endsWith('.exe')
-    return base === 'agy-acp-server' || (base.startsWith('agy-acp-server') && !base.includes('.'))
+    if (flavor === 'windows') return /^(agy_acp_server|agy-acp-server)\.exe$/i.test(base)
+    return base === 'agy_acp_server.par' || base === 'agy-acp-server' || base === 'agy_acp_server'
   })
   if (candidates.length === 0) {
     throw new AgyBinaryError(
@@ -308,47 +317,121 @@ export function resolveInstallRoot(
 
 /** 版本缓存目录与其解压子目录。 */
 export function versionCachePaths(cacheDir: string, version: string): { versionDir: string; extractDir: string } {
+  if (!/^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) {
+    throw new AgyBinaryError(AGY_BINARY_ERROR.BLOCKED_URL, 'ACP 版本号格式无效')
+  }
   const versionDir = join(cacheDir, version)
   return { versionDir, extractDir: join(versionDir, extractDirName(version)) }
 }
 
+/** 运行代码与可执行文件同属用户级安装根，禁止放回 Low 标签的数据缓存树。 */
+export function resolveRuntimeRoot(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+  platform: NodeJS.Platform = process.platform,
+  homedir: () => string = osHomedir,
+): string {
+  return join(resolveInstallRoot(env, platform, homedir), 'runtime')
+}
+
+const OWNER_FILE = 'dsh-owner.json'
+const PROCESS_STARTED_AT = new Date(Date.now() - process.uptime() * 1000).toISOString()
+interface DirectoryOwner { version: 1; pid: number; id: string; startedAt: string; state: 'active' | 'exited' }
+export interface RuntimeDirectory { path: string; root: string; ownerId: string }
+export type RuntimeDirectoryLease = RuntimeDirectory
+export type ProcessLiveness = (pid: number) => boolean | undefined | Promise<boolean | undefined>
+
+/** 只把 ESRCH 视为死亡；权限不足、PID 复用或任何未知状态均保留文件。 */
+export function isProcessAlive(pid: number): boolean | undefined {
+  try { process.kill(pid, 0); return true } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ESRCH' ? false : undefined
+  }
+}
+
+async function writeDirectoryOwner(path: string, pid = process.pid): Promise<DirectoryOwner> {
+  const owner: DirectoryOwner = { version: 1, pid, id: randomUUID(), startedAt: PROCESS_STARTED_AT, state: 'active' }
+  await writeFile(join(path, OWNER_FILE), JSON.stringify(owner), { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+  return owner
+}
+
+async function readDirectoryOwner(path: string): Promise<DirectoryOwner | undefined> {
+  try {
+    const file = join(path, OWNER_FILE)
+    const info = await lstat(file)
+    if (!info.isFile() || info.isSymbolicLink() || info.size > 4096) return undefined
+    const value = JSON.parse(await readFile(file, 'utf8')) as DirectoryOwner
+    return value.version === 1 && Number.isSafeInteger(value.pid) && value.pid > 0
+      && typeof value.id === 'string' && value.id.length > 0 && typeof value.startedAt === 'string'
+      ? value : undefined
+  } catch { return undefined }
+}
+
+/** 创建一次启动独占的目录。调用方需在 spawn 前检查 Windows 完整性标签。 */
+export async function createRuntimeDirectory(options: { root?: string; ownerPid?: number } = {}): Promise<RuntimeDirectory> {
+  const requestedRoot = resolve(options.root ?? resolveRuntimeRoot())
+  await mkdir(requestedRoot, { recursive: true, mode: 0o700 })
+  const root = await realpath(requestedRoot)
+  const path = await mkdtemp(join(root, 'instance-'))
+  try {
+    const owner = await writeDirectoryOwner(path, options.ownerPid)
+    return { path, root, ownerId: owner.id }
+  } catch (error) {
+    await rm(path, { recursive: true, force: true }).catch(() => undefined)
+    throw error
+  }
+}
+
+async function isOwnedDirectChild(path: string, root: string, prefix: string): Promise<boolean> {
+  const target = resolve(path)
+  if (dirname(target) !== resolve(root) || !target.slice(dirname(target).length + 1).startsWith(prefix)) return false
+  try {
+    const info = await lstat(target)
+    return info.isDirectory() && !info.isSymbolicLink() && await realpath(target) === target
+  } catch { return false }
+}
+
+/** 仅在关联子进程已确认退出后调用；ownerId 防止清除后来替换的目录。 */
+export async function releaseRuntimeDirectory(lease: RuntimeDirectory): Promise<void> {
+  if (!(await isOwnedDirectChild(lease.path, lease.root, 'instance-'))) return
+  const owner = await readDirectoryOwner(lease.path)
+  if (owner?.id !== lease.ownerId) return
+  // 先记下由 waitForExit 证实的退出事实，删除受文件锁阻塞时可在后续启动重试。
+  await writeFile(join(lease.path, OWNER_FILE), JSON.stringify({ ...owner, state: 'exited' }), { encoding: 'utf8', mode: 0o600 })
+  await rm(lease.path, { recursive: true, force: true, maxRetries: 2 })
+}
+
+/** 仅重试已经明确记录子进程退出的目录。宿主死亡不代表其所有后代已停止。 */
+export async function cleanupStaleRuntimeDirectories(
+  root: string = resolveRuntimeRoot(),
+): Promise<number> {
+  let canonicalRoot: string
+  try { canonicalRoot = await realpath(root) } catch { return 0 }
+  const entries = await readdir(canonicalRoot, { withFileTypes: true }).catch(() => [])
+  let removed = 0
+  for (const entry of entries) {
+    const path = join(canonicalRoot, entry.name)
+    if (!(await isOwnedDirectChild(path, canonicalRoot, 'instance-'))) continue
+    const owner = await readDirectoryOwner(path)
+    if (!owner || owner.state !== 'exited') continue
+    await releaseRuntimeDirectory({ path, root: canonicalRoot, ownerId: owner.id }).then(() => { removed += 1 }, () => undefined)
+  }
+  return removed
+}
+
 /** PyInstaller onefile 的解压目录前缀。 */
 export const PYI_TEMP_PREFIX = '_MEI'
-/** 判定「陈旧」的默认阈值；足够大，不会碰到并发实例正在用的目录。 */
+/** 旧 API 保留的常量；不再用年龄判断运行目录能否安全删除。 */
 export const PYI_TEMP_MAX_AGE_MS = 3_600_000
 
 /**
- * 清理 PyInstaller onefile 留下的陈旧 `_MEI*` 解压目录。
- *
- * 官方 server 是 onefile 打包：每次启动把 ~330MB 解压到 TMPDIR，正常退出时自行
- * 删除。但进程被强杀（含本插件终止链路、用户关机、崩溃）时不会清理，实测重复
- * 调试后会累积到几十 GB。这里按**目录 mtime 早于阈值**判定陈旧，避免误删并发
- * 实例正在使用的目录；任何失败都忽略（清理是尽力而为，不能影响启动）。
- *
- * @returns 实际删除的目录数。
+ * @deprecated 旧版共享 _MEI 无所有权记录，不能安全自动清理。
+ * 新运行目录通过 cleanupStaleRuntimeDirectories 清理。
  */
 export async function cleanupStalePyiTempDirs(
-  dir: string,
-  options: { maxAgeMs?: number; now?: () => number } = {},
+  _dir: string,
+  _options: { maxAgeMs?: number; now?: () => number } = {},
 ): Promise<number> {
-  const maxAgeMs = options.maxAgeMs ?? PYI_TEMP_MAX_AGE_MS
-  const now = (options.now ?? Date.now)()
-  let removed = 0
-  const entries = await readdir(dir, { withFileTypes: true }).catch(() => undefined)
-  if (!entries) return 0
-  for (const entry of entries) {
-    if (!entry.isDirectory() || !entry.name.startsWith(PYI_TEMP_PREFIX)) continue
-    const target = join(dir, entry.name)
-    try {
-      const info = await stat(target)
-      if (now - info.mtimeMs < maxAgeMs) continue
-      await rm(target, { recursive: true, force: true, maxRetries: 2 })
-      removed += 1
-    } catch {
-      // 目录正被占用（并发实例）或权限不足：跳过，不影响启动。
-    }
-  }
-  return removed
+  // 旧版共享 _MEI 目录没有进程所有权记录；年龄无法证明进程已死，禁止自动删除。
+  return 0
 }
 
 /** 下载解压暂存目录前缀。 */
@@ -359,11 +442,12 @@ export const STAGING_MAX_AGE_MS = 3_600_000
 /**
  * 清理下载或解压过程中因强杀/异常中断而残留的陈旧 `.staging-*` 目录。
  * 遍历指定目录自身及其直接子目录（如 `<installRoot>/<version>/.staging-*`）。
- * 仅删除 mtime 超过阈值的目录，避免干扰正在进行的并发安装。
+ * 仅删除有所有权记录、宿主 PID 已确认死亡且 mtime 超过阈值的目录。
+ * 旧版未记录 owner 的目录保留，避免干扰仍在执行的安装。
  */
 export async function cleanupStaleStagingDirs(
   dir: string,
-  options: { maxAgeMs?: number; now?: () => number } = {},
+  options: { maxAgeMs?: number; now?: () => number; isProcessAlive?: ProcessLiveness } = {},
 ): Promise<number> {
   const maxAgeMs = options.maxAgeMs ?? STAGING_MAX_AGE_MS
   const now = (options.now ?? Date.now)()
@@ -376,7 +460,8 @@ export async function cleanupStaleStagingDirs(
       const target = join(dir, entry.name)
       try {
         const info = await stat(target)
-        if (now - info.mtimeMs >= maxAgeMs) {
+        const owner = await readDirectoryOwner(target)
+        if (now - info.mtimeMs >= maxAgeMs && owner && await (options.isProcessAlive ?? isProcessAlive)(owner.pid) === false) {
           await rm(target, { recursive: true, force: true, maxRetries: 2 })
           removed += 1
         }
@@ -392,7 +477,8 @@ export async function cleanupStaleStagingDirs(
         const subtarget = join(subdir, sub.name)
         try {
           const info = await stat(subtarget)
-          if (now - info.mtimeMs >= maxAgeMs) {
+          const owner = await readDirectoryOwner(subtarget)
+          if (now - info.mtimeMs >= maxAgeMs && owner && await (options.isProcessAlive ?? isProcessAlive)(owner.pid) === false) {
             await rm(subtarget, { recursive: true, force: true, maxRetries: 2 })
             removed += 1
           }
@@ -537,6 +623,9 @@ export interface AgentBinaryOptions {
   env?: Readonly<Record<string, string | undefined>>
   /** 安装根目录覆盖；默认 {@link resolveInstallRoot}（**不是** DSH home）。 */
   cacheDir?: string
+  /** 平台覆写供离线发行表测试；正常调用使用 process.platform/arch。 */
+  platform?: NodeJS.Platform
+  arch?: string
 }
 
 async function fileExists(path: string): Promise<boolean> {
@@ -581,9 +670,6 @@ export async function ensureAgentBinary(options: AgentBinaryOptions = {}): Promi
   // 安装根目录取用户级应用数据目录，**不是** DSH home：后者带 Low 完整性标签，
   // 会把进程降成 LOW 并导致 session/new 静默挂死（见 resolveInstallRoot 注释）。
   const cacheDir = options.cacheDir ?? resolveInstallRoot(env)
-  const { platform, arch } = mapNodePlatform(process.platform, process.arch)
-  const flavor: ExecutableFlavor = platform === 'windows' ? 'windows' : 'posix'
-
   if (options.binaryPath && options.binaryPath.trim().length > 0) {
     if (!(await fileExists(options.binaryPath))) {
       throw new AgyBinaryError(AGY_BINARY_ERROR.BINARY_MISSING, `config.binaryPath 不存在: ${options.binaryPath}`)
@@ -598,6 +684,9 @@ export async function ensureAgentBinary(options: AgentBinaryOptions = {}): Promi
     }
     return { executablePath: resolve(envPath), source: 'env', checksumVerified: false }
   }
+
+  const { platform, arch } = mapNodePlatform(options.platform ?? process.platform, options.arch ?? process.arch)
+  const flavor: ExecutableFlavor = platform === 'windows' ? 'windows' : 'posix'
 
   const { versionDir, extractDir } = versionCachePaths(cacheDir, version)
   const cached = await findExtractedExecutable(extractDir, flavor)
@@ -620,14 +709,22 @@ export async function ensureAgentBinary(options: AgentBinaryOptions = {}): Promi
   const staging = await mkdtemp(join(versionDir, '.staging-'))
   const zipTmp = join(staging, 'agy-acp-server.zip.tmp')
   try {
+    await writeDirectoryOwner(staging)
     await downloadBinaryToFile(url, zipTmp, { fetchImpl: options.fetchImpl, signal: options.signal })
     const stagingExtract = join(staging, 'extract')
     await mkdir(stagingExtract, { recursive: true })
     const entries = await extractZipSafely(zipTmp, stagingExtract)
     const relative = pickExecutablePath(entries, flavor)
     const finalExtract = extractDir
-    await rm(finalExtract, { recursive: true, force: true })
-    await rename(stagingExtract, finalExtract)
+    try {
+      await rename(stagingExtract, finalExtract)
+    } catch (error) {
+      // 另一个宿主可能刚提交了同版本；不得删除它正在使用的完整产物。
+      const winner = await findExtractedExecutable(finalExtract, flavor)
+      if (!winner) throw error
+      await ensureExecutable(winner, flavor)
+      return { executablePath: winner, source: 'cache', version, checksumVerified: false }
+    }
     const executablePath = join(finalExtract, relative)
     await ensureExecutable(executablePath, flavor)
     return { executablePath, source: 'download', version, checksumVerified: false }

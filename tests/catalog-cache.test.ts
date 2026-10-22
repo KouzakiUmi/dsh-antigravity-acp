@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { readCachedCatalog, writeCachedCatalog } from '../src/runtime/catalog-cache.js'
@@ -14,6 +14,55 @@ const MODELS = [
 ]
 
 describe('catalog cache', () => {
+  it('首次缓存目录尚不存在时自动创建父目录并完整落盘', async () => {
+    const root = await tempDir()
+    const dir = join(root, 'new', 'catalog')
+    try {
+      await writeCachedCatalog({ cacheDir: dir, acpVersion: '1.4.0', models: MODELS })
+      await expect(readCachedCatalog({ cacheDir: dir, acpVersion: '1.4.0' })).resolves.toEqual(MODELS)
+      await expect(readdir(dir)).resolves.toEqual(['catalog.json'])
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
+  it('多worker并写时读者始终看到完整快照，写完不留下临时文件', async () => {
+    const dir = await tempDir()
+    const snapshots = Array.from({ length: 16 }, (_, index) => [{
+      id: `model-${index}`, name: `Model ${index}`, description: `${index}:`.repeat(1000 + index * 1500),
+    }])
+    try {
+      await writeCachedCatalog({ cacheDir: dir, acpVersion: '1.4.0', models: MODELS })
+      const valid = new Set([JSON.stringify(MODELS), ...snapshots.map((models) => JSON.stringify(models))])
+      await Promise.all([
+        ...snapshots.map((models) => writeCachedCatalog({ cacheDir: dir, acpVersion: '1.4.0', models })),
+        (async () => {
+          for (let index = 0; index < 40; index++) {
+            const observed = await readCachedCatalog({ cacheDir: dir, acpVersion: '1.4.0' })
+            expect(valid.has(JSON.stringify(observed))).toBe(true)
+          }
+        })(),
+      ])
+      // Windows can reject replacement while readFile holds the target open. Such
+      // failures preserve the old valid cache; without readers, parallel writers
+      // must still produce one complete new snapshot.
+      await Promise.all(snapshots.map((models) => writeCachedCatalog({ cacheDir: dir, acpVersion: '1.4.0', models })))
+      const final = await readCachedCatalog({ cacheDir: dir, acpVersion: '1.4.0' })
+      expect(snapshots.map((models) => JSON.stringify(models))).toContain(JSON.stringify(final))
+      await expect(readdir(dir)).resolves.toEqual(['catalog.json'])
+    } finally { await rm(dir, { recursive: true, force: true }) }
+  })
+
+  it('rename失败不影响请求，只清理本次拥有的临时文件', async () => {
+    const dir = await tempDir()
+    try {
+      await mkdir(join(dir, 'catalog.json'))
+      const other = '.catalog.json.other-writer.tmp'
+      await writeFile(join(dir, other), 'other writer', 'utf8')
+      await expect(writeCachedCatalog({ cacheDir: dir, acpVersion: '1.4.0', models: MODELS })).resolves.toBeUndefined()
+      expect((await readdir(dir)).sort()).toEqual([other, 'catalog.json'].sort())
+      await expect(readFile(join(dir, other), 'utf8')).resolves.toBe('other writer')
+    } finally { await rm(dir, { recursive: true, force: true }) }
+  })
+
   it('写入后可读回同形状目录', async () => {
     const dir = await tempDir()
     try {

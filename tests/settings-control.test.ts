@@ -8,6 +8,23 @@ function deferred() {
 }
 
 describe('设置页账户与目录控制', () => {
+  it('预热调用共享连接入口，状态读取可带实时快照且不会重新启动', async () => {
+    const gate = deferred()
+    const warmup = vi.fn(async () => gate.promise)
+    const connect = vi.fn(async () => {})
+    const control = new SettingsControl({ warmup, connect, models: async () => [],
+      runtime: () => ({ phase: 'ready', phaseElapsedMs: 20, processRunning: true, starts: 1, reuses: 0, recycles: 0 }) })
+    expect(control.account().runtime?.starts).toBe(1)
+    expect(warmup).not.toHaveBeenCalled()
+    expect(control.account('warmup').state).toBe('connecting')
+    control.account('warmup')
+    await Promise.resolve()
+    expect(warmup).toHaveBeenCalledTimes(1)
+    expect(connect).not.toHaveBeenCalled()
+    gate.resolve()
+    await vi.waitFor(() => expect(control.account().message).toContain('保留'))
+    await control.dispose()
+  })
   it('状态读取不登录；显式连接 single-flight，完成前不报告成功', async () => {
     const gate = deferred()
     const connect = vi.fn(async () => gate.promise)

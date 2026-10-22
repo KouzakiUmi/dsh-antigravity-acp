@@ -45,6 +45,13 @@ describe('redactSensitiveText', () => {
     expect(redactSensitiveText(line)).toBe(line)
   })
 
+  it('JSON 与 Python dict 的敏感字段也打码，包括转义引号', () => {
+    for (const input of ['{"access_token":"FAKE_TOKEN"}', "{'refresh_token': 'FAKE_TOKEN'}", '{"client_secret":"FAKE_TOKEN\\\"tail"}']) {
+      expect(redactSensitiveText(input)).not.toContain('FAKE_TOKEN')
+      expect(redactSensitiveText(input)).toContain('***')
+    }
+  })
+
   it('真实观测到的官方 stderr 行样例不再泄露 state/code_challenge', () => {
     const stderr = [
       'google\\api_core\\_python_version_support.py:232: FutureWarning: ...',

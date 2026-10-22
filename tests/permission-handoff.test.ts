@@ -17,7 +17,7 @@ function request(): RequestPermissionRequest {
   }
 }
 
-describe('ACP 权限描述转为不可信 DSH 工具请求（不是授权）', () => {
+describe('ACP 私有 MCP 权限路由解析（依赖会话禁用内置工具）', () => {
   it('识别官方 1.4.0 解包形式，保留参数值', () => {
     expect(parsePermissionHandoff(request(), context)).toEqual({ name: 'read', arguments: '{"path":"a.txt"}' })
   })
@@ -37,6 +37,30 @@ describe('ACP 权限描述转为不可信 DSH 工具请求（不是授权）', (
     const other = request(); other.toolCall._meta = { is_mcp_tool_call: true, mcp: { server: 'other', tool: 'read' } }
     for (const value of [foreign, unknown, other]) expect(parsePermissionHandoff(value, context)).toBeUndefined()
     expect(parsePermissionHandoff(request(), { ...context, tools: [] })).toBeUndefined()
+  })
+
+  it('有 MCP 元数据但名称或种类指向原生能力时拒绝', () => {
+    const named = request(); named.toolCall.name = 'run_command'
+    const execute = request(); execute.toolCall.kind = 'execute'
+    for (const value of [named, execute]) expect(parsePermissionHandoff(value, context)).toBeUndefined()
+  })
+
+  it.each(['Run read?', 'Run dsh-tools_read?'])('官方 eager 工具格式 %s 无 MCP 元数据也能进入桥', (title) => {
+    const value = request()
+    delete value.toolCall._meta
+    value.toolCall.title = title
+    value.toolCall.rawInput = { path: 'a.txt' }
+    expect(parsePermissionHandoff(value, context)).toEqual({ name: 'read', arguments: '{"path":"a.txt"}' })
+  })
+
+  it('eager 标题必须精确命中目录，外部 MCP 元数据不能退回标题匹配', () => {
+    const value = request()
+    value.toolCall.title = 'Run read?'
+    value.toolCall._meta = { is_mcp_tool_call: true, mcp: { server: 'external', tool: 'read' } }
+    expect(parsePermissionHandoff(value, context)).toBeUndefined()
+    delete value.toolCall._meta
+    value.toolCall.title = 'Please Run read? arbitrary text'
+    expect(parsePermissionHandoff(value, context)).toBeUndefined()
   })
 
   it('包装参数有冲突或形状不明时不猜测', () => {

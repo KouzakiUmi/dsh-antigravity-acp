@@ -157,8 +157,12 @@ describe('pickExecutablePath', () => {
   })
 
   it('多个候选时确定性取最浅深度', () => {
-    const entries = ['a/b/server.exe', 'server.exe']
-    expect(pickExecutablePath(entries, 'windows')).toBe('server.exe')
+    const entries = ['a/b/agy_acp_server.exe', 'agy_acp_server.exe', 'aaa-helper.exe']
+    expect(pickExecutablePath(entries, 'windows')).toBe('agy_acp_server.exe')
+  })
+
+  it('识别官方 POSIX .par 入口，不选择旁边的 helper', () => {
+    expect(pickExecutablePath(['localharness_external', 'agy_acp_server.par'], 'posix')).toBe('agy_acp_server.par')
   })
 })
 
@@ -244,6 +248,30 @@ describe('extractZipSafely', () => {
 })
 
 describe('ensureAgentBinary 临时文件清理', () => {
+  it('两个宿主并发下载同一版本时复用已提交产物，不删除另一个实例的文件', async () => {
+    const cacheDir = await mkdtemp(join(tmpdir(), 'agy-concurrent-install-'))
+    const executableName = process.platform === 'win32' ? 'agy_acp_server.exe' : 'agy_acp_server.par'
+    const archive = zip([{ name: executableName, data: Buffer.from('official fixture') }])
+    let arrived = 0
+    let release!: () => void
+    const bothDownloading = new Promise<void>((resolve) => { release = resolve })
+    const fetchImpl: FetchLike = async () => {
+      arrived += 1
+      if (arrived === 2) release()
+      await bothDownloading
+      return { ok: true, status: 200, arrayBuffer: async () => Uint8Array.from(archive).buffer }
+    }
+    try {
+      const options = { cacheDir, version: '1.4.0', env: {}, fetchImpl }
+      const [first, second] = await Promise.all([ensureAgentBinary(options), ensureAgentBinary(options)])
+      expect(first.executablePath).toBe(second.executablePath)
+      expect(await readFile(first.executablePath, 'utf8')).toBe('official fixture')
+      expect([first.source, second.source].sort()).toEqual(['cache', 'download'])
+    } finally {
+      await rm(cacheDir, { recursive: true, force: true })
+    }
+  })
+
   it('下载失败后版本目录不留临时残留', async () => {
     const cacheDir = await mkdtemp(join(tmpdir(), 'agy-cache-'))
     try {

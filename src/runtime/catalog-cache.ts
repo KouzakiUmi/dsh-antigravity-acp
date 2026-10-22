@@ -12,8 +12,9 @@
  *   `listModels`；
  * - 落盘内容是纯模型元数据，绝不写入 stderr、授权 URL 或任何凭据片段。
  */
-import { readFile, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { mkdir, open, readFile, rename, unlink } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { basename, dirname, join } from 'node:path'
 
 /** 缓存文件的形状；额外字段一律忽略。 */
 interface CatalogCacheFile {
@@ -83,9 +84,25 @@ export async function writeCachedCatalog(options: {
       ...(model.contextWindow === undefined ? {} : { contextWindow: model.contextWindow }),
     })),
   }
+  const file = join(options.cacheDir, options.fileName ?? 'catalog.json')
+  const temporary = join(dirname(file), `.${basename(file)}.${randomUUID()}.tmp`)
+  let ownsTemporary = false
   try {
-    await writeFile(join(options.cacheDir, options.fileName ?? 'catalog.json'), `${JSON.stringify(payload, null, 2)}\n`, 'utf8')
+    await mkdir(dirname(file), { recursive: true })
+    // Each writer owns a different sibling. Readers only see a complete old or new snapshot.
+    // open(wx) lets cleanup distinguish our partially written file from an unlikely collision.
+    const handle = await open(temporary, 'wx', 0o600)
+    ownsTemporary = true
+    try {
+      await handle.writeFile(`${JSON.stringify(payload, null, 2)}\n`, 'utf8')
+    } finally {
+      await handle.close()
+    }
+    await rename(temporary, file)
+    ownsTemporary = false
   } catch {
     // 缓存写不进去不影响功能。
+  } finally {
+    if (ownsTemporary) await unlink(temporary).catch(() => undefined)
   }
 }

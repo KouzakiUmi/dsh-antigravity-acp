@@ -192,6 +192,30 @@ describe('ensureAcpCredentials 对既有 settings.json 的处理', () => {
 describe('resolveOAuthClient 的二进制扫描', () => {
   const CLIENT_TEXT = `junk 12345-abcdef.apps.googleusercontent.com junk GOCSPX-${'a'.repeat(28)}`
 
+  it('OAuth 元数据使用新安装根与共享 CLI 发现，忽略旧 DSH 数据缓存', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'agy-oauth-paths-'))
+    const installRoot = join(root, 'install')
+    const dataCache = join(root, 'old-dsh-cache')
+    const extractDir = versionCachePaths(installRoot, '1.4.0').extractDir
+    const serverName = process.platform === 'win32' ? 'agy_acp_server.exe' : 'agy_acp_server.par'
+    const explicitCli = join(root, 'custom', process.platform === 'win32' ? 'agy.exe' : 'agy')
+    try {
+      await mkdir(extractDir, { recursive: true })
+      await writeFile(join(extractDir, serverName), 'test fixture')
+      const visited: string[] = []
+      const client = await resolveOAuthClient({
+        env: { AGY_ACP_HOME: installRoot, AGY_CLI_BIN: explicitCli, DSH_HOME: dataCache },
+        cacheDir: dataCache,
+        homedir: () => root,
+        readFileImpl: async (path) => { visited.push(path); return path === join(extractDir, serverName) ? CLIENT_TEXT : 'no metadata' },
+      })
+      expect(client?.clientId).toBe('12345-abcdef.apps.googleusercontent.com')
+      expect(visited[0]).toBe(explicitCli)
+      expect(visited).toContain(join(extractDir, serverName))
+      expect(visited.some((path) => path.startsWith(dataCache))).toBe(false)
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
   it('显式 binaryPaths 保持调用方给定的顺序并能解析出 client', async () => {
     const order: string[] = []
     const client = await resolveOAuthClient({
@@ -217,7 +241,7 @@ describe('resolveOAuthClient 的二进制扫描', () => {
       await resolveOAuthClient({
         env: { LOCALAPPDATA: '/local' },
         homedir: () => '/home/u',
-        cacheDir,
+        installRoot: cacheDir,
         acpVersion: '1.4.0',
         readFileImpl: async (path: string) => {
           order.push(path)

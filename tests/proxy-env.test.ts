@@ -39,8 +39,18 @@ describe('normalizeProxyUrl', () => {
     } catch (error) {
       expect(error).toBeInstanceOf(ProxyConfigError)
       expect((error as Error).message).not.toContain('secret')
-      expect((error as Error).message).toContain('***')
+      expect((error as Error).message).toContain('代理地址无法解析')
     }
+  })
+
+  it('无 scheme 的非法认证地址也不能回显凭据', () => {
+    for (const raw of ['alice:SECRET_PROXY_PASSWORD@[', 'http://alice:SECRET_PROXY_PASSWORD@[']) {
+      try { normalizeProxyUrl(raw); expect.unreachable('expected invalid proxy') } catch (error) {
+        expect(String(error)).not.toContain('SECRET_PROXY_PASSWORD')
+        expect(String(error)).not.toContain('alice')
+      }
+    }
+    expect(() => normalizeProxyUrl('socks4://localhost:1080')).toThrow(/不支持/)
   })
 
   it('不支持的协议与坏地址抛 ProxyConfigError', () => {

@@ -1,310 +1,115 @@
-# dsh-bundle-antigravity-host
+<div align="center">
 
-DeepSeek Harness (DSH) host bundle：把 Google 官方 Antigravity ACP server
-（`agy-acp-server`，Gemini 背后的 agent）作为 LLM provider 接入 DSH。
+# Antigravity ACP for DSH
 
-工作方式：
+**在 DSH 里使用 Antigravity 模型，工具仍交给 DSH。**
 
-- 插件通过宿主注入的 `ctx.subprocess` 服务以 stdio 启动官方 ACP server，
-  并以 Agent Client Protocol v1（JSON-RPC over newline-delimited JSON）通信。
-- 本包通过 `src/index.ts` 向 `ctx.llm` 注册 provider `antigravity-acp`
-  的 `LlmAdapter`。
-- 工具执行留在 DSH 侧：进程内私有 `127.0.0.1` loopback MCP 桥把当前
-  DSH 工具 schema 交给官方 agent；`tools/call` 被 park 后以 DSH
-  `tool-call` 结束本轮，下一轮带着 tool result 续同一 ACP prompt。
-- 若官方在 MCP 调用之前要求 ACP 授权，插件可把可解析的当前目录工具请求
-  转为普通 DSH `tool-call`；**官方原始调用仍被拒绝**，工具审批、参数校验和
-  沙箱执行由 DSH 负责。该路径每回合只接管一个请求，回收旧官方进程，收到
-  DSH 结果后按完整历史重建 ACP 回合，不在旧 prompt 上继续执行。
-- 登录态由本包**导入**：读本机官方 CLI 已登录的
-  `~/.gemini/antigravity-cli/antigravity-oauth-token`（只读），换发一颗
-  access token 后落成官方 server 认的 `~/.gemini/antigravity-acp/acp_token.json`，
-  并补写 `settings.json` 的 `auth.type = oauth-personal`。因此**不会拉起浏览器
-  登录页**，也不再发 `authenticate` 请求（该请求在没有交互式浏览器时会一直挂着）。
-  只有导入不到任何登录态时才回退到官方浏览器授权流程。
+接入 Google 官方 Antigravity ACP agent，在同一个对话界面选择模型、查看额度、预热连接。
 
-安全边界（自动下载路径）：
+[![npm](https://img.shields.io/npm/v/dsh-bundle-antigravity-host?color=3b82f6&label=npm)](https://www.npmjs.com/package/dsh-bundle-antigravity-host)
+[![license](https://img.shields.io/badge/license-MIT-64748b)](LICENSE)
+[![Node.js](https://img.shields.io/badge/Node.js-%E2%89%A522.19-64748b)](#兼容性与验证范围)
 
-- 仅允许 `https://dl.google.com`，拒绝任何 HTTP 重定向；
-- zip 解压前逐条目校验路径（拒绝绝对路径、`..` 穿越、盘符/反斜杠异常路径）；
-- 官方未提供校验和，因此不伪造任何签名/校验和声明；
-- 下载先落临时文件，成功后原子重命名，失败清理残留。
+[快速开始](#快速开始) · [功能亮点](#功能亮点) · [配置参考](docs/configuration.md) · [排障](docs/reference.md#排障) · [更新记录](docs/changelog.md)
 
-配置项：`binaryPath`（手动指定，优先级最高）、`autoDownload`（默认开启）、
-`extraArgs`、`acpVersion`、`requestTimeoutMs`、`authTimeoutMs`、
-`promptTimeoutMs`、`bridgeParkSettleMs`、`preferredModel`、`proxyUrl`、
-`proxyBypass`。
-环境变量：`AGY_ACP_BIN`（二进制覆盖）、`AGY_ACP_URL`（下载 URL 覆盖，
-供未验证平台组合使用）、`AGY_ACP_HOME`（可执行文件安装根目录覆盖）。
+</div>
 
-## 二进制装在哪里（重要）
+---
 
-自动下载的官方 server **不放在 DSH home 下**，默认装到用户级应用数据目录：
+> **0.1.24**：新增默认双 worker 并发、登录后模型发现、原生图片输入与可取消连接；完善工具续轮、代理和运行目录回收。类型检查、**33 个文件 / 515 项测试**与构建通过。真实上游生成、图片识别、安装后的 Desktop GUI 和跨平台实机验收尚未完成。[查看本次更新与限制](docs/changelog.md#0124--2026-10-22)。
 
-- Windows：`%LOCALAPPDATA%\dsh-antigravity-host\<版本>\`
-- macOS / Linux：`$XDG_CACHE_HOME/dsh-antigravity-host/<版本>/`，其次 `~/.cache/...`
+## 快速开始
 
-原因不是洁癖，而是**功能必需**：DSH 会把 `$DSH_HOME`（默认 `~/.dsh`）整棵树标为
-**Low 强制完整性**（`icacls` 可见 `Mandatory Label\Low Mandatory Level`），而 Windows
-在创建进程时**会采用映像文件的强制完整性标签**。装在 `~/.dsh` 下的 exe 因此只能以
-LOW 运行，受 MIC「禁止向上写」约束，写不进中等完整性的 `~/.gemini/antigravity-acp/`：
-官方 server 保存凭据用的 `tempfile.NamedTemporaryFile` 会在 `PermissionError` 上
-无限重试，`session/new` 永不返回——表现为「Gemini 一直不回话」且没有任何报错。
-
-插件在启动前会**只读**跑一次 `icacls` 探测该标签；一旦命中就直接报
-`AGY_BINARY_LOW_INTEGRITY` 并给出修法，而不是把卡死留给用户（探测本身失败不会阻断
-启动）。手动指定 `binaryPath` 时请同样避开带该标签的目录。
-
-## 出网代理
-
-官方 `agy_acp_server` 自己连 Google（OAuth 与 Cloud Code Assist），而宿主
-`subprocess` 会 scrub 父进程环境，所以代理只能由本包显式注入子进程：
-
-- `proxyUrl`：如 `http://127.0.0.1:7890`；缺 scheme 按 `http` 处理，
-  支持 `http`/`https`/`socks5`/`socks5h`/`socks4`。留空继承宿主代理环境变量，
-  宿主也未配置时才直连；清空此项不等于强制关闭宿主代理。
-- `proxyBypass`：逗号分隔的排除列表，用户条目会与本机地址合并。
-- 注入 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 与对应小写键，
-  Windows 上运行的 Python 栈读大写，小写键覆盖 POSIX 风格读取者。
-- `localhost`、`127.0.0.1`、`::1` 始终排除：私有 MCP 桥与 OAuth 回调都在
-  loopback，走了代理工具回合会直接卡死。
-- 地址非法时在 spawn 之前报 `AGY_INVALID_PROXY`，不会先启动再失败。
-- 代理只在子进程启动时读取，改配置后需完全重启 Desktop（或让官方进程退出）。
-
-## 模型目录
-
-ACP v1 没有「不建会话、不认证」就能读到模型目录的方法：`InitializeResponse`
-只带 `protocolVersion` / `agentCapabilities` / `authMethods` / `agentInfo`，
-`configOptions` 只出现在会话响应与 `config_option_update` 里。因此：
-
-- 不再展示「首次对话登录」占位模型。没有缓存时目录可以为空，通过设置页显式
-  连接 ACP 或「一键拉取模型」获得目录，不必先发送聊天消息。
-- `preferredModel` 可从目录选择或手填自定义 ID，保存后优先列出；目录外 ID 明确
-  标记为用户配置、尚未验证。不会自动替换当前会话的已选模型。
-- 旧会话的 `server-default` 路由仍兼容：映射到 `preferredModel`，留空沿用官方默认，
-  但不再广告为新选择项。
-- 观测到的目录会写入 `$DSH_HOME/cache/antigravity-acp/catalog.json`（只含
-  id/name/description/contextWindow，不含任何凭据），重启后用它兜住选择器；ACP server 版本变化
-  或文件损坏即失效；没有其它来源时目录为空。
-- **家族折叠 + 思考强度路由**（2026-10-16 用户指示）：官方把思考强度编码进
-  模型 id（`claude-opus-5-5-{low,medium,high}`），但模型选择**只出家族一行**
-  （`claude-opus-5-5`「Claude Opus 5.5」），强度由 DSH 的思考强度菜单（低/中/高）
-  决定，路由到对应档位模型（选「高」→ `claude-opus-5-5-high`；未选走默认档位
-  `medium`，与官方默认 `Gemini 3.8 Flash (Medium)` 一致）。家族来源是会话观测
-  目录与官方 CLI 只读 `agy models` 清单（2026-10-16 授权「不 wrap agy CLI」
-  **仅限只读取数用途**，缓存 `cli-models.json`）折叠去重；`gpt-oss-120b` 整族
-  排除（临近下架，用户指示不进选择器）。配置里显式钉住档位 id（如
-  `gemini-3.8-flash-high`）且未选强度时，尊重钉住的档位。
-- **上下文容量**：官方目录不报告 context window，本包不填猜测值；首个回合收到
-  官方 `usage_update.size`（协议定义即 total context window size）后，把实测值
-  写进 `resolveModel().context` 并随目录落盘（目录条目是官方档位 id，落盘时按家族
-  id 对齐，折叠前后都能读回），压缩引擎由此可量化上下文，不再每步报
-  `no context capacity`。首轮回话之前仍是未知。
-
-### 请求项映射
-
-ACP v1 没有采样参数通道，以下请求项的处理是明确的：
-
-| 请求项 | 行为 |
-| --- | --- |
-| `reasoningEffort` | **路由键**（不是不支持项）：低/中/高 → 家族的 `-low`/`-medium`/`-high` 档位模型；家族缺该档位时取最接近档位。 |
-| `maxTokens` | **静默忽略**（输出上限由官方 agent 自己的会话配置决定）。宿主的会话标题等内建流程固定携带它，硬拒绝会让这些功能永久失败。 |
-| `temperature` / `stop` | 抛 `UNSUPPORTED_OPTION`：用户显式要求的效果无法兑现，不假装接受。 |
-
-## 稳定性与诊断
-
-- **ACP 权限与 DSH 审批分层**：插件从不选择 ACP 的 `allow_once` 或 `allow_always`。
-  官方 1.4.0 的 `_meta.mcp` 来自参数信封，并非可靠执行身份；插件只用它解析一个
-  **不可信的 DSH 工具请求**，且必须命中当前会话、当前桥名与当前工具目录，参数包装一致。
-  请求交给 DSH 后，官方原始调用被拒绝，旧桥凭证撤销、进程回收；重复或迟到请求不能
-  重复投递。DSH 工具结果的调用 id 和 `isError` 随完整历史进入新 ACP 会话，DSH 的拒绝
-  不会变成 ACP 自动放行。代价是这类调用每次重建回合，有额外启动开销。
-  无法解析的请求仍拒绝，不按标题或原始参数猜测授权，也不使用全局自动批准模式。
-  权限诊断只记录固定字段存在性、匹配关系与选项种类，不记录标题、调用 id、参数正文、
-  路径值或令牌。`Denied by user`/`pre-tool hook` 单独出现不能证明是 DSH 沙箱拒绝；
-  日志会区分插件拒绝与已转交 DSH。纯文本回复成功不代表真实工具链路已验收。
-- 主对话与后台标题可以并发调用同一个 provider。适配器在首次异步启动前占位、
-  串行调度；工具 park 期间保留主回合所有权，标题等待，不能覆盖当前回合或撤销工具桥。
-  同会话同步压缩则走放弃旧 prompt、按完整历史重建的兜底，避免等待自身工具结果而死锁。
-- 官方返回 `end_turn` 却没有可见文本或工具调用时，返回 `AGY_EMPTY_RESPONSE`，
-  不把空白、仅思考或仅进度通知当成成功回复。回合日志区分 `purpose`、文本/思考字符数与结束原因，
-  不记录回复正文。
-- MCP 调用在入桥时重新核对当前工具目录，未知或已撤销的工具直接返回错误，不进入
-  DSH 工具执行队列；每个新 ACP 回合轮换 token 与授权代次，旧通道不能向新回合投递调用。
-  MCP 会话通道按回合回收：新回合开始时关闭上一回合的全部通道（未完成 initialize 的
-  请求也会被就地收尾），通道数不随回合累积。
-- `finish(tool-calls)` 只封住当前 DSH 输出，不代表官方 prompt 结束。封口后到达的
-  调用与文本暂存到续轮，避免聚合窗口之外的并发调用丢失；等待工具期间仍响应取消。
-- 失败或取消会撤销桥授权，经宿主 `ctx.subprocess` 回收该连接的受管进程。
-  下一回合等待回收完成；无法确认退出时拒绝继续，不把本地 finish 当成后台已停止。
-  这是协议与进程生命周期保护，**不是 OS 文件系统沙箱**，不扩大原生工具权限。
-
-- `ensureAcpRuntime` 是 single-flight：并发首轮只 spawn 一条官方进程、只做一次
-  `authenticate`，不会留下 dispose 杀不到的孤儿进程，也不会重复弹登录。
-- 官方 stderr 含**完整 OAuth 授权 URL**（`state`、`code_challenge` 等）。本包在把
-  stderr 写进 `LlmError` 之前统一脱敏：URL userinfo 与敏感 query 参数一律打码，
-  非凭据上下文保留以便诊断。
-- 认证等待超时时不再回显授权 URL，而是提示「官方进程已打开 Google 登录页，
-  请在浏览器里完成授权」。认证超时使用独立错误码 `AGY_AUTH_TIMEOUT`，与普通
-  请求超时区分。
-- 本 provider **不声明任何可重试失败码**。宿主若消费重试策略会在失败步骤上整步
-  重放 `stream()`：握手失败会重复 spawn，认证超时会重复弹登录，`session/prompt`
-  超时会新建会话并重放全部历史（可能造成重复内容与重复工具调用）。三类都不可
-  安全重放，因此宁可一次不重试。
-
-## 设置卡片
-
-卡片走宿主真实存在的通道：`remote.settings.describe()` 读取、`remote.settings.mutate()`
-写入（改 `preferredModel` / `proxyUrl` / `proxyBypass`），`remote.llm.listProviders()`
-确认路由是否注册。宿主没有 `remote.llm.listModels`，本包通过自有
-`remote.agyQuota.models` 提供目录；强制刷新走官方 `agy models`，失败保留旧目录并显示错误。
-
-- **连接 / 登录 ACP**：需用户确认，复用本机官方登录态，必要时由官方进程打开浏览器
-  授权。只创建空工具会话验证连接，不发送模型 prompt；支持取消，结束后回收独立进程。
-  对话/工具回合进行中拒绝登录，不抢占当前聊天。状态只是最近一次连接验证，不代表
-  CLI 已登录，也不展示任何令牌或账号凭据。
-- **CLI 登录独立**：额度与 CLI 模型目录仍需在官方 `agy` 中完成登录；不假装 ACP
-  登录同时解决两份登录态，不实现未经核实的 CLI 无头登录。
-- **额度手动刷新**：设置页与药丸共用读取器，刷新结果同步；失败、缓存及未知有明确标记。
-- **模型选择**：目录下拉框与手填 ID 共用 `preferredModel`，点击保存生效。不提供模型
-  删除、禁用或账户切换，也不自动开启 AI Credits 付费。
-
-客户端插件的 `inject` 必须逐个声明用到的 remote 命名空间
-（`remote`、`remote.settings`、`remote.llm`）：宿主把每个命名空间做成独立服务，
-漏声明时连读属性都会抛 `cannot get property "remote.<ns>" without inject`，
-击穿 `settings.section` 卡片。卡片对属性读取异常一律降级为卡内可读错误，
-不再让异常穿出组件。
-
-## 额度监控（模型选择器旁用量药丸）
-
-选中 `antigravity-acp` 的模型时，输入区模型选择器**左侧**出现用量药丸
-（`conversation.input.right` 槽，宿主 InputBar 把它渲染在模型选择器之前；
-实现手法参考 dsh-subusage 的同位置药丸）。药丸本身只有当前模型所属额度组的
-迷你条（每个窗口一条），悬浮与无障碍标签提供窗口和百分比，不再显示服务商文字摘要。
-Gemini、Claude/GPT、Gemini 4 Argon 分开匹配，同 provider 切换模型也立即切换额度条。
-未知自定义型号或旧 `server-default` 不借用其它模型的数字，而显示未知符号。
-
-展开面板固定展示三个额度组，缺少的数据标为未提供；展示每窗剩余百分比、重置时间、
-当前模型标记、缓存状态、更新时间和刷新按钮。适配深浅主题，支持 Escape / 外部点击关闭。
-AI Credits 余额通过官方 `agy -p /credits --output-format json` 读取，取
-`command.data.remaining_credits`，可选套餐名为 `plan_name`。只接受成功的 credits
-本地报告与非负安全整数；真实零余额显示 0，缺字段/非法数字不转成零。
-
-余额与套餐额度分别缓存、分别标记失败和更新时间，共用刷新按钮。暂时查询失败可显示
-旧余额并明确标为缓存；官方明确不提供账户信息时撤下旧值。余额失败不影响正常模型
-额度，额度失败也不掩盖有效余额。没有 CLI 时余额标为未提供，不从 HTTP 配额推算。
-不会展示未经核验的升级链接，也不会开启 `useG1Credits` 付费回退。
-
-2026-10-22 已用本机官方 CLI 实测 `/credits`：退出码 0、`status: SUCCESS`、
-`command.name: credits`，金额为 number，`num_turns: 0`、`usage.total_tokens: 0`。
-该无头契约由本机实现与真实回包补充核验，官方 TUI 文档本身不完整覆盖其 JSON 接口；
-不据此保证所有旧版 CLI 都支持，旧版本/无信息/请求失败会显式显示状态。
-
-UI 使用宿主 React 18.3.1，生命周期依照 [React 18 文档](https://18.react.dev/reference/react/useEffect)。
-CLI 登录与余额限制参见官方 [安装与认证](https://antigravity.google/docs/cli/install.md)、
-[无头模式](https://antigravity.google/docs/cli/headless.md) 和 [AI Credits](https://antigravity.google/docs/cli/commands/credits.md)。
-可运行 `node scripts/preview-ui.mjs` 生成离线模拟预览；它不访问宿主页面、不执行登录，不能替代真实 GUI 验收。
-
-取数链路（Host 侧 `remote.agyQuota.read`）：
-
-1. **首选官方 CLI 的只读额度查询**：`agy -p /usage --output-format json`（slash
-   命令由 CLI 本地处理，实测 `num_turns: 0`、`total_tokens: 0`，无模型回合），
-   结果取 `command.data.groups[].buckets[]`（`window`/`remaining_fraction`/
-   `reset_time`）。CLI 路径可用 `AGY_CLI_BIN` 覆盖，缺省按
-   `%LOCALAPPDATA%\agy\bin\agy.exe` 等默认位置探测。
-2. 余额独立执行 `agy -p /credits --output-format json`，与套餐额度并发取数，各有
-   45 秒超时。多视图并发刷新合并为一轮，每个命令各执行一次；有效缓存不重复取数。
-3. 无官方 CLI 时仅套餐额度退回 Cloud Code Assist HTTP 线（读 `antigravity-oauth-token`
-   → 过期时内存内换发 → `loadCodeAssist` → `retrieveUserQuotaSummary`）；余额不猜测回退接口。
-
-取数边界：
-
-- CLI 取数仅使用 `/usage`、`/credits` 和 `models`，不发送聊天或修改付费设置；
-  子进程一律经 DSH 的 `ctx.subprocess`，环境和超时沿用同一套受管通道。
-- HTTP 额度回退对登录态只读，换发出的 access token 仅在内存里用；
-  CLI 通道不由插件直接读写凭据，官方 CLI 自行管理其认证状态；
-- token 材料不进快照、不进错误文本、不进日志（错误统一过 `redactSensitiveText`，
-  含 `Bearer <token>` 打码）；
-- 取数失败折叠成 `status: 'error'` 的可读快照，不把异常抛穿到界面。
-
-实测状态（2026-10-16，本机账户，真实跑通）：官方 CLI 额度查询解析出 3 组额度窗
-（Gemini Models / Claude and GPT models / Gemini 4 Argon，weekly 与 5h 窗、
-剩余百分比与重置时间齐全）。Cloud Code Assist HTTP 线是 **Gemini Code Assist
-（企业授权产品）**：本账户 `retrieveUserQuotaSummary` 403「no valid license of
-this product (#3501)」，仅作备用。原生 gRPC 接口
-`google.gca.aicode.v1main.JetskiRemoteAgentProxyService/GetUserQuotaSummary`
-已定位（宿主 `aicode.googleapis.com:443`）但服务端路由未接通，记录备查。
-
-## 宿主（DSH Core）兼容性声明
-
-宿主在**安装/启用时**会校验插件 manifest 里的 DSH 版本要求，不通过就拒绝安装
-（`ManagementFailure(incompatible-version)`，诊断文本以 `dsh: installation rejected:`
-开头）。规则（读自宿主 `@deepseek-ai/dsh-app-boot` 的 `evaluatePluginCompatibility`）：
-
-- 若声明了 `engines.dsh`，**该范围单独决定**，`peerDependencies` 一律忽略；
-- 否则逐个校验 `peerDependencies` 中名为 `@deepseek-ai/dsh` 或以 `@deepseek-ai/dsh-`
-  开头的项，其余包（含 `@deepseek-ai/cordis`）**不参与**该判定；
-- 比较对象是**运行时版本**，取 `@deepseek-ai/dsh-app-boot` 自身 `package.json` 的
-  `version`（即实际加载的 Core 版本，不是壳版本、也不是任何全局 CLI 版本），
-  且按 `includePrerelease: true` 参与范围匹配。
-
-本包当前声明（0.1.22）：
-
-| peer | 范围 | 说明 |
-|---|---|---|
-| `@deepseek-ai/dsh-llm` | `>=0.2.0-rc.1 <0.2.1-0 \|\| >=0.2.1-0 <0.3.0-0` | 参与宿主校验 |
-| `@deepseek-ai/dsh-subprocess` | 同上 | 参与宿主校验 |
-| `@deepseek-ai/dsh-typert-protocol` | 同上 | 参与宿主校验 |
-| `@deepseek-ai/cordis` | `~4.0.4 \|\| 4.0.5-alpha.1 \|\| 4.0.5-alpha.2` | 宿主不校验，仅供 pnpm peer 解析 |
-
-0.1.10 及更早版本把三个 `dsh-*` peer 写成了逐版本枚举（止于 `0.2.1-alpha.3`），
-在宿主升到 `0.2.1-alpha.4` 后判定为不兼容；0.1.11 换成上面这条宽范围
-（与社区插件 `dsh-subusage` 0.13.4 一致），对 `0.2.1-alpha.x`、`0.2.2` 均为真，
-对 `0.3.0-0` 及以后为假。
-
-若宿主将来越过该范围：可以更新本包的范围，或在插件管理器 / `dsh plugin allow-version`
-里为**精确的 name@version + 精确运行时版本**授予豁免（豁免记录在 profile 的
-`compatibility.json`）。豁免是显式接受风险，不是默认恢复步骤。
-
-契约面（非声明面）的核对状态：以宿主 0.2.1-alpha.4 的实际产物逐项对比过——
-`dsh-subprocess` 与 `cordis` 的类型声明逐字节相同；`dsh-llm` 只有新增可选成员
-（`imageRequestTarget`、`defaultBaseURL` 等，基类提供默认实现）；`dsh-typert-protocol`
-新增 `resources`/`principal` 等可选访问控制面，`register(contribution)` 签名未变，
-本包用的 contribution 形态（`{package, face, schemas, model, invocations}`）与同宿主上
-可用的 `dsh-subusage` 0.13.4 完全一致；客户端依赖的 `conversation.input.right` /
-`conversation.input.model` slot、`__ModuleLoader__`、`listProviders` 在新壳中均存在。
-开发依赖已对齐宿主版本并精确锁定（`dsh-llm` / `dsh-subprocess` / `dsh-typert-protocol`
-= `0.2.1-alpha.4`，`cordis` = `4.0.5-alpha.2`），`npm run check`（320 测试 / 21 文件 +
-类型检查 + 构建）在该版本类型上全绿。**未做**：真机安装 0.1.22 后的 GUI 验收
-（对话与额度药丸）。
-
-## 安装参考
-
-通用 CLI 示例（`web` 只是文档用的 profile 名，不是本机 Desktop）：
-
-```sh
-dsh plugin --profile web add ./dsh-bundle-antigravity-host-0.1.22.tgz
+```console
+dsh plugin --profile web add dsh-bundle-antigravity-host
 ```
 
-本机 Desktop 壳独占 `desktop` profile，公共 `dsh` 不能对它执行 `plugin add`。
-请在 DSH NEXT 的插件管理器里添加本地包，路径示例：
+`web` 是示例 Profile，请替换为实际目标。**DSH NEXT Desktop 使用目标桌面壳提供的 DSH Desktop CLI**；不要用独立 npm 公共 CLI 管理保留的 `desktop` Profile。[安装与更新说明](docs/reference.md#安装与更新)
 
-`D:\dsh-antigravity-acp\.local-install\dsh-bundle-antigravity-host-0.1.22.tgz`
+1. **安装并启用**：按部署方式重载或重启，让 Host 与 Client 一起生效；只刷新页面不保证 Host 已升级。
+2. **打开「设置 → Antigravity ACP」**：需要代理时先配置并保存，再点击 **连接 / 登录 ACP**。插件优先复用已有 ACP 登录态，或导入本机已登录的官方 CLI 登录态；必要时才进入官方浏览器授权。成功建会话后读取模型目录，不需要先发送聊天。
+3. **选择模型，开始对话**：提供商名称为 **Antigravity (ACP)**，路由 ID 为 `antigravity-acp`。模型选择器左侧出现额度药丸和预热按钮；工具调用继续走 DSH 的校验、审批与执行。
 
-装好后需要完全退出并重开 Desktop。只要本机官方 CLI 已登录过，
-`oauth-personal` 登录态会自动导入，**不会**弹浏览器登录页。模型路由名为
-`antigravity-acp`。
+**额度或 AI Credits 没有显示？** ACP 连接与 CLI 登录是两条链路。额度查询优先使用已登录的官方 `agy`，AI Credits 仅从 CLI 读取；ACP 登录成功不代表 CLI 也已登录。[登录态与数据来源](docs/reference.md#登录态与额度来源)
 
-## 排障
+## 功能亮点
 
-| 现象 | 原因 | 处理 |
-|---|---|---|
-| 首次对话后 Gemini 完全不回话、也没有报错 | 二进制落在 Low 强制完整性目录，官方进程被降权后卡在凭据保存 | 插件现在会直接报 `AGY_BINARY_LOW_INTEGRITY`；删掉 DSH home 下的旧 `cache/antigravity-acp/*/extract-*` 即可，新版本默认装到 `%LOCALAPPDATA%` |
-| 启动即失败 `AGY_BINARY_MISSING` | 未配置 `binaryPath`、无缓存且 `autoDownload=false` | 打开 `autoDownload` 或指定 `binaryPath` |
-| 认证环节等到超时 | 导入不到任何本机登录态，退回官方浏览器授权 | 先用官方 CLI 登录一次，或在插件配置里填 `proxyUrl` 后重试 |
-| 官方进程连不上 Google | 宿主 scrub 了父环境，代理需显式注入 | 填 `proxyUrl`（留空时会自动转发宿主自身的 `*_PROXY`） |
-| 磁盘被 `_MEI*` 目录吃掉几十 GB | onefile 解压目录在进程被强杀后不会自清理 | 装载插件时会自动清理超过 1 小时的陈旧目录 |
-| 选某个具体型号后「没有反应」，默认项（首次对话登录）正常 | 该型号去索要原生 `fs`/`terminal` 能力（不同模型对工具的使用风格不同），回合被护栏终止 | 0.1.17 起改为「**拒绝但继续**」：原生请求与权限询问一律照旧**拒绝**（不授予任何本地能力），但不再当场终止回合，模型会改用桥过去的 DSH 工具；只有同一回合反复索要超过 3 次（明确坚持绕开工具桥）才按 fail-closed 终止 |
-| 药丸空着 / 药丸消失 | 贡献型 remote 的客户端挂载与依赖声明 | 插件必须在客户端 `ctx.remote.$mount(...)` 一次（0.1.15 起）；**不要**把 `remote.<ns>` 写进 `inject`（注册回调会永远等待 → 元素消失）|
+### 多个对话，不再共用一个待审批回合
 
-本 README 仅描述代码与产物现状，不构成已安装或兼容性承诺。
+默认按需启动最多 **2 个独立 worker**，可配置为 1–4 个。一个会话等待工具审批时，其它会话可使用空闲 worker；同一工具回合的结果仍回到原 worker。容量用满后排队，支持取消，默认等待上限 120 秒，主对话优先于排队中的后台标题。
+
+这不是无限并发，也不保证上游账户额度随 worker 数增加。[并发与续轮边界](docs/reference.md#并发与工具续轮)
+
+### 先连接、拿目录，再开始聊天
+
+设置页区分 **立即预热** 与 **连接 / 登录 ACP**：前者准备连接但不创建会话，后者验证会话并读取模型目录，两者都不发送聊天 prompt。目录使用缓存即时显示，支持主动刷新、选择默认模型或手填模型 ID；目录外 ID 明确标记为未验证。
+
+模型家族与思考强度分开：选择家族，再由 DSH 的思考强度菜单路由到官方对应档位。不硬编码账号应当拥有的模型清单。[模型与请求项映射](docs/reference.md#模型目录与请求项)
+
+### 图片传给模型，不只传一段文字说明
+
+在 **宿主附件服务可用且上游声明 image capability** 时，当前消息、历史消息和工具返回的图片通过真实图片内容传入。支持 PNG、JPEG、WebP 与 GIF；只读取宿主附件，不自行抓取图片 URL。已被宿主卸载的图片会明确说明未发送像素。
+
+这是输入能力，不包含图片生成、音频或视频；真实图片识别效果尚未实机验收。[多模态限制](docs/reference.md#图片输入)
+
+### 额度、余额与连接状态，就在对话旁
+
+- **额度药丸**：随当前模型切换对应额度组；展开查看三个组的窗口、剩余百分比、重置时间与缓存状态。
+- **AI Credits**：与套餐额度独立展示、独立缓存与报错；未知不是零，不会自动开启 Credits 付费回退。
+- **预热与诊断**：药丸可直接预热；设置页显示连接阶段、排队、进程复用，以及建会话、首块和工具续轮耗时。
+- **设置不丢草稿**：后台刷新保留未保存字段，外部冲突明确提示；遵守宿主只读状态。
+
+## 它如何工作
+
+```mermaid
+flowchart LR
+    D[DSH 对话] --> A[本插件 LlmAdapter / worker 池]
+    A -->|stdio · ACP v1| G[官方 Antigravity agent]
+    G -->|私有 loopback MCP| B[本插件工具桥]
+    B -->|挂起调用| T[DSH 校验 / 审批 / 执行]
+    T -->|工具结果回填原 prompt| B
+    B --> G
+```
+
+本包是 **Host + Web Client bundle**：Host 注册模型 provider、管理官方进程和工具桥，Client 提供设置页与额度药丸。不修改 DSH Core，也不把官方 CLI 包装成聊天接口；CLI 仅用于只读模型目录、额度与余额查询。
+
+**它不是直接的 Gemini 模型 API。** 普通新用户回合会创建 ACP 会话并重放完整 DSH 历史；工具续轮才复用同一 prompt。角色消息、采样控制、延迟与计费不能视为和原生 API 相同。
+
+## 使用前，先知道这些边界
+
+| 边界 | 当前行为 |
+|---|---|
+| 工具与权限 | AGY 内置工具、ACP fs / terminal 关闭；只允许已识别的私有桥请求进入 DSH，`allow_once` 不等于绕过 DSH 审批。协议约束**不是 OS 沙箱**。 |
+| 登录材料 | 插件可能读取 CLI 登录文件，并为官方 ACP 写入 / 更新本机凭据文件；这些文件不是加密凭据库，Windows 访问保护依赖目录 ACL。 |
+| 官方程序 | 按需从 `https://dl.google.com` 下载，拒绝重定向并检查 ZIP 路径；官方未提供校验和，不宣称签名验证通过。默认 server 版本为 **1.4.0**，不跟随 registry 自动升级。 |
+| 模型参数 | `reasoningEffort` 映射官方档位；`maxTokens` 忽略；显式 `temperature` / `stop` 返回 `UNSUPPORTED_OPTION`。 |
+| 数据可信度 | 缓存、失败、缺字段和未知分别标记；额度与余额仅供参考，不是计费依据。 |
+| 版本与测试 | 宽 peer 范围是安装条件，不是全部 Core / 平台版本实机兼容证明；隔离测试不替代真实账号与 GUI 验收。 |
+
+## 兼容性与验证范围
+
+| 项目 | 当前声明 / 证据 |
+|---|---|
+| Node.js | `>=22.19` |
+| DSH Core peer 范围 | `>=0.2.0-rc.1 <0.2.1-0 \|\| >=0.2.1-0 <0.3.0-0`，适用于所声明的三个 `dsh-*` peer |
+| 开发契约基准 | `dsh-llm` / `dsh-subprocess` / `dsh-typert-protocol` / `dsh-attachment` **0.2.1-alpha.4**，Cordis **4.0.5-alpha.2** |
+| 上游协议 | ACP **v1**；SDK **1.4.0** 与默认 server **1.4.0** 是两个独立版本 |
+| 本次本地验证 | 类型检查、33 个文件 / 515 项隔离测试、构建 |
+| 尚未覆盖 | 0.1.24 安装后的 Desktop GUI、真实上游生成与图片识别、非 Windows 实机 |
+
+宿主附件服务是可选依赖，缺少时仍可文本聊天，但不声明图片能力。安装准入、开发类型检查和真实运行兼容性分别看待。[完整声明与验证方法](docs/development.md)
+
+## 文档导航
+
+| 你想做什么 | 文档 |
+|---|---|
+| 安装、连接、查看额度或排查错误 | [使用与技术参考](docs/reference.md) |
+| 调整并发、超时、模型、代理或二进制位置 | [完整配置与环境变量](docs/configuration.md) |
+| 查看 0.1.24 更新、迁移注意与剩余限制 | [更新记录](docs/changelog.md) |
+| 构建、测试、打包或维护 npm 发布流程 | [开发、验证与发布](docs/development.md) |
+
+## 许可与反馈
+
+本插件采用 [MIT License](LICENSE)。Google Antigravity 官方程序是独立下载的第三方软件，不随本包再分发；本插件并非 Google 官方产品。
+
+遇到问题请[提交 Issue](https://github.com/KouzakiUmi/dsh-antigravity-acp/issues)，附插件版本、**实际 DSH Core 版本**、操作系统、操作步骤和已脱敏错误码。不要附 token、Cookie、完整 OAuth URL、代理密码或凭据文件。

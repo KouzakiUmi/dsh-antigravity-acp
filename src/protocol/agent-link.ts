@@ -60,6 +60,8 @@ export const AGY_LINK_ERROR = {
   AGENT_REFUSED: 'AGY_AGENT_REFUSED',
   /** 未完成 initialize 就调用会话方法。 */
   NOT_INITIALIZED: 'AGY_NOT_INITIALIZED',
+  INCOMPATIBLE_PROTOCOL: 'AGY_INCOMPATIBLE_PROTOCOL',
+  UNSUPPORTED_CAPABILITY: 'AGY_UNSUPPORTED_CAPABILITY',
 } as const
 
 export class AgentLinkError extends Error {
@@ -112,6 +114,8 @@ export interface AgentLinkOptions {
    */
   authTimeoutMs?: number
   handlers?: AgentLinkHandlers
+  /** 关闭仅等待有界时间；进程回收仍由宿主负责。 */
+  closeTimeoutMs?: number
 }
 
 export interface AgentLinkRequestOptions {
@@ -159,6 +163,8 @@ export class AgentLink {
   #handshakeTimeoutMs: number
   #authTimeoutMs: number
   #handlers: AgentLinkHandlers
+  #closeTimeoutMs: number
+  #closePromise?: Promise<void>
 
   #pending = new Map<JsonRpcId, PendingEntry>()
   #nextId = 1
@@ -179,6 +185,7 @@ export class AgentLink {
     this.#handshakeTimeoutMs = options.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS
     this.#authTimeoutMs = options.authTimeoutMs ?? DEFAULT_AUTH_TIMEOUT_MS
     this.#handlers = options.handlers ?? {}
+    this.#closeTimeoutMs = options.closeTimeoutMs ?? 250
   }
 
   /** 链路是否已关闭（主动 close、对端断流或协议违规都会置位）；已关闭的链路不可复用。 */
@@ -362,10 +369,17 @@ export class AgentLink {
       entry.reject(new AgentLinkError(AGY_LINK_ERROR.REQUEST_TIMEOUT, `ACP 请求被中止: ${method}`, { cause: options.signal?.reason }))
     }
     options.signal?.addEventListener('abort', abortHandler, { once: true })
+    let writeCompleted = false
     try {
-      await this.#write({ jsonrpc: '2.0', id, method, params })
-      return await pending
+      const sent = this.#write({ jsonrpc: '2.0', id, method, params }).then(() => {
+        writeCompleted = true
+        return pending
+      })
+      // 响应 deadline 同时覆盖管道 backpressure；不能先无限等待 write。
+      return await Promise.race([sent, pending])
     } catch (error) {
+      // 写入是否已完整送达无法确认时，不允许复用这条连接。
+      if (!writeCompleted) void this.close()
       // 写出失败（对端断流、链路关闭）时 pending 条目没有人消费：必须当场摘除并
       // 清掉超时定时器，否则它会一直留在表里，定时器到期后写出多余的
       // $/cancel_request，并 reject 一个无人等待的 promise。
@@ -400,6 +414,11 @@ export class AgentLink {
         },
         { timeoutMs: this.#handshakeTimeoutMs },
       )
+      if (!response || response.protocolVersion !== PROTOCOL_VERSION) {
+        void this.close()
+        throw new AgentLinkError(AGY_LINK_ERROR.INCOMPATIBLE_PROTOCOL,
+          `ACP 协议版本不兼容：客户端仅支持 ${PROTOCOL_VERSION}，服务端未返回相同版本`)
+      }
       this.#initialized = true
       this.#initializeResponse = response
       return response
@@ -440,6 +459,14 @@ export class AgentLink {
   /** 创建会话并保存会话 id。 */
   async newSession(request: NewSessionRequest, options?: AgentLinkRequestOptions): Promise<NewSessionResponse> {
     this.#requireInitialized('session/new')
+    for (const server of request.mcpServers) {
+      if ('type' in server && server.type === 'http' && this.#initializeResponse?.agentCapabilities?.mcpCapabilities?.http !== true) {
+        throw new AgentLinkError(AGY_LINK_ERROR.UNSUPPORTED_CAPABILITY, 'ACP 服务端未声明 HTTP MCP 支持，无法安全接入 DSH 工具')
+      }
+      if ('type' in server && server.type === 'sse' && this.#initializeResponse?.agentCapabilities?.mcpCapabilities?.sse !== true) {
+        throw new AgentLinkError(AGY_LINK_ERROR.UNSUPPORTED_CAPABILITY, 'ACP 服务端未声明 SSE MCP 支持')
+      }
+    }
     const response = await this.request<NewSessionResponse>('session/new', request, options)
     this.#boundSessionId = response.sessionId
     return response
@@ -454,6 +481,14 @@ export class AgentLink {
   /** 发送一轮用户 prompt；响应只含 stopReason，流式内容走 session/update。 */
   async prompt(params: PromptRequest, options?: AgentLinkRequestOptions): Promise<PromptResponse> {
     this.#requireInitialized('session/prompt')
+    const capabilities = this.#initializeResponse?.agentCapabilities?.promptCapabilities
+    for (const content of params.prompt) {
+      const unsupported = content.type === 'image' ? capabilities?.image !== true
+        : content.type === 'audio' ? capabilities?.audio !== true
+          : content.type === 'resource' ? capabilities?.embeddedContext !== true : false
+      if (unsupported) throw new AgentLinkError(AGY_LINK_ERROR.UNSUPPORTED_CAPABILITY,
+        `ACP 服务端未声明 ${content.type} 输入支持`)
+    }
     return this.request<PromptResponse>('session/prompt', params, options)
   }
 
@@ -479,19 +514,24 @@ export class AgentLink {
    * 关闭链接：拒绝所有在途请求、关闭出站流、等待入站泵结束。幂等。
    */
   async close(): Promise<void> {
-    if (!this.#closed) {
-      this.#closed = true
-      this.#rejectAllPending(new AgentLinkError(AGY_LINK_ERROR.LINK_CLOSED, 'ACP 链路已关闭'))
-      // 先取消入站泵（对端不关流时 pump 才能结束），再关出站流。
-      await this.#reader?.cancel().catch(() => undefined)
-      try {
-        if (this.#writer) await this.#writer.close()
-        else await this.#stream.writable.close()
-      } catch {
-        // 出站流可能已由对端关闭；忽略。
-      }
+    this.#closePromise ??= this.#closeBounded()
+    return this.#closePromise
+  }
+
+  async #closeBounded(): Promise<void> {
+    this.#closed = true
+    this.#rejectAllPending(new AgentLinkError(AGY_LINK_ERROR.LINK_CLOSED, 'ACP 链路已关闭'))
+    const closing = Promise.allSettled([
+      this.#reader?.cancel(),
+      this.#writer ? this.#writer.close() : this.#stream.writable.close(),
+      this.#pumpPromise,
+    ])
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([closing, new Promise<void>((resolve) => { timer = setTimeout(resolve, this.#closeTimeoutMs) })])
+    } finally {
+      if (timer) clearTimeout(timer)
     }
-    await this.#pumpPromise?.catch(() => undefined)
   }
 }
 

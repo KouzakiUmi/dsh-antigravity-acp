@@ -51,7 +51,7 @@ export function describePermissionRequest(
     kind: call.kind == null ? 'absent' : TOOL_KINDS.has(call.kind) ? call.kind : 'unrecognized',
     titlePresent: typeof call.title === 'string',
     metaPresent: request._meta != null || call._meta != null,
-    // 官方 server 1.4.0 从参数信封生成这些字段；只能诊断，不能据此授权。
+    // 官方 1.4.0 从参数信封生成；需结合会话工具过滤，不能作为独立执行身份。
     mcpMeta: {
       marked: meta?.is_mcp_tool_call === true,
       serverMatches: mcp?.server === context.serverName,

@@ -59,11 +59,11 @@ function strictCodec(typeSymbol: string, parse: (value: unknown) => unknown): Ty
 const requestCodec = strictCodec(`${PACKAGE_NAME}#AgYQuotaRequest`, parseRequest)
 const resultCodec = strictCodec(`${PACKAGE_NAME}#AgYQuotaResult`, parseResult)
 
-function parseAccountRequest(value: unknown): { action: 'status' | 'login' | 'cancel' } {
+function parseAccountRequest(value: unknown): { action: 'status' | 'login' | 'warmup' | 'cancel' } {
   if (value === undefined) return { action: 'status' }
   if (!value || typeof value !== 'object' || !('action' in value)
-    || !['status', 'login', 'cancel'].includes(String(value.action))) throw new TypeError('Invalid AgYAccountRequest')
-  return { action: value.action as 'status' | 'login' | 'cancel' }
+    || !['status', 'login', 'warmup', 'cancel'].includes(String(value.action))) throw new TypeError('Invalid AgYAccountRequest')
+  return { action: value.action as 'status' | 'login' | 'warmup' | 'cancel' }
 }
 function parseAccount(value: unknown): unknown {
   if (!value || typeof value !== 'object' || !('state' in value) || !('message' in value)
@@ -165,6 +165,8 @@ export interface AgYQuotaServiceOptions {
    * 官方 CLI 是套餐额度的唯一可用来源。
    */
   cli?: { run: CliRun; cliPath: string }
+  /** Re-detect installations without restarting the host. */
+  resolveCli?: () => { run: CliRun; cliPath: string } | undefined
   /** 宿主日志（index.ts 接 `ctx.logger`）；用于记录每次取数的来源与结果。 */
   log?: { info(message: string): void; warn(message: string, error?: unknown): void }
 }
@@ -181,6 +183,7 @@ export class AgYQuotaService extends TypertRemoteService {
   private readonly _creditsCache: { value?: CreditsSnapshot; at?: number } = {}
   private readonly _deps: QuotaDeps
   private readonly _cli: { run: CliRun; cliPath: string } | undefined
+  private readonly _resolveCli: AgYQuotaServiceOptions['resolveCli']
   private readonly _log: AgYQuotaServiceOptions['log']
   private readonly _control: SettingsControl | undefined
   /** 在途取数：并发调用（多会话药丸 / 定时器 + 手动刷新）共享同一次取数，而不是各起一个进程。 */
@@ -192,11 +195,12 @@ export class AgYQuotaService extends TypertRemoteService {
     super(ctx, AGY_QUOTA_SERVICE)
     this._deps = options.deps ?? {}
     this._cli = options.cli
+    this._resolveCli = options.resolveCli
     this._log = options.log
     this._control = options.control
   }
 
-  account(request?: { action: 'status' | 'login' | 'cancel' }): AccountSnapshot {
+  account(request?: { action: 'status' | 'login' | 'warmup' | 'cancel' }): AccountSnapshot {
     if (!this._control) throw new Error('账户控制服务未就绪')
     return this._control.account(parseAccountRequest(request).action)
   }
@@ -234,7 +238,8 @@ export class AgYQuotaService extends TypertRemoteService {
       delete this._creditsCache.at
     }
     // 这条日志让「药丸到底有没有把请求发到 Host」可证：浏览器侧完全无法写宿主日志。
-    const source = this._cli ? `cli=${this._cli.cliPath}` : 'http（未找到 agy CLI）'
+    const cli = this._resolveCli?.() ?? this._cli
+    const source = cli ? `cli=${redactSensitiveText(cli.cliPath)}` : 'http（未找到 agy CLI）'
     this._log?.info(`antigravity-acp: 额度取数请求（force=${request?.force === true}，来源 ${source}）`)
     try {
       const now = Date.now()
@@ -251,7 +256,6 @@ export class AgYQuotaService extends TypertRemoteService {
       // 上一次成功数据必须在取数**前**捕获：HTTP 回退实现（fetchQuotaSnapshot）
       // 会把失败快照写进同一个缓存对象，取完再读就只剩失败结果了。
       const previous = this._cache.value
-      const cli = this._cli
       // 两个只读命令并发且各有超时，不把 45s + 45s 串成超过客户端 60s 的请求。
       const [fresh, freshCredits] = await Promise.all([
         quotaCached ? Promise.resolve(cached!) : cli
@@ -286,7 +290,7 @@ export class AgYQuotaService extends TypertRemoteService {
       // 取数实现自身已折叠错误；这里兜住意外异常，绝不让原始错误穿到客户端。
       // 脱敏与快照内其它错误一致：token / URL userinfo 等不能进 UI 或宿主日志。
       const message = redactSensitiveText(error instanceof Error ? error.message : String(error))
-      this._log?.warn?.('antigravity-acp: 额度取数抛异常', error)
+      this._log?.warn?.(`antigravity-acp: 额度取数抛异常：${message}`)
       return {
         status: 'error',
         updatedAt: new Date().toISOString(),

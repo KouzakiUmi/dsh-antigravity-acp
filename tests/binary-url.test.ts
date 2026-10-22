@@ -11,6 +11,8 @@ import {
   mapNodePlatform,
   resolveCacheDir,
   resolveDownloadUrl,
+  defaultAgentArgs,
+  versionCachePaths,
 } from '../src/runtime/binary.js'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -27,13 +29,26 @@ describe('resolveDownloadUrl', () => {
     expect(resolveDownloadUrl('windows', 'x86_64')).toContain('agy-acp-server-1.4.0-windows-x86_64.zip')
   })
 
-  it('darwin/linux 按 hyphen 模式拼接（URL 结构断言，不宣称可用性）', () => {
+  it('darwin/linux 按官方 registry 发行命名拼接（不宣称旧版实机验证）', () => {
     expect(resolveDownloadUrl('darwin', 'aarch64', '1.4.0')).toBe(
-      'https://dl.google.com/agy-extensions/releases/darwin/agy-acp-server-1.4.0-darwin-aarch64.zip',
+      'https://dl.google.com/agy-extensions/releases/macos/agy-acp-server-1.4.0-darwin-arm64.zip',
     )
     expect(resolveDownloadUrl('linux', 'x86_64', '1.4.0')).toBe(
       'https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-1.4.0-linux-x86_64.zip',
     )
+  })
+
+  it('Linux 官方启动参数保留 uid 空值，其他系统没有该参数', () => {
+    expect(defaultAgentArgs('linux')).toEqual(['--uid='])
+    expect(defaultAgentArgs('darwin')).toEqual([])
+    expect(defaultAgentArgs('win32')).toEqual([])
+  })
+
+  it('版本号不能注入路径或查询参数', () => {
+    for (const version of ['../outside', '1.4.0/../../elsewhere', '1.4.0?secret=x']) {
+      expect(() => versionCachePaths('/cache', version)).toThrow(/版本号/)
+      expect(() => resolveDownloadUrl('windows', 'x86_64', version)).toThrow(/版本号/)
+    }
   })
 
   it('任何产物都不得包含 underscore 变体（实测 404 形式）', () => {

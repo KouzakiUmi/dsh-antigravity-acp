@@ -26,7 +26,8 @@ const USAGE_JSON = {
 describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
   it('设置控制面可经真实 Cordis 代理调用，非法 action 不能变成登录', async () => {
     let connected = 0
-    const control = new SettingsControl({ connect: async () => { connected++ }, models: async () => [{ id: 'gemini-test', name: 'Gemini' }] })
+    let warmed = 0
+    const control = new SettingsControl({ connect: async () => { connected++ }, warmup: async () => { warmed++ }, models: async () => [{ id: 'gemini-test', name: 'Gemini' }] })
     const ctx = new Context()
     ctx.plugin(AgYQuotaService, { control })
     await new Promise((resolve) => setTimeout(resolve, 0))
@@ -43,6 +44,10 @@ describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(connected).toBe(1)
     expect(service.account().state).toBe('connected')
+    expect(parse({ action: 'warmup' })).toEqual({ action: 'warmup' })
+    service.account({ action: 'warmup' })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(warmed).toBe(1)
     await control.dispose()
   })
 

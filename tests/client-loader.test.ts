@@ -197,12 +197,12 @@ function modelStore(provider: string | null) {
 }
 
 describe('browser client module', () => {
-  it('设置页仅在确认后登录，可手动拉取模型和刷新额度', async () => {
+  it('设置页点击即可预热或登录，可手动拉取模型和刷新额度', async () => {
     const control = vi.fn(async (method: string, request?: { action?: string; force?: boolean }) => method === 'account'
       ? { state: request?.action === 'login' ? 'connecting' : 'idle', message: 'test' }
       : { status: 'ok', models: [{ id: 'gemini-example', name: 'Gemini Example' }] })
     const readQuota = vi.fn(async () => ({ status: 'ok', groups: [] }))
-    const card = loadRegistrations({ stateOverrides: { 6: true } }).get('antigravity-acp')!.component
+    const card = loadRegistrations().get('antigravity-acp')!.component
     const tree = card({ remote: {}, control, readQuota })
     const text = texts(tree).join(' ')
     expect(text).toContain('账户 · ACP 连接')
@@ -214,11 +214,13 @@ describe('browser client module', () => {
       expect(target, label).toBeDefined()
       ;(target!.props.onClick as () => void)()
     }
-    click('确认连接')
+    click('立即预热')
+    click('连接 / 登录 ACP')
     click('一键拉取模型')
     click('刷新额度')
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(control).toHaveBeenCalledWith('account', { action: 'login' })
+    expect(control).toHaveBeenCalledWith('account', { action: 'warmup' })
     expect(control).toHaveBeenCalledWith('models', { force: true })
     expect(readQuota).toHaveBeenCalledWith(true)
   })
@@ -398,6 +400,47 @@ describe('AI Credits 展示', () => {
 })
 
 describe('额度药丸（conversation.input.right）', () => {
+  it('药丸旁的预热按钮复用设置控制入口，不发送模型请求', async () => {
+    const control = vi.fn(async (_method: string, request: { action: string }) => ({
+      state: request.action === 'warmup' ? 'connecting' : 'idle', message: 'test',
+    }))
+    const { component } = loadPill()
+    const tree = component({ store: modelStore('antigravity-acp'), control })
+    const button = elements(tree).find((item) => item.props['aria-label'] === '预热 ACP')!
+    expect(texts(button)).toEqual(['预热'])
+    expect(button.props.disabled).toBe(false)
+    ;(button.props.onClick as () => void)()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(control).toHaveBeenCalledWith('account', { action: 'warmup' })
+    expect(control.mock.calls.every(([method]) => method === 'account')).toBe(true)
+  })
+
+  it.each([
+    [{ state: 'connecting' }, '预热中…'],
+    [{ state: 'connected', runtime: { phase: 'ready' } }, '已预热'],
+    [{ state: 'connected', runtime: { phase: 'waiting-tools' } }, '运行中'],
+  ])('启动中或正在使用的 ACP 不重复启动：%s', (account, label) => {
+    const control = vi.fn(async () => account)
+    const { component } = loadRegistrations({ stateOverrides: { 4: account } }).get('antigravity-quota')!
+    const tree = component({ store: modelStore('antigravity-acp'), control })
+    const button = elements(tree).find((item) => item.props['aria-label'] === '预热 ACP')!
+    expect(texts(button)).toEqual([label])
+    expect(button.props.disabled).toBe(true)
+    expect(control.mock.calls).toHaveLength(1)
+  })
+
+  it('其他 provider 不显示预热按钮，也不读取 ACP 状态', () => {
+    const control = vi.fn()
+    expect(loadPill().component({ store: modelStore('deepseek-official'), control })).toBeNull()
+    expect(control).not.toHaveBeenCalled()
+  })
+
+  it('药丸与设置页注入同一个预热控制器', () => {
+    const entries = loadRegistrations()
+    expect(entries.get('antigravity-quota')!.row.inject!('session').control)
+      .toBe(entries.get('antigravity-acp')!.row.inject!('').control)
+  })
+
   const completeQuota = { status: 'ok', groups: [
     { name: 'Gemini Models', buckets: [{ window: '5h', remainingPct: 82 }, { window: 'weekly', remainingPct: 71 }] },
     { name: 'Claude and GPT models', buckets: [{ window: '5h', remainingPct: 43 }] },

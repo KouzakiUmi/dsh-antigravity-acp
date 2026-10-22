@@ -20,7 +20,8 @@ import { readFile, readdir } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { redactSensitiveText } from './redact.js'
-import { resolveCacheDir, versionCachePaths, DEFAULT_ACP_SERVER_VERSION } from './binary.js'
+import { resolveInstallRoot, versionCachePaths, DEFAULT_ACP_SERVER_VERSION } from './binary.js'
+import { agyCliCandidates } from './agy-cli.js'
 
 /** Cloud Code Assist 内部端点前缀（方法以 `:method` 拼接，POST JSON）。 */
 export const CODE_ASSIST_BASE_URL = 'https://daily-cloudcode-pa.googleapis.com/v1internal'
@@ -111,6 +112,10 @@ export interface QuotaDeps {
   now?: () => number
   homedir?: () => string
   cacheDir?: string
+  /** 可执行文件安装根；与模型/额度的数据 cacheDir 分开。 */
+  installRoot?: string
+  /** 设置中显式选择的官方 CLI 路径，优先于环境变量和 PATH。 */
+  cliPath?: string
   /** 候选官方二进制路径（用于提取 OAuth client 元数据）。 */
   binaryPaths?: readonly string[]
   /**
@@ -210,28 +215,28 @@ async function candidateBinaryPaths(deps: QuotaDeps): Promise<string[]> {
   if (deps.binaryPaths) return [...deps.binaryPaths]
   const home = (deps.homedir ?? homedir)()
   const env = deps.env ?? process.env
-  const cacheDir = deps.cacheDir ?? resolveCacheDir({ DSH_HOME: env.DSH_HOME }, deps.homedir)
-  const { extractDir } = versionCachePaths(cacheDir, deps.acpVersion ?? DEFAULT_ACP_SERVER_VERSION)
+  const installRoot = deps.installRoot ?? resolveInstallRoot(env, process.platform, () => home)
+  const { extractDir } = versionCachePaths(installRoot, deps.acpVersion ?? DEFAULT_ACP_SERVER_VERSION)
   const names = process.platform === 'win32'
-    ? ['agy.exe', 'agy_acp_server.exe']
-    : ['agy', 'agy_acp_server']
+    ? ['agy.exe', 'agy_acp_server.exe', 'agy-acp-server.exe']
+    : ['agy', 'agy_acp_server.par', 'agy_acp_server', 'agy-acp-server']
   // 官方 agy CLI 才携带 client 元数据，排最前；缓存里的 ACP server 只是兜底
   // （每次白扫它要多读 80MB+）。
-  const out: string[] = []
-  const localAppData = env.LOCALAPPDATA
-  if (localAppData && localAppData.trim().length > 0) out.push(join(localAppData, 'agy', 'bin', 'agy.exe'))
-  out.push(join(home, 'AppData', 'Local', 'agy', 'bin', 'agy.exe'))
-  out.push(join(home, '.local', 'bin', 'agy'))
-  out.push(join(home, 'bin', 'agy'))
-  try {
-    const entries = await readdir(extractDir)
-    for (const name of names) {
-      if (entries.includes(name)) out.push(join(extractDir, name))
+  const out = [...agyCliCandidates(env, home, deps.cliPath)]
+  if (env.AGY_ACP_BIN?.trim()) out.push(env.AGY_ACP_BIN.trim())
+  const scan = async (directory: string, depth: number): Promise<void> => {
+    try {
+      const entries = await readdir(directory, { withFileTypes: true })
+      for (const entry of entries) {
+        if (entry.isFile() && names.includes(entry.name)) out.push(join(directory, entry.name))
+        else if (entry.isDirectory() && depth < 2) await scan(join(directory, entry.name), depth + 1)
+      }
+    } catch {
+      // 缓存目录不存在：跳过。
     }
-  } catch {
-    // 缓存目录不存在：跳过。
   }
-  return out
+  await scan(extractDir, 0)
+  return [...new Set(out)]
 }
 
 /** 用 refresh_token 换发 access_token（只在内存中使用，不写回登录文件）。 */

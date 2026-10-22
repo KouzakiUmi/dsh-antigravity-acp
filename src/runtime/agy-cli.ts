@@ -12,7 +12,7 @@
  * （本模块通过 {@link CliRun} 注入，不碰 child_process），失败折叠为可读错误。
  */
 import { homedir } from 'node:os'
-import { dirname, join, win32 } from 'node:path'
+import { dirname, posix, win32 } from 'node:path'
 import type { SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import { redactSensitiveText } from './redact.js'
 import { ambientProxyEnv, buildProxyEnv } from './proxy-env.js'
@@ -36,20 +36,28 @@ export type CliRun = (request: CliRunRequest) => Promise<CliRunResult>
 /** 默认超时：CLI 启动会做登录/配置刷新，冷启动可达数秒。 */
 export const AGY_CLI_TIMEOUT_MS = 45_000
 
-/** 解析官方 CLI 的候选路径（按优先级）：环境变量覆盖优先，其次各平台默认安装位置。 */
+/** CLI 候选优先级：显式配置、环境覆盖、PATH 绝对目录、各平台默认安装位置。 */
 export function agyCliCandidates(
   env: Readonly<Record<string, string | undefined>> = process.env,
   home: string = homedir(),
+  explicitPath?: string,
+  platform: NodeJS.Platform = process.platform,
 ): readonly string[] {
-  const override = env.AGY_CLI_BIN?.trim()
+  const override = explicitPath?.trim() || env.AGY_CLI_BIN?.trim()
   if (override) return [override]
+  const paths = platform === 'win32' ? win32 : posix
+  const executable = platform === 'win32' ? 'agy.exe' : 'agy'
+  const searchPath = Object.entries(env).find(([key]) => platform === 'win32' ? key.toLowerCase() === 'path' : key === 'PATH')?.[1]
+  // 跳过空条目与相对目录，避免从当前工作区意外加载同名文件。
+  const fromPath = (searchPath ?? '').split(paths.delimiter)
+    .map((entry) => entry.trim().replace(/^"(.*)"$/, '$1'))
+    .filter((entry) => paths.isAbsolute(entry))
+    .map((entry) => paths.join(entry, executable))
   const localAppData = env.LOCALAPPDATA?.trim()
-  return [
-    ...(localAppData ? [win32.join(localAppData, 'agy', 'bin', 'agy.exe')] : []),
-    win32.join(home, 'AppData', 'Local', 'agy', 'bin', 'agy.exe'),
-    join(home, '.local', 'bin', 'agy'),
-    join(home, 'bin', 'agy'),
-  ]
+  const defaults = platform === 'win32'
+    ? [...(localAppData ? [win32.join(localAppData, 'agy', 'bin', 'agy.exe')] : []), win32.join(home, 'AppData', 'Local', 'agy', 'bin', 'agy.exe')]
+    : [posix.join(home, '.local', 'bin', 'agy'), posix.join(home, 'bin', 'agy')]
+  return [...new Set([...fromPath, ...defaults])]
 }
 
 /** CLI 取数失败（错误文本已脱敏，不含凭据）。 */
