@@ -131,7 +131,7 @@ export class FakeAcpAgent {
         this.unanswered.add(record.id)
         const handler = this.#handlers.get(record.method)
         if (!handler) continue
-        void Promise.resolve(handler(record.params)).then(
+        void Promise.resolve().then(() => handler(record.params)).then(
           (result) => {
             if (result === NO_REPLY) return
             if (!this.unanswered.has(record.id)) return

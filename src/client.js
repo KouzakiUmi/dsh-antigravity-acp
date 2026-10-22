@@ -28,6 +28,11 @@ window.__ModuleLoader__.load({
     /** Editable fields surfaced in this card; everything else stays in the host form. */
     const FIELDS = [
       { key: 'autoWarmup', checkbox: true, defaultChecked: true, label: '启动时自动预热 ACP', hint: '提前启动并保留连接，不发送模型消息。保存后下次启用插件生效；本次可点击“立即预热”。' },
+      { key: 'reuseSessions', checkbox: true, defaultChecked: true, label: '复用 ACP 会话（增量发送）', hint: '校验历史与实际输出后只发新增消息；变化的上下文仍发送，不一致时自动重建。' },
+      { key: 'resumeSessions', checkbox: true, label: '重启后恢复 ACP 会话', hint: '尝试加载本地映射，失败则重建；仅保存 ID 与指纹。需要开启会话复用。' },
+      { key: 'keepProcessAfterCancel', checkbox: true, label: '取消后保留已停止的进程', hint: '仅在 agent 确认停止后保留；等待期间新轮排队，超时或通信失败回收。' },
+      { key: 'cancelGraceMs', numeric: true, defaultValue: 30000, min: 0, max: 60000, label: '取消确认宽限（毫秒）', hint: '默认 30000；0 表示不等待并立即回收，不会复用未确认连接。' },
+      { key: 'idleRecycleMs', numeric: true, defaultValue: 300000, min: 0, max: 3600000, label: '进程空闲回收（毫秒）', hint: '默认 300000（5 分钟），0 禁用。聊天、预热、目录发现结束后统一计时；等待工具不算空闲。' },
       { key: 'preferredModel', label: '默认 / 自定义模型 ID', placeholder: '选择目录中的模型，或输入自定义 ID', hint: '保存后优先列出此模型；目录之外的 ID 标为自定义、未验证。不会替换当前会话已选模型。留空不指定默认项。' },
       { key: 'proxyUrl', label: '出网代理', placeholder: 'http://127.0.0.1:7890', hint: '此处配置优先；留空则继承宿主代理环境变量，宿主也未配置时才直连。' },
       { key: 'proxyBypass', label: '代理排除列表', placeholder: '10.0.0.0/8,*.internal', hint: 'localhost/127.0.0.1/::1 始终自动排除（私有 MCP 桥在 loopback）。' },
@@ -189,7 +194,7 @@ window.__ModuleLoader__.load({
           const found = namespaces.find((item) => item?.ns === ENTRY_ID)
           setView(found ?? null)
           const current = found?.value && typeof found.value === 'object' ? found.value : {}
-          const server = Object.fromEntries(FIELDS.map((field) => [field.key, field.checkbox ? (field.defaultChecked ? current[field.key] !== false : current[field.key] === true) : current[field.key] ?? '']))
+          const server = Object.fromEntries(FIELDS.map((field) => [field.key, field.checkbox ? (field.defaultChecked ? current[field.key] !== false : current[field.key] === true) : current[field.key] ?? field.defaultValue ?? '']))
           const changed = []
           const next = { ...server }
           for (const key of dirty.current) {
@@ -216,6 +221,12 @@ window.__ModuleLoader__.load({
 
       const save = React.useCallback(async () => {
         if (!view || !writable || loading || savingRef.current || dirty.current.size === 0) return
+        const invalid = FIELDS.find((field) => field.numeric && dirty.current.has(field.key)
+          && (!Number.isSafeInteger(draftRef.current[field.key]) || draftRef.current[field.key] < field.min || draftRef.current[field.key] > field.max))
+        if (invalid) {
+          setStatus({ kind: 'error', text: invalid.label + '必须是 ' + invalid.min + '–' + invalid.max + ' 的整数。' })
+          return
+        }
         savingRef.current = true
         setSaving(true)
         setStatus({ kind: 'busy', text: '保存中…' })
@@ -316,12 +327,14 @@ window.__ModuleLoader__.load({
           h('span', null, field.label),
           h('input', {
             name: field.key,
-            type: field.checkbox ? 'checkbox' : 'text',
+            type: field.checkbox ? 'checkbox' : field.numeric ? 'number' : 'text',
+            ...(field.numeric ? { min: field.min, max: field.max, step: 1 } : {}),
             disabled: editingDisabled,
             ...(field.checkbox ? { checked: draft[field.key] === true } : { value: draft[field.key] ?? '' }),
             placeholder: field.placeholder,
             style: field.checkbox ? { alignSelf: 'flex-start' } : { ...ACTION, cursor: 'text', width: '100%', boxSizing: 'border-box' },
-            onChange: (event) => editField(field.key, field.checkbox ? event.target.checked : event.target.value),
+            onChange: (event) => editField(field.key, field.checkbox ? event.target.checked
+              : field.numeric && event.target.value !== '' ? Number(event.target.value) : event.target.value),
           }),
           h('small', { style: { opacity: 0.7 } }, field.hint),
         )),

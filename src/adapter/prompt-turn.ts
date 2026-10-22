@@ -83,7 +83,7 @@ export interface PromptTurnOptions {
    */
   onTerminate(reason: string, info?: { clean?: boolean; aborted?: boolean }): void
   /** prompt 已应答（含取消应答）时回调；adapter 用它确认「取消是否真的生效」。 */
-  onPromptSettled?(turn: PromptTurn): void
+  onPromptSettled?(turn: PromptTurn, response?: PromptResponse): void
   /** 尚未终止回合的一次拒绝；permission 不等于原生 fs/terminal，不能据此做身份判断。 */
   onNativeRefusal?(info: { kind: 'permission' | 'request'; detail: string; count: number }): void
   /** 固定词表的权限结构摘要；仅诊断，不作为放行依据。 */
@@ -126,6 +126,7 @@ export class PromptTurn {
   #producerDone = false
   #roundEnded = false
   #promptSettled = false
+  #promptStarted = false
   #failure: LlmFailure | undefined
   #aborted = false
   #truncated = false
@@ -160,6 +161,8 @@ export class PromptTurn {
   get promptSettled(): boolean {
     return this.#promptSettled
   }
+
+  get promptStarted(): boolean { return this.#promptStarted }
 
   /** 本地已终止，不再允许续接；对端回收由 adapter 的屏障保证。 */
   get terminated(): boolean {
@@ -285,6 +288,7 @@ export class PromptTurn {
       this.#fail({ code: AGY_TURN_ERROR.ABORTED, message: `Antigravity ACP 回合在发起前即被调用方中止：${String(signal.reason ?? 'aborted')}` })
       return
     }
+    this.#promptStarted = true
     const prompt = this.#link.prompt({ sessionId: this.sessionId, prompt: content }, { timeoutMs: this.#promptTimeoutMs })
     void this.#drive(prompt)
     if (signal) this.#attachAbort(signal)
@@ -381,7 +385,7 @@ export class PromptTurn {
   async #drive(prompt: Promise<PromptResponse>): Promise<void> {
     try {
       const response = await prompt
-      this.#markPromptSettled()
+      this.#markPromptSettled(response)
       this.#finishWith(response)
     } catch (error) {
       this.#markPromptSettled()
@@ -392,13 +396,13 @@ export class PromptTurn {
     }
   }
 
-  #markPromptSettled(): void {
+  #markPromptSettled(response?: PromptResponse): void {
     this.#promptSettled = true
     this.dispose()
     const waiters = this.#settledWaiters
     this.#settledWaiters = []
     for (const resolve of waiters) resolve()
-    this.#onPromptSettled?.(this)
+    this.#onPromptSettled?.(this, response)
   }
 
   #finishWith(response: PromptResponse): void {

@@ -182,6 +182,39 @@ describe('settings card with real React state and effects', () => {
     expect(renderedText(renderer)).toContain('当前目录支持的输入：文本、图片')
   })
 
+  it('shows session switches and submits timers as numbers, preserving zero', async () => {
+    const service = transport()
+    const { renderer } = await mount(service.remote)
+    expect(renderer.root.findByProps({ name: 'reuseSessions' }).props.checked).toBe(true)
+    expect(renderer.root.findByProps({ name: 'resumeSessions' }).props.checked).toBe(false)
+    expect(renderer.root.findByProps({ name: 'keepProcessAfterCancel' }).props.checked).toBe(false)
+    expect(renderer.root.findByProps({ name: 'cancelGraceMs' }).props.value).toBe(30000)
+    expect(renderer.root.findByProps({ name: 'idleRecycleMs' }).props.value).toBe(300000)
+    await act(async () => {
+      renderer.root.findByProps({ name: 'keepProcessAfterCancel' }).props.onChange({ target: { checked: true } })
+      renderer.root.findByProps({ name: 'cancelGraceMs' }).props.onChange({ target: { value: '12000' } })
+      renderer.root.findByProps({ name: 'idleRecycleMs' }).props.onChange({ target: { value: '0' } })
+    })
+    await act(async () => { await button(renderer, '保存').props.onClick() })
+    expect(service.mutate).toHaveBeenCalledWith('llm-antigravity-acp', [
+      { op: 'set', path: ['keepProcessAfterCancel'], value: true },
+      { op: 'set', path: ['cancelGraceMs'], value: 12000 },
+      { op: 'set', path: ['idleRecycleMs'], value: 0 },
+    ], 1)
+  })
+
+  for (const invalid of ['', '-1', '0.5', '60001', 'NaN']) {
+    it(`rejects invalid cancel grace ${JSON.stringify(invalid)} without losing the draft`, async () => {
+      const service = transport()
+      const { renderer } = await mount(service.remote)
+      await act(async () => { renderer.root.findByProps({ name: 'cancelGraceMs' }).props.onChange({ target: { value: invalid } }) })
+      await act(async () => { await button(renderer, '保存').props.onClick() })
+      expect(service.mutate).not.toHaveBeenCalled()
+      expect(renderedText(renderer)).toContain('必须是 0–60000 的整数')
+      expect(button(renderer, '保存').props.disabled).toBe(false)
+    })
+  }
+
   it('displays pool pressure and clears subscriptions and polling on unmount', async () => {
     const service = transport()
     const control = vi.fn(async (method: string) => method === 'account'

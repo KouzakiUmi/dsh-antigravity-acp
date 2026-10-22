@@ -41,7 +41,7 @@ import type { AcpCredentialResult } from './runtime/credentials.js'
 import { describeLowIntegrity, isLowIntegrityTarget } from './runtime/integrity.js'
 import { describeAuthWait, redactSensitiveText } from './runtime/redact.js'
 import { readCachedCatalog, writeCachedCatalog } from './runtime/catalog-cache.js'
-import { readSessionMap, writeSessionMap } from './runtime/session-map.js'
+import { createFileSessionMapStore } from './runtime/session-map.js'
 import { agyCliCandidates, createSubprocessCliRun, fetchAgyModels } from './runtime/agy-cli.js'
 import { AgYQuotaService, registerAgYQuotaRemote } from './quota/quota-remote.js'
 import { SettingsControl } from './quota/control.js'
@@ -105,6 +105,9 @@ export interface ActiveAcpRuntime {
  */
 export async function disposeAcpRuntime(active: ActiveAcpRuntime): Promise<void> {
   active.disposed = true
+  // 同步封住 adapter 的生产者与定时器，再切断链接；不等待桥清理才终止子进程。
+  const bridgeCleanup = active.bridgeTeardown?.()
+  void bridgeCleanup?.catch(() => undefined)
   active.abort?.abort(new Error('插件已卸载'))
   active.handle?.terminate()
   await active.link?.close().catch(() => undefined)
@@ -115,7 +118,7 @@ export async function disposeAcpRuntime(active: ActiveAcpRuntime): Promise<void>
     await releaseRuntimeDirectory(active.directory).catch(() => undefined)
     active.directory = undefined
   }
-  await active.bridgeTeardown?.()
+  await bridgeCleanup
   active.lifecycle?.stopped('disposed')
 }
 
@@ -503,6 +506,9 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
     return cliModelRows ?? []
   }
 
+  const sessionStore = config.resumeSessions === true ? createFileSessionMapStore(cacheDir,
+    () => ctx.logger?.warn?.('antigravity-acp: 会话映射不可用或由另一 Host 占用，跨进程恢复已降级；不影响本地聊天'),
+  ) : undefined
   const workers: AntigravityAcpAdapter[] = []
   let metadata: AdapterMetadata | undefined
   // Serialize startup/credential preparation, not inference. This avoids competing OAuth imports.
@@ -536,12 +542,7 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
       keepProcessAfterCancel: config.keepProcessAfterCancel,
       cancelGraceMs: config.cancelGraceMs,
       idleRecycleMs: config.idleRecycleMs,
-      ...(config.resumeSessions === true
-        ? {
-            loadSessionMap: () => readSessionMap(cacheDir),
-            saveSessionMap: (entries) => writeSessionMap(cacheDir, entries),
-          }
-        : {}),
+      sessionStore,
       canReadImages: () => attachmentStore !== undefined,
       readImage: (ref, signal) => {
         if (!attachmentStore) throw new LlmError('宿主附件服务不可用，无法读取图片', 'AGY_IMAGE_UNAVAILABLE')
@@ -634,7 +635,10 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
   ctx.effect(function* () {
     yield () => registration()
     yield async () => control.dispose()
-    yield async () => { try { await adapter.dispose() } finally { await pluginFetch.close() } }
+    yield async () => {
+      try { await adapter.dispose() }
+      finally { try { await sessionStore?.close() } finally { await pluginFetch.close() } }
+    }
   }, 'antigravity-acp 生命周期清理')
   if (config.autoWarmup === true) control.account('warmup')
   else if (config.autoWarmup === false) void prefetchAgentBinary(config, ctx)

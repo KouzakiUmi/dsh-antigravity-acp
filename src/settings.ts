@@ -67,7 +67,7 @@ export interface AntigravityHostConfig {
    * 开启后先等 `cancelGraceMs` 让 agent 确认停止；确认了就只丢弃会话、保留进程。
    */
   keepProcessAfterCancel?: boolean
-  /** 取消后的确认宽限（毫秒）；0 表示不等待、直接保留进程。 */
+  /** 取消后的确认宽限（毫秒）；0 表示不等待、立即回收。 */
   cancelGraceMs?: number
   /** 保留进程的最长空闲时间（毫秒），超时回收；0 表示不设上限。 */
   idleRecycleMs?: number
@@ -93,6 +93,6 @@ export const Config = Schema.object({
   reuseSessions: Schema.boolean().default(true).description('复用同一个 ACP 会话，后续回合只发送新增消息；历史被压缩/回退或模型、工具目录变化时自动重建。关闭则每轮新会话并重放全部历史'),
   resumeSessions: Schema.boolean().default(false).description('重启后尝试用 session/load 恢复上次的 ACP 会话；依赖 agent 的 loadSession 能力，恢复失败会自动重建'),
   keepProcessAfterCancel: Schema.boolean().default(false).description('用户取消后保留官方进程：宽限内确认 agent 已停止就只丢弃会话，下一轮不必冷启动；默认关闭'),
-  cancelGraceMs: Schema.natural().max(60_000).default(30_000).description('取消后等待 agent 确认停止的上限（毫秒）；0 表示不等待、直接保留进程'),
-  idleRecycleMs: Schema.natural().max(3_600_000).default(300_000).description('保留进程的最长空闲时间（毫秒），超时回收；0 表示不设上限。默认 5 分钟，与 Gemini 显式缓存默认 TTL(300s) 一致'),
+  cancelGraceMs: Schema.natural().max(60_000).default(30_000).description('取消后等待 agent 确认停止的上限（毫秒）；0 表示不等待、立即回收'),
+  idleRecycleMs: Schema.natural().max(3_600_000).default(300_000).description('保留进程的最长空闲时间（毫秒），超时回收；0 表示不设上限。默认 5 分钟是本插件的资源回收策略，不代表上游缓存 TTL'),
 })
