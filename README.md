@@ -10,7 +10,11 @@
 [![license](https://img.shields.io/badge/license-MIT-64748b)](LICENSE)
 [![Node.js](https://img.shields.io/badge/Node.js-%E2%89%A522.19-64748b)](#兼容性与验证范围)
 
-[快速开始](#快速开始) · [功能亮点](#功能亮点) · [配置参考](docs/configuration.md) · [排障](docs/reference.md#排障) · [更新记录](docs/changelog.md)
+[快速开始](#快速开始) · [功能预览](#功能预览) · [功能亮点](#功能亮点) · [配置参考](docs/configuration.md) · [排障](docs/reference.md#排障) · [更新记录](docs/changelog.md)
+
+<img src="https://raw.githubusercontent.com/KouzakiUmi/dsh-antigravity-acp/main/assets/banner.png" width="1200" alt="Antigravity ACP for DSH：左侧为标题与定位，右侧是由真实组件渲染的额度弹层与设置页（虚构数据，离线预览）">
+
+<sub>真实组件 · 虚构数据 · 离线预览，不是运行中的 DSH 截图</sub>
 
 </div>
 
@@ -31,6 +35,15 @@ dsh plugin --profile web add dsh-bundle-antigravity-host
 3. **选择模型，开始对话**：提供商名称为 **Antigravity (ACP)**，路由 ID 为 `antigravity-acp`。模型选择器左侧出现额度药丸和预热按钮；工具调用继续走 DSH 的校验、审批与执行。
 
 **额度或 AI Credits 没有显示？** ACP 连接与 CLI 登录是两条链路。额度查询优先使用已登录的官方 `agy`，AI Credits 仅从 CLI 读取；ACP 登录成功不代表 CLI 也已登录。[登录态与数据来源](docs/reference.md#登录态与额度来源)
+
+## 功能预览
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/KouzakiUmi/dsh-antigravity-acp/main/assets/readme/features-dark.png">
+  <img src="https://raw.githubusercontent.com/KouzakiUmi/dsh-antigravity-acp/main/assets/readme/features-light.png" width="1200" alt="模型选择器旁的额度药丸与展开的套餐额度弹层，以及「设置 → Antigravity ACP」中的连接状态与模型管理；虚构数据离线预览">
+</picture>
+
+左：模型选择器旁的额度药丸，展开后按额度组显示窗口与剩余百分比。右：设置页的连接状态、分阶段耗时与模型管理。画面来自当前 `src/client.js` 的真实组件，数字与套餐名均为虚构。
 
 ## 功能亮点
 
