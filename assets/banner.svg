@@ -1,0 +1,130 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="520" viewBox="0 0 1280 520" font-family="'Inter','Segoe UI','Microsoft YaHei','PingFang SC','Noto Sans CJK SC',Arial,sans-serif" role="img" aria-labelledby="t d">
+  <title id="t">Antigravity ACP for DSH</title>
+  <desc id="d">示意图：官方 Antigravity agent 经 stdio 的 ACP 与私有 loopback 桥相连，工具调用穿过桥交给 DSH 校验、审批与执行，结果再回填给 agent。</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#070b16"/>
+      <stop offset="0.6" stop-color="#0c1430"/>
+      <stop offset="1" stop-color="#08202c"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="0.55" stop-color="#6366f1"/>
+      <stop offset="1" stop-color="#c084fc"/>
+    </linearGradient>
+    <linearGradient id="accentV" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#6366f1"/>
+    </linearGradient>
+    <linearGradient id="titleFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#a9b8d0"/>
+    </linearGradient>
+    <radialGradient id="glowA" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#6366f1" stop-opacity="0.38"/>
+      <stop offset="1" stop-color="#6366f1" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowB" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#22d3ee" stop-opacity="0.26"/>
+      <stop offset="1" stop-color="#22d3ee" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="core" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="0.45" stop-color="#7dd3fc"/>
+      <stop offset="1" stop-color="#6366f1"/>
+    </radialGradient>
+    <linearGradient id="fadeRight" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#fff" stop-opacity="0"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="1"/>
+    </linearGradient>
+    <mask id="gridMask"><rect width="1280" height="520" fill="url(#fadeRight)"/></mask>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" fill="none" stroke="#9fb3ff" stroke-opacity="0.08"/>
+    </pattern>
+    <marker id="arrowR" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M1 1L9 5L1 9" fill="none" stroke="#7dd3fc" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <marker id="arrowL" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M1 1L9 5L1 9" fill="none" stroke="#c4b5fd" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+
+  <!-- 背景 -->
+  <rect width="1280" height="520" fill="url(#bg)"/>
+  <rect width="1280" height="520" fill="url(#grid)" mask="url(#gridMask)"/>
+  <circle cx="1010" cy="250" r="330" fill="url(#glowA)"/>
+  <circle cx="740" cy="260" r="220" fill="url(#glowB)"/>
+  <rect width="10" height="520" fill="url(#accentV)"/>
+
+  <!-- 左侧文案 -->
+  <g>
+    <text x="68" y="150" font-size="15" letter-spacing="3.5" fill="#7dd3fc" font-weight="600">DSH PLUGIN · OFFICIAL ACP</text>
+    <text x="66" y="226" font-size="62" font-weight="800" fill="url(#titleFill)" letter-spacing="-1">Antigravity ACP</text>
+    <text x="68" y="286" font-size="26" fill="#dbe4f2">在 DSH 里使用 Antigravity 模型，</text>
+    <text x="68" y="322" font-size="26" fill="#dbe4f2">工具仍交给 DSH。</text>
+    <text x="68" y="362" font-size="15" fill="#8da0bb">官方 agent 负责模型与推理；校验、审批与执行留在 DSH。</text>
+    <g font-size="14" fill="#cbd5e1">
+      <rect x="68" y="392" width="108" height="34" rx="17" fill="#ffffff" fill-opacity="0.06" stroke="#475569" stroke-opacity="0.8"/>
+      <text x="122" y="414" text-anchor="middle">官方 ACP v1</text>
+      <rect x="186" y="392" width="116" height="34" rx="17" fill="#ffffff" fill-opacity="0.06" stroke="#475569" stroke-opacity="0.8"/>
+      <text x="244" y="414" text-anchor="middle">工具仍在 DSH</text>
+      <rect x="312" y="392" width="124" height="34" rx="17" fill="#ffffff" fill-opacity="0.06" stroke="#475569" stroke-opacity="0.8"/>
+      <text x="374" y="414" text-anchor="middle">并发 worker 池</text>
+    </g>
+  </g>
+
+  <!-- 右侧示意图 -->
+  <g>
+    <!-- Agent：同心环 + 卫星 -->
+    <g transform="translate(730 260)">
+      <circle r="70" fill="none" stroke="url(#accent)" stroke-width="1.6" stroke-opacity="0.9"/>
+      <circle r="48" fill="none" stroke="#7dd3fc" stroke-opacity="0.45" stroke-dasharray="3 7"/>
+      <circle r="26" fill="#0b1226" stroke="url(#accent)" stroke-width="1.6"/>
+      <circle r="11" fill="url(#core)"/>
+      <circle cx="0" cy="-70" r="4.5" fill="#22d3ee"/>
+      <circle cx="60.6" cy="35" r="3.5" fill="#818cf8"/>
+      <circle cx="-60.6" cy="35" r="3.5" fill="#c084fc"/>
+      <g>
+        <circle cx="48" cy="0" r="3" fill="#e0f2fe"/>
+        <animateTransform attributeName="transform" type="rotate" from="0" to="360" dur="14s" repeatCount="indefinite"/>
+      </g>
+    </g>
+    <text x="730" y="372" text-anchor="middle" font-size="16" font-weight="600" fill="#e2e8f0">Antigravity agent</text>
+    <text x="730" y="394" text-anchor="middle" font-size="12" fill="#8da0bb" font-family="'JetBrains Mono','Cascadia Mono',Consolas,monospace">ACP v1 · stdio</text>
+
+    <!-- 私有桥：门框 -->
+    <g>
+      <rect x="922" y="190" width="10" height="140" rx="5" fill="url(#accentV)" fill-opacity="0.85"/>
+      <rect x="948" y="190" width="10" height="140" rx="5" fill="url(#accentV)" fill-opacity="0.85"/>
+      <path d="M940 244 L952 260 L940 276 L928 260 Z" fill="#0b1226" stroke="#c4b5fd" stroke-width="1.5"/>
+      <path d="M940 254 V266" stroke="#c4b5fd" stroke-width="1.5" stroke-linecap="round"/>
+    </g>
+    <text x="940" y="372" text-anchor="middle" font-size="16" font-weight="600" fill="#e2e8f0">私有桥</text>
+    <text x="940" y="394" text-anchor="middle" font-size="12" fill="#8da0bb" font-family="'JetBrains Mono','Cascadia Mono',Consolas,monospace">loopback MCP</text>
+
+    <!-- DSH：六边形 -->
+    <g transform="translate(1150 260)">
+      <polygon points="-66,0 -33,-57 33,-57 66,0 33,57 -33,57" fill="#0b1226" stroke="url(#accent)" stroke-width="1.8"/>
+      <polygon points="-50,0 -25,-43 25,-43 50,0 25,43 -25,43" fill="none" stroke="#7dd3fc" stroke-opacity="0.35" stroke-dasharray="3 6"/>
+      <text y="9" text-anchor="middle" font-size="26" font-weight="800" fill="#f1f5f9" letter-spacing="1">DSH</text>
+    </g>
+    <text x="1150" y="372" text-anchor="middle" font-size="16" font-weight="600" fill="#e2e8f0">校验 · 审批 · 执行</text>
+    <text x="1150" y="394" text-anchor="middle" font-size="12" fill="#8da0bb" font-family="'JetBrains Mono','Cascadia Mono',Consolas,monospace">tools stay in DSH</text>
+
+    <!-- 工具调用：agent → 桥 → DSH -->
+    <path id="callPath" d="M797 235 H1096" fill="none" stroke="#7dd3fc" stroke-width="1.8" stroke-opacity="0.9" marker-end="url(#arrowR)"/>
+    <text x="862" y="224" text-anchor="middle" font-size="12" fill="#7dd3fc" font-family="'JetBrains Mono','Cascadia Mono',Consolas,monospace">tool call</text>
+    <circle r="4" fill="#e0f2fe">
+      <animateMotion dur="3.2s" repeatCount="indefinite" path="M797 235 H1096"/>
+    </circle>
+
+    <!-- 结果回填：DSH → 桥 → agent -->
+    <path id="resultPath" d="M1096 285 H797" fill="none" stroke="#c4b5fd" stroke-width="1.8" stroke-opacity="0.9" stroke-dasharray="6 6" marker-end="url(#arrowL)"/>
+    <text x="862" y="308" text-anchor="middle" font-size="12" fill="#c4b5fd" font-family="'JetBrains Mono','Cascadia Mono',Consolas,monospace">result</text>
+    <circle r="4" fill="#ede9fe">
+      <animateMotion dur="3.2s" begin="1.6s" repeatCount="indefinite" path="M1096 285 H797"/>
+    </circle>
+  </g>
+
+  <text x="68" y="486" font-size="12" fill="#6b7d96">示意图 · Host + Web Client bundle · 不修改 DSH Core</text>
+</svg>

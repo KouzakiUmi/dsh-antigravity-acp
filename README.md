@@ -12,9 +12,7 @@
 
 [快速开始](#快速开始) · [功能预览](#功能预览) · [功能亮点](#功能亮点) · [配置参考](docs/configuration.md) · [排障](docs/reference.md#排障) · [更新记录](docs/changelog.md)
 
-<img src="https://raw.githubusercontent.com/KouzakiUmi/dsh-antigravity-acp/main/assets/banner.png" width="1200" alt="Antigravity ACP for DSH：左侧为标题与定位，右侧是由真实组件渲染的额度弹层与设置页（虚构数据，离线预览）">
-
-<sub>真实组件 · 虚构数据 · 离线预览，不是运行中的 DSH 截图</sub>
+<img src="https://raw.githubusercontent.com/KouzakiUmi/dsh-antigravity-acp/main/assets/banner.svg" width="1200" alt="Antigravity ACP for DSH：官方 Antigravity agent 经 ACP 与私有 loopback 桥相连，工具调用交给 DSH 校验、审批与执行，结果回填 agent（示意图）">
 
 </div>
 
