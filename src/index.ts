@@ -7,7 +7,7 @@
  * 生命周期闭环：dispose 时终止受管进程并关闭 AgentLink，确认退出后释放运行目录，
  * 最后关闭插件进程内的私有 loopback MCP 桥。
  */
-import { existsSync } from 'node:fs'
+import { createReadStream, existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { LlmError } from '@deepseek-ai/dsh-llm'
@@ -313,6 +313,7 @@ async function startAcpRuntime(
         clientInfo: AGY_CLIENT_INFO,
         handlers,
         requestTimeoutMs: config.requestTimeoutMs,
+        handshakeTimeoutMs: config.handshakeTimeoutMs ?? 120_000,
         // 认证需要人工在浏览器里点授权，走独立的更长超时（默认 5 分钟）。
         authTimeoutMs: config.authTimeoutMs,
       })
@@ -617,5 +618,22 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
     yield async () => control.dispose()
     yield async () => { try { await adapter.dispose() } finally { await pluginFetch.close() } }
   }, 'antigravity-acp 生命周期清理')
-  if (config.autoWarmup) control.account('warmup')
+  if (config.autoWarmup === true) control.account('warmup')
+  else if (config.autoWarmup === false) void prefetchAgentBinary(config, ctx)
+}
+
+/**
+ * 预读已缓存的官方 exe（约 200MB）进系统文件缓存：冷启动时磁盘首次读取可达数十秒
+ * （实测 52 秒，热启动约 10 秒）。只读、不下载、不 spawn，失败静默。
+ */
+async function prefetchAgentBinary(config: AntigravityHostConfig, ctx: Context): Promise<void> {
+  try {
+    const resolution = await ensureAgentBinary({ binaryPath: config.binaryPath, autoDownload: false, version: config.acpVersion })
+    const started = Date.now()
+    let bytes = 0
+    for await (const chunk of createReadStream(resolution.executablePath)) bytes += (chunk as Buffer).length
+    ctx.logger?.info?.(`antigravity-acp: 已预读官方二进制 ${Math.round(bytes / 1048576)}MB，用时 ${Date.now() - started}ms`)
+  } catch {
+    // 未下载或不可读时无需预读；真正启动时会给出明确错误。
+  }
 }

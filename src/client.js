@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     const ENTRY_ID = 'llm-antigravity-acp'
     /** Editable fields surfaced in this card; everything else stays in the host form. */
     const FIELDS = [
-      { key: 'autoWarmup', checkbox: true, label: '启动时自动预热 ACP', hint: '提前启动并保留连接，不发送模型消息。保存后下次启用插件生效；本次可点击“立即预热”。' },
+      { key: 'autoWarmup', checkbox: true, defaultChecked: true, label: '启动时自动预热 ACP', hint: '提前启动并保留连接，不发送模型消息。保存后下次启用插件生效；本次可点击“立即预热”。' },
       { key: 'preferredModel', label: '默认 / 自定义模型 ID', placeholder: '选择目录中的模型，或输入自定义 ID', hint: '保存后优先列出此模型；目录之外的 ID 标为自定义、未验证。不会替换当前会话已选模型。留空不指定默认项。' },
       { key: 'proxyUrl', label: '出网代理', placeholder: 'http://127.0.0.1:7890', hint: '此处配置优先；留空则继承宿主代理环境变量，宿主也未配置时才直连。' },
       { key: 'proxyBypass', label: '代理排除列表', placeholder: '10.0.0.0/8,*.internal', hint: 'localhost/127.0.0.1/::1 始终自动排除（私有 MCP 桥在 loopback）。' },
@@ -58,6 +58,13 @@ window.__ModuleLoader__.load({
       if (ms < 1000) return Math.round(ms) + ' ms'
       if (ms < 60000) return (ms / 1000).toFixed(2) + ' s'
       return Math.floor(ms / 60000) + ' 分 ' + Math.floor(ms % 60000 / 1000) + ' 秒'
+    }
+    /** 连接中且进程仍在启动时，给出阶段、已用时间与冷启动提示（官方进程冷启动可达 1 分钟）。 */
+    function startupHint(account) {
+      const runtime = account?.runtime
+      if (account?.state !== 'connecting' || !runtime || !['binary', 'credentials', 'spawn', 'initialize', 'authenticate', 'session'].includes(runtime.phase)) return undefined
+      const slow = ['spawn', 'initialize'].includes(runtime.phase) ? '；官方进程冷启动首次可能需要约 1 分钟，请耐心等待' : ''
+      return (RUNTIME_PHASES[runtime.phase] ?? runtime.phase) + '… 已用 ' + duration(runtime.phaseElapsedMs) + slow
     }
     function RuntimeDetails({ runtime }) {
       if (!runtime) return null
@@ -182,7 +189,7 @@ window.__ModuleLoader__.load({
           const found = namespaces.find((item) => item?.ns === ENTRY_ID)
           setView(found ?? null)
           const current = found?.value && typeof found.value === 'object' ? found.value : {}
-          const server = Object.fromEntries(FIELDS.map((field) => [field.key, field.checkbox ? current[field.key] === true : current[field.key] ?? '']))
+          const server = Object.fromEntries(FIELDS.map((field) => [field.key, field.checkbox ? (field.defaultChecked ? current[field.key] !== false : current[field.key] === true) : current[field.key] ?? '']))
           const changed = []
           const next = { ...server }
           for (const key of dirty.current) {
@@ -285,7 +292,7 @@ window.__ModuleLoader__.load({
           h('h3', { style: { margin: '0 0 8px', fontSize: '14px' } }, '账户 · ACP 连接'),
           h('p', { role: 'status', style: { fontSize: '12px', margin: '0 0 10px' } }, account?.runtime?.phase === 'stopped'
             ? 'ACP 连接已停止，可以重新预热。' : account?.runtime?.phase === 'error'
-              ? account.runtime.error ?? account?.message ?? 'ACP 连接异常，请重试。' : account?.message ?? '尚未验证 ACP 连接'),
+              ? account.runtime.error ?? account?.message ?? 'ACP 连接异常，请重试。' : startupHint(account) ?? account?.message ?? '尚未验证 ACP 连接'),
           h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '8px' } },
             h('button', { type: 'button', style: ACTION, disabled: !props.control || ['connecting', 'cancelling'].includes(account?.state) || runtimeBusy(account?.runtime) || account?.runtime?.phase === 'ready', onClick: () => accountAction('warmup') }, account?.runtime?.phase === 'ready' ? '连接已预热' : '立即预热'),
             h('button', { type: 'button', style: ACTION, disabled: !props.control || ['connecting', 'cancelling'].includes(account?.state) || runtimeBusy(account?.runtime), onClick: () => accountAction('login') }, '连接 / 登录 ACP'),
