@@ -23,7 +23,7 @@ import type {
   RequestMessage,
   StreamChunk,
 } from '@deepseek-ai/dsh-llm'
-import type { AnyRequest, McpServer as AcpMcpServer, SessionConfigOption, SessionNotification } from '@agentclientprotocol/sdk'
+import type { AnyRequest, McpServer as AcpMcpServer, SessionConfigOption, SessionNotification, Usage } from '@agentclientprotocol/sdk'
 import type { AgentLink, AgentLinkHandlers } from '../protocol/agent-link.js'
 import { BRIDGE_MCP_SERVER_NAME, McpToolBridge } from '../bridge/mcp-bridge.js'
 import type { BridgeToolResult } from '../bridge/mcp-bridge.js'
@@ -39,11 +39,13 @@ import {
 import type { AgyReasoningEffort } from '../runtime/agy-cli.js'
 import { findModelSelector, toModelCatalog } from './model-catalog.js'
 import type { ModelSelector } from './model-catalog.js'
-import { buildPromptWithImages, buildToolResultContent } from './image-content.js'
+import { buildPromptDeltaWithImages, buildPromptWithImages, buildToolResultContent } from './image-content.js'
 import type { ImageReader } from './image-content.js'
 import { AGY_TURN_ERROR, PromptTurn } from './prompt-turn.js'
 import type { AcpLifecycle } from '../runtime/lifecycle.js'
 import { ContinuationState } from './continuation-state.js'
+import { messageSourceKind, prefixHash, prefixMatches, reusableSessionKey, routeFingerprint, shouldSendIncrement } from './session-reuse.js'
+import type { SessionMapEntry } from '../runtime/session-map.js'
 
 /** DSH 侧 provider 标识符；与 cordis.patch.yml 的 id 及文档保持一致。 */
 export const AGY_PROVIDER_ID = 'antigravity-acp'
@@ -111,6 +113,30 @@ export interface AntigravityAcpAdapterOptions {
    * `session/set_config_option` 失败原因。缺省时不产任何日志。
    */
   log?: AdapterLog
+  /**
+   * 复用同一个 ACP 会话（默认 true）：同一 DSH 对话的后续回合只发送新增消息，
+   * 不再每轮 `session/new` 并重放全部历史。历史被压缩/回退、路由或工具目录
+   * 变化时仍会受控重建。关闭后回到旧的「每轮新会话 + 全量重放」。
+   */
+  reuseSessions?: boolean
+  /**
+   * 跨进程恢复 ACP 会话（默认 false）：重启后若存在会话映射，尝试
+   * `session/load` 恢复而不是从零重建。需要提供 loadSessionMap / saveSessionMap。
+   */
+  resumeSessions?: boolean
+  /**
+   * 用户取消后是否保留官方进程（默认 false：立即回收，下一轮要冷启动）。
+   * 开启后先等 `cancelGraceMs` 让 agent 确认停止；确认了就只丢弃会话、保留进程。
+   */
+  keepProcessAfterCancel?: boolean
+  /** 取消后的确认宽限（毫秒）；0 表示不等待、直接保留进程。 */
+  cancelGraceMs?: number
+  /** 保留进程的最长空闲时间（毫秒），超时回收；0 表示不设上限。 */
+  idleRecycleMs?: number
+  /** 读取上次运行的 ACP 会话映射；失败由实现方返回空表。 */
+  loadSessionMap?: () => Promise<Record<string, SessionMapEntry>>
+  /** 保存 ACP 会话映射；失败由实现方吞掉。 */
+  saveSessionMap?: (entries: Record<string, SessionMapEntry>) => Promise<void> | void
 }
 
 /** 适配器可用的最小日志面（与 cordis 的 `ctx.logger` 结构兼容）。 */
@@ -132,6 +158,24 @@ export interface AdapterMetadata {
   catalog: CachedModel[]
   contextWindows: Array<[string, number]>
   imageSupported?: boolean
+}
+
+/**
+ * 一个可复用的 ACP 会话。
+ *
+ * `sentCount` / `sentHash` 记录「哪些 DSH 消息已经在这个 ACP 会话里体现过」：
+ * 新轮只发送其后的新增消息；历史被压缩、回退或编辑导致前缀不再匹配时，
+ * 记录作废并受控重建。
+ */
+interface ReusedSession {
+  key: string
+  sessionId: string
+  link: AgentLink
+  sentCount: number
+  sentHash: string
+  route: string
+  /** 该会话是否注册过 MCP 工具；只有这类会话依赖桥的 token 归属。 */
+  usesTools: boolean
 }
 
 /*
@@ -175,6 +219,25 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   readonly #loadCliCatalog?: AntigravityAcpAdapterOptions['loadCliCatalog']
   readonly #log?: AdapterLog
   readonly #onMetadataChanged?: AntigravityAcpAdapterOptions['onMetadataChanged']
+  readonly #reuseSessions: boolean
+  readonly #resumeSessions: boolean
+  readonly #loadSessionMap?: AntigravityAcpAdapterOptions['loadSessionMap']
+  readonly #saveSessionMap?: AntigravityAcpAdapterOptions['saveSessionMap']
+  /** 同一 DSH 对话（普通聊天轮）→ 可复用的 ACP 会话。 */
+  readonly #sessions = new Map<string, ReusedSession>()
+  /** 本 worker 写进会话映射的键，删除时要从磁盘一并移除。 */
+  readonly #ownedSessionKeys = new Set<string>()
+  /** 会话映射的惰性读取结果（resume 开启时只读一次）。 */
+  #sessionMapLoad?: Promise<Record<string, SessionMapEntry>>
+  /** >0 时丢弃入站 session/update：`session/load` 会把整段历史重放回来。 */
+  #suppressUpdates = 0
+  readonly #keepProcessAfterCancel: boolean
+  readonly #cancelGraceMs: number
+  readonly #idleRecycleMs: number
+  /** 取消后的确认定时器；agent 先确认停止就取消回收。 */
+  #cancelGrace: { timer: ReturnType<typeof setTimeout>; link: AgentLink; turn: PromptTurn } | undefined
+  /** 保留进程的空闲回收定时器；有新回合就撤销。 */
+  #idleRecycle: { timer: ReturnType<typeof setTimeout>; link: AgentLink } | undefined
   #continuationState: ContinuationState | undefined
   readonly #readImage?: ImageReader
   readonly #canReadImages?: () => boolean
@@ -234,6 +297,13 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     this.#loadCliCatalog = options.loadCliCatalog
     this.#log = options.log
     this.#onMetadataChanged = options.onMetadataChanged
+    this.#reuseSessions = options.reuseSessions ?? true
+    this.#resumeSessions = options.resumeSessions ?? false
+    this.#loadSessionMap = options.loadSessionMap
+    this.#saveSessionMap = options.saveSessionMap
+    this.#keepProcessAfterCancel = options.keepProcessAfterCancel ?? false
+    this.#cancelGraceMs = Math.max(0, options.cancelGraceMs ?? 30_000)
+    this.#idleRecycleMs = Math.max(0, options.idleRecycleMs ?? 300_000)
     this.#readImage = options.readImage
     this.#canReadImages = options.canReadImages
     this.#bridge = new McpToolBridge({
@@ -246,10 +316,15 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       this.#wakeAccessWaiters()
       this.#turn?.dispose()
       this.#releaseTurnSubscription()
+      this.#dropAllSessions('adapter 卸载')
+      this.#clearCancelGrace()
+      this.#clearIdleRecycle()
       await this.#bridge.close()
     })
     this.#handlers = {
       onSessionUpdate: (notification) => {
+        // session/load 会把整段历史重放回来；那不是本轮输出，必须丢弃。
+        if (this.#suppressUpdates > 0) return
         this.#observeUsageUpdate(notification)
         return this.#turn?.handleSessionUpdate(notification)
       },
@@ -541,8 +616,12 @@ export class AntigravityAcpAdapter extends LlmAdapter {
    * 之前串行化 stream。工具 park 保留回合所有权，辅助请求等待而不是抢占主回合。
    */
   override async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
-    // 1) 不支持项先行拒绝：必须在任何 IO 之前失败。
-    assertSupportedOptions(options)
+    // temperature / stop 在 ACP v1 没有会话通道：不因它们拒绝整个请求（否则宿主里
+    // 任何携带这两个字段的流程都会整单失败），只明确告知「值不生效」。
+    const unsupported = unsupportedOptions(options)
+    if (unsupported.length > 0) {
+      this.#log?.warn(`antigravity-acp: 忽略不支持的请求项 ${unsupported.join('、')}（ACP v1 无对应会话通道，值不会生效）`)
+    }
     if (options.signal?.aborted) {
       yield { type: 'finish', reason: { kind: 'aborted', failure: {
         code: AGY_TURN_ERROR.ABORTED, message: 'Antigravity ACP 请求在发起前已取消',
@@ -567,10 +646,258 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     }
   }
 
+  /* ── ACP 会话复用 ─────────────────────────────────────────────────── */
+
+  /**
+   * 本轮要发送给已有 ACP 会话的新增消息。
+   *
+   * 快照类注入（runtime-context / time-context / hindsight 等）只在首轮或重建
+   * 时随全量历史发送，后续轮不再重复；若因此只剩注入块（正常不会发生），
+   * 退回发送全部新增消息，避免发出空 prompt。
+   */
+  #incrementalMessages(options: GenerateOptions, record: ReusedSession): readonly RequestMessage[] {
+    const fresh = options.messages.slice(record.sentCount)
+    const sendable = fresh.filter(shouldSendIncrement)
+    const chosen = sendable.length > 0 ? sendable : fresh
+    // 最新真实用户消息之后可能还跟着注入块；重排到末尾，使「当前请求」是
+    // prompt 的最后一段（与全量重建路径的 <dsh-current-request> 等价）。
+    let latestUser = -1
+    for (let index = 0; index < chosen.length; index += 1) {
+      const message = chosen[index]
+      if (!message || message.role !== 'user') continue
+      const kind = messageSourceKind(message)
+      if (kind === undefined || kind === 'user') latestUser = index
+    }
+    if (latestUser < 0 || latestUser === chosen.length - 1) return chosen
+    const reordered = [...chosen]
+    const [latest] = reordered.splice(latestUser, 1)
+    if (latest) reordered.push(latest)
+    return reordered
+  }
+
+  /**
+   * 跨进程恢复：重启后若磁盘上还留着该对话的 ACP 会话映射，尝试 `session/load`。
+   * 只信任「路由一致 + 历史仍以已发送前缀开头」；其余情况回退重建，不猜测。
+   */
+  async #resumeSession(options: GenerateOptions, key: string): Promise<ReusedSession | undefined> {
+    if (!this.#reuseSessions || !this.#resumeSessions || !this.#loadSessionMap) return undefined
+    this.#sessionMapLoad ??= this.#loadSessionMap().catch(() => ({}))
+    const map = await this.#sessionMapLoad
+    const entry = map[key]
+    if (!entry) return undefined
+    const discard = (reason: string): undefined => {
+      this.#log?.info(`antigravity-acp: 放弃恢复 ACP 会话（${reason}）`)
+      delete map[key]
+      // 记进 owned：下次落盘会把这个键从共享映射里删掉。
+      this.#ownedSessionKeys.add(key)
+      this.#persistSessionMap()
+      return undefined
+    }
+    if (entry.cwd !== this.#cwd) return discard('会话工作目录与当前不一致')
+    if (entry.route !== routeFingerprint(options)) return discard('模型、系统提示或工具目录已变化')
+    if (options.messages.length <= entry.sentCount) return discard('没有新增消息')
+    if (!prefixMatches(options.messages, entry.sentCount, entry.sentHash)) return discard('历史不是已发送前缀的追加')
+    if (options.messages.slice(entry.sentCount).some((message) => message.role === 'tool')) return discard('新增消息包含工具结果')
+    const link = await this.#getLink(this.#handlers, options.signal)
+    this.#observeCapabilities(link)
+    const tools = options.tools ?? []
+    let mcpServers: AcpMcpServer[] = []
+    if (tools.length > 0) {
+      this.#bridge.beginRound(tools, key)
+      if (!this.#bridge.listening) await this.#bridge.start()
+      mcpServers = this.#bridge.acpRegistration()
+    }
+    this.#suppressUpdates += 1
+    try {
+      const response = await link.loadSession({
+        sessionId: entry.sessionId,
+        cwd: this.#cwd,
+        mcpServers,
+        _meta: { antigravity: { enabledTools: [], eagerMcpServers: tools.length > 0 ? [BRIDGE_MCP_SERVER_NAME] : [] } },
+      }, { signal: options.signal, timeoutMs: Math.min(this.#promptTimeoutMs, 120_000) })
+      this.observeSessionConfigOptions(response.configOptions)
+    } catch (error) {
+      this.#log?.warn(`antigravity-acp: session/load 恢复失败，按新轮重建 session=${entry.sessionId}`, error)
+      return discard('session/load 失败')
+    } finally {
+      this.#suppressUpdates -= 1
+    }
+    const record: ReusedSession = {
+      key,
+      sessionId: entry.sessionId,
+      link,
+      sentCount: entry.sentCount,
+      sentHash: entry.sentHash,
+      route: entry.route,
+      usesTools: tools.length > 0,
+    }
+    this.#sessions.set(key, record)
+    this.#ownedSessionKeys.add(key)
+    this.#log?.info(`antigravity-acp: 已恢复 ACP 会话 session=${entry.sessionId} 已发送消息=${entry.sentCount}`)
+    return record
+  }
+
+  /** 找到可复用的会话；记录失效时顺手丢弃（关闭对端会话，下一轮重建）。 */
+  #findReusableSession(options: GenerateOptions, key: string): ReusedSession | undefined {
+    if (!this.#reuseSessions) return undefined
+    const record = this.#sessions.get(key)
+    if (!record) return undefined
+    // 进程崩溃/被回收后链接已关闭：记录不可用，按新轮重建。
+    if (record.link.closed) {
+      this.#dropSession(record, 'ACP 链接已关闭')
+      return undefined
+    }
+    if (record.route !== routeFingerprint(options)) {
+      this.#dropSession(record, '模型、系统提示或工具目录已变化')
+      return undefined
+    }
+    // 用过工具的会话依赖桥的授权代次：桥被另一个对话接管后它的 MCP 连接
+    // 持有旧 token，沿用只会让工具调用被拒；直接重建。
+    if (record.usesTools && this.#bridge.owner !== record.key) {
+      this.#dropSession(record, 'MCP 桥已被其他对话接管')
+      return undefined
+    }
+    if (options.messages.length <= record.sentCount) return undefined
+    if (!prefixMatches(options.messages, record.sentCount, record.sentHash)) {
+      this.#dropSession(record, '历史已不是已发送前缀的追加（压缩、回退或编辑）')
+      return undefined
+    }
+    // 新增部分若含工具结果，只能走 MCP 回喂，不能当 prompt 文本重发。
+    if (options.messages.slice(record.sentCount).some((message) => message.role === 'tool')) {
+      this.#dropSession(record, '新增消息包含工具结果')
+      return undefined
+    }
+    return record
+  }
+
+  /** 记录一个刚建立会话 / 刚完成全量发送的 ACP 会话。 */
+  #rememberSession(options: GenerateOptions, key: string, link: AgentLink, sessionId: string): ReusedSession {
+    const record: ReusedSession = {
+      key,
+      sessionId,
+      link,
+      sentCount: options.messages.length,
+      sentHash: prefixHash(options.messages),
+      route: routeFingerprint(options),
+      usesTools: (options.tools?.length ?? 0) > 0,
+    }
+    this.#sessions.set(key, record)
+    this.#ownedSessionKeys.add(key)
+    return record
+  }
+
+  /** 回合成功后推进「已发送」游标；下次只发其后新增的消息。 */
+  #advanceSession(record: ReusedSession, options: GenerateOptions): void {
+    if (this.#sessions.get(record.key) !== record) return
+    record.sentCount = options.messages.length
+    record.sentHash = prefixHash(options.messages)
+    this.#persistSessionMap()
+  }
+
+  /** 续轮带来的 assistant/tool 消息已在 ACP 会话里体现过，只需推进游标。 */
+  #advanceSessionAfterContinuation(options: GenerateOptions, turn: PromptTurn): void {
+    const key = reusableSessionKey(options)
+    const record = key === undefined ? undefined : this.#sessions.get(key)
+    if (!record || record.sessionId !== turn.sessionId) return
+    if (!prefixMatches(options.messages, record.sentCount, record.sentHash)) {
+      this.#dropSession(record, '续轮历史与已发送前缀不一致')
+      return
+    }
+    this.#advanceSession(record, options)
+  }
+
+  /** 丢弃会话记录并关闭对端会话；失败忽略——记录本来就已经不可信。 */
+  #dropSession(record: ReusedSession, reason: string): void {
+    if (this.#sessions.get(record.key) !== record) return
+    this.#sessions.delete(record.key)
+    // 已加载的映射缓存里也要删除，避免 resume 时又 load 一个刚关闭的会话。
+    void this.#sessionMapLoad?.then((map) => { delete map[record.key] }).catch(() => undefined)
+    this.#log?.info(`antigravity-acp: 放弃 ACP 会话复用（${reason}）`)
+    void record.link.closeSession(record.sessionId).catch(() => undefined)
+    this.#persistSessionMap()
+  }
+
+  #dropSessionsForLink(link: AgentLink, reason: string): void {
+    for (const record of [...this.#sessions.values()]) {
+      if (record.link === link) this.#dropSession(record, reason)
+    }
+  }
+
+  #dropSessionsForTurn(sessionId: string, reason: string): void {
+    for (const record of [...this.#sessions.values()]) {
+      if (record.sessionId === sessionId) this.#dropSession(record, reason)
+    }
+  }
+
+  /**
+   * 卸载时关闭所有对端会话，但**保留**磁盘映射：那正是下次启动 `session/load`
+   * 恢复的依据。真正失效的会话在 #dropSession 里连同映射一起删掉。
+   */
+  #dropAllSessions(reason: string): void {
+    for (const record of [...this.#sessions.values()]) {
+      this.#sessions.delete(record.key)
+      this.#log?.info(`antigravity-acp: 关闭 ACP 会话（${reason}）`)
+      void record.link.closeSession(record.sessionId).catch(() => undefined)
+    }
+  }
+
+  /**
+   * 会话映射落盘（仅 resume 开启时）。
+   *
+   * 多个 worker 共享同一个映射文件：写前先读磁盘并只覆盖自己拥有的键，
+   * 否则会把其他 worker/对话的条目一起抹掉。写失败不影响对话。
+   */
+  #persistSessionMap(): void {
+    if (!this.#resumeSessions || !this.#saveSessionMap) return
+    const save = this.#saveSessionMap
+    const load = this.#loadSessionMap
+    const mine: Record<string, SessionMapEntry> = {}
+    for (const record of this.#sessions.values()) {
+      mine[record.key] = {
+        sessionId: record.sessionId,
+        cwd: this.#cwd,
+        sentCount: record.sentCount,
+        sentHash: record.sentHash,
+        route: record.route,
+        updatedAt: Date.now(),
+      }
+    }
+    const owned = [...this.#ownedSessionKeys]
+    void Promise.resolve()
+      .then(async () => {
+        const existing = load ? await load().catch(() => ({})) : {}
+        const merged: Record<string, SessionMapEntry> = { ...existing }
+        for (const key of owned) if (!(key in mine)) delete merged[key]
+        Object.assign(merged, mine)
+        await save(merged)
+      })
+      .catch(() => undefined)
+  }
+
   /**
    * 等待上一次回收完成。上一次失败时本轮照旧失败（屏障不能被绕过），但同时把
    * 屏障复位为「重试同一条连接的回收」：失败的 promise 不再被每一轮原样重放。
    */
+  /** 保留进程时开始空闲计时：超过上限仍无新消息就回收（释放常驻内存）。 */
+  #scheduleIdleRecycle(link: AgentLink): void {
+    this.#clearIdleRecycle()
+    if (this.#idleRecycleMs <= 0) return
+    const timer = setTimeout(() => {
+      this.#idleRecycle = undefined
+      this.#log?.info(`antigravity-acp: 进程空闲 ${this.#idleRecycleMs}ms 无新消息，回收`)
+      this.#scheduleRecycle(link)
+    }, this.#idleRecycleMs)
+    timer.unref?.()
+    this.#idleRecycle = { timer, link }
+  }
+
+  #clearIdleRecycle(): void {
+    const idle = this.#idleRecycle
+    if (!idle) return
+    clearTimeout(idle.timer)
+    this.#idleRecycle = undefined
+  }
+
   async #settleRecycle(): Promise<void> {
     try {
       await this.#cleanup
@@ -587,8 +914,54 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     }
   }
 
+  /**
+   * 取消后的宽限：等 agent 应答 `cancelled` 再决定是否回收进程。
+   *
+   * 官方 `session/cancel` 是通知，不代表执行已停止；直接保留进程可能让它继续
+   * 跑旧会话。因此默认仍立即回收；开启 keepProcessAfterCancel 后：
+   * - 宽限内收到 prompt 应答（取消生效）→ 只丢弃会话，保留进程；
+   * - 超时未应答 → 按原策略回收；
+   * - cancelGraceMs = 0 → 不等待，直接保留。
+   */
+  #scheduleCancelGrace(link: AgentLink, turn: PromptTurn): void {
+    this.#clearCancelGrace()
+    if (this.#cancelGraceMs <= 0) {
+      this.#log?.info('antigravity-acp: 取消后保留 ACP 进程（未等待 agent 确认）')
+      this.#scheduleIdleRecycle(link)
+      return
+    }
+    const timer = setTimeout(() => {
+      this.#cancelGrace = undefined
+      this.#log?.warn(`antigravity-acp: 取消后 ${this.#cancelGraceMs}ms 内未收到 agent 确认，回收进程`)
+      this.#scheduleRecycle(link)
+    }, this.#cancelGraceMs)
+    timer.unref?.()
+    this.#cancelGrace = { timer, link, turn }
+    this.#log?.info(`antigravity-acp: 取消后保留进程，最多等待 ${this.#cancelGraceMs}ms 供 agent 停止`)
+  }
+
+  /** agent 已应答（取消生效）：撤销回收，只丢弃会话。 */
+  #confirmCancelGrace(turn: PromptTurn): void {
+    const grace = this.#cancelGrace
+    if (!grace || grace.turn !== turn) return
+    clearTimeout(grace.timer)
+    this.#cancelGrace = undefined
+    this.#log?.info('antigravity-acp: agent 已确认停止，保留 ACP 进程')
+    this.#scheduleIdleRecycle(grace.link)
+  }
+
+  #clearCancelGrace(): void {
+    const grace = this.#cancelGrace
+    if (!grace) return
+    clearTimeout(grace.timer)
+    this.#cancelGrace = undefined
+  }
+
   /** 先允许当前拒绝响应出站，再回收；同一连接的接管/取消不得重复覆盖屏障。 */
   #scheduleRecycle(link: AgentLink): void {
+    this.#clearCancelGrace()
+    this.#clearIdleRecycle()
+    this.#dropSessionsForLink(link, 'ACP 链接回收')
     if (this.#unrecycledLink === link) return
     this.#unrecycledLink = link
     this.#cleanup = new Promise<void>((resolve) => setTimeout(resolve, 0))
@@ -665,7 +1038,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   }
 
   /** 启动阶段也响应取消；迟到资源先回收，后续回合不能越过清理屏障。 */
-  async #prepareRound(options: GenerateOptions) {
+  async #prepareRound(options: GenerateOptions, owner?: string) {
     let link: AgentLink | undefined
     const check = (): void => {
       if (this.#disposed) throw new LlmError('Antigravity ACP adapter 已卸载', 'AGY_LINK_CLOSED')
@@ -677,8 +1050,10 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       this.#observeCapabilities(link)
       check()
       const tools = options.tools ?? []
-      this.#bridge.beginRound(tools)
       let mcpServers: AcpMcpServer[] = []
+      // 复用会话时无工具的一次性请求（标题、压缩）不接管桥：轮换 token 会让同一
+      // worker 上仍在复用的 ACP 会话失去工具连接。关闭复用时恢复旧的每轮清桥。
+      if (tools.length > 0 || !this.#reuseSessions) this.#bridge.beginRound(tools, owner)
       if (tools.length > 0) {
         if (!this.#bridge.listening) await this.#bridge.start()
         check()
@@ -721,6 +1096,10 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   }
 
   async *#runNewRound(options: GenerateOptions): AsyncGenerator<StreamChunk> {
+    // 新回合意味着保留的进程又被使用：撤销空闲回收，也撤销还在等待的取消宽限，
+    // 避免定时器把正在跑的新回合一起回收。
+    this.#clearIdleRecycle()
+    this.#clearCancelGrace()
     await withAbort(this.#settleRecycle(), options.signal)
     if (this.#disposed) throw new LlmError('Antigravity ACP adapter 已卸载', 'AGY_LINK_CLOSED')
     this.#turnOwner = {
@@ -731,23 +1110,56 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     // usage_update 的上下文容量归属到本次请求的 DSH 路由键。
     this.#routeModelId = options.model
     this.#lifecycle?.beginRound(options.model)
-    const { link, session, tools } = await this.#prepareRound(options).catch((error: unknown) => {
-      this.#lifecycle?.failed(error)
-      throw error
-    })
+    const key = reusableSessionKey(options)
+    let reused = key === undefined ? undefined : this.#findReusableSession(options, key)
+    // 内存里没有记录时（插件刚重启），只有 resume 开启才尝试从磁盘映射恢复。
+    if (!reused && key !== undefined) reused = await this.#resumeSession(options, key)
+    const tools = options.tools ?? []
+    let link: AgentLink
+    let sessionId: string
+    if (reused) {
+      // 复用：同一 ACP 会话已有原生历史，只发本轮新增消息。
+      link = reused.link
+      sessionId = reused.sessionId
+      this.#log?.info(
+        `antigravity-acp: 复用 ACP 会话 session=${sessionId} 已发送消息=${reused.sentCount}` +
+          ` 本轮新增=${options.messages.length - reused.sentCount}`,
+      )
+    } else {
+      const prepared = await this.#prepareRound(options, key).catch((error: unknown) => {
+        this.#lifecycle?.failed(error)
+        throw error
+      })
+      link = prepared.link
+      sessionId = prepared.session.sessionId
+    }
 
-    const turn = new PromptTurn(session.sessionId, {
+    const turn = new PromptTurn(sessionId, {
       link,
       bridge: this.#bridge,
-      promptTimeoutMs: this.#promptTimeoutMs,
+      promptTimeoutMs: purposeTimeoutMs(options.purpose, this.#promptTimeoutMs),
       parkSettleMs: this.#parkSettleMs,
+      onPromptSettled: (settledTurn) => this.#confirmCancelGrace(settledTurn),
       onTerminate: (reason, info) => {
         this.#lifecycle?.failed(reason)
-        this.#bridge.invalidateRound(reason)
         this.#releaseTurnSubscription(turn)
+        // 干净失败（refusal / 空回复）不算异常：agent 已应答、状态自洽，桥与会话
+        // 都保留（含带工具的会话），下一次仍可复用。
+        if (info?.clean !== true) {
+          this.#bridge.invalidateRound(reason)
+          this.#dropSessionsForLink(link, '回合异常终止')
+        }
         if (info?.clean === true) {
           // prompt 已正常应答的干净失败（refusal / 空回复等）：agent 状态自洽，
           // 链接可复用——不为下一次对话重新 spawn 官方进程、不重弹登录。
+          // 只清未回喂的 park，不轮换 token/owner（否则带工具的会话无法复用）。
+          this.#bridge.resetPending(reason)
+          this.#wakeAccessWaiters()
+          return
+        }
+        // 用户取消且开启保留进程：先等 agent 确认停止；确认了就只丢会话、不回收。
+        if (info?.aborted === true && this.#keepProcessAfterCancel) {
+          this.#scheduleCancelGrace(link, turn)
           this.#wakeAccessWaiters()
           return
         }
@@ -777,11 +1189,19 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     // 回合生命周期打点：选具体型号后「没有反应」这类问题，只靠这条能分清是
     // 「prompt 没送出去」「送出去了但没有块回来」还是「块回来了但没被消费」。
     this.#log?.info(
-      `antigravity-acp: 回合开始 model=${options.model} purpose=${options.purpose ?? 'chat'} session=${session.sessionId} tools=${tools.length}` +
-        `${options.reasoningEffort === undefined ? '' : ` effort=${String(options.reasoningEffort)}`}`,
+      `antigravity-acp: 回合开始 model=${options.model} purpose=${options.purpose ?? 'chat'} session=${sessionId} tools=${tools.length}` +
+        `${options.reasoningEffort === undefined ? '' : ` effort=${String(options.reasoningEffort)}`}` +
+        `${reused ? ' reused=true' : ''}`,
     )
-    const content = await buildPromptWithImages(options.system, options.messages, tools, this.#imageOptions(options.signal))
+    // 复用会话只发增量；否则全量重建（含 system、工具策略与历史强调块）。
+    const content = reused
+      ? await buildPromptDeltaWithImages(this.#incrementalMessages(options, reused), this.#imageOptions(options.signal))
+      : await buildPromptWithImages(options.system, options.messages, tools, this.#imageOptions(options.signal))
     this.#lifecycle?.promptSent()
+    // 全量重建后先把「已发送」记到本轮完整历史，之后才有资格复用。
+    const record = reused ?? (key !== undefined && this.#reuseSessions
+      ? this.#rememberSession(options, key, link, sessionId)
+      : undefined)
     turn.startPrompt(content, options.signal)
     try {
       let chunks = 0
@@ -804,8 +1224,18 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       )
       const timing = this.#lifecycle?.read().round
       if (timing) this.#log?.info(`antigravity-acp: 回合计时 elapsedMs=${Math.round(timing.elapsedMs)} firstChunkMs=${timing.firstChunkMs === undefined ? '-' : Math.round(timing.firstChunkMs)} firstToolMs=${timing.firstToolMs === undefined ? '-' : Math.round(timing.firstToolMs)} setup=${JSON.stringify(timing.timings)}`)
+      if (record) {
+        // 只有正常收尾（含工具续轮）才推进游标；失败回合的会话下一次重建。
+        if (finish === 'stop' || finish === 'max-tokens' || finish === 'tool-calls') {
+          this.#advanceSession(record, options)
+        } else if (turn.promptSettled) {
+          // 干净失败（refusal / 空回复）：agent 已应答，会话仍可继续复用。
+          this.#advanceSession(record, options)
+        } else this.#dropSession(record, `回合以 ${finish === '' ? 'unknown' : finish} 结束`)
+      }
     } catch (error) {
       this.#log?.warn(`antigravity-acp: 回合失败 model=${options.model}`, error)
+      if (record) this.#dropSession(record, '回合异常')
       throw error
     } finally {
       // 只有该 ACP prompt **真正结束**（已应答且不再等待回喂）才退订；
@@ -856,6 +1286,10 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         yield chunk
       }
     } finally {
+      // 续轮带来的 assistant/tool 消息已经在 ACP 会话里体现过：成功时推进游标，
+      // 让下一次用户轮只发送真正的新消息；回合被终止则作废该会话。
+      if (turn.terminated) this.#dropSessionsForTurn(turn.sessionId, '续轮目标回合已终止')
+      else this.#advanceSessionAfterContinuation(options, turn)
       this.#releaseTurnSubscriptionIfClosed(turn)
     }
   }
@@ -886,13 +1320,12 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   #releaseTurnSubscriptionIfClosed(turn: PromptTurn): void {
     if (!this.#isTurnClosed(turn)) return
     this.#releaseTurnSubscription(turn)
-    if (this.#turn === turn) this.#bridge.invalidateRound('ACP 回合已结束')
+    // 复用会话时不再 invalidateRound：轮换 token 会让 agent 手里的 MCP 连接
+    // 立即失效。关闭复用时恢复旧行为（每轮结束清桥）。
+    if (!this.#reuseSessions && this.#turn === turn) this.#bridge.invalidateRound('ACP 回合已结束')
   }
 
-  /**
-   * 放弃当前回合：取消 ACP 会话、封口 chunk 队列、清空 bridge 的 park。
-   * 不等待 prompt 应答（agent 可能已挂起），避免放弃动作被拖死。
-   */
+  /** 放弃当前回合：取消 ACP 会话、封口 chunk 队列、清空 bridge 的 park。 */
   #abandonTurn(reason: string): void {
     const turn = this.#turn
     this.#turn = undefined
@@ -902,6 +1335,8 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     turn.finishRound()
     turn.dispose()
     this.#bridge.resetPending(reason)
+    // 续轮条件被放弃说明这个 ACP 会话已不可信，下一次按新轮重建。
+    this.#dropSessionsForTurn(turn.sessionId, reason)
   }
 
   #isTurnClosed(turn: PromptTurn): boolean {
@@ -1085,6 +1520,16 @@ async function* drainTurn(turn: PromptTurn): AsyncGenerator<StreamChunk> {
   }
 }
 
+/**
+ * 按用途收紧等待上限：标题生成与压缩都是一次性请求，挂住会占住 worker 并拖慢
+ * 聊天；给它们各自更短的上限，而不是沿用聊天的 30 分钟。
+ */
+function purposeTimeoutMs(purpose: string | undefined, fallback: number): number {
+  if (purpose === 'session-title') return Math.min(fallback, 90_000)
+  if (purpose === 'compaction') return Math.min(fallback, 600_000)
+  return fallback
+}
+
 /** 把 DSH 传来的思考强度归一到官方档位；无法识别时返回 undefined（走默认档位）。 */
 function normalizeEffort(effort?: { toString(): string }): AgyReasoningEffort | undefined {
   const raw = effort === undefined ? undefined : effort.toString().toLowerCase()
@@ -1099,15 +1544,11 @@ function normalizeEffort(effort?: { toString(): string }): AgyReasoningEffort | 
  * `#applyModelSelection`。`maxTokens` 同样静默忽略（宿主会话标题等流程固定
  * 携带它，硬拒绝会让这些功能永久失败）。
  */
-function assertSupportedOptions(options: GenerateOptions): void {
+function unsupportedOptions(options: GenerateOptions): string[] {
   const unsupported: string[] = []
   if (options.temperature !== undefined) unsupported.push('temperature')
   if (options.stop !== undefined) unsupported.push('stop')
-  if (unsupported.length === 0) return
-  throw new LlmError(
-    `Antigravity ACP provider 不支持这些请求项：${unsupported.join('、')}。ACP v1 未为它们定义会话通道，值由官方 agent 自身的会话配置决定`,
-    AGY_UNSUPPORTED_OPTION,
-  )
+  return unsupported
 }
 
 /** 取 messages 尾部连续的 tool 结果消息（按原顺序）。 */

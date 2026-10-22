@@ -81,7 +81,9 @@ export interface PromptTurnOptions {
    * `info.clean === true` 表示 prompt 已**正常应答**的干净失败（refusal / 空回复 /
    * 未知 stopReason）：agent 状态自洽，调用方可以复用链接而不必回收。
    */
-  onTerminate(reason: string, info?: { clean?: boolean }): void
+  onTerminate(reason: string, info?: { clean?: boolean; aborted?: boolean }): void
+  /** prompt 已应答（含取消应答）时回调；adapter 用它确认「取消是否真的生效」。 */
+  onPromptSettled?(turn: PromptTurn): void
   /** 尚未终止回合的一次拒绝；permission 不等于原生 fs/terminal，不能据此做身份判断。 */
   onNativeRefusal?(info: { kind: 'permission' | 'request'; detail: string; count: number }): void
   /** 固定词表的权限结构摘要；仅诊断，不作为放行依据。 */
@@ -135,6 +137,7 @@ export class PromptTurn {
   readonly #onBridgePermission: PromptTurnOptions['onBridgePermission']
   readonly #onArgumentIssues: PromptTurnOptions['onArgumentIssues']
   readonly #onTerminate: PromptTurnOptions['onTerminate']
+  readonly #onPromptSettled: PromptTurnOptions['onPromptSettled']
   /** 本轮封口不等于 ACP prompt 结束；封口后的事件留给下一次 stream 消费。 */
   #deferred: Array<{ kind: 'call'; call: BridgeParkedCall } | { kind: 'update'; update: SessionUpdate }> = []
 
@@ -148,6 +151,7 @@ export class PromptTurn {
     this.#onNativeRefusal = options.onNativeRefusal
     this.#onPermissionDiagnostic = options.onPermissionDiagnostic
     this.#onTerminate = options.onTerminate
+    this.#onPromptSettled = options.onPromptSettled
     this.#onBridgePermission = options.onBridgePermission
     this.#onArgumentIssues = options.onArgumentIssues
   }
@@ -394,6 +398,7 @@ export class PromptTurn {
     const waiters = this.#settledWaiters
     this.#settledWaiters = []
     for (const resolve of waiters) resolve()
+    this.#onPromptSettled?.(this)
   }
 
   #finishWith(response: PromptResponse): void {
@@ -449,7 +454,10 @@ export class PromptTurn {
     // 即使 prompt 已超时/拒绝，仍回收连接，避免复用残留执行状态。
     this.#terminated = true
     if (!this.#promptSettled) void this.#link.cancel(this.sessionId).catch(() => undefined)
-    this.#onTerminate(failure.message, clean ? { clean: true } : undefined)
+    this.#onTerminate(failure.message, {
+      ...(clean ? { clean: true } : {}),
+      ...(this.#aborted ? { aborted: true } : {}),
+    })
   }
 
   /**
@@ -592,8 +600,9 @@ function renderContentText(content: unknown): string | undefined {
 /**
  * ACP Usage → DSH TokenUsage。
  *
- * ACP 的 usage 是**会话累计**值；由于本 adapter 把整段 DSH 历史重放进单个
- * ACP prompt 回合（一回合一次 session/prompt），该累计值恰好等于本回合用量。
+ * 协议把 `PromptResponse.usage` 标为「本轮用量」（UNSTABLE），但官方
+ * agy_acp_server 1.4.0 实测不返回该字段，因此本 adapter 通常不上报 usage；
+ * 返回时按原值上报，不做任何估算或累计换算。
  */
 export function mapUsage(usage: Usage | null | undefined): TokenUsage | undefined {
   if (!usage) return undefined
@@ -604,3 +613,4 @@ export function mapUsage(usage: Usage | null | undefined): TokenUsage | undefine
   if (usage.thoughtTokens != null) mapped = { ...mapped, reasoningTokens: usage.thoughtTokens }
   return mapped
 }
+

@@ -41,6 +41,7 @@ import type { AcpCredentialResult } from './runtime/credentials.js'
 import { describeLowIntegrity, isLowIntegrityTarget } from './runtime/integrity.js'
 import { describeAuthWait, redactSensitiveText } from './runtime/redact.js'
 import { readCachedCatalog, writeCachedCatalog } from './runtime/catalog-cache.js'
+import { readSessionMap, writeSessionMap } from './runtime/session-map.js'
 import { agyCliCandidates, createSubprocessCliRun, fetchAgyModels } from './runtime/agy-cli.js'
 import { AgYQuotaService, registerAgYQuotaRemote } from './quota/quota-remote.js'
 import { SettingsControl } from './quota/control.js'
@@ -529,6 +530,18 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
       promptTimeoutMs: config.promptTimeoutMs,
       parkSettleMs: config.bridgeParkSettleMs,
       preferredModel: config.preferredModel,
+      // ACP 会话复用：同一条 DSH 对话的后续回合只发增量；重启恢复默认关闭。
+      reuseSessions: config.reuseSessions,
+      resumeSessions: config.resumeSessions,
+      keepProcessAfterCancel: config.keepProcessAfterCancel,
+      cancelGraceMs: config.cancelGraceMs,
+      idleRecycleMs: config.idleRecycleMs,
+      ...(config.resumeSessions === true
+        ? {
+            loadSessionMap: () => readSessionMap(cacheDir),
+            saveSessionMap: (entries) => writeSessionMap(cacheDir, entries),
+          }
+        : {}),
       canReadImages: () => attachmentStore !== undefined,
       readImage: (ref, signal) => {
         if (!attachmentStore) throw new LlmError('宿主附件服务不可用，无法读取图片', 'AGY_IMAGE_UNAVAILABLE')
@@ -554,7 +567,12 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
     if (metadata) worker.importMetadata(metadata)
     workers.push(worker)
     return { adapter: worker, read: () => lifecycle.read(), dispose: () => disposeAcpRuntime(active) }
-  }, { capacity: config.maxConcurrentSessions, queueTimeoutMs: config.queueTimeoutMs })
+  }, {
+    capacity: config.maxConcurrentSessions,
+    queueTimeoutMs: config.queueTimeoutMs,
+    // 复用会话时同一对话必须粘在同一个 worker；关闭复用时回到纯负载调度。
+    sessionAffinity: config.reuseSessions !== false,
+  })
   ctx.inject(['attachments'], (scope) => {
     const store = scope.attachments
     attachmentStore = store

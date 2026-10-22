@@ -125,6 +125,8 @@ export interface McpToolBridgeOptions {
 export class McpToolBridge {
   #token: string
   #generation = 0
+  /** 当前授权代次归属的 ACP 会话 key；桥被另一个对话接管后，旧会话不能复用。 */
+  #owner: string | undefined
   readonly #requestedPort: number
   readonly #pending = new Map<string, PendingEntry>()
   readonly #listeners = new Set<(call: BridgeParkedCall) => void>()
@@ -181,10 +183,21 @@ export class McpToolBridge {
     this.#tools = [...tools]
   }
 
-  /** 新 ACP 回合取得独立授权代次，旧连接不能把调用投递到新回合。 */
-  beginRound(tools: readonly ToolSchema[]): void {
+  /** 当前桥授权代次归属的会话 key（未接管时为 undefined）。 */
+  get owner(): string | undefined {
+    return this.#owner
+  }
+
+  /**
+   * 新 ACP 回合取得独立授权代次，旧连接不能把调用投递到新回合。
+   *
+   * `owner` 记录这次代次属于哪个 DSH 对话：桥被另一个对话接管后，前一个
+   * 对话的 ACP 会话不能再复用（它的 MCP 连接持有旧 token）。
+   */
+  beginRound(tools: readonly ToolSchema[], owner?: string): void {
     this.invalidateRound('已切换 ACP 回合')
     this.publishTools(tools)
+    this.#owner = owner
     // 上一回合的 MCP 会话通道已无用（新回合会新建 ACP 会话与连接），在这里
     // 收掉以免按回合累积。**不能**放进 invalidateRound：回合失败/取消时
     // resetPending 刚把错误结果结算给 agent，立即关闭 transport 会截断那个响应，
@@ -197,6 +210,7 @@ export class McpToolBridge {
     this.#generation += 1
     this.#token = randomBytes(32).toString('hex')
     this.#tools = []
+    this.#owner = undefined
     this.resetPending(reason)
   }
 

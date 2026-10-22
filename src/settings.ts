@@ -50,6 +50,27 @@ export interface AntigravityHostConfig {
    * 因为私有 MCP 桥与 OAuth 回调都在 loopback 上。
    */
   proxyBypass?: string
+  /**
+   * 复用同一个 ACP 会话：同一 DSH 对话的后续回合只发送新增消息，不再每轮
+   * `session/new` 并重放全部历史。历史被压缩/回退、模型或工具目录变化时
+   * 仍会受控重建。关闭后回到「每轮新会话 + 全量重放」的旧行为。
+   */
+  reuseSessions?: boolean
+  /**
+   * 跨进程恢复 ACP 会话：插件/宿主重启后，若上次留下会话映射，尝试用
+   * `session/load` 恢复该对话而不是从零重建。依赖 agent 的 `loadSession`
+   * 能力；agent 侧历史可能与 DSH 当前历史不一致，失败时自动回退重建。
+   */
+  resumeSessions?: boolean
+  /**
+   * 用户取消（停止按钮）后是否保留官方进程：默认关闭（立即回收，下一轮冷启动）。
+   * 开启后先等 `cancelGraceMs` 让 agent 确认停止；确认了就只丢弃会话、保留进程。
+   */
+  keepProcessAfterCancel?: boolean
+  /** 取消后的确认宽限（毫秒）；0 表示不等待、直接保留进程。 */
+  cancelGraceMs?: number
+  /** 保留进程的最长空闲时间（毫秒），超时回收；0 表示不设上限。 */
+  idleRecycleMs?: number
 }
 
 export const Config = Schema.object({
@@ -69,4 +90,9 @@ export const Config = Schema.object({
   preferredModel: Schema.string().description('默认/自定义模型 ID，优先列入目录；目录外 ID 未验证。兼容旧 server-default 路由，留空不指定默认项'),
   proxyUrl: Schema.string().description('官方进程出网代理，如 http://127.0.0.1:7890（缺 scheme 按 http 处理）。留空继承宿主代理，宿主也未配置时才直连'),
   proxyBypass: Schema.string().description('代理排除列表，逗号分隔，如 example.internal,*.internal；不支持 CIDR。localhost/127.0.0.1/::1 始终自动排除'),
+  reuseSessions: Schema.boolean().default(true).description('复用同一个 ACP 会话，后续回合只发送新增消息；历史被压缩/回退或模型、工具目录变化时自动重建。关闭则每轮新会话并重放全部历史'),
+  resumeSessions: Schema.boolean().default(false).description('重启后尝试用 session/load 恢复上次的 ACP 会话；依赖 agent 的 loadSession 能力，恢复失败会自动重建'),
+  keepProcessAfterCancel: Schema.boolean().default(false).description('用户取消后保留官方进程：宽限内确认 agent 已停止就只丢弃会话，下一轮不必冷启动；默认关闭'),
+  cancelGraceMs: Schema.natural().max(60_000).default(30_000).description('取消后等待 agent 确认停止的上限（毫秒）；0 表示不等待、直接保留进程'),
+  idleRecycleMs: Schema.natural().max(3_600_000).default(300_000).description('保留进程的最长空闲时间（毫秒），超时回收；0 表示不设上限。默认 5 分钟，与 Gemini 显式缓存默认 TTL(300s) 一致'),
 })

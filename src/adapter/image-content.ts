@@ -3,7 +3,7 @@ import type { ContentBlock as DshContentBlock, ImageBlock, RequestMessage, ToolS
 import type { ImageAttachmentRef, StoredImageAttachment } from '@deepseek-ai/dsh-attachment'
 import type { ContentBlock } from '@agentclientprotocol/sdk'
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js'
-import { buildPromptContent, encodeMessage } from './prompt-transcript.js'
+import { buildPromptContent, currentRequestBlock, encodeMessage, historyNoticeBlock } from './prompt-transcript.js'
 
 export type ImageReader = (ref: ImageAttachmentRef, signal?: AbortSignal) => Promise<StoredImageAttachment>
 export interface ImageContentOptions {
@@ -48,6 +48,32 @@ export async function buildPromptWithImages(
   system: string | undefined, messages: readonly RequestMessage[], tools: readonly ToolSchema[], options: ImageContentOptions,
 ): Promise<ContentBlock[]> {
   const content = buildPromptContent(system, [], tools)
+  // 历史说明块：与无图片路径保持同样的「历史只是背景」声明。
+  if (messages.length > 0) content.push(historyNoticeBlock())
+  await appendMessageContent(content, messages, options)
+  // 最新用户请求放到最后强调；图片字节仍跟随各自消息的信封块。
+  const current = currentRequestBlock(messages)
+  if (current) content.push(current)
+  return content
+}
+
+/**
+ * 复用 ACP 会话时的增量 prompt：只编码本轮新增消息。
+ *
+ * 会话已有原生历史（真机验证官方 agent 会保留上下文），因此不再重复
+ * system / 工具策略 / 旧消息；这些新增消息本身就是本轮的用户输入。
+ */
+export async function buildPromptDeltaWithImages(
+  messages: readonly RequestMessage[], options: ImageContentOptions,
+): Promise<ContentBlock[]> {
+  const content: ContentBlock[] = []
+  await appendMessageContent(content, messages, options)
+  return content
+}
+
+async function appendMessageContent(
+  content: ContentBlock[], messages: readonly RequestMessage[], options: ImageContentOptions,
+): Promise<void> {
   for (const message of messages) {
     aborted(options.signal)
     content.push({ type: 'text', text: encodeMessage(message) })
@@ -56,7 +82,6 @@ export async function buildPromptWithImages(
       else if (block.type === 'file') throw new LlmError('文件引用必须先由 DSH 投影为可读文本', 'AGY_UNSUPPORTED_CONTENT')
     }
   }
-  return content
 }
 
 export async function buildToolResultContent(

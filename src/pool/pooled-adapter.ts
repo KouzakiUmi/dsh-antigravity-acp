@@ -9,7 +9,13 @@ export interface AcpWorker {
   read(): AcpLifecycleSnapshot
   dispose(): Promise<void>
 }
-interface Slot { worker: AcpWorker; leased: boolean; owner?: Pick<GenerateOptions, 'sessionId' | 'purpose'> }
+interface Slot {
+  worker: AcpWorker
+  leased: boolean
+  owner?: Pick<GenerateOptions, 'sessionId' | 'purpose'>
+  /** 最近一次服务过的 DSH 对话：新对话优先用别的 worker，避免抢走别人的复用会话。 */
+  lastOwner?: string
+}
 interface Waiter {
   options?: GenerateOptions
   resolve(slot: Slot): void
@@ -20,10 +26,13 @@ interface Waiter {
 export class PooledAcpAdapter extends LlmAdapter {
   private readonly slots: Slot[] = []
   private readonly waiters: Waiter[] = []
+  /** DSH 对话 → 承载它的 worker 下标：会话复用记录在 worker 内部，换 worker 即丢失。 */
+  private readonly affinity = new Map<string, number>()
   private closed = false
   private poll?: ReturnType<typeof setInterval>
   private readonly capacity: number
   private readonly queueTimeoutMs: number
+  private readonly sessionAffinity: boolean
   private preparation?: Promise<void>
   private preparationAbort?: AbortController
   private preparationWaiters = 0
@@ -31,10 +40,11 @@ export class PooledAcpAdapter extends LlmAdapter {
   private preparationGeneration = 0
   private disposal?: Promise<void>
 
-  constructor(private readonly create: () => AcpWorker, options: { capacity?: number; queueTimeoutMs?: number } = {}) {
+  constructor(private readonly create: () => AcpWorker, options: { capacity?: number; queueTimeoutMs?: number; sessionAffinity?: boolean } = {}) {
     super()
     this.capacity = Math.max(1, Math.min(4, Math.floor(options.capacity ?? 2)))
     this.queueTimeoutMs = Math.max(1_000, options.queueTimeoutMs ?? 120_000)
+    this.sessionAffinity = options.sessionAffinity ?? true
     this.addSlot()
   }
 
@@ -90,11 +100,15 @@ export class PooledAcpAdapter extends LlmAdapter {
   override async *stream(options: GenerateOptions): AsyncGenerator<StreamChunk> {
     const slot = await this.acquire(options, options.signal)
     slot.owner = { sessionId: options.sessionId, purpose: options.purpose }
+    // 粘住承载该对话的 worker：ACP 会话复用记录在 worker 内部。
+    const affinityKey = this.affinityKey(options)
+    if (affinityKey !== undefined) this.rememberAffinity(affinityKey, this.slots.indexOf(slot))
     try {
       yield* slot.worker.adapter.stream(options)
     } finally {
       slot.leased = false
       if (!slot.worker.adapter.busy) slot.owner = undefined
+      if (this.sessionAffinity && options.sessionId !== undefined && options.purpose === undefined) slot.lastOwner = options.sessionId
       this.dispatch()
     }
   }
@@ -158,6 +172,23 @@ export class PooledAcpAdapter extends LlmAdapter {
     return slot
   }
 
+  /** 只有普通聊天轮参与粘性；标题/压缩等一次性请求不占用会话绑定。 */
+  private affinityKey(options?: GenerateOptions): string | undefined {
+    if (!this.sessionAffinity || !options?.sessionId || options.purpose !== undefined) return undefined
+    return options.sessionId
+  }
+
+  private rememberAffinity(key: string, index: number): void {
+    if (index < 0) return
+    this.affinity.delete(key)
+    this.affinity.set(key, index)
+    while (this.affinity.size > 64) {
+      const oldest = this.affinity.keys().next().value
+      if (oldest === undefined) break
+      this.affinity.delete(oldest)
+    }
+  }
+
   private select(options?: GenerateOptions): Slot | undefined {
     // Preserve ownership across tool-result calls, including synchronous compaction.
     const owner = options && this.slots.find(s => s.owner
@@ -165,8 +196,28 @@ export class PooledAcpAdapter extends LlmAdapter {
       && s.owner.sessionId === options.sessionId
       && (s.owner.purpose === options.purpose || options.purpose === 'compaction'))
     if (owner) return owner.leased ? undefined : owner
-    const free = this.slots.find(s => !s.leased && !s.worker.adapter.busy)
-    if (free) return free
+    // 已有归属的 DSH 对话只等它自己的 worker：换一个 worker 会丢掉 ACP 会话
+    // 复用记录，退化成每轮重建。没有归属（或记录已被淘汰）时照常调度。
+    const affinityKey = this.affinityKey(options)
+    if (affinityKey !== undefined) {
+      const pinned = this.slots[this.affinity.get(affinityKey) ?? -1]
+      // 空闲就用自己的 worker（保住 ACP 会话复用）；被别的对话占用时不硬等——
+      // 宁可这一轮换 worker 重建会话，也不让用户看着「没反应」。同一对话自己的
+      // 并发请求由上面的 owner 分支负责排队，不会走到这里。
+      if (pinned && !pinned.leased && !pinned.worker.adapter.busy) return pinned
+    }
+    const free = this.slots.filter(s => !s.leased && !s.worker.adapter.busy)
+    if (free.length > 0) {
+      // 开启会话粘性时，新对话优先用没服务过任何对话的 worker；都在服务过时，
+      // 容量允许就先扩容——避免已有对话的复用会话被顺手接管。关闭粘性时保持
+      // 旧的纯负载调度（不额外 spawn）。
+      if (this.sessionAffinity) {
+        const unbound = free.find(s => s.lastOwner === undefined)
+        if (unbound) return unbound
+        if (this.slots.length < this.capacity) return this.addSlot()
+      }
+      return free[0]
+    }
     if (this.slots.length < this.capacity) return this.addSlot()
     return undefined
   }

@@ -35,6 +35,12 @@ const POLICY_CLOSE = '</dsh-tool-policy>'
 /** 工具参数签名块的哨兵（固定文本，不参与消息逆解析）。 */
 const SIGNATURES_OPEN = '<dsh-tool-signatures>'
 const SIGNATURES_CLOSE = '</dsh-tool-signatures>'
+/** 历史重放说明块的哨兵（固定文本，不参与消息逆解析）。 */
+export const HISTORY_OPEN = '<dsh-conversation-history>'
+export const HISTORY_CLOSE = '</dsh-conversation-history>'
+/** 当前请求强调块的哨兵（纯文本，不参与消息逆解析）。 */
+export const CURRENT_REQUEST_OPEN = '<dsh-current-request>'
+export const CURRENT_REQUEST_CLOSE = '</dsh-current-request>'
 
 /**
  * 每次 prompt 都会附带的一段工具策略说明。
@@ -49,6 +55,23 @@ export const TOOL_POLICY_TEXT = [
   '- 不要反复索要原生能力；直接改用等价的随会话工具完成。',
   '- 随会话 MCP 工具由 DSH 审批和执行，结果会在当前 ACP prompt 内返回；isError=true 的拒绝/失败是权威结果，不要绕过审批或重复执行。',
   '- ACP 权限拒绝可能发生在插件转交 DSH 之前。仅凭 Denied by user 或 pre-tool hook 文本，不能断言 DSH 全局禁用了工具，也不能建议关闭沙箱或审批。请明确报告拒绝来源尚未核实。',
+].join('\n')
+
+/**
+ * 历史重放说明。新轮会把整段 DSH 历史（含大量工具轨迹）编码进同一条 ACP
+ * prompt；官方 agent 每轮新建会话、没有原生对话历史，只能靠这段文字判断
+ * 「现在要做什么」。不声明边界时它会顺着历史里未完成的任务继续跑，表现为
+ * 「用户后续的话没传过去」。
+ */
+export const HISTORY_NOTICE_TEXT = [
+  '下面是本次请求之前已经发生的对话与工具轨迹，作为背景资料重放；它们不是新的任务请求。',
+  '不要因为历史里还有未完成的步骤就继续它。',
+].join('\n')
+
+/** 当前请求说明：把最新一条真实用户消息从历史里单独强调出来。 */
+export const CURRENT_REQUEST_NOTICE_TEXT = [
+  '当前需要回应的最新用户消息如下（以此为准，优先级高于上面的历史）。',
+  '请直接回应它；只有它明确要求继续时，才续做历史里未完成的工作。',
 ].join('\n')
 
 /** 解析出的单条消息信封。 */
@@ -74,9 +97,9 @@ export function encodeMessage(message: RequestMessage): string {
 }
 
 /**
- * 构造一次 ACP prompt 的 content 块序列：system（若给出）在前，随后每条
- * DSH 消息一个信封块。空 system 文本不产生块（ACP 的 TextContent.text 为空串
- * 没有语义价值）。
+ * 构造一次 ACP prompt 的 content 块序列：system（若给出）在前，随后工具策略、
+ * 历史重放说明、每条 DSH 消息一个信封块，最后是最新用户请求的强调块。
+ * 空 system 文本不产生块（ACP 的 TextContent.text 为空串没有语义价值）。
  */
 export function buildPromptContent(
   system: string | undefined,
@@ -91,8 +114,61 @@ export function buildPromptContent(
   // prompt，让必填项与参数名在调用时就可见。
   const signatures = renderToolSignatures(tools)
   if (signatures !== undefined) blocks.push(textBlock(`${SIGNATURES_OPEN}${signatures}${SIGNATURES_CLOSE}`))
+  // 声明历史只是背景，避免模型把上一轮未完成的工具循环当成当前任务。
+  if (messages.length > 0) blocks.push(historyNoticeBlock())
   for (const message of messages) blocks.push(textBlock(encodeMessage(message)))
+  // 最新用户请求放到最后：它前面可能还跟着 time-context / hindsight 等注入块，
+  // 不强调时模型会把注意力停在旧任务上。
+  const current = currentRequestBlock(messages)
+  if (current) blocks.push(current)
   return blocks
+}
+
+/** 历史重放说明块；不参与消息逆解析。 */
+export function historyNoticeBlock(): ContentBlock {
+  return textBlock(`${HISTORY_OPEN}${HISTORY_NOTICE_TEXT}${HISTORY_CLOSE}`)
+}
+
+/**
+ * 最新的真实用户请求。
+ *
+ * DSH 会在用户消息之后继续追加 `user` 角色的注入块（time-context /
+ * runtime-context / hindsight / 技能目录…），它们带自己的 `source.kind`；
+ * 只看 role 会把最后一条注入块误当请求。一次性请求（RequestUserInput）没有
+ * source，按用户输入处理。
+ */
+export function latestUserRequest(messages: readonly RequestMessage[]): RequestMessage | undefined {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    if (!message || message.role !== 'user') continue
+    const source = (message as { readonly source?: { readonly kind?: unknown } }).source
+    if (source === undefined || source.kind === 'user') return message
+  }
+  return undefined
+}
+
+/**
+ * 当前请求强调块：纯文本复制最新用户消息的可见内容。
+ *
+ * 刻意不复制 `<dsh-message>` 信封——否则 `parsePromptTranscript` 会把同一条
+ * 消息解析两次；这里只需要给模型一个明确的「现在回这条」信号。
+ */
+export function currentRequestBlock(messages: readonly RequestMessage[]): ContentBlock | undefined {
+  const latest = latestUserRequest(messages)
+  if (!latest) return undefined
+  const parts: string[] = []
+  for (const block of latest.content) {
+    if (block.type === 'text') parts.push(block.text)
+    else if (block.type === 'image') parts.push('[本条消息附带图片，见上文对应的消息块]')
+    else parts.push(`[本条消息附带 ${block.type} 内容，见上文对应的消息块]`)
+  }
+  const body = parts.join('\n').trim()
+  return textBlock([
+    CURRENT_REQUEST_OPEN,
+    CURRENT_REQUEST_NOTICE_TEXT,
+    body === '' ? '（本条消息没有文本内容）' : body,
+    CURRENT_REQUEST_CLOSE,
+  ].join('\n'))
 }
 
 /**
@@ -110,6 +186,9 @@ export function parsePromptTranscript(blocks: readonly ContentBlock[]): { system
       system = text.slice(SYSTEM_OPEN.length, text.length - SYSTEM_CLOSE.length)
       continue
     }
+    // 历史说明与当前请求强调块只为引导模型，不是消息本身：跳过它们，
+    // 否则当前请求的纯文本副本会被重复计入逆解析结果。
+    if (text.startsWith(HISTORY_OPEN) || text.startsWith(CURRENT_REQUEST_OPEN)) continue
     entries.push(...parseMessageEnvelopes(text))
   }
   return system === undefined ? { entries } : { system, entries }

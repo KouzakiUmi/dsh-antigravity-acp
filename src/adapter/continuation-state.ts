@@ -1,13 +1,14 @@
 import type { ContentBlock, GenerateOptions, RequestMessage } from '@deepseek-ai/dsh-llm'
 
 /** Only model-visible values participate; durable message IDs are not prompt content. */
-function messageValue(message: RequestMessage): unknown {
+export function messageValue(message: RequestMessage): unknown {
   return message.role === 'tool'
     ? { role: message.role, content: message.content, toolCallId: message.toolCallId, isError: message.isError === true }
     : { role: message.role, content: message.content }
 }
 
-function stable(value: unknown): string {
+/** Deterministic JSON: object keys sorted, so fingerprints survive property order. */
+export function stable(value: unknown): string {
   return JSON.stringify(value, (_key, item: unknown) => {
     if (!item || typeof item !== 'object' || Array.isArray(item)) return item
     return Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b)))

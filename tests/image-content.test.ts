@@ -12,7 +12,12 @@ describe('host-owned native image transport', () => {
   it('sends verified image bytes as ACP image content, not a JSON replacement', async () => {
     const readImage = vi.fn(async () => ({ ref, data }))
     const result = await buildPromptWithImages(undefined, [createUserMessage({ content: [block], source: { kind: 'user' } })], [], { readImage, supported: true })
-    expect(result.at(-1)).toEqual({ type: 'image', mimeType: 'image/png', data: data.toString('base64') })
+    // 图片仍是原生字节块（跟随消息信封），不是 JSON 文本替换。
+    expect(result.filter((item) => item.type === 'image')).toEqual([
+      { type: 'image', mimeType: 'image/png', data: data.toString('base64') },
+    ])
+    // 末尾是当前请求强调块：最新用户消息被明确标出，避免被历史注入块淹没。
+    expect(result.at(-1)).toMatchObject({ type: 'text', text: expect.stringContaining('<dsh-current-request>') })
     expect(readImage).toHaveBeenCalledWith(ref, undefined)
     expect(result.filter((item) => item.type === 'text').some((item) => item.text.includes(data.toString('base64')))).toBe(false)
   })

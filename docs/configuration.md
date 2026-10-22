@@ -24,6 +24,11 @@
 | `preferredModel` | 未设置 | 默认 / 自定义模型 ID，在目录中优先列出；目录外 ID 未验证。兼容旧 `server-default` 路由，不替换现有会话选择。 |
 | `proxyUrl` | 未设置 | 显式出网代理；留空继承 Host 代理环境，Host 也未配置才直连。支持 HTTP、HTTPS、SOCKS5、SOCKS5H。 |
 | `proxyBypass` | 未设置 | 逗号分隔排除列表，支持域名匹配，不支持 CIDR；始终合并 localhost、127.0.0.1、::1。 |
+| `reuseSessions` | `true` | 复用同一个 ACP 会话：同一 DSH 对话的后续回合只发送**新增消息**，不再每轮 `session/new` 并重放全部历史。历史被压缩、回退或编辑，模型/思考强度变化，工具目录变化，或 MCP 桥被其他对话接管时自动重建。关闭后回到旧的「每轮新会话 + 全量重放」。 |
+| `resumeSessions` | `false` | 插件或 Host 重启后，尝试用 `session/load` 恢复上次的 ACP 会话。映射写在缓存目录的 `sessions.json`，只存会话 ID、cwd、已发送条数、路由 sha256 与时间戳，不存对话内容、system 提示或工具 schema。恢复失败或前缀不一致时自动回退为新轮重建。 |
+| `keepProcessAfterCancel` | `false` | 用户按停止后是否保留官方进程。关闭时立即回收（下一轮冷启动）；开启后先等 `cancelGraceMs` 确认 agent 已停止，确认了就只丢弃会话、保留进程。 |
+| `cancelGraceMs` | `30000` | 取消后等待 agent 确认停止的上限（毫秒）；`0` 表示不等待、直接保留进程。热启动约 10 秒，30 秒留出余量。 |
+| `idleRecycleMs` | `300000` | 保留进程的最长空闲时间（毫秒），超时回收释放内存；`0` 表示不设上限。默认 5 分钟与 Gemini 显式缓存默认 TTL 300s 对齐。 |
 
 示例（不包含代理密码或账号材料）：
 
@@ -34,9 +39,32 @@
   "autoWarmup": true,
   "autoDownload": true,
   "acpVersion": "1.4.0",
+  "reuseSessions": true,
+  "resumeSessions": false,
   "proxyUrl": "http://127.0.0.1:7890"
 }
 ```
+
+### 会话复用与恢复
+
+ACP 官方 agent 在同一会话内会保留上下文（2026-10-23 真机验证：同一 `session` 连发两条 prompt，第二条能复述第一条的暗号），并且声明了 `loadSession`。因此插件默认复用会话：
+
+- 同一 DSH 对话的**普通聊天回合**只发送本轮新增消息；system、工具策略与历史不再每轮重放。
+- 出现以下任一情况即受控重建（`session/close` + `session/new` + 全量重放）：历史不是已发送前缀的追加（压缩检查点、回退、编辑）、模型或思考强度变化、system 或工具目录变化、MCP 桥被另一对话接管、回合异常终止。
+- 标题、压缩等一次性请求不参与复用，各自独立建会话，避免污染对话历史。
+- 连接池会把同一对话粘在同一个 worker 上（换 worker 就丢了会话记录）；新对话优先使用未被占用的 worker，容量用尽才排队。
+- `resumeSessions` 只用「路由一致 + 历史仍以已发送前缀开头」作为恢复依据；agent 侧历史可能已被清理，失败即重建，不猜测。
+
+### 取消与进程保留
+
+`session/cancel` 是通知，不代表官方 agent 的执行已经停止；因此默认仍在取消后回收进程（安全优先，代价是下一轮冷启动）。开启 `keepProcessAfterCancel` 后：
+
+- 先给 `cancelGraceMs`（默认 30 秒，热启动约 10 秒）让 agent 回应 `cancelled`；确认了就只丢弃会话、保留进程（下一轮免冷启动）。
+- 宽限内没有确认 → 照旧回收。
+- 保留期间 `idleRecycleMs` 内没有新消息 → 回收，释放常驻内存。
+- 保留进程不等于复用会话：被取消的会话一律作废，避免沿用可能仍在执行的 turn。
+
+实测（2026-10-23，官方 1.4.0）：同一会话空闲 60s、120s 后仍能复述上一轮暗号，响应耗时稳定（约 3s）；`usage_update.used` 持续累计（3463 → 3628 → 3745）。官方没有公开会话空闲 TTL；Gemini 显式缓存默认 TTL 为 300s（[官方文档](https://ai.google.dev/gemini-api/docs/generate-content/caching)），因此默认空闲回收取 5 分钟。
 
 配置更新可能重载插件。非法代理当前会在插件装载期抛 `ProxyConfigError`，可能需要通过宿主通用配置面修复，不能假定本插件卡片还能显示。需要代理时先保存再连接；已有官方进程不会因为页面上的文本变化自动换出口。按部署方式重载 Host / 重启 Desktop，不把刷新网页当成 Host 已更新。
 

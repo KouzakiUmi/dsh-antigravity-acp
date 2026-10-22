@@ -27,6 +27,8 @@ import type {
   InitializeRequest,
   InitializeResponse,
   JsonRpcId,
+  LoadSessionRequest,
+  LoadSessionResponse,
   NewSessionRequest,
   NewSessionResponse,
   PromptRequest,
@@ -476,6 +478,31 @@ export class AgentLink {
   async setConfigOption(params: SetSessionConfigOptionRequest, options?: AgentLinkRequestOptions): Promise<SetSessionConfigOptionResponse> {
     this.#requireInitialized('session/set_config_option')
     return this.request<SetSessionConfigOptionResponse>('session/set_config_option', params, options)
+  }
+
+  /**
+   * 加载已有会话以恢复上一次对话（仅当 agent 声明 `loadSession` 时可用）。
+   *
+   * 注意：按 ACP 规范，agent 会把**整段历史**通过 `session/update` 重放回来；
+   * 调用方必须在这段时间抑制通知处理，否则回放内容会被当成新一轮输出。
+   * `LoadSessionResponse` 不含 sessionId，恢复后沿用请求里的 id。
+   */
+  async loadSession(request: LoadSessionRequest, options?: AgentLinkRequestOptions): Promise<LoadSessionResponse> {
+    this.#requireInitialized('session/load')
+    if (this.#initializeResponse?.agentCapabilities?.loadSession !== true) {
+      throw new AgentLinkError(AGY_LINK_ERROR.UNSUPPORTED_CAPABILITY, 'ACP 服务端未声明 loadSession，无法恢复已有会话')
+    }
+    const response = await this.request<LoadSessionResponse>('session/load', request, options)
+    this.#boundSessionId = request.sessionId
+    return response
+  }
+
+  /** 关闭一个会话，释放 agent 侧状态；失败原样抛给调用方决定是否忽略。 */
+  async closeSession(sessionId: string = this.#boundSessionId ?? '', options?: AgentLinkRequestOptions): Promise<void> {
+    this.#requireInitialized('session/close')
+    if (!sessionId) return
+    await this.request('session/close', { sessionId }, options)
+    if (this.#boundSessionId === sessionId) this.#boundSessionId = undefined
   }
 
   /** 发送一轮用户 prompt；响应只含 stopReason，流式内容走 session/update。 */

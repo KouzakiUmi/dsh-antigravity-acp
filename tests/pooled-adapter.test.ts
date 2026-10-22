@@ -108,6 +108,80 @@ afterEach(async () => {
   vi.useRealTimers()
 })
 
+describe('会话粘性（ACP 会话复用需要同一 worker）', () => {
+  it('a later round of the same session returns to its worker, new sessions take other workers', async () => {
+    const { pool, workers } = setup({ capacity: 2 })
+    const a1 = run(pool, request('s1'))
+    await flush()
+    workers[0]!.calls[0]!.complete('finish')
+    await a1
+
+    // 新对话不抢 s1 的 worker。
+    const b1 = run(pool, request('s2'))
+    await flush()
+    expect(workers[1]!.calls.map(call => call.options.sessionId)).toEqual(['s2'])
+    workers[1]!.calls[0]!.complete('finish')
+    await b1
+
+    // s1 的下一轮回到 worker0（否则它会丢掉 ACP 会话复用记录）。
+    const a2 = run(pool, request('s1'))
+    await flush()
+    expect(workers[0]!.calls.map(call => call.options.sessionId)).toEqual(['s1', 's1'])
+    workers[0]!.calls[1]!.complete('finish')
+    await a2
+  })
+
+  it('falls back to another worker instead of queueing behind an unrelated conversation', async () => {
+    const { pool, workers } = setup({ capacity: 2 })
+    const a1 = run(pool, request('s1'))
+    await flush()
+    workers[0]!.calls[0]!.complete('finish')
+    await a1
+    const c1 = run(pool, request('s3'))
+    await flush()
+    workers[1]!.calls[0]!.complete('finish')
+    await c1
+
+    // s2 借用 s1 原来的 worker0（容量已满、两者都空闲）。
+    const b1 = run(pool, request('s2'))
+    await flush()
+    expect(workers[0]!.calls.length).toBe(2)
+
+    // s1 回来时只死等自己的 worker 会卡住；应改落到空闲的 worker1。
+    const a2 = run(pool, request('s1'))
+    await flush()
+    expect(pool.read().queue?.waiting).toBe(0)
+    expect(workers[1]!.calls.length).toBe(2)
+    workers[1]!.calls[1]!.complete('finish')
+    await a2
+    workers[0]!.calls[1]!.complete('finish')
+    await b1
+  })
+
+  it('title requests do not claim affinity', async () => {
+    const { pool, workers } = setup({ capacity: 2 })
+    const a1 = run(pool, request('s1'))
+    await flush()
+    workers[0]!.calls[0]!.complete('finish')
+    await a1
+
+    const title = run(pool, request('title', { purpose: 'session-title' }))
+    await flush()
+    // 标题请求按普通调度走，不建立/占用会话绑定。
+    const worker = workers.find(w => w.calls.some(call => call.options.sessionId === 'title'))!
+    worker.calls.find(call => call.options.sessionId === 'title')!.complete('finish')
+    await title
+
+    const a2 = run(pool, request('s1'))
+    await flush()
+    // 标题请求可能落在同一个 worker（它不接管桥，所以不影响复用）；关键是
+    // s1 的下一轮仍然回到自己的 worker。
+    expect(workers[0]!.calls.at(-1)!.options.sessionId).toBe('s1')
+    workers[0]!.calls.at(-1)!.complete('finish')
+    await a2
+  })
+})
+
 describe('PooledAcpAdapter scheduling with independent fake workers', () => {
   it('runs different sessions concurrently up to capacity and queues the third', async () => {
     const { pool, workers } = setup({ capacity: 2 })
