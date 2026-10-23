@@ -16,12 +16,11 @@ import {
   ToolCallId,
 } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, RequestMessage, StreamChunk, ToolSchema } from '@deepseek-ai/dsh-llm'
-import type { ContentBlock, SessionConfigOption } from '@agentclientprotocol/sdk'
+import type { ContentBlock, RequestPermissionRequest, SessionConfigOption } from '@agentclientprotocol/sdk'
 import { AntigravityAcpAdapter, AGY_PROVIDER_ID, AGY_PLACEHOLDER_MODEL_ID, AGY_ADAPTER_ERROR } from '../src/adapter/antigravity-adapter.js'
 import type { AdapterLog } from '../src/adapter/antigravity-adapter.js'
 import type { ImageReader } from '../src/adapter/image-content.js'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
-import { NATIVE_REFUSAL_LIMIT } from '../src/adapter/prompt-turn.js'
 import { SessionMapStore } from '../src/runtime/session-map.js'
 import type { SessionMapEntry } from '../src/runtime/session-map.js'
 import { outputHash, prefixHash, routeFingerprint } from '../src/adapter/session-reuse.js'
@@ -583,18 +582,32 @@ describe('模型目录来自 ACP 会话配置', () => {
     await streaming
   })
 
-  it('选模响应缺少配置时安全失败但保留上一份有效目录', async () => {
+  it('选模 RPC 成功但未回传配置时继续对话并保留目录', async () => {
     const harness = createHarness()
     harness.agent.on('session/set_config_option', () => NO_REPLY)
     const streaming = collect(harness.adapter.stream(baseOptions({ model: 'gemini-3-flash' })))
-      .then(() => 'success', (error: unknown) => (error as { code?: string }).code)
     await waitForRequest(harness.agent, 'session/set_config_option')
     const before = await harness.adapter.listModels(AGY_PROVIDER_ID)
     expect(before.length).toBeGreaterThan(0)
     await harness.agent.reply('session/set_config_option', {})
-    expect(await streaming).toBe(AGY_ADAPTER_ERROR.MODEL_SELECTION_MISMATCH)
+    await waitForRequest(harness.agent, 'session/prompt')
     expect(await harness.adapter.listModels(AGY_PROVIDER_ID)).toEqual(before)
-    expect(harness.agent.requestsFor('session/prompt')).toHaveLength(0)
+    await harness.agent.reply('session/prompt', { stopReason: 'end_turn' })
+    await streaming
+  })
+
+  it('选模 RPC 成功且服务端返回归一化 ID 时继续对话', async () => {
+    const harness = createHarness()
+    harness.agent.on('session/set_config_option', () => ({ configOptions: [{
+      id: 'model', type: 'select', name: 'Model', category: 'model',
+      currentValue: 'gemini-3-flash-medium',
+      options: [{ value: 'gemini-3-flash-medium', name: 'Gemini Flash Medium' }],
+    }] }))
+    const streaming = collect(harness.adapter.stream(baseOptions({ model: 'gemini-3-flash' })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    expect(harness.agent.requestsFor('session/set_config_option')[0]?.params.value).toBe('gemini-3-flash')
+    await harness.agent.reply('session/prompt', { stopReason: 'end_turn' })
+    await streaming
   })
 
   it('config_option_update 也刷新模型目录', async () => {
@@ -1345,23 +1358,23 @@ describe('MCP 工具桥：park 与续轮', () => {
 })
 
 describe('权限与原生活动策略', () => {
-  it('补充权限诊断不放行看似桥接的请求、伪装的原生请求或外来会话', async () => {
+  it('权限诊断不放行未知工具、外部服务器、原生名称或外来会话', async () => {
     const warn = vi.fn()
     const harness = createHarness({ log: { info: vi.fn(), warn } })
     const streaming = collect(harness.adapter.stream(baseOptions({ tools: TOOLS })))
     await waitForRequest(harness.agent, 'session/prompt')
     const calls = [
-      { sessionId: SESSION_1, name: 'call_mcp_tool', kind: 'other' },
-      { sessionId: SESSION_1, name: 'run_command', kind: 'execute' },
-      { sessionId: 'SECRET_FOREIGN_SESSION', name: 'call_mcp_tool', kind: 'other' },
-      { sessionId: SESSION_1, name: undefined, kind: 'other' },
+      { sessionId: SESSION_1, name: 'call_mcp_tool', kind: 'other', server: 'dsh-tools', tool: 'unknown' },
+      { sessionId: SESSION_1, name: 'run_command', kind: 'execute', server: 'dsh-tools', tool: 'read_file' },
+      { sessionId: 'SECRET_FOREIGN_SESSION', name: 'call_mcp_tool', kind: 'other', server: 'dsh-tools', tool: 'read_file' },
+      { sessionId: SESSION_1, name: undefined, kind: 'other', server: 'external', tool: 'read_file' },
     ]
     for (const call of calls) {
       const response = await harness.agent.callClient('session/request_permission', {
         sessionId: call.sessionId,
         toolCall: {
           toolCallId: 'SECRET_ID', name: call.name, kind: call.kind,
-          _meta: { is_mcp_tool_call: true, mcp: { server: 'dsh-tools', tool: 'read_file' } },
+          _meta: { is_mcp_tool_call: true, mcp: { server: call.server, tool: call.tool } },
           title: 'SECRET_TITLE',
           rawInput: { ServerName: 'dsh-tools', ToolName: 'read_file', Arguments: { path: 'SECRET_PATH', token: 'SECRET_TOKEN' } },
         },
@@ -1377,10 +1390,10 @@ describe('权限与原生活动策略', () => {
     const diagnosticLines = warn.mock.calls.map(([message]) => String(message)).filter((message) => message.includes('权限请求结构'))
     expect(diagnosticLines).toHaveLength(4)
     expect(diagnosticLines[0]).toContain('"programmaticName":"mcp-wrapper"')
-    expect(diagnosticLines[0]).toContain('"toolAdvertised":true')
+    expect(diagnosticLines[0]).toContain('"toolAdvertised":false')
     expect(diagnosticLines[1]).toContain('"programmaticName":"other"')
     expect(diagnosticLines[2]).toContain('"sessionMatches":false')
-    expect(diagnosticLines[3]).toContain('"mcpMeta":{"marked":true,"serverMatches":true,"toolAdvertised":true}')
+    expect(diagnosticLines[3]).toContain('"mcpMeta":{"marked":true,"serverMatches":false,"toolAdvertised":true}')
     expect(warn.mock.calls.some(([message]) => String(message).includes('来源=ACP插件，尚未转交DSH工具审批'))).toBe(true)
     expect(JSON.stringify(warn.mock.calls)).not.toContain('SECRET_')
     await replyWithText(harness, '拒绝规则未改变')
@@ -1426,28 +1439,22 @@ describe('权限与原生活动策略', () => {
     expect(last.reason?.kind).not.toBe('error')
   })
 
-  it('同一回合反复索要原生能力超过上限时按 fail-closed 终止回合', async () => {
+  it('反复索要原生能力仍逐次拒绝，但不因累计次数终止对话或回收进程', async () => {
     const harness = createHarness()
     const streaming = collect(harness.adapter.stream(baseOptions()))
     await waitForRequest(harness.agent, 'session/prompt')
-    // 上限 3：连续 4 次「拒绝但继续」之后才终止。
-    for (let attempt = 1; attempt <= NATIVE_REFUSAL_LIMIT + 1; attempt += 1) {
-      await harness.agent.callClient('fs/read_text_file', { sessionId: SESSION_1, path: `/tmp/${attempt}` })
+    for (let attempt = 1; attempt <= 6; attempt += 1) {
+      const response = await harness.agent.callClient('fs/read_text_file', { sessionId: SESSION_1, path: `/tmp/${attempt}` })
+      expect(response).toMatchObject({ error: { code: -32601 } })
+      const denied = await harness.agent.callClient('session/request_permission', {
+        sessionId: SESSION_1, toolCall: { toolCallId: `native-${attempt}`, name: 'run_command', kind: 'execute' },
+        options: [{ optionId: 'no', name: 'Deny', kind: 'reject_once' }],
+      })
+      expect(denied).toMatchObject({ result: { outcome: { optionId: 'no' } } })
     }
-    const last = (await streaming).at(-1) as { type: string; reason?: { kind?: string; failure?: { code?: string } } }
-    expect(last).toMatchObject({
-      type: 'finish',
-      reason: {
-        kind: 'error',
-        failure: { code: AGY_TURN_ERROR.NATIVE_ACTIVITY_REFUSED, message: expect.stringContaining('fs/read_text_file') },
-      },
-    })
-    // 对端不答 cancelled 也必须回收，不能把后续对话永久卡在 AGY_BUSY。
-    await vi.waitFor(() => expect(harness.recycles()).toBe(1))
-    const next = collect(harness.adapter.stream(baseOptions()))
-    await waitForRequest(harness.agent, 'session/prompt')
-    await replyWithText(harness, '新回合回复')
-    expect((await next).at(-1)).toMatchObject({ reason: { kind: 'stop' } })
+    await replyWithText(harness, '拒绝后继续回复')
+    expect((await streaming).at(-1)).toMatchObject({ reason: { kind: 'stop' } })
+    expect(harness.recycles()).toBe(0)
   })
 
   it('initialize 上报全关闭的 client 能力（fs / terminal / elicitation）', async () => {
@@ -1613,7 +1620,7 @@ describe('主对话与辅助请求隔离', () => {
 })
 
 describe('ACP 私有 MCP 权限与原 prompt 续轮', () => {
-  function permission(sessionId = SESSION_1, id = 'official-call-1', args = { path: 'a.txt' }) {
+  function permission(sessionId = SESSION_1, id = 'official-call-1', args = { path: 'a.txt' }): RequestPermissionRequest {
     return {
       sessionId,
       toolCall: {
@@ -1636,9 +1643,12 @@ describe('ACP 私有 MCP 权限与原 prompt 续轮', () => {
     expect(harness.agent.requestsFor('session/new')[0]!.params._meta).toEqual({
       antigravity: { enabledTools: [], eagerMcpServers: ['dsh-tools'] },
     })
-    const response = await harness.agent.callClient('session/request_permission', permission())
+    const approval: RequestPermissionRequest = permission()
+    approval.toolCall.kind = 'read'
+    delete approval.toolCall.rawInput
+    const response = await harness.agent.callClient('session/request_permission', approval)
     expect(response).toMatchObject({ result: { outcome: { outcome: 'selected', optionId: 'yes' } } })
-    // 权限应答本身不合成工具调用。只有实际 tools/call 到桥才交给 DSH。
+    // 展示分类或提示参数缺失不拦桥；权限应答本身不合成调用，只有实际 tools/call 才交给 DSH。
     expect(harness.adapter.bridge.pendingCallIds()).toEqual([])
     const client = await connectAgentMcpClient(harness)
     const pending = client.callTool({ name: 'read_file', arguments: { path: 'a.txt' } })
@@ -2471,13 +2481,13 @@ describe('ACP 会话复用与跨进程恢复', () => {
     expect(harness.agent.requestsFor('session/new')).toHaveLength(0)
   })
 
-  it('恢复后选模未被 agent 确认时回收重建，不静默用错误模型', async () => {
+  it('恢复后选模 RPC 被 agent 拒绝时回收重建', async () => {
     const harness = createHarness({ resumeSessions: true, loadSessionCapability: true,
       loadSessionMap: async () => ({ [`${DSH_SESSION}::chat`]: savedEntry() }), saveSessionMap: () => undefined })
     const original = harness.agent
     const drifted = MODEL_CONFIG_OPTIONS.map(option => option.id === 'model' && option.type === 'select' ? { ...option, currentValue: 'gemini-3-flash' } : option)
     original.on('session/load', () => ({ configOptions: drifted }))
-    original.on('session/set_config_option', () => ({ configOptions: drifted }))
+    original.on('session/set_config_option', () => { throw new Error('model selection rejected') })
     const running = collect(harness.adapter.stream(baseOptions({ sessionId: DSH_SESSION, messages: secondRoundMessages() })))
     await waitForRequest(original, 'session/set_config_option')
     await vi.waitFor(() => expect(harness.recycles()).toBe(1))

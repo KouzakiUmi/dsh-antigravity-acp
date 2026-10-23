@@ -13,7 +13,7 @@ export function parseAgyCredits(value: unknown): Pick<CreditsSnapshot, 'remainin
   const envelope = record(value)
   const command = record(envelope.command)
   const data = record(command.data)
-  if (envelope.status !== 'SUCCESS' || command.name !== 'credits' || envelope.num_turns !== 0) {
+  if (envelope.status !== 'SUCCESS' || command.name !== 'credits') {
     throw new AgyCliError('cli-bad-output', 'agy /credits 未返回成功的本地余额报告')
   }
   const remaining = data.remaining_credits

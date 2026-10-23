@@ -328,6 +328,21 @@ describe('PooledAcpAdapter scheduling with independent fake workers', () => {
     await Promise.all([a, b])
   })
 
+  it('聊天结束后的预热、目录读取及能力准备复用空闲 worker，不因粘性扩容', async () => {
+    const { pool, workers } = setup()
+    const chat = run(pool, request('chat'))
+    await flush()
+    workers[0]!.calls[0]!.complete('finish')
+    await chat
+    await pool.warmup()
+    await pool.discoverModels()
+    await pool.prepareCall('test', 'model')
+    expect(workers).toHaveLength(1)
+    expect(workers[0]!.adapter.warmup).toHaveBeenCalledTimes(1)
+    expect(workers[0]!.adapter.discoverModels).toHaveBeenCalledTimes(1)
+    expect(workers[0]!.adapter.prepareCall).toHaveBeenCalledTimes(1)
+  })
+
   it('reserves a worker for warmup and queues chat until preparation finishes', async () => {
     const { pool, workers } = setup({ capacity: 1 })
     workers[0]!.warmupGate = deferred<void>()

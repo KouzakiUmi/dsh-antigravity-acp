@@ -1519,11 +1519,9 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       )
       throw error
     }
-    // 不完整/不匹配的响应不能确认选模，也不能抹掉上一份有效目录。
-    if (findModelSelector(response.configOptions)?.currentValue !== requested) {
-      throw new LlmError('Antigravity ACP 未确认请求的模型配置，已停止发送 prompt，避免静默使用其他模型', AGY_ADAPTER_ERROR.MODEL_SELECTION_MISMATCH)
-    }
-    this.observeSessionConfigOptions(response.configOptions)
+    // RPC 成功即接受选模；服务端可归一化模型 ID，不再额外要求回显逐字一致。
+    // 缺少模型配置时保留现有目录，后续 config_option_update 仍可更新它。
+    if (findModelSelector(response.configOptions)) this.observeSessionConfigOptions(response.configOptions)
   }
 }
 

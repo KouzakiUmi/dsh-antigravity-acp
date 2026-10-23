@@ -104,17 +104,23 @@ window.__ModuleLoader__.load({
       const modelVersion = React.useRef(0)
       const accountVersion = React.useRef(0)
       const polling = React.useRef(false)
+      const manualModelPull = React.useRef(false)
       const pullModels = React.useCallback(async (force = false) => {
-        if (!props.control) return
+        if (!props.control || manualModelPull.current) return
+        if (force) manualModelPull.current = true
         const version = ++modelVersion.current
         setModelBusy(true)
+        if (force) setModelMessage('正在拉取模型目录…')
         try {
           const value = unwrap(await props.control('models', force ? { force: true } : undefined))
           if (!alive.current || version !== modelVersion.current) return
           setModels(value.models ?? [])
           setModelMessage(value.status === 'error' ? value.message : (value.models?.length ? '目录已更新；不会自动替换当前会话的已选模型。' : '暂无模型目录。连接 / 登录 ACP 可验证会话并读取目录；也可从已登录的官方 CLI 拉取。'))
         } catch (error) { if (alive.current && version === modelVersion.current) setModelMessage(error instanceof Error ? error.message : String(error)) }
-        finally { if (alive.current && version === modelVersion.current) setModelBusy(false) }
+        finally {
+          if (force) manualModelPull.current = false
+          if (alive.current && version === modelVersion.current) setModelBusy(false)
+        }
       }, [props.control])
       const accountAction = React.useCallback(async (action = 'status') => {
         if (!props.control) return
@@ -626,7 +632,11 @@ window.__ModuleLoader__.load({
         const deadline = Date.now() + 20_000
         for (;;) {
           const service = scope.get('remote.agyQuota')
-          if (typeof service?.[method] === 'function') return await withTimeout(service[method](request), 60_000, '设置操作超时，请重试')
+          if (typeof service?.[method] === 'function') {
+            const pending = service[method](request)
+            // 目录发现可能包含冷启动；各阶段超时由 Host 管理，客户端不另设更短的总期限。
+            return method === 'models' ? await pending : await withTimeout(pending, 60_000, '设置操作超时，请重试')
+          }
           if (Date.now() >= deadline) throw new Error('设置控制服务未就绪，请确认 Host 与 Client 版本一致')
           await new Promise((resolve) => setTimeout(resolve, 500))
         }

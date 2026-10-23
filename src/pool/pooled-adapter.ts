@@ -211,7 +211,7 @@ export class PooledAcpAdapter extends LlmAdapter {
       // 开启会话粘性时，新对话优先用没服务过任何对话的 worker；都在服务过时，
       // 容量允许就先扩容——避免已有对话的复用会话被顺手接管。关闭粘性时保持
       // 旧的纯负载调度（不额外 spawn）。
-      if (this.sessionAffinity) {
+      if (affinityKey !== undefined) {
         const unbound = free.find(s => s.lastOwner === undefined)
         if (unbound) return unbound
         if (this.slots.length < this.capacity) return this.addSlot()

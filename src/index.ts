@@ -596,7 +596,8 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
     models: async (force) => {
       if (force) {
         if (findCli()) await loadCliModels(true)
-        else await adapter.discoverModels(AbortSignal.timeout(Math.min(config.requestTimeoutMs ?? 30_000, 45_000)), false)
+        // 排队、启动握手和 session/new 各自已有超时，不再用普通请求预算截断整个冷启动。
+        else await adapter.discoverModels(undefined, false)
       }
       return adapter.listModels(AGY_PROVIDER_ID)
     },

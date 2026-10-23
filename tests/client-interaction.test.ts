@@ -182,6 +182,32 @@ describe('settings card with real React state and effects', () => {
     expect(renderedText(renderer)).toContain('当前目录支持的输入：文本、图片')
   })
 
+  it('后台目录通知不覆盖手动拉取的等待状态和失败原因，可再次点击重试', async () => {
+    const service = transport()
+    const pending = deferred<unknown>()
+    let revision = 1
+    let fail = true
+    const control = vi.fn(async (method: string, request?: { force?: boolean }) => {
+      if (method === 'account') return { state: 'idle', runtime: { modelCatalogRevision: revision } }
+      if (request?.force) return fail ? pending.promise : { status: 'ok', models: [{ id: 'new-model', name: 'New Model' }] }
+      return { status: 'ok', models: [{ id: 'old-model', name: 'Old Model' }] }
+    })
+    const { renderer, intervals } = await mount(service.remote, control)
+    await act(async () => { void button(renderer, '一键拉取模型').props.onClick() })
+    expect(renderedText(renderer)).toContain('正在拉取模型目录')
+    const calls = control.mock.calls.filter(([method]) => method === 'models').length
+    revision++
+    await act(async () => { for (const timer of intervals.values()) if (timer.delay === 2000) timer.callback() })
+    expect(control.mock.calls.filter(([method]) => method === 'models')).toHaveLength(calls)
+    expect(button(renderer, '拉取中…').props.disabled).toBe(true)
+    await act(async () => { pending.resolve({ status: 'error', models: [{ id: 'old-model', name: 'Old Model' }], message: '目录拉取失败，请重试' }) })
+    expect(renderedText(renderer)).toContain('目录拉取失败，请重试')
+    expect(button(renderer, '一键拉取模型').props.disabled).toBe(false)
+    fail = false
+    await act(async () => { await button(renderer, '一键拉取模型').props.onClick() })
+    expect(renderer.root.findAllByType('option').some((option) => option.props.value === 'new-model')).toBe(true)
+  })
+
   it('shows session switches and submits timers as numbers, preserving zero', async () => {
     const service = transport()
     const { renderer } = await mount(service.remote)

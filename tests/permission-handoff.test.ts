@@ -39,10 +39,14 @@ describe('ACP 私有 MCP 权限路由解析（依赖会话禁用内置工具）'
     expect(parsePermissionHandoff(request(), { ...context, tools: [] })).toBeUndefined()
   })
 
-  it('有 MCP 元数据但名称或种类指向原生能力时拒绝', () => {
+  it('有 MCP 元数据但名称明确指向原生能力时仍拒绝', () => {
     const named = request(); named.toolCall.name = 'run_command'
-    const execute = request(); execute.toolCall.kind = 'execute'
-    for (const value of [named, execute]) expect(parsePermissionHandoff(value, context)).toBeUndefined()
+    expect(parsePermissionHandoff(named, context)).toBeUndefined()
+  })
+
+  it.each(['read', 'execute', 'search', 'edit', 'other'] as const)('展示分类 %s 不阻断私有桥路由', (kind) => {
+    const value = request(); value.toolCall.kind = kind
+    expect(parsePermissionHandoff(value, context)?.name).toBe('read')
   })
 
   it.each(['Run read?', 'Run dsh-tools_read?'])('官方 eager 工具格式 %s 无 MCP 元数据也能进入桥', (title) => {
@@ -63,10 +67,10 @@ describe('ACP 私有 MCP 权限路由解析（依赖会话禁用内置工具）'
     expect(parsePermissionHandoff(value, context)).toBeUndefined()
   })
 
-  it('包装参数有冲突或形状不明时不猜测', () => {
-    for (const rawInput of [null, [], 'x', { path: 'a.txt' }, { arguments: { path: 'a' }, path: 'b' }]) {
+  it('权限提示参数缺失或包装不同不阻断已识别的桥，实际参数留给 tools/call', () => {
+    for (const rawInput of [undefined, null, [], 'x', { path: 'a.txt' }, { arguments: { path: 'a' }, path: 'b' }]) {
       const value = request(); value.toolCall.rawInput = rawInput
-      expect(parsePermissionHandoff(value, context)).toBeUndefined()
+      expect(parsePermissionHandoff(value, context)?.name).toBe('read')
     }
   })
 
@@ -78,10 +82,12 @@ describe('ACP 私有 MCP 权限路由解析（依赖会话禁用内置工具）'
       .toEqual(value.toolCall.rawInput)
   })
 
-  it('工具同名 arguments 参数与包装层无法区分时拒绝猜测', () => {
+  it('工具声明 arguments 字段且与包装同形时也可进入桥，诊断保留原输入', () => {
     const value = request()
     const declared: ToolSchema[] = [{ name: 'read', description: 'Read', parameters: { type: 'object', properties: { arguments: { type: 'object' }, path: { type: 'string' } } } }]
-    expect(parsePermissionHandoff(value, { ...context, tools: declared })).toBeUndefined()
+    const handoff = parsePermissionHandoff(value, { ...context, tools: declared })
+    expect(handoff?.name).toBe('read')
+    expect(JSON.parse(handoff!.arguments)).toEqual(value.toolCall.rawInput)
   })
 
   it('空参数工具保留空对象，不添加官方包装字段', () => {

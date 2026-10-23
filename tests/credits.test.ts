@@ -33,10 +33,15 @@ describe('官方 AI Credits 契约', () => {
     expect(() => parseAgyCredits(payload)).toThrow('remaining_credits')
   })
 
-  it('拒绝错误信封、其它命令和非本地回合', () => {
+  it('拒绝错误信封和其它命令', () => {
     expect(() => parseAgyCredits({ ...envelope(), status: 'ERROR' })).toThrow()
-    expect(() => parseAgyCredits({ ...envelope(), num_turns: 1 })).toThrow()
     expect(() => parseAgyCredits({ ...envelope(), command: { name: 'usage', data: { remaining_credits: 5 } } })).toThrow()
+  })
+
+  it.each([undefined, 0, 1])('余额有效时不因无关回合计数 %s 拒绝报告', (turns) => {
+    const { num_turns: _turns, ...payload } = envelope(123)
+    expect(parseAgyCredits(turns === undefined ? payload : { ...payload, num_turns: turns }))
+      .toEqual({ remainingCredits: 123 })
   })
 
   it('只调用 /credits；读取有界，错误已脱敏', async () => {

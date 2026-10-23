@@ -178,7 +178,7 @@ describe('apply wiring with real pool and SettingsControl', () => {
     apply(instance.ctx, {})
     const control = instance.control()
     expect((await control.models(true)).status).toBe('ok')
-    expect(external.workers[0]!.discoverModels).toHaveBeenLastCalledWith(expect.any(AbortSignal), false)
+    expect(external.workers[0]!.discoverModels).toHaveBeenLastCalledWith(undefined, false)
     expect(control.account().state).toBe('idle')
     expect(control.account('login').state).toBe('connecting')
     await flush()

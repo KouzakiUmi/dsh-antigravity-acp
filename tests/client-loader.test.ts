@@ -37,6 +37,7 @@ let lastMountCalls: Array<{ package?: string; descriptors?: Array<{ id?: string;
 interface QuotaStubOptions {
   /** 返回 remote 的原始回包（**未拆信封**），与真实网关一致。 */
   quotaRead?: () => Promise<unknown>
+  models?: (request?: { force?: boolean }) => Promise<unknown>
   /**
    * 注入会话模型目录的当前 provider。药丸只在 provider 匹配时取数，因此要驱动
    * 取数链路就必须把它设成 `antigravity-acp`；缺省保持空快照（渲染即 null）。
@@ -124,7 +125,8 @@ function loadRegistrations(options: QuotaStubOptions = {}): Map<string, SlotRegi
       return () => {}
     },
     get: (name: string) =>
-      name === 'remote.agyQuota' && options.quotaRead ? { read: () => options.quotaRead!() } : undefined,
+      name === 'remote.agyQuota' && (options.quotaRead || options.models)
+        ? { read: options.quotaRead, models: options.models } : undefined,
     // 忠实模拟 cordis 的 ReflectService：读取**未 inject** 的 `remote.<ns>` 属性会抛
     // 「cannot get property "remote.<ns>" without inject」。贡献型 remote 不进 inject，
     // 因此组件只能走 `ctx.get('remote.<ns>')`；这条替身行为让写错的一行在测试里就暴露。
@@ -223,6 +225,24 @@ describe('browser client module', () => {
     expect(control).toHaveBeenCalledWith('account', { action: 'warmup' })
     expect(control).toHaveBeenCalledWith('models', { force: true })
     expect(readQuota).toHaveBeenCalledWith(true)
+  })
+
+  it('目录冷启动超过 60 秒时客户端继续等待 Host，而不是提前报超时', async () => {
+    vi.useFakeTimers()
+    try {
+      let complete!: (value: unknown) => void
+      const models = vi.fn(() => new Promise<unknown>((resolve) => { complete = resolve }))
+      const settings = loadRegistrations({ models }).get('antigravity-acp')!.row.inject!('')
+      const control = settings.control as (method: string, request?: { force?: boolean }) => Promise<unknown>
+      let settled = false
+      const pending = control('models', { force: true }).then((value) => { settled = true; return value })
+      await vi.advanceTimersByTimeAsync(120_000)
+      expect(settled).toBe(false)
+      expect(models).toHaveBeenCalledWith({ force: true })
+      const snapshot = { status: 'ok', models: [{ id: 'example', name: 'Example' }] }
+      complete(snapshot)
+      expect(await pending).toEqual(snapshot)
+    } finally { vi.useRealTimers() }
   })
 
   it('设置页与药丸共享同一个读取器，手动刷新可通知另一视图', async () => {

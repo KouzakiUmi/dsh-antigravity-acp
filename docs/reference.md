@@ -2,7 +2,7 @@
 
 [返回主页](../README.md) · [配置](configuration.md) · [更新记录](changelog.md) · [开发与验证](development.md)
 
-本文对应 `dsh-bundle-antigravity-host` **0.1.26**。安装或连接成功不等于真实模型生成、图片识别或所有平台已验收。
+本文对应 `dsh-bundle-antigravity-host` **0.1.27**。安装或连接成功不等于真实模型生成、图片识别或所有平台已验收。
 
 ## 安装与更新
 
@@ -89,7 +89,7 @@ dsh plugin --profile web add ./dsh-bundle-antigravity-host-0.1.24.tgz
 
 普通用户回合默认复用 ACP session，校验输入前缀和上一步实际输出，只发增量；编辑回答、外部 provider 的额外输出或路由变化会触发全量重建。`resumeSessions` 可选开启跨进程恢复（默认关闭），恢复后校正模型；文本历史信封不等同于模型 API 的原生角色消息。上游 `end_turn` 没有可见文本或工具调用时返回 `AGY_EMPTY_RESPONSE`，仅思考或进度通知不算成功。
 
-ACP fs / terminal 与未知原生权限请求始终拒绝。单次拒绝允许模型改用 DSH 工具；同回合反复索要超过 3 次会 fail-closed 终止。协议能力与权限拒绝**不是操作系统沙箱**，不证明官方二进制只能执行被协议观察到的操作。
+ACP fs / terminal 与未知原生权限请求始终拒绝并记录，但不因拒绝次数终止整个对话，模型仍可改用 DSH 工具。已识别私有桥调用的 `kind` 仅用于展示；权限提示参数只供诊断，不因缺失或包装差异阻断，真正执行仍取自后续 `tools/call`。协议能力与权限拒绝**不是操作系统沙箱**，不证明官方二进制只能执行被协议观察到的操作。
 
 ## 图片输入
 
@@ -125,7 +125,9 @@ ACP fs / terminal 与未知原生权限请求始终拒绝。单次拒绝允许�
 | AI Credits | `agy -p /credits --output-format json` 的 `command.data.remaining_credits`，可选 `plan_name` | 无 CLI 不提供，不从套餐额度推算 |
 | 模型目录 | 会话观测与 `agy models` | 手动强制刷新无 CLI 时尝试非交互 ACP 发现 |
 
-CLI 额度 / 余额命令各有 45 秒超时，并发刷新合并、有效缓存不重复取数。额度与 Credits 独立缓存、独立标记更新时间与错误；查询失败可保留旧值但明确标缓存，上游明确无账户信息时移除旧值。Credits 只接受成功本地报告与非负安全整数；真实零显示 0，缺字段不变成零。不请求购买、不自动开启 `useG1Credits`。
+ACP 目录发现沿用排队、握手与会话请求各阶段的超时，不再额外套用普通请求或客户端 60 秒总期限。预热、目录发现和能力准备优先复用已有空闲 worker，不因聊天粘性额外扩容。
+
+CLI 额度 / 余额命令各有 45 秒超时，并发刷新合并、有效缓存不重复取数。额度与 Credits 独立缓存、独立标记更新时间与错误；查询失败可保留旧值但明确标缓存，上游明确无账户信息时移除旧值。Credits 校验成功状态、命令与非负安全整数金额，不用 `num_turns` 判断报告是否有效；真实零显示 0，缺字段不变成零。不请求购买、不自动开启 `useG1Credits`。
 
 HTTP 额度回退只读 CLI 登录材料，换发 access token 仅留内存，不写回 CLI 文件。所有 CLI 进程经宿主受管通道启动。日志与错误对 OAuth URL、Bearer、代理密码和结构化 token 脱敏，不回显正文或工具参数值。
 

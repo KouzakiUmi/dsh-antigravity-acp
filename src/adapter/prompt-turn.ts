@@ -97,14 +97,6 @@ export interface PromptTurnOptions {
   onArgumentIssues?(info: { tool: string; missing: string[]; unknown: string[]; unknownCount: number }): void
 }
 
-/**
- * 同一回合重复拒绝的保护上限（历史导出名保留）。
- *
- * 计数包含 ACP permission 和原生客户端请求；超过上限仅说明重复请求了未授予的
- * 能力，不足以证明它在绕开工具桥。首次若干次只拒绝、不掐回合。
- */
-export const NATIVE_REFUSAL_LIMIT = 3
-
 export class PromptTurn {
   /** ACP 会话 id。 */
   readonly sessionId: string
@@ -117,7 +109,7 @@ export class PromptTurn {
   readonly #parked: BridgeParkedCall[] = []
   #settledWaiters: Array<() => void> = []
   #onConfigOptions: ((options: readonly SessionConfigOption[]) => void) | undefined
-  /** 本回合内被拒绝的原生能力索要次数（超过 NATIVE_REFUSAL_LIMIT 才终止回合）。 */
+  /** 本回合内被拒绝的原生能力索要次数，仅用于诊断。 */
   #nativeRefusals = 0
   #onNativeRefusal: PromptTurnOptions['onNativeRefusal']
   readonly #onPermissionDiagnostic: PromptTurnOptions['onPermissionDiagnostic']
@@ -259,22 +251,10 @@ export class PromptTurn {
     this.#recordNativeRefusal('request', method)
   }
 
-  /** 计数并在超过上限时终止回合；未超限只记录（回合继续跑）。 */
+  /** 操作照常拒绝并记录，不把拒绝次数升级为整个对话失败。 */
   #recordNativeRefusal(kind: 'permission' | 'request', detail: string): void {
     this.#nativeRefusals += 1
     this.#onNativeRefusal?.({ kind, detail, count: this.#nativeRefusals })
-    if (this.#nativeRefusals <= NATIVE_REFUSAL_LIMIT) return
-    this.#fail(
-      kind === 'permission'
-        ? {
-            code: AGY_TURN_ERROR.PERMISSION_DENIED,
-            message: `Antigravity ACP 反复请求工具执行授权（${detail}，本回合第 ${this.#nativeRefusals} 次）：当前拒绝规则未授予权限，桥调用身份需另行核验`,
-          }
-        : {
-            code: AGY_TURN_ERROR.NATIVE_ACTIVITY_REFUSED,
-            message: `Antigravity ACP 反复发起未预期的原生请求 ${detail}（本回合第 ${this.#nativeRefusals} 次）：本插件已关闭 fs/terminal 能力，工具一律经私有 MCP 桥暴露`,
-          },
-    )
   }
 
   /**
