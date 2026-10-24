@@ -29,6 +29,7 @@ afterEach(() => { for (const cleanup of effectCleanups.splice(0)) cleanup() })
 
 /** 最近一次 `loadRegistrations` 期间，各处 `ctx.inject([...])` 声明的依赖列表。 */
 let lastInjectDeps: string[][] = []
+let latestStateValues: unknown[] = []
 
 /** 最近一次 `loadRegistrations` 期间，`ctx.remote.$mount(...)` 收到的 remote 声明。 */
 let lastMountCalls: Array<{ package?: string; descriptors?: Array<{ id?: string; method?: string }> }> = []
@@ -47,11 +48,13 @@ interface QuotaStubOptions {
   stateOverrides?: Record<number, unknown>
   immediateUnmount?: boolean
   refOverrides?: Record<number, unknown>
+  refStateBindings?: Record<number, number>
   listeners?: Map<string, (event: { key?: string; target?: unknown }) => void>
 }
 
 function loadRegistrations(options: QuotaStubOptions = {}): Map<string, SlotRegistration> {
   lastStateCalls = []
+  latestStateValues = []
   lastInjectDeps = []
   lastMountCalls = []
   let registration: {
@@ -79,6 +82,10 @@ function loadRegistrations(options: QuotaStubOptions = {}): Map<string, SlotRegi
   let refIndex = 0
   const react = {
     createElement(type: unknown, props: Record<string, unknown> | null, ...children: unknown[]): StubElement {
+      if (typeof type === 'function') {
+        const rendered = (type as StubComponent)({ ...(props ?? {}), children: children.flat() })
+        return rendered ?? { type: 'fragment', props: {}, children: [] }
+      }
       return { type, props: props ?? {}, children: children.flat() }
     },
     // 记录 setState 的入参：额度链路「拆信封」的回归就靠它断言。
@@ -86,7 +93,12 @@ function loadRegistrations(options: QuotaStubOptions = {}): Map<string, SlotRegi
       const index = stateIndex++
       const value = options.stateOverrides && index in options.stateOverrides ? options.stateOverrides[index]
         : initial === null && options.quotaSnapshot !== undefined ? options.quotaSnapshot : initial
-      return [value, (next: unknown) => { lastStateCalls.push(next) }]
+      latestStateValues[index] = value
+      return [value, (next: unknown) => {
+        const resolved = typeof next === 'function' ? (next as (previous: unknown) => unknown)(latestStateValues[index]) : next
+        latestStateValues[index] = resolved
+        lastStateCalls.push(resolved)
+      }]
     },
     useCallback: <T,>(fn: T) => fn,
     // 维持挂载直到 afterEach；立即卸载必须显式选择，不能期待卸载后仍 setState。
@@ -98,8 +110,13 @@ function loadRegistrations(options: QuotaStubOptions = {}): Map<string, SlotRegi
       }
     },
     useSyncExternalStore: (_subscribe: unknown, getSnapshot: () => unknown) => getSnapshot(),
+    useId: () => 'test',
     useMemo: <T,>(fn: () => T) => fn(),
-    useRef: <T,>(initial: T) => ({ current: options.refOverrides?.[refIndex++] ?? initial }),
+    useRef: <T,>(initial: T) => {
+      const index = refIndex++
+      const stateIndex = options.refStateBindings?.[index]
+      return { get current() { return stateIndex === undefined ? options.refOverrides?.[index] ?? initial : latestStateValues[stateIndex] } }
+    },
   }
 
   const registrations = new Map<string, SlotRegistration>()
@@ -199,7 +216,7 @@ function modelStore(provider: string | null) {
 }
 
 describe('browser client module', () => {
-  it('设置页点击即可预热或登录，可手动拉取模型和刷新额度', async () => {
+  it('设置页点击即可预热或登录，可手动拉取模型目录', async () => {
     const control = vi.fn(async (method: string, request?: { action?: string; force?: boolean }) => method === 'account'
       ? { state: request?.action === 'login' ? 'connecting' : 'idle', message: 'test' }
       : { status: 'ok', models: [{ id: 'gemini-example', name: 'Gemini Example' }] })
@@ -207,7 +224,7 @@ describe('browser client module', () => {
     const card = loadRegistrations().get('antigravity-acp')!.component
     const tree = card({ remote: {}, control, readQuota })
     const text = texts(tree).join(' ')
-    expect(text).toContain('账户 · ACP 连接')
+    expect(text).toContain('01 · 连接')
     expect(text).toContain('默认 / 自定义模型 ID')
     expect(text).not.toContain('首次')
     expect(control.mock.calls.some(([, request]) => request?.action === 'login')).toBe(false)
@@ -218,13 +235,23 @@ describe('browser client module', () => {
     }
     click('立即预热')
     click('连接 / 登录 ACP')
-    click('一键拉取模型')
-    click('刷新额度')
+    click('刷新模型目录')
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(control).toHaveBeenCalledWith('account', { action: 'login' })
     expect(control).toHaveBeenCalledWith('account', { action: 'warmup' })
     expect(control).toHaveBeenCalledWith('models', { force: true })
-    expect(readQuota).toHaveBeenCalledWith(true)
+    expect(readQuota).not.toHaveBeenCalled()
+    expect(texts(tree).join(' ')).not.toContain('AI Credits 余额')
+  })
+
+  it('设置页按任务分区，额度只在药丸中展示', () => {
+    const tree = loadCard()({ remote: {} })
+    const text = texts(tree).join(' ')
+    for (const label of ['01 · 连接', '02 · 模型', '03 · 偏好', '高级设置', '连接诊断']) expect(text).toContain(label)
+    expect(text).toContain('额度药丸中查看')
+    expect(text).not.toContain('套餐额度管理')
+    expect(elements(tree).filter((item) => item.props['aria-label'] === 'AI Credits 余额')).toHaveLength(0)
+    expect(elements(tree).filter((item) => item.type === 'details')).toHaveLength(2)
   })
 
   it('目录冷启动超过 60 秒时客户端继续等待 Host，而不是提前报超时', async () => {
@@ -245,13 +272,13 @@ describe('browser client module', () => {
     } finally { vi.useRealTimers() }
   })
 
-  it('设置页与药丸共享同一个读取器，手动刷新可通知另一视图', async () => {
+  it('设置页不订阅额度；药丸刷新仍通知其它药丸视图', async () => {
     const snapshot = { status: 'ok', groups: [] }
     const registrations = loadRegistrations({ quotaRead: async () => ({ ok: true, value: snapshot }) })
     const settings = registrations.get('antigravity-acp')!.row.inject!('')
     const pill = registrations.get('antigravity-quota')!.row.inject!('s')
-    expect(settings.readQuota).toBe(pill.readQuota)
-    const reader = settings.readQuota as ((force: boolean) => Promise<unknown>) & { subscribe(fn: (value: unknown) => void): () => void }
+    expect(settings.readQuota).toBeUndefined()
+    const reader = pill.readQuota as ((force: boolean) => Promise<unknown>) & { subscribe(fn: (value: unknown) => void): () => void }
     const changed = vi.fn()
     const off = reader.subscribe(changed)
     await reader(true)
@@ -407,15 +434,13 @@ describe('AI Credits 展示', () => {
     if (expected !== '0') expect(texts(card)).not.toContain('0')
   })
 
-  it('缓存余额显示旧值与独立错误，设置页和弹层使用相同卡片', () => {
+  it('缓存余额只在药丸详情显示旧值与独立错误', () => {
     const data = { status: 'ok', groups: [], credits: { status: 'ok', remainingCredits: 42, stale: true, staleReason: '余额刷新超时', updatedAt: '2026-01-01T00:00:00Z' } }
-    for (const id of ['antigravity-quota', 'antigravity-acp']) {
-      const tree = loadRegistrations({ quotaSnapshot: data, stateOverrides: id === 'antigravity-quota' ? { 2: true } : undefined }).get(id)!.component({ store: modelStore('antigravity-acp'), remote: {} })
-      const card = elements(tree).find((item) => item.props['aria-label'] === 'AI Credits 余额')!
-      expect(texts(card)).toContain('42')
-      expect(texts(card).join('')).toContain('余额缓存 · 余额刷新超时')
-      expect(texts(card).join('')).toContain('余额更新于')
-    }
+    const tree = loadRegistrations({ quotaSnapshot: data, stateOverrides: { 2: true } }).get('antigravity-quota')!.component({ store: modelStore('antigravity-acp') })
+    const card = elements(tree).find((item) => item.props['aria-label'] === 'AI Credits 余额')!
+    expect(texts(card)).toContain('42')
+    expect(texts(card).join('')).toContain('余额缓存 · 余额刷新超时')
+    expect(texts(card).join('')).toContain('余额更新于')
   })
 })
 
@@ -502,7 +527,7 @@ describe('额度药丸（conversation.input.right）', () => {
   })
 
   it('窄屏靠左的药丸展开时把弹层夹在视口内', () => {
-    const pill = loadRegistrations({ stateOverrides: { 2: true }, refOverrides: {
+    const pill = loadRegistrations({ stateOverrides: { 2: true }, refStateBindings: { 1: 3 }, refOverrides: {
       2: { getBoundingClientRect: () => ({ right: 75, top: 760, bottom: 786 }) },
     } }).get('antigravity-quota')!.component
     pill({ store: modelStore('antigravity-acp') })
@@ -538,6 +563,20 @@ describe('额度药丸（conversation.input.right）', () => {
     expect(pillLabel(pill(props))).toContain('2%')
     model = 'server-default'
     expect(pillLabel(pill(props))).toContain('额度未匹配')
+  })
+
+  it('官方未单列 Argon 额度时使用 Gemini 共享组，独立组存在时优先使用', () => {
+    const quotaSnapshot = { status: 'ok', groups: [
+      { name: 'Gemini Models', buckets: [{ window: '5h', remainingPct: 82 }] },
+      { name: 'Claude and GPT models', buckets: [{ window: '5h', remainingPct: 43 }] },
+    ] }
+    const store = { ...modelStore('antigravity-acp'), getSnapshot: () => ({ current: { provider: 'antigravity-acp', model: 'gemini-4-argon-high' } }) }
+    const shared = loadRegistrations({ quotaSnapshot }).get('antigravity-quota')!.component({ store })
+    expect(pillLabel(shared)).toContain('82%')
+    expect(pillLabel(shared)).not.toContain('额度未知')
+    const separate = loadRegistrations({ quotaSnapshot: { ...quotaSnapshot, groups: [...quotaSnapshot.groups, { name: 'Gemini 4 Argon', buckets: [{ window: 'weekly', remainingPct: 12 }] }] } }).get('antigravity-quota')!.component({ store })
+    expect(pillLabel(separate)).toContain('12%')
+    expect(pillLabel(separate)).not.toContain('82%')
   })
 
   it('额度百分比缺失不能显示为零额度', () => {
@@ -655,7 +694,7 @@ describe('额度药丸：remote 回包拆信封', () => {
     expect(written).not.toHaveProperty('ok')
   })
 
-  it('失败信封：转成可读错误状态（不再静默 pending）', async () => {
+  it('失败信封：失败调用不通知其它药丸覆盖成功快照', async () => {
     const entry = loadRegistrations({
       quotaRead: async () => ({ ok: false, error: { message: 'remote denied' } }),
       quotaProvider: 'antigravity-acp',
@@ -665,13 +704,13 @@ describe('额度药丸：remote 回包拆信封', () => {
     if (typeof inject !== 'function') throw new Error('额度药丸槽位未声明 inject')
     const props = inject('session-1') as {
       store: unknown
-      readQuota: (force?: boolean) => Promise<unknown>
+      readQuota: ((force?: boolean) => Promise<unknown>) & { subscribe(listener: (value: unknown) => void): () => void }
     }
-    entry.component(props)
-    await settle()
-    const written = [...lastStateCalls].reverse().find((value) => value !== null && typeof value === 'object' && 'status' in value) as { status?: string; error?: { message?: string } }
-    expect(written.status).toBe('error')
-    expect(written.error?.message).toContain('remote denied')
+    const listener = vi.fn()
+    const off = props.readQuota.subscribe(listener)
+    await expect(props.readQuota(false)).rejects.toThrow('remote denied')
+    expect(listener).not.toHaveBeenCalled()
+    off()
   })
 })
 

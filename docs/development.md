@@ -58,18 +58,18 @@ npm pack
 
 ## 本次验证矩阵
 
-0.1.27 本地检查日期：**2026-10-23**。
+0.1.28 本地检查日期：**2026-10-25**。
 
 | 验证项 | 状态与范围 |
 |---|---|
 | TypeScript | `npm run typecheck` 通过 |
-| 隔离回归 | `npm test`：36 个文件 / 603 项通过 |
+| 隔离回归 | `npm test`：36 个文件 / 617 项通过 |
 | 构建 | `npm run build` 通过 |
 | 工具 / runtime | 假 ACP / MCP、乱序工具结果、池所有权、续轮变更、取消、写入阻塞和回收 |
 | 图片 | 附件引用校验、图片内容映射与跨 worker 能力；未调用真实视觉模型 |
 | 设置交互 | React 18 renderer 测试草稿、冲突、只读与连接状态；不是浏览器像素测试 |
 | 代理 | 合成依赖、失败不直连、本地 SOCKS 测试；不是 Google 网络可达性保证 |
-| 真实上游 / GUI | 本次未验收 0.1.27 安装后的 GUI、真实生成或图片识别 |
+| 真实上游 / GUI | 本次未验收 0.1.28 安装后的 GUI、真实生成或图片识别 |
 | 非 Windows | 有平台映射与契约测试，未实机验收 |
 | 生产依赖漏洞 | `check` 不包含漏洞审计；没有单独成功审计证据就不声明通过 |
 
@@ -81,7 +81,13 @@ npm pack
 node scripts/preview-ui.mjs
 ```
 
-输出 `.local-preview/quota-ui.html`，使用当前真实 Client 组件和**模拟数据 / hooks**生成静态 HTML，不联网、不登录、不访问 DSH 页面。按钮不会执行真实操作。这是开发预览，不是当前 DSH 截图，也不是真实 React / 浏览器行为验收。
+输出 `.local-preview/quota-ui.html`，使用当前真实 Client 组件和**模拟数据 / hooks**生成静态 HTML，不联网、不登录、不访问 DSH 页面。按钮不会执行真实操作。这是开发预览，不是当前 DSH 截图，也不是真实宿主 React 行为验收；真实状态交互另由 `tests/client-interaction.test.ts` 的 React 18 renderer 覆盖。
+
+### 本次改动的补充验证
+
+2026-10-25 的源码工作副本执行 `npm run check`：TypeScript 检查、**36 个文件 / 617 项测试**与构建通过。新增覆盖手动预热的有界回收恢复、空模型配置保留目录、worker 元数据与档位合并、实际 worker 图片能力准备、额度信封与独立缓存竞态、Argon 共享额度、客户端失败保留快照，以及设置页分组与草稿行为。
+
+同时使用本机 Chrome 无头截图检查 `.local-preview/quota-ui.html` 的浅色 / 深色及 750px 窄屏静态预览；预览数字全部为虚构，不访问真实账户或 DSH 页面。未执行发布、Profile 安装、Host 重启或真实 Desktop GUI / 官方账号验收。
 
 ## 维护与发布到 npm
 

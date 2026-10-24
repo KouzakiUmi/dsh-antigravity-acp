@@ -567,7 +567,12 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
     })
     if (metadata) worker.importMetadata(metadata)
     workers.push(worker)
-    return { adapter: worker, read: () => lifecycle.read(), dispose: () => disposeAcpRuntime(active) }
+    return {
+      adapter: worker,
+      ensureImages: (signal) => worker.prepareImages(signal),
+      read: () => lifecycle.read(),
+      dispose: () => disposeAcpRuntime(active),
+    }
   }, {
     capacity: config.maxConcurrentSessions,
     queueTimeoutMs: config.queueTimeoutMs,

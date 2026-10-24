@@ -177,7 +177,8 @@ describe('ensureAcpCredentials 换发回退', () => {
 describe('额度失败保留旧值', () => {
   const CREDITS = JSON.stringify({ status: 'SUCCESS', num_turns: 0, command: { name: 'credits', data: { remaining_credits: 100 } } })
   const USAGE = JSON.stringify({
-    command: { data: { groups: [{ name: 'Gemini', buckets: [{ name: '5h', window: '5h', remaining_fraction: 0.62 }] }] } },
+    status: 'SUCCESS',
+    command: { name: 'usage', data: { groups: [{ name: 'Gemini', buckets: [{ name: '5h', window: '5h', remaining_fraction: 0.62 }] }] } },
   })
 
   it('先成功后失败：返回上次数据并标记 stale，且下次调用立刻重试而不是被缓存挡住', async () => {

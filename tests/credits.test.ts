@@ -8,7 +8,7 @@ import { AgYQuotaService, AGY_QUOTA_SERVICE } from '../src/quota/quota-remote.js
 const envelope = (remaining: unknown = 123) => ({ status: 'SUCCESS', num_turns: 0,
   usage: { total_tokens: 0 }, command: { name: 'credits', data: { remaining_credits: remaining } } })
 const success = (value: unknown) => ({ exitCode: 0, stdout: JSON.stringify(value), stderr: '' })
-const usage = () => success({ command: { data: { groups: [{ name: 'Gemini Models', buckets: [{ name: '5h', window: '5h', remaining_fraction: .7 }] }] } } })
+const usage = () => success({ status: 'SUCCESS', command: { name: 'usage', data: { groups: [{ name: 'Gemini Models', buckets: [{ name: '5h', window: '5h', remaining_fraction: .7 }] }] } } })
 
 async function service(run?: CliRun) {
   const ctx = new Context()

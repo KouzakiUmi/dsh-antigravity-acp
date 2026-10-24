@@ -5,7 +5,7 @@
  * 这里必须经真实 Cordis Context 调用，直接 `new` 实例复现不出来。
  */
 import { Context } from '@deepseek-ai/cordis'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { CliRun } from '../src/runtime/agy-cli.js'
 import { AgYQuotaService, AGY_QUOTA_SERVICE, AGY_QUOTA_INVOCATIONS } from '../src/quota/quota-remote.js'
 
@@ -14,10 +14,12 @@ import { SettingsControl } from '../src/quota/control.js'
 const CREDITS_JSON = { status: 'SUCCESS', num_turns: 0, command: { name: 'credits', data: { remaining_credits: 200 } } }
 
 const USAGE_JSON = {
+  status: 'SUCCESS',
   command: {
+    name: 'usage',
     data: {
       groups: [
-        { name: 'Gemini', models: ['gemini-x'], usage: { remainingFraction: 0.5, resetTime: '2026-10-21T00:00:00Z' } },
+        { name: 'Gemini', buckets: [{ window: '5h', remaining_fraction: 0.5, reset_time: '2026-10-21T00:00:00Z' }] },
       ],
     },
   },
@@ -76,6 +78,48 @@ describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
     expect(calls[1]).toEqual(['/fake/agy', '-p', '/credits', '--output-format', 'json'])
     expect(logs.join('\n')).toContain('cli=/fake/agy')
   })
+  it('同一轮双路刷新不会把后完成的缓存时间戳回退', async () => {
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(new Date('2026-10-25T00:00:00Z'))
+      const startedAt = Date.now()
+      let runs = 0
+      const run: CliRun = async (request) => {
+        runs += 1
+        if (request.argv.includes('/credits')) vi.setSystemTime(startedAt + 10_000)
+        return { exitCode: 0, stdout: JSON.stringify(request.argv.includes('/credits') ? CREDITS_JSON : USAGE_JSON), stderr: '' }
+      }
+      const ctx = new Context()
+      ctx.plugin(AgYQuotaService, { cli: { run, cliPath: '/fake/agy' } })
+      await vi.advanceTimersByTimeAsync(0)
+      const service = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
+      await service.read()
+      expect(runs).toBe(2)
+      vi.setSystemTime(startedAt + 290_000)
+      await service.read()
+      // 两路缓存都只有 5 分钟寿命；usage 的时间戳不能比本轮开始还早。
+      expect(runs).toBe(2)
+
+    } finally { vi.useRealTimers() }
+  })
+
+  it('一次强制刷新后，新数据立即进入独立缓存', async () => {
+    let runs = 0
+    const run: CliRun = async (request) => {
+      runs += 1
+      return { exitCode: 0, stdout: JSON.stringify(request.argv.includes('/credits') ? CREDITS_JSON : USAGE_JSON), stderr: '' }
+    }
+    const ctx = new Context()
+    ctx.plugin(AgYQuotaService, { cli: { run, cliPath: '/fake/agy' } })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const service = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
+    await service.read({ force: true })
+    expect(runs).toBe(2)
+    await service.read()
+    expect(runs).toBe(2)
+
+  })
+
   it('并发 read 合并为一次 CLI 取数，而不是各起一个进程', async () => {
     let runs = 0
     let release: (() => void) | undefined

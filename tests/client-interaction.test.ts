@@ -28,7 +28,8 @@ function loadCard() {
   const intervals = new Map<number, { callback: () => void; delay: number }>()
   let timerId = 0
   runInNewContext(readFileSync(new URL('../src/client.js', import.meta.url), 'utf8'), {
-    window: { __ModuleLoader__: { load: (value: typeof registration) => { registration = value } } },
+    window: { __ModuleLoader__: { load: (value: typeof registration) => { registration = value } }, innerHeight: 800, addEventListener: () => {}, removeEventListener: () => {} },
+    document: { documentElement: { clientWidth: 1200 }, addEventListener: () => {}, removeEventListener: () => {} },
     setInterval: (callback: () => void, delay: number) => { intervals.set(++timerId, { callback, delay }); return timerId },
     clearInterval: (id: number) => intervals.delete(id),
     setTimeout, clearTimeout,
@@ -47,7 +48,7 @@ function loadCard() {
     inject: (_names: string[], callback: (scope: unknown) => void) => callback(ctx),
   }
   registration!.factory(() => React).apply(ctx)
-  return { Card: components.get('antigravity-acp')!, intervals }
+  return { Card: components.get('antigravity-acp')!, Pill: components.get('antigravity-quota')!, intervals }
 }
 
 function transport(initial = document()) {
@@ -76,6 +77,19 @@ async function mount(remote: unknown, control?: unknown) {
   return { renderer, intervals }
 }
 
+async function mountPill(readQuota: unknown) {
+  const { Pill } = loadCard()
+  const modelSnapshot = { current: { provider: 'antigravity-acp', model: 'gemini-flash' } }
+  const store = {
+    subscribe: () => () => {},
+    getSnapshot: () => modelSnapshot,
+  }
+  let renderer!: ReactTestRenderer
+  await act(async () => { renderer = create(React.createElement(Pill, { store, readQuota })) })
+  renderers.push(renderer)
+  return renderer
+}
+
 function button(renderer: ReactTestRenderer, label: string): ReactTestInstance {
   return renderer.root.findAllByType('button').find((node) => node.children.join('') === label)!
 }
@@ -83,6 +97,37 @@ function modelInput(renderer: ReactTestRenderer): ReactTestInstance {
   return renderer.root.findByProps({ placeholder: '选择目录中的模型，或输入自定义 ID' })
 }
 function renderedText(renderer: ReactTestRenderer): string { return JSON.stringify(renderer.toJSON()) }
+
+describe('quota pill with real React state and effects', () => {
+  it('失败信封转成可读错误，不把异常抛出组件', async () => {
+    const renderer = await mountPill(async () => ({ ok: false, error: { message: 'remote denied' } }))
+    expect(renderer.root.findByProps({ 'aria-haspopup': 'dialog' }).props['aria-label']).toContain('额度读取失败')
+    await act(async () => { await renderer.root.findByProps({ 'aria-haspopup': 'dialog' }).props.onClick() })
+    expect(renderedText(renderer)).toContain('remote denied')
+  })
+
+  it('刷新异常保留成功快照并标缓存，后续成功清除缓存标记', async () => {
+    let fail = false
+    const snapshot = { status: 'ok', updatedAt: '2026-10-25T00:00:00Z', groups: [
+      { name: 'Gemini Models', buckets: [{ window: '5h', remainingPct: 82 }] },
+    ] }
+    const readQuota = vi.fn(async () => {
+      if (fail) throw new Error('refresh timeout')
+      return snapshot
+    })
+    const renderer = await mountPill(readQuota)
+    await act(async () => { await renderer.root.findByProps({ 'aria-haspopup': 'dialog' }).props.onClick() })
+    expect(renderedText(renderer)).toContain('82')
+    fail = true
+    await act(async () => { await button(renderer, '刷新额度').props.onClick() })
+    expect(renderedText(renderer)).toContain('缓存数据 · Error: refresh timeout')
+    expect(renderedText(renderer)).toContain('82')
+    fail = false
+    await act(async () => { await button(renderer, '刷新额度').props.onClick() })
+    expect(renderedText(renderer)).not.toContain('缓存数据')
+    expect(renderedText(renderer)).toContain('82')
+  })
+})
 
 describe('settings card with real React state and effects', () => {
   it('respects read-only settings instead of offering a save that will fail', async () => {
@@ -179,7 +224,7 @@ describe('settings card with real React state and effects', () => {
     await act(async () => { for (const timer of intervals.values()) if (timer.delay === 2000) timer.callback() })
     expect(control.mock.calls.filter(([method]) => method === 'models').length).toBeGreaterThan(before)
     expect(renderer.root.findAllByType('option').some((option) => option.props.value === 'example-model')).toBe(true)
-    expect(renderedText(renderer)).toContain('当前目录支持的输入：文本、图片')
+    expect(renderedText(renderer)).toContain('支持输入：文本、图片')
   })
 
   it('后台目录通知不覆盖手动拉取的等待状态和失败原因，可再次点击重试', async () => {
@@ -193,18 +238,18 @@ describe('settings card with real React state and effects', () => {
       return { status: 'ok', models: [{ id: 'old-model', name: 'Old Model' }] }
     })
     const { renderer, intervals } = await mount(service.remote, control)
-    await act(async () => { void button(renderer, '一键拉取模型').props.onClick() })
+    await act(async () => { void button(renderer, '刷新模型目录').props.onClick() })
     expect(renderedText(renderer)).toContain('正在拉取模型目录')
     const calls = control.mock.calls.filter(([method]) => method === 'models').length
     revision++
     await act(async () => { for (const timer of intervals.values()) if (timer.delay === 2000) timer.callback() })
     expect(control.mock.calls.filter(([method]) => method === 'models')).toHaveLength(calls)
-    expect(button(renderer, '拉取中…').props.disabled).toBe(true)
+    expect(button(renderer, '正在刷新…').props.disabled).toBe(true)
     await act(async () => { pending.resolve({ status: 'error', models: [{ id: 'old-model', name: 'Old Model' }], message: '目录拉取失败，请重试' }) })
     expect(renderedText(renderer)).toContain('目录拉取失败，请重试')
-    expect(button(renderer, '一键拉取模型').props.disabled).toBe(false)
+    expect(button(renderer, '刷新模型目录').props.disabled).toBe(false)
     fail = false
-    await act(async () => { await button(renderer, '一键拉取模型').props.onClick() })
+    await act(async () => { await button(renderer, '刷新模型目录').props.onClick() })
     expect(renderer.root.findAllByType('option').some((option) => option.props.value === 'new-model')).toBe(true)
   })
 
@@ -249,6 +294,7 @@ describe('settings card with real React state and effects', () => {
     const { renderer, intervals } = await mount(service.remote, control)
     expect(renderedText(renderer)).toContain('运行 2 · 等待工具 1 · 排队 3')
     expect(button(renderer, '连接 / 登录 ACP').props.disabled).toBe(true)
+    expect(button(renderer, '立即预热').props.disabled).toBe(true)
     const before = service.describe.mock.calls.length
     await act(async () => { renderer.unmount() })
     expect(intervals.size).toBe(0)

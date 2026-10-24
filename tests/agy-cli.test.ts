@@ -155,6 +155,19 @@ describe('fetchAgyUsage', () => {
     expect(at(at(snapshot.groups, 0).buckets, 0).window).toBe('weekly')
   })
 
+  it('应用层失败或错误的本地命令不能当成有效额度', async () => {
+    for (const payload of [
+      { ...USAGE_JSON, status: 'ERROR' },
+      { ...USAGE_JSON, command: { ...USAGE_JSON.command, name: 'credits' } },
+    ]) {
+      const { run } = fakeRun({ '-p /usage --output-format json': { stdout: JSON.stringify(payload) } })
+      const snapshot = await fetchAgyUsage(run, 'x')
+      expect(snapshot.status).toBe('error')
+      expect(snapshot.groups).toEqual([])
+      expect(snapshot.error?.message).toContain('未返回成功')
+    }
+  })
+
   it('非零退出码折叠为可读错误', async () => {
     const { run } = fakeRun({ '-p /usage --output-format json': { exitCode: 2, stderr: 'boom' } })
     const snapshot = await fetchAgyUsage(run, 'C:\\agy\\bin\\agy.exe')

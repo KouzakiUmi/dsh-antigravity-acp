@@ -67,8 +67,10 @@ interface McpRegistration {
 interface Harness {
   agent: FakeAcpAgent
   adapter: AntigravityAcpAdapter
+  currentAgent: () => FakeAcpAgent
   bridgeTeardown: () => Promise<void>
   recycles: () => number
+  recycleAttempts: () => number
 }
 
 const teardowns: Array<() => Promise<void>> = []
@@ -92,6 +94,9 @@ function createHarness(
     recycleFailure?: Error
     /** 只在第一次回收时失败：模拟「旧进程暂时没退干净，稍后退出」。 */
     recycleFailureOnce?: Error
+    holdRecycle?: Promise<void>
+    holdRecycleAttempts?: number[]
+    onRecycleAttempt?: (count: number) => void
     loadCachedCatalog?: () => Promise<{ id: string; name: string; description?: string }[] | undefined>
     saveCatalog?: (models: readonly { id: string; name: string; description?: string }[]) => Promise<void> | void
     loadCliCatalog?: () => Promise<readonly { id: string; name: string }[]>
@@ -115,6 +120,7 @@ function createHarness(
   let agent = new FakeAcpAgent()
   let recycles = 0
   let recycleFailedOnce = false
+  let recycleAttempts = 0
   let configOptions: SessionConfigOption[] | null = options.configOptions === undefined ? MODEL_CONFIG_OPTIONS : options.configOptions
   let sessionSeq = 0
 
@@ -165,6 +171,9 @@ function createHarness(
       return inflight
     },
     recycleLink: async (old) => {
+      recycleAttempts += 1
+      options.onRecycleAttempt?.(recycleAttempts)
+      if (options.holdRecycleAttempts?.includes(recycleAttempts)) await options.holdRecycle
       if (options.recycleFailure) throw options.recycleFailure
       if (options.recycleFailureOnce && !recycleFailedOnce) {
         recycleFailedOnce = true
@@ -206,6 +215,8 @@ function createHarness(
   return {
     get agent() { return agent },
     recycles: () => recycles,
+    recycleAttempts: () => recycleAttempts,
+    currentAgent: () => agent,
     adapter,
     bridgeTeardown: async () => {
       await bridgeTeardown?.()
@@ -334,7 +345,7 @@ describe('模型目录来自 ACP 会话配置', () => {
     const ref = { attachmentId: 'sha256:test', mediaType: 'image/png', bytes: data.length, width: 1, height: 1 } as ImageAttachmentRef
     const readImage = vi.fn(async () => ({ ref, data }))
     const harness = createHarness({ readImage, imageCapability: true })
-    expect((await harness.adapter.resolveModel(AGY_PROVIDER_ID, 'gemini-3-pro')).inputModalities).toEqual(['text'])
+    expect((await harness.adapter.resolveModel(AGY_PROVIDER_ID, 'gemini-3-pro')).inputModalities).toBeUndefined()
     expect(harness.agent.requests).toEqual([])
     const prepared = await harness.adapter.prepareCall(AGY_PROVIDER_ID, 'gemini-3-pro')
     expect(prepared.model.inputModalities).toEqual(['text', 'image'])
@@ -956,6 +967,49 @@ describe('不支持的请求项', () => {
   })
 })
 
+describe('模型元数据一致性', () => {
+  it('仅导入目录、尚未列目录时也能解析家族名称与真实档位', async () => {
+    const loadCliCatalog = async () => [
+      { id: 'claude-opus-5-5-low', name: 'Claude Opus 5.5 (Low)' },
+      { id: 'claude-opus-5-5-high', name: 'Claude Opus 5.5 (High)' },
+    ]
+    const source = createHarness({ loadCliCatalog, configOptions: [
+      { id: 'model', type: 'select', name: 'Model', category: 'model', currentValue: 'claude-opus-5-5-high', options: [
+        { value: 'claude-opus-5-5-low', name: 'Claude Opus 5.5 (Low)' },
+        { value: 'claude-opus-5-5-high', name: 'Claude Opus 5.5 (High)' },
+      ] },
+    ] })
+    await source.adapter.discoverModels()
+    const target = createHarness()
+    target.adapter.importMetadata(source.adapter.exportMetadata())
+    const resolved = await target.adapter.resolveModel(AGY_PROVIDER_ID, 'claude-opus-5-5')
+    expect(resolved.name).toBe('Claude Opus 5.5')
+    expect(resolved.reasoning?.efforts.map(entry => entry.id.toString())).toEqual(['low', 'high'])
+    expect(resolved.reasoning?.defaultEffort?.toString()).not.toBe('medium')
+    // CLI-only 的家族兜底不能覆盖另一个 worker 的完整 ACP 档位观测。
+    const observed = createHarness()
+    await observed.adapter.discoverModels()
+    const original = observed.adapter.exportMetadata()
+    observed.adapter.importMetadata({ ...source.adapter.exportMetadata(), catalogSource: 'fallback' })
+    expect(observed.adapter.exportMetadata().catalog).toEqual(original.catalog)
+  })
+
+  it('磁盘 ACP 原始档位优先于其它 worker 的 CLI 家族兜底', async () => {
+    const loadCachedCatalog = async () => [
+      { id: 'claude-opus-5-5-low', name: 'Claude Opus 5.5 (Low)' },
+      { id: 'claude-opus-5-5-high', name: 'Claude Opus 5.5 (High)' },
+    ]
+    const fallback = createHarness({ loadCliCatalog: async () => [
+      { id: 'claude-opus-5-5', name: 'Claude Opus 5.5' },
+    ] })
+    await fallback.adapter.listModels(AGY_PROVIDER_ID)
+    const target = createHarness({ loadCachedCatalog })
+    target.adapter.importMetadata(fallback.adapter.exportMetadata())
+    const resolved = await target.adapter.resolveModel(AGY_PROVIDER_ID, 'claude-opus-5-5')
+    expect(resolved.reasoning?.efforts.map(entry => entry.id.toString())).toEqual(['low', 'high'])
+  })
+})
+
 describe('abort 语义', () => {
   it('回收失败时禁止新回合，不绕过回收屏障继续使用旧进程', async () => {
     const failure = new Error('无法确认旧进程已退出')
@@ -977,14 +1031,47 @@ describe('abort 语义', () => {
     await waitForRequest(harness.agent, 'session/prompt')
     controller.abort()
     await first
-    // 第一次回收失败：这一轮被屏障挡住（既有语义）。
+    // 普通聊天不自动补试回收；上一次错误若已发生就原样交给调用方。
+    await vi.waitFor(() => expect(harness.recycleAttempts()).toBe(1))
     await expect(collect(harness.adapter.stream(baseOptions()))).rejects.toBe(failure)
-    // 屏障必须可重试：再次回收成功后，下一轮应能正常对话，而不是永远重放同一个失败。
+    // 屏障必须可重试：回收成功后，下一轮应能正常对话，而不是永远重放同一个失败。
     const third = collect(harness.adapter.stream(baseOptions()))
-    await waitForRequest(harness.agent, 'session/prompt')
+    await vi.waitFor(() => expect(harness.currentAgent().requestsFor('session/prompt').length).toBe(1))
     await replyWithText(harness, '恢复后的回复')
     expect((await third).at(-1)).toMatchObject({ reason: { kind: 'stop' } })
     expect(harness.recycles()).toBe(1)
+  })
+
+  it('显式预热可从一次性旧回收故障中恢复，不跳过退出确认', async () => {
+    let releaseRecycle!: () => void
+    const holdRecycle = new Promise<void>((resolve) => { releaseRecycle = resolve })
+    let failedRecycle!: () => void
+    const failed = new Promise<void>((resolve) => { failedRecycle = resolve })
+    const harness = createHarness({
+      recycleFailureOnce: new Error('无法确认旧进程已退出'), holdRecycle, holdRecycleAttempts: [2],
+      onRecycleAttempt: (count) => { if (count === 2) failedRecycle() },
+    })
+    const controller = new AbortController()
+    const first = collect(harness.adapter.stream(baseOptions({ signal: controller.signal })))
+    const previousAgent = harness.agent
+    await waitForRequest(previousAgent, 'session/prompt')
+    controller.abort()
+    await first
+    await vi.waitFor(() => expect(harness.recycleAttempts()).toBe(1))
+    const warmup = harness.adapter.warmup()
+    await failed
+    expect(harness.recycleAttempts()).toBe(2)
+    releaseRecycle()
+    await warmup
+    // 第一次回收失败已发生，本次在同一预热操作内重试并成功恢复。
+    expect(harness.recycleAttempts()).toBe(2)
+    expect(harness.recycles()).toBe(1)
+    expect(previousAgent.requestsFor('session/prompt')).toHaveLength(1)
+    expect(harness.agent.requestsFor('session/prompt')).toHaveLength(0)
+    const next = collect(harness.adapter.stream(baseOptions()))
+    await waitForRequest(harness.agent, 'session/prompt')
+    await replyWithText(harness, '预热恢复后的回复')
+    expect(visibleText(await next)).toBe('预热恢复后的回复')
   })
 
   it('prompt 超时后回收连接，下一次对话不再卡在 AGY_BUSY', async () => {
@@ -1861,7 +1948,7 @@ describe('审查回归：取消、身份、目录和历史', () => {
     link.start()
     const recycle = vi.fn(async (old: AgentLink) => { await old.close() })
     const getLink = vi.fn(() => pending)
-    const adapter = new AntigravityAcpAdapter({ getLink, recycleLink: recycle, registerBridgeTeardown: (fn) => { teardown = fn } })
+  const adapter = new AntigravityAcpAdapter({ getLink, recycleLink: recycle, registerBridgeTeardown: (fn) => { teardown = fn } })
     teardowns.push(async () => { release(link); await teardown(); await link.close() })
     const controller = new AbortController()
     const streaming = collect(adapter.stream(baseOptions({ signal: controller.signal })))
@@ -2613,6 +2700,25 @@ describe('ACP 会话复用与跨进程恢复', () => {
     expect(promptTexts(harness, 1)).not.toContain('tool data')
     expect(promptTexts(harness, 1)).not.toContain('最终回答')
     await replyWithText(harness, 'next', 1); await next
+  })
+
+  it('后续会话省略模型配置时保留已知目录与选择器', async () => {
+    const harness = createHarness({ reuseSessions: false })
+    let calls = 0
+    harness.agent.on('session/new', () => ({
+      sessionId: `partial-${++calls}`,
+      configOptions: calls === 1 ? MODEL_CONFIG_OPTIONS : null,
+    }))
+    const first = collect(harness.adapter.stream(baseOptions()))
+    await waitForRequest(harness.agent, 'session/prompt')
+    await replyWithText(harness, 'first')
+    await first
+    expect((await harness.adapter.listModels(AGY_PROVIDER_ID)).length).toBeGreaterThan(0)
+    const second = collect(harness.adapter.stream(baseOptions()))
+    await waitForRequest(harness.agent, 'session/prompt', 2)
+    await replyWithText(harness, 'second', 1)
+    expect(visibleText(await second)).toBe('second')
+    expect((await harness.adapter.listModels(AGY_PROVIDER_ID)).map(model => model.id)).toContain('gemini-3-pro')
   })
 
   it('内存会话表有界，超过 64 个会话关闭最旧会话', async () => {

@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { GenerateOptions, LlmModelInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
+import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
+import { AttachmentId } from '@deepseek-ai/dsh-attachment'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { PooledAcpAdapter, type AcpWorker } from '../src/pool/pooled-adapter.js'
 import type { AcpLifecycleSnapshot } from '../src/runtime/lifecycle.js'
 
@@ -15,12 +18,13 @@ class FakeWorker implements AcpWorker {
   running = false
   calls: Array<{ options: GenerateOptions; complete(value: Completion): void }> = []
   catalog: LlmModelInfo[] = []
-  resolved: LlmResolvedModelInfo = { provider: 'test', id: 'model', name: 'Model', inputModalities: ['text'] }
+  resolved: LlmResolvedModelInfo = { provider: 'test', id: 'model', name: 'model', inputModalities: ['text'] }
   warmupGate: ReturnType<typeof deferred<void>> | undefined
   discoveryGate: ReturnType<typeof deferred<void>> | undefined
   preparationGate: ReturnType<typeof deferred<void>> | undefined
   preparationSignals: Array<AbortSignal | undefined> = []
   disposeGate: ReturnType<typeof deferred<void>> | undefined
+  ensureImages?: AcpWorker['ensureImages']
   counters = { starts: 1, reuses: 2, recycles: 3 }
 
   constructor(readonly index: number) {}
@@ -79,20 +83,22 @@ class FakeWorker implements AcpWorker {
 const owners = new WeakMap<AcpWorker['adapter'], FakeWorker>()
 function owner(adapter: AcpWorker['adapter']): FakeWorker { return owners.get(adapter)! }
 const pools: PooledAcpAdapter[] = []
-function setup(options: { capacity?: number; queueTimeoutMs?: number } = {}) {
+function setup(options: { capacity?: number; queueTimeoutMs?: number; ensureImages?: AcpWorker['ensureImages'] } = {}) {
+  const { ensureImages, ...poolOptions } = options
   const workers: FakeWorker[] = []
   const pool = new PooledAcpAdapter(() => {
     const worker = new FakeWorker(workers.length)
+    worker.ensureImages = ensureImages
     owners.set(worker.adapter, worker)
     workers.push(worker)
     return worker
-  }, options)
+  }, poolOptions)
   pools.push(pool)
   return { pool, workers }
 }
 
 function request(sessionId: string, overrides: Partial<GenerateOptions> = {}): GenerateOptions {
-  return { provider: 'test', model: 'model', messages: [], sessionId: sessionId as GenerateOptions['sessionId'], ...overrides }
+  return { provider: 'test', model: 'model', sessionId: sessionId as GenerateOptions['sessionId'], messages: [], ...overrides }
 }
 
 async function flush() { for (let i = 0; i < 20; i++) await Promise.resolve() }
@@ -319,13 +325,66 @@ describe('PooledAcpAdapter scheduling with independent fake workers', () => {
     await flush()
     workers[0]!.catalog = [{ provider: 'test', id: 'one', name: 'One' }]
     workers[1]!.catalog = [{ provider: 'test', id: 'one', name: 'One updated' }, { provider: 'test', id: 'two', name: 'Two', inputModalities: ['text', 'image'] }]
-    workers[1]!.resolved = { ...workers[1]!.resolved, context: { contextWindow: 123_456 }, inputModalities: ['text', 'image'] }
+    workers[1]!.resolved = { ...workers[1]!.resolved, name: 'Friendly Model', context: { contextWindow: 123_456 }, inputModalities: ['text', 'image'] }
     expect((await pool.listModels('test')).map(model => model.id)).toEqual(['one', 'two'])
-    expect(await pool.resolveModel('test', 'model')).toMatchObject({ context: { contextWindow: 123_456 }, inputModalities: ['text', 'image'] })
+    expect(await pool.resolveModel('test', 'model')).toMatchObject({ name: 'Friendly Model', context: { contextWindow: 123_456 }, inputModalities: ['text'] })
     expect(pool.read()).toMatchObject({ starts: 2, reuses: 4, recycles: 6 })
     workers[0]!.calls[0]!.complete('finish')
     workers[1]!.calls[0]!.complete('finish')
     await Promise.all([a, b])
+  })
+
+  it('conservative modality capabilities and union of supported reasoning tiers', async () => {
+    const { pool, workers } = setup()
+    const a = run(pool, request('a'))
+    const b = run(pool, request('b'))
+    await flush()
+    workers[0]!.resolved = { ...workers[0]!.resolved, inputModalities: ['text'], reasoning: { efforts: [
+      { id: 'low' as NonNullable<GenerateOptions['reasoningEffort']>, name: 'Low' },
+      { id: 'high' as NonNullable<GenerateOptions['reasoningEffort']>, name: 'High' },
+    ], defaultEffort: 'medium' as GenerateOptions['reasoningEffort'] } }
+    workers[1]!.resolved = { ...workers[1]!.resolved, inputModalities: ['text', 'image'], reasoning: { efforts: [
+      { id: 'medium' as NonNullable<GenerateOptions['reasoningEffort']>, name: 'Medium' },
+    ], defaultEffort: 'medium' as GenerateOptions['reasoningEffort'] } }
+    const resolved = await pool.resolveModel('test', 'model')
+    expect(resolved.inputModalities).toEqual(['text'])
+    expect(resolved.reasoning?.efforts.map(entry => entry.id.toString())).toEqual(['low', 'medium', 'high'])
+    expect(resolved.reasoning?.defaultEffort?.toString()).toBe('medium')
+    workers[0]!.resolved = { ...workers[0]!.resolved, inputModalities: ['text', 'image'] }
+    workers[1]!.resolved = { ...workers[1]!.resolved, inputModalities: undefined }
+    expect((await pool.resolveModel('test', 'model')).inputModalities).toBeUndefined()
+    workers[0]!.calls[0]!.complete('finish')
+    workers[1]!.calls[0]!.complete('finish')
+    await Promise.all([a, b])
+  })
+
+  it('图片请求只准备实际承载的 worker，文本请求不新增握手', async () => {
+    const ensureImages = vi.fn(async () => undefined)
+    const { pool, workers } = setup({ capacity: 2, ensureImages })
+    const a = run(pool, request('a'))
+    await flush()
+    const ref: ImageAttachmentRef = { attachmentId: AttachmentId('sha256:image'), mediaType: 'image/png', bytes: 1, width: 1, height: 1 }
+    const image = run(pool, request('image', { messages: [createUserMessage({ content: [{ type: 'image', attachment: ref }], source: { kind: 'user' } })] }))
+    await vi.waitFor(() => expect(workers.length).toBe(2))
+    await vi.waitFor(() => expect(workers[1]!.calls).toHaveLength(1))
+    expect(ensureImages).toHaveBeenCalledTimes(1)
+    workers[0]!.calls[0]!.complete('finish')
+    workers[1]!.calls[0]!.complete('finish')
+    await Promise.all([a, image])
+  })
+
+  it('图片准备失败后归还 worker，下一次文本请求仍可调度', async () => {
+    const failure = new Error('capability handshake failed')
+    const ensureImages = vi.fn(async () => { throw failure })
+    const { pool, workers } = setup({ capacity: 1, ensureImages })
+    const ref: ImageAttachmentRef = { attachmentId: AttachmentId('sha256:image'), mediaType: 'image/png', bytes: 1, width: 1, height: 1 }
+    await expect(outcome(run(pool, request('image', { messages: [createUserMessage({ content: [{ type: 'image', attachment: ref }], source: { kind: 'user' } })] }))))
+      .resolves.toMatchObject({ ok: false, error: failure })
+    expect(pool.busy).toBe(false)
+    const next = run(pool, request('next'))
+    await vi.waitFor(() => expect(workers[0]!.calls).toHaveLength(1))
+    workers[0]!.calls[0]!.complete('finish')
+    expect(await next).toContainEqual({ type: 'text-delta', index: 0, text: 'worker-0' })
   })
 
   it('聊天结束后的预热、目录读取及能力准备复用空闲 worker，不因粘性扩容', async () => {

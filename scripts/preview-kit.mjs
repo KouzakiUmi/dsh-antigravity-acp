@@ -12,9 +12,9 @@ runInNewContext(source, { window: { __ModuleLoader__: { load(value) { plugin = v
 let index = 0
 let states = {}
 const React = {
-  createElement: (type, props, ...children) => ({ type, props: props ?? {}, children: children.flat() }),
+  createElement: (type, props, ...children) => typeof type === 'function' ? type({ ...(props ?? {}), children: children.flat() }) : ({ type, props: props ?? {}, children: children.flat() }),
   useState: (initial) => [index in states ? states[index++] : (index++, initial), () => {}],
-  useRef: (value) => ({ current: value }), useCallback: (fn) => fn, useEffect() {},
+  useRef: (value) => ({ current: value }), useCallback: (fn) => fn, useEffect() {}, useId: () => 'preview',
   useSyncExternalStore: (_subscribe, getSnapshot) => getSnapshot(),
 }
 const components = new Map()
@@ -49,13 +49,13 @@ function pill(model, open = false) {
 }
 const models = [{ id: 'gemini-3.8-flash', name: 'Gemini Flash', inputModalities: ['text', 'image'] }, { id: 'claude-sonnet-5-5', name: 'Claude Sonnet', inputModalities: ['text'] }, { id: 'gemini-4-argon', name: 'Gemini 4 Argon', inputModalities: ['text', 'image'] }]
 const settings = render('antigravity-acp', {
-  0: quota, 2: { state: 'connected', message: 'ACP 已预热，连接将保留供聊天复用（模拟）', runtime: {
+  0: { state: 'connected', message: 'ACP 已预热，连接将保留供聊天复用（模拟）', runtime: {
     phase: 'ready', phaseElapsedMs: 800, processRunning: true, uptimeMs: 183400,
     starts: 1, reuses: 4, recycles: 0,
     queue: { active: 0, parked: 0, waiting: 0, workers: 1, capacity: 2 },
     startup: { elapsedMs: 7120, timings: { binary: 20, credentials: 2100, spawn: 10, initialize: 4990 } },
     round: { model: 'gemini-3.8-flash-low', elapsedMs: 4800, timings: { connection: 1, session: 1200, model: 10 }, firstChunkMs: 1800, firstToolMs: 2100, continuations: 2, lastContinuationMs: 1200 },
-  } }, 3: models,
-  6: { revision: 1 }, 7: true, 8: { autoWarmup: true, preferredModel: 'gemini-3.8-flash', proxyUrl: '', proxyBypass: '', agyCliPath: '' }, 10: false, 11: true,
+  } }, 1: models,
+  4: { revision: 1 }, 5: true, 6: { autoWarmup: true, reuseSessions: true, preferredModel: 'gemini-3.8-flash', proxyUrl: '', proxyBypass: '', agyCliPath: '' }, 8: false, 9: true,
 }, { remote: {}, control() {} })
 export { quota, models, settings, pill, render, escape }

@@ -158,6 +158,8 @@ export interface CachedModel {
 export interface AdapterMetadata {
   catalog: CachedModel[]
   contextWindows: Array<[string, number]>
+  /** 区分真实 ACP 档位观测与 CLI 家族兜底，避免弱快照覆盖完整目录。 */
+  catalogSource: 'acp' | 'fallback'
   imageSupported?: boolean
 }
 
@@ -244,10 +246,16 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   readonly #readImage?: ImageReader
   readonly #canReadImages?: () => boolean
   #imageSupported: boolean | undefined
+  /** 当前目录来源：ACP 原始档位观测优先于 CLI 家族兜底。 */
+  #catalogSource: 'acp' | 'fallback' = 'fallback'
+  /** 仅其它 worker 的 CLI 家族目录，不能冒充当前 worker 的 ACP 观测。 */
+  #fallbackCatalog: LlmModelInfo[] = []
   /** 官方 CLI 清单的在途读取；完成即释放，底层负责缓存和后台刷新。 */
   #cliCatalog?: Promise<readonly { id: string; name: string }[]>
-  /** 家族 → 支持的思考强度档位（由 listModels 折叠得到）。 */
+  /** 家族 → 支持的思考强度档位（由目录折叠得到）。 */
   #familyTiers = new Map<string, ReadonlySet<AgyReasoningEffort>>()
+  /** 防止异步 CLI 读取后的旧折叠结果覆盖较新的会话目录。 */
+  #catalogFoldGeneration = 0
   /**
    * 最近一次家族折叠的结果（id → 折叠后的条目）。供 `resolveModel` 同步取
    * 显示名：DSH 的路由键是折叠后的家族 id，而 `#catalog` 只含 ACP 的档位 id。
@@ -357,7 +365,11 @@ export class AntigravityAcpAdapter extends LlmAdapter {
 
   exportMetadata(): AdapterMetadata {
     return {
-      catalog: this.#catalog.map(({ id, name, description }) => ({ id, name, ...(description === undefined ? {} : { description }) })),
+      // 同步原始档位条目：仅传折叠后的家族会丢掉其他 worker 尚未列出的
+      // low/high 变体，导致模型名称与 reasoning 档位在不同 worker 间漂移。
+      catalog: this.#catalog.length ? this.#catalog.map(({ id, name, description }) => ({ id, name, ...(description === undefined ? {} : { description }) }))
+        : [...this.#foldedFamilies.values()].map(({ id, name, description }) => ({ id, name, ...(description === undefined ? {} : { description }) })),
+      catalogSource: this.#catalogSource,
       contextWindows: [...this.#contextWindows],
       ...(this.#imageSupported === undefined ? {} : { imageSupported: this.#imageSupported }),
     }
@@ -365,8 +377,16 @@ export class AntigravityAcpAdapter extends LlmAdapter {
 
   importMetadata(metadata: AdapterMetadata): void {
     if (metadata.imageSupported !== undefined) this.#imageSupported = metadata.imageSupported
-    if (metadata.catalog.length) {
-      this.#catalog = metadata.catalog.map((model) => ({ ...model, provider: AGY_PROVIDER_ID, inputModalities: ['text'] }))
+    if (metadata.catalog.length && (this.#catalog.length === 0 || metadata.catalogSource === 'acp' || this.#catalogSource !== 'acp')) {
+      ++this.#catalogFoldGeneration
+      const catalog = metadata.catalog.map((model) => ({ ...model, provider: AGY_PROVIDER_ID, inputModalities: ['text'] as const }))
+      if (metadata.catalogSource === 'fallback') {
+        this.#fallbackCatalog = catalog
+        this.#catalogSource = 'fallback'
+      } else {
+        this.#catalog = catalog
+        this.#catalogSource = 'acp'
+      }
       this.#catalogObserved = true
       this.#cacheLoad = undefined
     }
@@ -384,7 +404,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     let link: AgentLink | undefined
     let discoverySession: string | undefined
     try {
-      await withAbort(this.#settleRecycle(), signal)
+      await withAbort(this.#settleRecycle(true), signal)
       link = await this.#getLink(this.#handlers, signal, interactive ? undefined : 'warmup')
       this.#observeCapabilities(link)
       throwIfAborted(signal)
@@ -415,7 +435,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     this.#streamActive = true
     this.#clearIdleRecycle()
     try {
-      await withAbort(this.#settleRecycle(), signal)
+      await withAbort(this.#settleRecycle(true), signal)
       const link = await this.#getLink(this.#handlers, signal, interactive ? undefined : 'warmup')
       this.#observeCapabilities(link)
     } finally {
@@ -437,8 +457,11 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     return { readImage: this.#readImage, supported: this.#imageSupported === true && (this.#canReadImages?.() ?? true), signal }
   }
 
-  #inputModalities(): readonly ('text' | 'image')[] {
-    return this.#readImage && this.#imageSupported === true && (this.#canReadImages?.() ?? true) ? ['text', 'image'] : ['text']
+  #inputModalities(): readonly ('text' | 'image')[] | undefined {
+    if (!this.#readImage || !(this.#canReadImages?.() ?? true)) return ['text']
+    // 尚未握手时能力是未知，而不是确定只支持文本；准备调用会协商。
+    if (this.#imageSupported === undefined) return undefined
+    return this.#imageSupported ? ['text', 'image'] : ['text']
   }
 
   /** 私有 MCP 桥（诊断与测试可见；agent 侧只经 ACP mcpServers 访问它）。 */
@@ -488,7 +511,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         id: model.id,
         name: model.name,
         ...(model.description === undefined ? {} : { description: model.description }),
-        inputModalities: this.#inputModalities(),
+        ...(this.#inputModalities() === undefined ? {} : { inputModalities: this.#inputModalities() }),
       })),
     ]
   }
@@ -501,10 +524,11 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     models: Array<{ id: string; name: string; description?: string }>
     tiers: Map<string, ReadonlySet<AgyReasoningEffort>>
   }> {
+    const generation = ++this.#catalogFoldGeneration
     // 未观测到真实目录时用磁盘缓存兜住选择器空窗。
-    const source = this.#catalog.length > 0
-      ? this.#catalog
-      : await this.#cachedModels(provider)
+    // 磁盘缓存来自 ACP 原始档位观测，优先于其它 worker 的 CLI 家族兜底。
+    const cached = this.#catalog.length > 0 ? this.#catalog : await this.#cachedModels(provider)
+    const source = cached.length > 0 ? cached : [...this.#fallbackCatalog]
     const folded = foldAgyModelFamilies([
       ...source
         .filter((model) => model.id !== AGY_PLACEHOLDER_MODEL_ID)
@@ -515,8 +539,11 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         })),
       ...await this.#cliRawRows(),
     ])
-    this.#familyTiers = folded.tiers
-    this.#foldedFamilies = new Map(folded.models.map((model) => [model.id, model]))
+    // 目录可能在 CLI 缓存读取期间更新；旧折叠结果不能覆盖新观测。
+    if (generation === this.#catalogFoldGeneration) {
+      this.#familyTiers = folded.tiers
+      this.#foldedFamilies = new Map(folded.models.map((model) => [model.id, model]))
+    }
     return folded
   }
 
@@ -583,12 +610,18 @@ export class AntigravityAcpAdapter extends LlmAdapter {
    * （catalog membership remains advisory），因此这里不因未登记的 id 报错；
    * 真正的能力拒绝发生在 ACP 会话侧（模型不存在时 agent 自行报错）。
    */
-  override async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+  override async resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+    // 显示名与档位不能只依赖此前是否有人列过目录；跨 worker 导入目录后
+    // 也要走同一份折叠结果。这里仅读缓存，不启动 ACP 连接。
+    const folded = await withAbort(this.#foldCatalog(provider), signal)
+    throwIfAborted(signal)
+    const families = new Map(folded.models.map((entry) => [entry.id, entry]))
+    const tiers = folded.tiers
     // DSH 的路由键是折叠后的家族 id（`claude-opus-5-5`），而 `#catalog` 只含
     // ACP 声明的档位 id（`…-high`）。查不到时用最近一次折叠结果补上显示名，
     // 不要退化成裸 id。
     const known = this.#catalog.find((entry) => entry.id === model)
-      ?? this.#foldedFamilies.get(model)
+      ?? families.get(model)
     // 上下文容量只在**实测**过（usage_update.size）或缓存过时才声明；官方目录
     // 不报告容量，绝不填猜测值。缺省时不带 context，压缩引擎按未知处理。
     const contextWindow = this.#contextWindows.get(model)
@@ -596,18 +629,18 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       provider,
       id: model,
       name: known?.name ?? model,
-      inputModalities: this.#inputModalities(),
+      ...(this.#inputModalities() === undefined ? {} : { inputModalities: this.#inputModalities() }),
       ...(known?.description === undefined ? {} : { description: known.description }),
       ...(contextWindow === undefined ? {} : { context: { contextWindow } }),
       // 思考强度菜单：官方把强度编码进模型 id 后缀，本 provider 只出家族条目，
       // 由菜单选择路由到对应档位（2026-10-16 用户指示）。
-      reasoning: this.#reasoningInfo(model),
+      reasoning: this.#reasoningInfo(model, tiers),
     }
   }
 
   /** 该路由可选的思考强度（low/medium/high，弱→强）；缺省档位为 medium。 */
-  #reasoningInfo(model: string): LlmModelReasoningInfo {
-    const tiers = this.#familyTiers.get(modelFamilyId(model))
+  #reasoningInfo(model: string, familyTiers = this.#familyTiers): LlmModelReasoningInfo {
+    const tiers = familyTiers.get(modelFamilyId(model))
     // 已知该 id 没有档位变体（目录里的普通 id）：强度菜单不适用，不显示。
     if (tiers !== undefined && tiers.size === 0) return { efforts: [] }
     const efforts = AGY_REASONING_EFFORTS
@@ -616,13 +649,19 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         id: ReasoningEffortId(effort),
         name: AGY_REASONING_EFFORT_NAMES[effort],
       }))
-    return { efforts, defaultEffort: ReasoningEffortId(DEFAULT_AGY_REASONING_EFFORT) }
+    const fallback = efforts.find((entry) => entry.id === ReasoningEffortId(DEFAULT_AGY_REASONING_EFFORT))
+    return { efforts, ...(fallback ? { defaultEffort: fallback.id } : {}) }
+  }
+
+  /** 池已选定 worker 后，为该连接协商图片能力；不建会话、不发送 prompt。 */
+  async prepareImages(signal?: AbortSignal): Promise<void> {
+    if (this.#readImage && (this.#canReadImages?.() ?? true) && this.#imageSupported === undefined) await this.warmup(signal, true)
   }
 
   override async prepareCall(provider: string, model: string, signal?: AbortSignal): Promise<PreparedAdapterCall> {
     // Request preparation runs before DSH projects image blocks. Discovery here only
     // handshakes; passive listModels/resolveModel remain free of connection I/O.
-    if (this.#readImage && (this.#canReadImages?.() ?? true) && this.#imageSupported === undefined) await this.warmup(signal, true)
+    await this.prepareImages(signal)
     const modelInfo = await this.resolveModel(provider, model, signal)
     return {
       model: modelInfo,
@@ -891,8 +930,11 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     this.#idleRecycle = undefined
   }
 
-  /** 等待取消排空与回收；回收失败仍保留屏障，后续调用可重试同一连接。 */
-  async #settleRecycle(): Promise<void> {
+  /**
+   * 等待取消排空与回收。普通聊天保留旧语义：上一次回收失败先报告给本轮，
+   * 同时在后台重试；显式预热/目录刷新则等待本次补试，不无限自旋。
+   */
+  async #settleRecycle(retryFailed = false): Promise<void> {
     // 本地 aborted 不是停止证明；新回合不能撤销旧回合的排空屏障。
     await this.#cancelGrace?.pending
     try {
@@ -904,8 +946,8 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         : this.#recycleLink(stuck).then(() => {
           if (this.#unrecycledLink === stuck) this.#unrecycledLink = undefined
         })
-      // 重试在后台进行；它失败时下一轮会再次走到这里。
       void this.#cleanup.catch(() => undefined)
+      if (retryFailed) return await this.#cleanup
       throw error
     }
   }
@@ -1423,11 +1465,17 @@ export class AntigravityAcpAdapter extends LlmAdapter {
    * `session/new`、`session/set_config_option` 与 `config_option_update` 共用。
    */
   observeSessionConfigOptions(configOptions: readonly SessionConfigOption[] | null | undefined): void {
+    ++this.#catalogFoldGeneration
     const selector = findModelSelector(configOptions)
     this.#catalogObserved = true
-    this.#modelSelector = selector
-    this.#catalog = toModelCatalog(AGY_PROVIDER_ID, selector)
-    this.#onMetadataChanged?.(this.exportMetadata())
+    // session/new 与 session/load 允许省略 configOptions。一次不完整观测
+    // 不能抹掉已知目录或选择器，否则后续会话会无故失去模型路由能力。
+    if (selector) {
+      this.#modelSelector = selector
+      this.#catalog = toModelCatalog(AGY_PROVIDER_ID, selector)
+      this.#catalogSource = 'acp'
+      this.#onMetadataChanged?.(this.exportMetadata())
+    }
     // 观测到真实目录后缓存不再参与 listModels，避免配置变更后仍读到旧磁盘目录。
     this.#cacheLoad = undefined
     // 真实目录只在会话建立后才能观测到；落盘后重启不必退化成占位模型。

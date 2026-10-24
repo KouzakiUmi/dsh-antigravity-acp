@@ -266,13 +266,16 @@ export async function fetchAgyUsage(run: CliRun, cliPath: string): Promise<Quota
     return usageFailure(stamp, new AgyCliError('cli-bad-output', 'agy /usage 输出不是合法 JSON'))
   }
   const envelope = typeof payload === 'object' && payload !== null ? payload as Record<string, unknown> : {}
+  const command = typeof envelope.command === 'object' && envelope.command !== null
+    ? envelope.command as Record<string, unknown>
+    : {}
+  if (envelope.status !== 'SUCCESS' || command.name !== 'usage') {
+    return usageFailure(stamp, new AgyCliError('cli-bad-output', 'agy /usage 未返回成功的本地额度报告'))
+  }
   const groups = parseAgyUsage(payload)
   if (groups.length === 0) {
     return usageFailure(stamp, new AgyCliError('cli-bad-output', 'agy /usage 输出里没有额度分组'))
   }
-  const command = typeof envelope.command === 'object' && envelope.command !== null
-    ? envelope.command as Record<string, unknown>
-    : {}
   const data = typeof command.data === 'object' && command.data !== null
     ? command.data as Record<string, unknown>
     : {}

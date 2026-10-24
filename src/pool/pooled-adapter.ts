@@ -6,6 +6,7 @@ import type { AntigravityAcpAdapter } from '../adapter/antigravity-adapter.js'
 /** Workers own independent transports, bridges and prompt state. No tool execution lives here. */
 export interface AcpWorker {
   adapter: Pick<AntigravityAcpAdapter, 'busy' | 'stream' | 'listModels' | 'resolveModel' | 'warmup' | 'discoverModels'> & Partial<Pick<AntigravityAcpAdapter, 'prepareCall'>>
+  ensureImages?: (signal?: AbortSignal) => Promise<void>
   read(): AcpLifecycleSnapshot
   dispose(): Promise<void>
 }
@@ -56,7 +57,21 @@ export class PooledAcpAdapter extends LlmAdapter {
   }
   override async resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
     const models = await Promise.all(this.slots.map(s => s.worker.adapter.resolveModel(provider, model, signal)))
-    return models.find(m => m.context !== undefined) ?? models[0]!
+    const first = models[0]
+    if (!first) throw new LlmError('ACP 没有可用的模型元数据', 'AGY_MODEL_UNAVAILABLE')
+    const known = models.find(m => m.name !== m.id)
+    const reasoning = mergeReasoning(models)
+    const modalities = models.every(m => m.inputModalities !== undefined)
+      ? models.map(m => m.inputModalities!).reduce((supported, entries) => supported.filter(entry => entries.includes(entry)))
+      : undefined
+    return {
+      ...first,
+      inputModalities: undefined,
+      ...(modalities === undefined ? {} : { inputModalities: modalities }),
+      ...(known ? { name: known.name, ...(known.description === undefined ? {} : { description: known.description }) } : {}),
+      ...(models.some(m => m.context !== undefined) ? { context: models.find(m => m.context !== undefined)!.context } : {}),
+      ...(reasoning ? { reasoning } : {}),
+    }
   }
 
   /** Recheck capabilities when host services change, without interrupting active callers. */
@@ -99,11 +114,13 @@ export class PooledAcpAdapter extends LlmAdapter {
   }
   override async *stream(options: GenerateOptions): AsyncGenerator<StreamChunk> {
     const slot = await this.acquire(options, options.signal)
-    slot.owner = { sessionId: options.sessionId, purpose: options.purpose }
-    // 粘住承载该对话的 worker：ACP 会话复用记录在 worker 内部。
-    const affinityKey = this.affinityKey(options)
-    if (affinityKey !== undefined) this.rememberAffinity(affinityKey, this.slots.indexOf(slot))
     try {
+      // 握手失败或取消也必须归还槽位，不能让池被一次图片准备错误耗尽。
+      if (slot.worker.ensureImages && hasImageInput(options)) await slot.worker.ensureImages(options.signal)
+      slot.owner = { sessionId: options.sessionId, purpose: options.purpose }
+      // 粘住承载该对话的 worker：ACP 会话复用记录在 worker 内部。
+      const affinityKey = this.affinityKey(options)
+      if (affinityKey !== undefined) this.rememberAffinity(affinityKey, this.slots.indexOf(slot))
       yield* slot.worker.adapter.stream(options)
     } finally {
       slot.leased = false
@@ -274,6 +291,23 @@ export class PooledAcpAdapter extends LlmAdapter {
     if (this.waiters.length && !this.poll) { this.poll = setInterval(() => this.dispatch(), 100); this.poll.unref() }
     if (!this.waiters.length && this.poll) { clearInterval(this.poll); this.poll = undefined }
   }
+}
+
+function hasImageInput(options: GenerateOptions): boolean {
+  return options.messages.some(message => message.role === 'tool'
+    ? message.content.some(block => block.type === 'image')
+    : Array.isArray(message.content) && message.content.some(block => block.type === 'image'))
+}
+
+const effortOrder: Record<string, number> = { low: 0, medium: 1, high: 2 }
+function mergeReasoning(models: readonly LlmResolvedModelInfo[]): LlmResolvedModelInfo['reasoning'] {
+  const known = models.filter(model => model.reasoning !== undefined)
+  if (known.length === 0) return undefined
+  const efforts = [...new Map(known.flatMap(model => model.reasoning!.efforts).map(entry => [entry.id.toString(), entry])).values()]
+    .sort((a, b) => (effortOrder[a.id.toString()] ?? 99) - (effortOrder[b.id.toString()] ?? 99))
+  const preferred = known.map(model => model.reasoning!.defaultEffort?.toString()).find(value => value !== undefined)
+  const fallback = efforts.find(entry => entry.id.toString() === preferred) ?? efforts.find(entry => entry.id.toString() === 'medium')
+  return { efforts, ...(fallback ? { defaultEffort: fallback.id } : {}) }
 }
 
 function waitWithSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {

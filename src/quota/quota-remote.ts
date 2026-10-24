@@ -190,6 +190,10 @@ export class AgYQuotaService extends TypertRemoteService {
   private _inflight: Promise<QuotaSnapshot> | undefined
   /** 在途取数是否真的绕过了缓存（而非「命中缓存」的即时返回）；force 的合并判定依据。 */
   private _inflightBypassed = false
+  /** _read 在首个 await 前同步写入，供 read() 判断在途请求是否真正全量刷新。 */
+  private _readCacheStatus = { quota: true, credits: true }
+  /** 上次实际执行的 force 是否要求两路绕过缓存（在调用 _read 前失效）。 */
+  private _forcedRead = false
 
   constructor(ctx: Context, options: AgYQuotaServiceOptions = {}) {
     super(ctx, AGY_QUOTA_SERVICE)
@@ -220,8 +224,18 @@ export class AgYQuotaService extends TypertRemoteService {
       if (!force || this._inflightBypassed) return existing
       await existing.catch(() => undefined)
     }
+    if (force) {
+      // 必须在调用 _read 前失效：旧的部分读取即使刚完成，也不能把新 force
+      // 误变成命中缓存。保留 value 供失败时 stale 展示。
+      delete this._cache.at
+      delete this._creditsCache.at
+    }
+    this._forcedRead = force
     const run = this._read(request)
     this._inflight = run
+    // 只有「两路都取新数据」的在途读取才能吸收后续强制刷新。若其中一路命中
+    // 缓存，让 force 等本轮结束后再单独补刷，避免把手动刷新静默降级成旧值。
+    this._inflightBypassed = !this._readCacheStatus.quota && !this._readCacheStatus.credits
     try {
       return await run
     } finally {
@@ -230,29 +244,24 @@ export class AgYQuotaService extends TypertRemoteService {
   }
 
   private async _read(request?: AgYQuotaRequest): Promise<QuotaSnapshot> {
-    // 本次读取是否真正取了新数（_read 的同步段就会定出，供 read() 做合并判定）。
-    this._inflightBypassed = false
-    if (request?.force === true) {
-      // 只让缓存失效（清时间戳），保留上一次成功的数据：刷新失败时还能以 stale 形式展示。
-      delete this._cache.at
-      delete this._creditsCache.at
-    }
     // 这条日志让「药丸到底有没有把请求发到 Host」可证：浏览器侧完全无法写宿主日志。
     const cli = this._resolveCli?.() ?? this._cli
     const source = cli ? `cli=${redactSensitiveText(cli.cliPath)}` : 'http（未找到 agy CLI）'
     this._log?.info(`antigravity-acp: 额度取数请求（force=${request?.force === true}，来源 ${source}）`)
     try {
       const now = Date.now()
+      // 双路 CLI 的完成时间可能不同：本轮时间戳必须一致，且不能早于请求开始。
+      // 否则后到结果的时间戳会被另一路覆盖，使缓存提前过期或 force 后立即重读。
+      const fetchedAt = Math.max(now, this._cache.at ?? 0, this._creditsCache.at ?? 0)
       const cached = this._cache.value
       const previousCredits = this._creditsCache.value
-      const quotaCached = Boolean(cached && this._cache.at !== undefined && now - this._cache.at < QUOTA_CACHE_MS && cached.status === 'ok' && cached.stale !== true)
-      const creditsCached = Boolean(previousCredits && this._creditsCache.at !== undefined && now - this._creditsCache.at < QUOTA_CACHE_MS && previousCredits.status !== 'error' && !previousCredits.stale)
+      const quotaCached = !this._forcedRead && Boolean(cached && this._cache.at !== undefined && now - this._cache.at < QUOTA_CACHE_MS && cached.status === 'ok' && cached.stale !== true)
+      const creditsCached = !this._forcedRead && Boolean(previousCredits && this._creditsCache.at !== undefined && now - this._creditsCache.at < QUOTA_CACHE_MS && previousCredits.status !== 'error' && !previousCredits.stale)
+      this._readCacheStatus = { quota: quotaCached, credits: creditsCached }
       if (quotaCached && creditsCached) {
         this._log?.info('antigravity-acp: 套餐额度与余额命中独立缓存')
         return { ...cached!, credits: previousCredits }
       }
-      // force 只能加入两路均取新数据的请求，不能把局部刷新误认成全部刷新。
-      this._inflightBypassed = !quotaCached && !creditsCached
       // 上一次成功数据必须在取数**前**捕获：HTTP 回退实现（fetchQuotaSnapshot）
       // 会把失败快照写进同一个缓存对象，取完再读就只剩失败结果了。
       const previous = this._cache.value
@@ -270,7 +279,7 @@ export class AgYQuotaService extends TypertRemoteService {
         : freshCredits
       this._creditsCache.value = credits
       if (credits.stale || credits.status === 'error') delete this._creditsCache.at
-      else if (!creditsCached) this._creditsCache.at = now
+      else if (!creditsCached) this._creditsCache.at = fetchedAt
       // 刷新失败但手里有上一次成功的数据：继续展示它并标记 stale，而不是让药丸
       // 因为一次网络抖动就从「剩余 62%」变成「额度读取失败」。CLI 与 HTTP 回退
       // 共用同一条 stale 保留语义。
@@ -280,7 +289,7 @@ export class AgYQuotaService extends TypertRemoteService {
       this._cache.value = snapshot
       // stale 不算新鲜：不刷新时间戳，也不被缓存命中分支当作可复用结果，下次调用立刻重试。
       if (snapshot.stale === true) delete this._cache.at
-      else if (!quotaCached) this._cache.at = now
+      else if (!quotaCached) this._cache.at = fetchedAt
       this._log?.info(
         `antigravity-acp: 额度取数结果 status=${snapshot.status} 组数=${snapshot.groups.length}` +
           (snapshot.error ? ` 错误=${snapshot.error.code}:${snapshot.error.message.slice(0, 160)}` : ''),
