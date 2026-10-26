@@ -23,9 +23,9 @@ window.__ModuleLoader__.load({
     const React = require('react')
     const h = React.createElement
     const PROVIDER = 'antigravity-acp'
-    /** Settings namespace injected by `settings.configure({ auto: true })` in src/index.ts. */
+    /** Settings namespace projected from Config's volatile fields in src/settings.ts. */
     const ENTRY_ID = 'llm-antigravity-acp'
-    /** Editable fields surfaced in this card; everything else stays in the host form. */
+    /** Live fields owned by this card; ordinary fields stay in the host config editor. */
     const FIELDS = [
       { key: 'autoWarmup', group: 'general', checkbox: true, defaultChecked: true, label: '启动时自动预热', hint: '提前启动并保留连接，不发送模型消息。保存后下次启用插件生效；本次可点击“立即预热”。' },
       { key: 'reuseSessions', group: 'general', checkbox: true, defaultChecked: true, label: '复用 ACP 会话（增量发送）', hint: '校验历史与实际输出后只发新增消息；变化的上下文仍发送，不一致时自动重建。' },
@@ -280,7 +280,8 @@ window.__ModuleLoader__.load({
           setConflicts((previous) => [...new Set([...previous.filter((key) => dirty.current.has(key)), ...changed])])
           setWritable(settings?.writable === true)
           setRegistered(rows.some((row) => row?.id === PROVIDER))
-          if (!preserveStatus) setStatus(null)
+          if (!found) setStatus({ kind: 'error', text: '宿主尚未提供 Antigravity ACP 的可编辑设置。请确认 Host 与 Client 插件版本一致，并重新加载插件后刷新配置。' })
+          else if (!preserveStatus) setStatus(null)
         } catch (cause) {
           if (alive.current && version === settingsVersion.current) setStatus({ kind: 'error', text: cause instanceof Error ? cause.message : String(cause) })
         } finally {
@@ -310,7 +311,7 @@ window.__ModuleLoader__.load({
           }
           setDirtyKeys([...dirty.current])
           setConflicts([])
-          setStatus({ kind: 'ok', text: '已保存。重新加载插件可应用运行配置；当前对话中的已选模型保持不变。' })
+          setStatus({ kind: 'ok', text: '已保存。会话偏好从下一轮生效；代理用于后续请求及新启动的 ACP 进程，已有进程需重新加载插件才能切换代理。自动预热在下次启用插件时生效；当前已选模型保持不变。' })
           await reload(true)
         } catch (cause) {
           if (!alive.current) return

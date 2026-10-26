@@ -3,6 +3,7 @@
  * schema 写法对准已安装 @deepseek-ai/schemastery 3.18.x 的实际导出。
  */
 import Schema from '@deepseek-ai/schemastery'
+import type { Volatile } from '@deepseek-ai/cordis'
 import { DEFAULT_ACP_SERVER_VERSION } from './runtime/binary.js'
 
 export interface AntigravityHostConfig {
@@ -73,11 +74,43 @@ export interface AntigravityHostConfig {
   idleRecycleMs?: number
 }
 
+// Only fields owned by the custom settings card are live. Ordinary launch/pool
+// configuration remains ordinary, so editing it still follows the host lifecycle.
+export const LIVE_SETTING_KEYS = ['autoWarmup', 'reuseSessions', 'preferredModel', 'proxyUrl', 'proxyBypass', 'agyCliPath', 'resumeSessions', 'keepProcessAfterCancel', 'cancelGraceMs', 'idleRecycleMs'] as const
+export type LiveSettingKey = typeof LIVE_SETTING_KEYS[number]
+export type AntigravityPluginConfig = Omit<AntigravityHostConfig, LiveSettingKey> & {
+  [K in LiveSettingKey]?: AntigravityHostConfig[K] | Volatile<AntigravityHostConfig[K]>
+}
+
+function readSetting(value: string | Volatile<string | undefined> | undefined): string | undefined
+function readSetting(value: boolean | Volatile<boolean | undefined> | undefined): boolean | undefined
+function readSetting(value: number | Volatile<number | undefined> | undefined): number | undefined
+function readSetting(value: string | boolean | number | Volatile<string | boolean | number | undefined> | undefined): string | boolean | number | undefined {
+  return typeof value === 'object' ? value.get() : value
+}
+
+/** Keep references live; callers may spread this view to capture one operation. */
+export function liveHostConfig(config: AntigravityPluginConfig): AntigravityHostConfig {
+  return {
+    ...config,
+    get autoWarmup() { return readSetting(config.autoWarmup) },
+    get reuseSessions() { return readSetting(config.reuseSessions) },
+    get preferredModel() { return readSetting(config.preferredModel) },
+    get proxyUrl() { return readSetting(config.proxyUrl) },
+    get proxyBypass() { return readSetting(config.proxyBypass) },
+    get agyCliPath() { return readSetting(config.agyCliPath) },
+    get resumeSessions() { return readSetting(config.resumeSessions) },
+    get keepProcessAfterCancel() { return readSetting(config.keepProcessAfterCancel) },
+    get cancelGraceMs() { return readSetting(config.cancelGraceMs) },
+    get idleRecycleMs() { return readSetting(config.idleRecycleMs) },
+  }
+}
+
 export const Config = Schema.object({
   maxConcurrentSessions: Schema.natural().min(1).max(4).default(2).description('最大并发 ACP 连接数（1–4），按需启动；不同对话互不占用工具审批回合'),
   queueTimeoutMs: Schema.natural().min(1000).default(120000).description('等待空闲 ACP 连接的最长时间（毫秒），排队期间可取消'),
-  agyCliPath: Schema.string().description('官方 agy CLI 路径；留空依次查 AGY_CLI_BIN、PATH 和默认安装目录'),
-  autoWarmup: Schema.boolean().default(true).description('插件启用时预热并保留 ACP 连接，减少首次聊天启动等待；复用本机登录态，不发送模型消息'),
+  agyCliPath: Schema.string().volatile().description('官方 agy CLI 路径；留空依次查 AGY_CLI_BIN、PATH 和默认安装目录'),
+  autoWarmup: Schema.boolean().default(true).volatile().description('插件启用时预热并保留 ACP 连接，减少首次聊天启动等待；复用本机登录态，不发送模型消息'),
   binaryPath: Schema.string().description('官方 agy-acp-server 可执行文件路径；留空则按 AGY_ACP_BIN → 缓存 → 自动下载解析'),
   autoDownload: Schema.boolean().default(true).description('未找到本地二进制时自动从 dl.google.com 下载（仅 https + 官方域名 + 拒绝重定向）'),
   extraArgs: Schema.array(Schema.string()).default([]).description('传给 ACP server 的额外命令行参数'),
@@ -87,12 +120,12 @@ export const Config = Schema.object({
   authTimeoutMs: Schema.natural().default(300_000).description('authenticate（需人工在浏览器完成 OAuth 授权）的等待上限（毫秒）'),
   promptTimeoutMs: Schema.natural().default(1_800_000).description('单轮 session/prompt 的等待上限（毫秒）'),
   bridgeParkSettleMs: Schema.natural().default(50).description('并发 MCP tools/call 的聚合窗口（毫秒）'),
-  preferredModel: Schema.string().description('默认/自定义模型 ID，优先列入目录；目录外 ID 未验证。兼容旧 server-default 路由，留空不指定默认项'),
-  proxyUrl: Schema.string().description('官方进程出网代理，如 http://127.0.0.1:7890（缺 scheme 按 http 处理）。留空继承宿主代理，宿主也未配置时才直连'),
-  proxyBypass: Schema.string().description('代理排除列表，逗号分隔，如 example.internal,*.internal；不支持 CIDR。localhost/127.0.0.1/::1 始终自动排除'),
-  reuseSessions: Schema.boolean().default(true).description('复用同一个 ACP 会话，后续回合只发送新增消息；历史被压缩/回退或模型、工具目录变化时自动重建。关闭则每轮新会话并重放全部历史'),
-  resumeSessions: Schema.boolean().default(false).description('重启后尝试用 session/load 恢复上次的 ACP 会话；依赖 agent 的 loadSession 能力，恢复失败会自动重建'),
-  keepProcessAfterCancel: Schema.boolean().default(false).description('用户取消后保留官方进程：宽限内确认 agent 已停止就只丢弃会话，下一轮不必冷启动；默认关闭'),
-  cancelGraceMs: Schema.natural().max(60_000).default(30_000).description('取消后等待 agent 确认停止的上限（毫秒）；0 表示不等待、立即回收'),
-  idleRecycleMs: Schema.natural().max(3_600_000).default(300_000).description('保留进程的最长空闲时间（毫秒），超时回收；0 表示不设上限。默认 5 分钟是本插件的资源回收策略，不代表上游缓存 TTL'),
+  preferredModel: Schema.string().volatile().description('默认/自定义模型 ID，优先列入目录；目录外 ID 未验证。兼容旧 server-default 路由，留空不指定默认项'),
+  proxyUrl: Schema.string().volatile().description('官方进程出网代理，如 http://127.0.0.1:7890（缺 scheme 按 http 处理）。留空继承宿主代理，宿主也未配置时才直连'),
+  proxyBypass: Schema.string().volatile().description('代理排除列表，逗号分隔，如 example.internal,*.internal；不支持 CIDR。localhost/127.0.0.1/::1 始终自动排除'),
+  reuseSessions: Schema.boolean().default(true).volatile().description('复用同一个 ACP 会话，后续回合只发送新增消息；历史被压缩/回退或模型、工具目录变化时自动重建。关闭则每轮新会话并重放全部历史'),
+  resumeSessions: Schema.boolean().default(false).volatile().description('重启后尝试用 session/load 恢复上次的 ACP 会话；依赖 agent 的 loadSession 能力，恢复失败会自动重建'),
+  keepProcessAfterCancel: Schema.boolean().default(false).volatile().description('用户取消后保留官方进程：宽限内确认 agent 已停止就只丢弃会话，下一轮不必冷启动；默认关闭'),
+  cancelGraceMs: Schema.natural().max(60_000).default(30_000).volatile().description('取消后等待 agent 确认停止的上限（毫秒）；0 表示不等待、立即回收'),
+  idleRecycleMs: Schema.natural().max(3_600_000).default(300_000).volatile().description('保留进程的最长空闲时间（毫秒），超时回收；0 表示不设上限。默认 5 分钟是本插件的资源回收策略，不代表上游缓存 TTL'),
 })

@@ -3,6 +3,7 @@ import { runInNewContext } from 'node:vm'
 import React from 'react'
 import { act, create, type ReactTestInstance, type ReactTestRenderer } from 'react-test-renderer'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { Config, LIVE_SETTING_KEYS, liveHostConfig } from '../src/settings.js'
 
 type SettingsDocument = { writable: boolean; namespaces: Array<{ ns: string; revision: number; value: Record<string, unknown> }> }
 
@@ -130,6 +131,50 @@ describe('quota pill with real React state and effects', () => {
 })
 
 describe('settings card with real React state and effects', () => {
+  it('所有设置控件都来自宿主实际可投影的 volatile 字段，并可修改、保存、回读', async () => {
+    const fields = Object.entries(Config.dict ?? {}).filter(([, field]) => field.meta.volatile).map(([key]) => key)
+    expect([...fields].sort()).toEqual([...LIVE_SETTING_KEYS].sort())
+    const values = liveHostConfig(Config({ autoWarmup: false }))
+    const projected = Object.fromEntries(fields.map(key => [key, Reflect.get(values, key)]))
+    const service = transport({ writable: true, namespaces: fields.length ? document(projected).namespaces : [] })
+    service.mutate.mockImplementation(async (_ns, ops, revision) => {
+      expect(revision).toBe(1)
+      for (const value of ops) {
+        const op = value as { path: string[]; value: unknown }
+        expect(fields).toContain(op.path[0])
+        projected[op.path[0]!] = op.value
+      }
+      service.change(document(projected, 2))
+      return { ok: true, value: undefined }
+    })
+    const { renderer } = await mount(service.remote)
+    const inputs = renderer.root.findAllByType('input')
+    expect(inputs).toHaveLength(LIVE_SETTING_KEYS.length)
+    expect(inputs.every(input => input.props.disabled === false)).toBe(true)
+    await act(async () => {
+      for (const input of inputs) input.props.onChange({ target: input.props.type === 'checkbox'
+        ? { checked: !input.props.checked }
+        : { value: input.props.type === 'number' ? '0' : 'test-value' } })
+    })
+    expect(button(renderer, '保存').props.disabled).toBe(false)
+    await act(async () => { await button(renderer, '保存').props.onClick() })
+    expect(service.mutate).toHaveBeenCalledTimes(1)
+    expect(service.mutate.mock.calls[0]![1]).toHaveLength(LIVE_SETTING_KEYS.length)
+    expect(button(renderer, '保存').props.disabled).toBe(true)
+    expect(modelInput(renderer).props.value).toBe('test-value')
+    expect(renderedText(renderer)).toContain('会话偏好从下一轮生效')
+  })
+
+  it('缺少设置 namespace 时解释禁用原因，宿主恢复后重新启用控件', async () => {
+    const service = transport({ writable: true, namespaces: [] })
+    const { renderer } = await mount(service.remote)
+    expect(modelInput(renderer).props.disabled).toBe(true)
+    expect(renderedText(renderer)).toContain('尚未提供 Antigravity ACP 的可编辑设置')
+    await act(async () => { service.change(document({ preferredModel: 'restored' })) })
+    expect(modelInput(renderer).props.disabled).toBe(false)
+    expect(renderedText(renderer)).not.toContain('尚未提供 Antigravity ACP 的可编辑设置')
+  })
+
   it('respects read-only settings instead of offering a save that will fail', async () => {
     const service = transport(document({ preferredModel: 'old-model' }, 1, false))
     const { renderer } = await mount(service.remote)

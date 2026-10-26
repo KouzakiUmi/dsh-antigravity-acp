@@ -1,10 +1,39 @@
 import { createServer } from 'node:net'
 import type { AddressInfo, Socket } from 'node:net'
 import { describe, expect, it, vi } from 'vitest'
-import { createProxiedFetch, PROXY_CLOSE_TIMEOUT_MS } from '../src/runtime/proxied-fetch.js'
+import { createLiveProxiedFetch, createProxiedFetch, PROXY_CLOSE_TIMEOUT_MS } from '../src/runtime/proxied-fetch.js'
 import type { UndiciLike } from '../src/runtime/proxied-fetch.js'
 
 describe('explicit proxy safety', () => {
+  it('保存后的代理切换和清空用于后续请求，不中断旧响应且卸载全部释放', async () => {
+    let proxy: { url: string; bypass: string } | undefined = { url: 'http://localhost:7890', bypass: '' }
+    const agents: Array<{ uri: string; destroy: ReturnType<typeof vi.fn> }> = []
+    const fallback = vi.fn(async () => new Response('host route'))
+    const request = createLiveProxiedFetch(() => proxy, {
+      fallback,
+      loadUndici: async () => ({
+        ProxyAgent: class {
+          uri: string
+          destroy = vi.fn(async () => {})
+          constructor(options: { uri: string }) { this.uri = options.uri; agents.push(this) }
+        },
+        fetch: async () => new Response('proxy route'),
+      }),
+    })
+    const first = await request('https://example.invalid/')
+    proxy = { url: 'http://localhost:7891', bypass: '' }
+    await request('https://example.invalid/')
+    expect(agents.map(agent => agent.uri)).toEqual(['http://localhost:7890/', 'http://localhost:7891/'])
+    expect(agents.every(agent => agent.destroy.mock.calls.length === 0)).toBe(true)
+    expect(await first.text()).toBe('proxy route')
+    proxy = undefined
+    expect(await (await request('https://example.invalid/')).text()).toBe('host route')
+    expect(fallback).toHaveBeenCalledTimes(1)
+    await Promise.all([request.close(), request.close()])
+    expect(agents.every(agent => agent.destroy.mock.calls.length === 1)).toBe(true)
+    await expect(request('https://example.invalid/')).rejects.toThrow('已关闭')
+  })
+
   it('never falls back when the configured proxy rejects a request', async () => {
     let fallbackCalls = 0
     const request = createProxiedFetch({ url: 'http://localhost:7890', bypass: '' }, {

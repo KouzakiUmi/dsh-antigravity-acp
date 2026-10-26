@@ -134,6 +134,8 @@ export interface AntigravityAcpAdapterOptions {
   idleRecycleMs?: number
   /** 所有 worker 共享的映射存储（含键所有权与串行提交）。 */
   sessionStore?: SessionMapStore
+  /** Capture live preferences only between ACP turns, never during tool continuation. */
+  readSettings?: () => Pick<AntigravityAcpAdapterOptions, 'preferredModel' | 'reuseSessions' | 'resumeSessions' | 'keepProcessAfterCancel' | 'cancelGraceMs' | 'idleRecycleMs' | 'sessionStore'>
   /** 独立 adapter 的兼容读取回调；连接池必须改用共享 sessionStore。 */
   loadSessionMap?: () => Promise<Record<string, SessionMapEntry>>
   /** 保存 ACP 会话映射；失败由实现方吞掉。 */
@@ -218,23 +220,24 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   readonly #promptTimeoutMs: number
   readonly #parkSettleMs: number
   readonly #cwd: string
-  readonly #preferredModel: string
+  #preferredModel: string
+  readonly #readSettings?: AntigravityAcpAdapterOptions['readSettings']
   readonly #loadCachedCatalog?: AntigravityAcpAdapterOptions['loadCachedCatalog']
   readonly #saveCatalog?: AntigravityAcpAdapterOptions['saveCatalog']
   readonly #loadCliCatalog?: AntigravityAcpAdapterOptions['loadCliCatalog']
   readonly #log?: AdapterLog
   readonly #onMetadataChanged?: AntigravityAcpAdapterOptions['onMetadataChanged']
-  readonly #reuseSessions: boolean
-  readonly #resumeSessions: boolean
-  readonly #sessionStore?: SessionMapStore
+  #reuseSessions: boolean
+  #resumeSessions: boolean
+  #sessionStore?: SessionMapStore
   readonly #sessionOwner = Symbol('acp-worker')
   /** 同一 DSH 对话（普通聊天轮）→ 可复用的 ACP 会话，最多 64 个。 */
   readonly #sessions = new Map<string, ReusedSession>()
   /** >0 时丢弃入站 session/update：`session/load` 会把整段历史重放回来。 */
   #suppressUpdates = 0
-  readonly #keepProcessAfterCancel: boolean
-  readonly #cancelGraceMs: number
-  readonly #idleRecycleMs: number
+  #keepProcessAfterCancel: boolean
+  #cancelGraceMs: number
+  #idleRecycleMs: number
   /** 取消后的确认定时器；agent 先确认停止就取消回收。 */
   #cancelGrace: { timer: ReturnType<typeof setTimeout>; link: AgentLink; turn: PromptTurn; pending: Promise<void>; resolve(): void } | undefined
   /** 保留进程的空闲回收定时器；有新回合就撤销。 */
@@ -302,6 +305,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     this.#parkSettleMs = options.parkSettleMs ?? DEFAULT_PARK_SETTLE_MS
     this.#cwd = options.cwd ?? process.cwd()
     this.#preferredModel = options.preferredModel?.trim() ?? ''
+    this.#readSettings = options.readSettings
     this.#loadCachedCatalog = options.loadCachedCatalog
     this.#saveCatalog = options.saveCatalog
     this.#loadCliCatalog = options.loadCliCatalog
@@ -395,10 +399,24 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     }
   }
 
+  #refreshSettings(): void {
+    const settings = this.#readSettings?.()
+    if (!settings) return
+    this.#preferredModel = settings.preferredModel?.trim() ?? ''
+    this.#reuseSessions = settings.reuseSessions ?? true
+    this.#resumeSessions = settings.resumeSessions ?? false
+    this.#keepProcessAfterCancel = settings.keepProcessAfterCancel ?? false
+    this.#cancelGraceMs = Math.max(0, settings.cancelGraceMs ?? 30_000)
+    this.#idleRecycleMs = Math.max(0, settings.idleRecycleMs ?? 300_000)
+    if (this.#sessionStore !== settings.sessionStore) this.#sessionStore?.release(this.#sessionOwner)
+    this.#sessionStore = settings.sessionStore
+  }
+
   /** Explicit discovery is allowed to authenticate, but never sends a model prompt. */
   async discoverModels(signal?: AbortSignal, interactive = true): Promise<readonly LlmModelInfo[]> {
     if (this.busy) throw new LlmError('ACP 正在处理对话，请在空闲时连接并读取模型目录', AGY_ADAPTER_ERROR.BUSY)
     if (this.#disposed) throw new LlmError('Antigravity ACP adapter 已卸载', 'AGY_LINK_CLOSED')
+    this.#refreshSettings()
     this.#streamActive = true
     this.#clearIdleRecycle()
     let link: AgentLink | undefined
@@ -432,6 +450,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   async warmup(signal?: AbortSignal, interactive = false): Promise<void> {
     if (this.#disposed) throw new LlmError('Antigravity ACP adapter 已卸载', 'AGY_LINK_CLOSED')
     if (this.busy) throw new LlmError('ACP 正在处理对话，无需再次预热', AGY_ADAPTER_ERROR.BUSY)
+    this.#refreshSettings()
     this.#streamActive = true
     this.#clearIdleRecycle()
     try {
@@ -499,7 +518,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     const models = [...folded.models]
     // 不再广告「首次对话登录」占位项；旧会话的 server-default 路由仍兼容。
     // 自定义 ID 由用户明确配置，加入目录但不伪称已经过官方验证。
-    const preferred = this.#preferredModel
+    const preferred = this.#readSettings ? this.#readSettings().preferredModel?.trim() ?? '' : this.#preferredModel
     if (preferred && preferred !== AGY_PLACEHOLDER_MODEL_ID && !models.some((model) => model.id === preferred)) {
       models.unshift({ id: preferred, name: preferred, description: '用户配置的模型 ID，尚未验证可用性' })
     } else if (preferred) {
@@ -692,6 +711,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       return
     }
     await this.#acquireStream(options)
+    if (!this.#turn || this.#isTurnClosed(this.#turn)) this.#refreshSettings()
     this.#clearIdleRecycle()
     let handedOff = false
     try {

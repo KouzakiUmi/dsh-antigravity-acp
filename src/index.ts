@@ -34,7 +34,7 @@ import {
 } from './runtime/binary.js'
 import type { RuntimeDirectoryLease } from './runtime/binary.js'
 import { resolveProxy } from './runtime/proxy-env.js'
-import { createProxiedFetch } from './runtime/proxied-fetch.js'
+import { createLiveProxiedFetch, createProxiedFetch } from './runtime/proxied-fetch.js'
 import type { ResolvedProxy } from './runtime/proxy-env.js'
 import { ensureAcpCredentials } from './runtime/credentials.js'
 import type { AcpCredentialResult } from './runtime/credentials.js'
@@ -46,11 +46,20 @@ import { agyCliCandidates, createSubprocessCliRun, fetchAgyModels } from './runt
 import { AgYQuotaService, registerAgYQuotaRemote } from './quota/quota-remote.js'
 import { SettingsControl } from './quota/control.js'
 import { AcpLifecycle } from './runtime/lifecycle.js'
-import type { AntigravityHostConfig } from './settings.js'
+import { liveHostConfig } from './settings.js'
+import type { AntigravityHostConfig, AntigravityPluginConfig } from './settings.js'
 
 export { AGY_PROVIDER_ID } from './adapter/antigravity-adapter.js'
 export { Config } from './settings.js'
 export type { AntigravityHostConfig } from './settings.js'
+
+// Loader is optional in headless compositions; its live-update event is scoped
+// to the owning plugin fiber, so unrelated settings never invalidate our catalog.
+declare module '@deepseek-ai/cordis' {
+  interface Events {
+    'loader/volatile-update'(paths: string[][]): void
+  }
+}
 
 export const name = 'llm-antigravity-acp'
 export const inject = ['llm', 'subprocess']
@@ -443,7 +452,8 @@ export async function connectAcpAccount(ctx: Context, config: AntigravityHostCon
   }
 }
 
-export function apply(ctx: Context, config: AntigravityHostConfig): void {
+export function apply(ctx: Context, input: AntigravityPluginConfig): void {
+  const config = liveHostConfig(input)
   const cacheDir = resolveCacheDir()
   const acpVersion = config.acpVersion ?? DEFAULT_ACP_SERVER_VERSION
 
@@ -458,9 +468,12 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
   // 代理规则与官方 ACP 进程一致：**配置的 proxyUrl 优先，其次宿主环境自身导出的
   // 代理**。CLI 每次启动都会做登录/配置刷新，缺代理会一直挂在网络上（实测），
   // 表现为额度药丸永远停在「额度…」。地址非法时以 AGY_INVALID_PROXY 明确失败。
-  const cliProxy = resolveProxy({ url: config.proxyUrl, bypass: config.proxyBypass })
-  const pluginFetch = createProxiedFetch(cliProxy)
-  const cliRun = createSubprocessCliRun(ctx.subprocess, cliProxy)
+  const readProxy = () => resolveProxy({ url: config.proxyUrl, bypass: config.proxyBypass })
+  // Validate the initial route before registering resources. Subsequent operations
+  // capture the latest settings; existing ACP processes keep their launch env.
+  readProxy()
+  const pluginFetch = createLiveProxiedFetch(readProxy)
+  const cliRun: ReturnType<typeof createSubprocessCliRun> = (request) => createSubprocessCliRun(ctx.subprocess, readProxy())(request)
   const findCli = () => agyCliCandidates(process.env, undefined, config.agyCliPath).find((candidate) => existsSync(candidate))
   let modelCatalogRevision = 0
   const catalogChanged = (): void => {
@@ -468,6 +481,9 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
     // The host model picker subscribes to this existing registry notification.
     try { ctx.emit('llm/adapters-updated') } catch { /* Observers cannot veto catalog updates. */ }
   }
+  ctx.on('loader/volatile-update', (paths) => {
+    if (paths.some(([key]) => key === 'preferredModel')) catalogChanged()
+  })
   let attachmentStore: AttachmentStore | undefined
 
   /**
@@ -506,9 +522,10 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
     return cliModelRows ?? []
   }
 
-  const sessionStore = config.resumeSessions === true ? createFileSessionMapStore(cacheDir,
+  // The store is lazy: no lock or file is opened until recovery is enabled and used.
+  const sessionStore = createFileSessionMapStore(cacheDir,
     () => ctx.logger?.warn?.('antigravity-acp: 会话映射不可用或由另一 Host 占用，跨进程恢复已降级；不影响本地聊天'),
-  ) : undefined
+  )
   const workers: AntigravityAcpAdapter[] = []
   let metadata: AdapterMetadata | undefined
   // Serialize startup/credential preparation, not inference. This avoids competing OAuth imports.
@@ -524,7 +541,7 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
       getLink: (handlers, signal, purpose) => {
         const launch = startupBarrier.catch(() => undefined).then(() => {
           signal?.throwIfAborted()
-          return ensureAcpRuntime(ctx, config, handlers, active, { signal, fetchImpl: pluginFetch, allowInteractiveAuth: purpose !== 'warmup' && workerIndex === 0 })
+          return ensureAcpRuntime(ctx, { ...config }, handlers, active, { signal, fetchImpl: pluginFetch, allowInteractiveAuth: purpose !== 'warmup' && workerIndex === 0 })
         })
         startupBarrier = launch.then(() => undefined, () => undefined)
         return launch
@@ -536,13 +553,14 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
       promptTimeoutMs: config.promptTimeoutMs,
       parkSettleMs: config.bridgeParkSettleMs,
       preferredModel: config.preferredModel,
+      readSettings: () => ({ ...config, sessionStore: config.resumeSessions ? sessionStore : undefined }),
       // ACP 会话复用：同一条 DSH 对话的后续回合只发增量；重启恢复默认关闭。
       reuseSessions: config.reuseSessions,
       resumeSessions: config.resumeSessions,
       keepProcessAfterCancel: config.keepProcessAfterCancel,
       cancelGraceMs: config.cancelGraceMs,
       idleRecycleMs: config.idleRecycleMs,
-      sessionStore,
+      sessionStore: config.resumeSessions ? sessionStore : undefined,
       canReadImages: () => attachmentStore !== undefined,
       readImage: (ref, signal) => {
         if (!attachmentStore) throw new LlmError('宿主附件服务不可用，无法读取图片', 'AGY_IMAGE_UNAVAILABLE')
@@ -577,7 +595,7 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
     capacity: config.maxConcurrentSessions,
     queueTimeoutMs: config.queueTimeoutMs,
     // 复用会话时同一对话必须粘在同一个 worker；关闭复用时回到纯负载调度。
-    sessionAffinity: config.reuseSessions !== false,
+    sessionAffinity: () => config.reuseSessions !== false,
   })
   ctx.inject(['attachments'], (scope) => {
     const store = scope.attachments
@@ -626,13 +644,14 @@ export function apply(ctx: Context, config: AntigravityHostConfig): void {
     },
   })
 
-  // 把 Config schema 投到设置表单（插件页）。弱依赖 settings，无 Web 的 profile 仍能加载。
+  // Config 的即时字段由 settings 投影；使用自定义卡片，不重复生成页面。
+  // 弱依赖 settings，无 Web 的 profile 仍能加载。
   ctx.inject(['settings'], (settingsCtx) => {
     const settings = settingsCtx.get('settings') as {
       configure: (opts: { auto: boolean }, fiber: unknown) => () => void
     }
     settingsCtx.effect(
-      () => settings.configure({ auto: true }, settingsCtx.fiber),
+      () => settings.configure({ auto: false }, ctx.fiber),
       'antigravity-acp: schema settings form',
     )
   })

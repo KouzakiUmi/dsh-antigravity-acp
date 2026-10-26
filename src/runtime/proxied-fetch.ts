@@ -63,6 +63,28 @@ export function matchesBypass(hostname: string, bypass: string): boolean {
   return false
 }
 
+/** Resolve routing at request boundaries; keep old agents until unload so an
+ * in-flight response is never destroyed by a settings save. */
+export function createLiveProxiedFetch(readProxy: () => ResolvedProxy | undefined, deps: ProxiedFetchDeps = {}): ManagedFetch {
+  const routes = new Map<string, ManagedFetch>()
+  let closed = false
+  const request: typeof fetch = (input, init) => {
+    if (closed) return Promise.reject(new ProxyConfigError('代理传输已关闭；请求未发送'))
+    const proxy = readProxy()
+    const key = JSON.stringify(proxy ?? null)
+    let route = routes.get(key)
+    if (!route) { route = createProxiedFetch(proxy, deps); routes.set(key, route) }
+    return route(input, init)
+  }
+  return Object.assign(request, { close: async () => {
+    closed = true
+    const results = await Promise.allSettled([...routes.values()].map(route => route.close()))
+    routes.clear()
+    const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')
+    if (failed) throw failed.reason
+  } })
+}
+
 export function createProxiedFetch(proxy: ResolvedProxy | undefined, deps: ProxiedFetchDeps = {}): ManagedFetch {
   const fallback = deps.fallback ?? ((input, init) => globalThis.fetch(input, init))
   if (!proxy) return Object.assign(((input, init) => fallback(input, init)) as typeof fetch, { close: async () => undefined })

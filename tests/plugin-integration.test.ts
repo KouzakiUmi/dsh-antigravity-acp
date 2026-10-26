@@ -5,6 +5,8 @@ import type { AntigravityAcpAdapterOptions } from '../src/adapter/antigravity-ad
 import type { SettingsControl } from '../src/quota/control.js'
 import { PooledAcpAdapter } from '../src/pool/pooled-adapter.js'
 import { apply } from '../src/index.js'
+import { isVolatile, updateVolatile } from '@deepseek-ai/cosmokit'
+import { Config } from '../src/settings.js'
 
 interface WorkerStub {
   options: AntigravityAcpAdapterOptions
@@ -34,7 +36,7 @@ vi.mock('../src/runtime/proxy-env.js', async (original) => ({
   ...await original<typeof import('../src/runtime/proxy-env.js')>(), resolveProxy: () => undefined,
 }))
 vi.mock('../src/runtime/proxied-fetch.js', () => ({
-  createProxiedFetch: () => Object.assign(external.fetch, { close: external.fetchClose }),
+  createLiveProxiedFetch: () => Object.assign(external.fetch, { close: external.fetchClose }),
 }))
 vi.mock('../src/runtime/agy-cli.js', () => ({
   agyCliCandidates: () => [], createSubprocessCliRun: () => external.cli, fetchAgyModels: external.cli,
@@ -103,6 +105,7 @@ function harness(initialAttachment?: AttachmentStub) {
     subprocess: { spawn: vi.fn(() => { throw new Error('Unexpected subprocess') }) },
     llm: { registerAdapter: vi.fn((_providers: string[], adapter: PooledAcpAdapter) => { registered = adapter; return unregister }) },
     logger: { info: vi.fn(), warn: vi.fn() }, emit: vi.fn(),
+    on: vi.fn((_event: string, _listener: (paths: string[][]) => void) => () => {}),
     inject(names: string[], callback: (scope: unknown) => void) {
       if (names.includes('attachments')) {
         injectAttachment = callback
@@ -120,6 +123,8 @@ function harness(initialAttachment?: AttachmentStub) {
   const result = {
     ctx: ctx as unknown as Context,
     registered: () => registered!, control: () => control!, attach, detach, unregister,
+    emit: ctx.emit,
+    updateSettings: (paths: string[][]) => ctx.on.mock.calls.find(([event]) => event === 'loader/volatile-update')?.[1](paths),
     async dispose() {
       if (disposed) return
       disposed = true
@@ -150,6 +155,26 @@ afterEach(async () => {
 })
 
 describe('apply wiring with real pool and SettingsControl', () => {
+  it('passes live preferences to existing workers and notifies the host picker on a saved model', () => {
+    const instance = harness()
+    const parsed = Config({ preferredModel: 'before' })
+    apply(instance.ctx, parsed)
+    const next = Config({ preferredModel: 'after', reuseSessions: false })
+    for (const key of ['preferredModel', 'reuseSessions'] as const) {
+      const before = parsed[key]
+      const after = next[key]
+      if (!isVolatile(before) || !isVolatile(after)) throw new Error('Expected live setting')
+      updateVolatile(before, after)
+    }
+    expect(external.workers[0]!.options.readSettings?.()).toMatchObject({ preferredModel: 'after', reuseSessions: false })
+    const beforeRevision = instance.control().account().runtime!.modelCatalogRevision!
+    instance.updateSettings([['preferredModel']])
+    expect(instance.control().account().runtime!.modelCatalogRevision).toBe(beforeRevision + 1)
+    expect(instance.emit).toHaveBeenCalledWith('llm/adapters-updated')
+    instance.updateSettings([['proxyUrl']])
+    expect(instance.control().account().runtime!.modelCatalogRevision).toBe(beforeRevision + 1)
+  })
+
   it('handles synchronously available attachments without initialization-order errors', async () => {
     const instance = harness({ readImage: vi.fn() })
     expect(() => apply(instance.ctx, {})).not.toThrow()

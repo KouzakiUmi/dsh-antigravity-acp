@@ -18,7 +18,7 @@ import {
 import type { GenerateOptions, RequestMessage, StreamChunk, ToolSchema } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, RequestPermissionRequest, SessionConfigOption } from '@agentclientprotocol/sdk'
 import { AntigravityAcpAdapter, AGY_PROVIDER_ID, AGY_PLACEHOLDER_MODEL_ID, AGY_ADAPTER_ERROR } from '../src/adapter/antigravity-adapter.js'
-import type { AdapterLog } from '../src/adapter/antigravity-adapter.js'
+import type { AdapterLog, AntigravityAcpAdapterOptions } from '../src/adapter/antigravity-adapter.js'
 import type { ImageReader } from '../src/adapter/image-content.js'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { SessionMapStore } from '../src/runtime/session-map.js'
@@ -88,6 +88,7 @@ function createHarness(
   options: {
     parkSettleMs?: number
     preferredModel?: string
+    readSettings?: AntigravityAcpAdapterOptions['readSettings']
     log?: AdapterLog
     configOptions?: SessionConfigOption[] | null
     promptTimeoutMs?: number
@@ -156,6 +157,7 @@ function createHarness(
   let bridgeTeardown: (() => Promise<void>) | undefined
   const adapter = new AntigravityAcpAdapter({
     preferredModel: options.preferredModel,
+    readSettings: options.readSettings,
     getLink: async (handlers, _signal, purpose) => {
       options.onGetLink?.(purpose)
       if (link) return link
@@ -307,6 +309,19 @@ async function connectAgentMcpClient(harness: Harness): Promise<Client> {
 }
 
 describe('模型目录来自 ACP 会话配置', () => {
+  it('默认模型的即时配置更新和清空会反映在目录，不需要重建 adapter', async () => {
+    let preferredModel = 'custom-before'
+    const harness = createHarness({ readSettings: () => ({ preferredModel }) })
+    expect((await harness.adapter.listModels(AGY_PROVIDER_ID))[0]?.id).toBe('custom-before')
+    preferredModel = 'custom-after'
+    const models = await harness.adapter.listModels(AGY_PROVIDER_ID)
+    expect(models[0]?.id).toBe('custom-after')
+    expect(models.some(model => model.id === 'custom-before')).toBe(false)
+    preferredModel = ''
+    expect((await harness.adapter.listModels(AGY_PROVIDER_ID)).some(model => model.id === 'custom-after')).toBe(false)
+    expect(harness.agent.requestsFor('session/prompt')).toHaveLength(0)
+  })
+
   it('显式发现模型通过无工具 session/new，首次无 CLI 也能取得目录且不发 prompt', async () => {
     const harness = createHarness()
     expect(await harness.adapter.listModels(AGY_PROVIDER_ID)).toEqual([])
@@ -2357,6 +2372,25 @@ describe('ACP 会话复用与跨进程恢复', () => {
     await second
     // 每次都是独立 ACP 会话。
     expect(harness.agent.requestsFor('session/new')).toHaveLength(2)
+  })
+
+  it('运行中修改复用设置不打断当前回合，下一轮采用新值', async () => {
+    let reuseSessions = true
+    const harness = createHarness({ readSettings: () => ({ reuseSessions }) })
+    const first = collect(harness.adapter.stream(baseOptions({ sessionId: DSH_SESSION })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    reuseSessions = false
+    // Background catalog reads must not replace the current turn's captured settings.
+    await harness.adapter.listModels(AGY_PROVIDER_ID)
+    await replyWithText(harness, '第一轮回答')
+    expect(visibleText(await first)).toBe('第一轮回答')
+    expect(harness.recycles()).toBe(0)
+    const second = collect(harness.adapter.stream(baseOptions({ sessionId: DSH_SESSION, messages: secondRoundMessages() })))
+    await waitForRequest(harness.agent, 'session/prompt', 2)
+    expect(harness.agent.requestsFor('session/new')).toHaveLength(2)
+    expect(promptTexts(harness, 1)).toContain('你好')
+    await replyWithText(harness, '第二轮回答', 1)
+    expect(visibleText(await second)).toBe('第二轮回答')
   })
 
   it('关闭复用开关时回到每轮新会话', async () => {

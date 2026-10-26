@@ -33,7 +33,8 @@ export class PooledAcpAdapter extends LlmAdapter {
   private poll?: ReturnType<typeof setInterval>
   private readonly capacity: number
   private readonly queueTimeoutMs: number
-  private readonly sessionAffinity: boolean
+  private readonly readSessionAffinity: () => boolean
+  private get sessionAffinity(): boolean { return this.readSessionAffinity() }
   private preparation?: Promise<void>
   private preparationAbort?: AbortController
   private preparationWaiters = 0
@@ -41,11 +42,12 @@ export class PooledAcpAdapter extends LlmAdapter {
   private preparationGeneration = 0
   private disposal?: Promise<void>
 
-  constructor(private readonly create: () => AcpWorker, options: { capacity?: number; queueTimeoutMs?: number; sessionAffinity?: boolean } = {}) {
+  constructor(private readonly create: () => AcpWorker, options: { capacity?: number; queueTimeoutMs?: number; sessionAffinity?: boolean | (() => boolean) } = {}) {
     super()
     this.capacity = Math.max(1, Math.min(4, Math.floor(options.capacity ?? 2)))
     this.queueTimeoutMs = Math.max(1_000, options.queueTimeoutMs ?? 120_000)
-    this.sessionAffinity = options.sessionAffinity ?? true
+    const affinity = options.sessionAffinity ?? true
+    this.readSessionAffinity = typeof affinity === 'function' ? affinity : () => affinity
     this.addSlot()
   }
 
