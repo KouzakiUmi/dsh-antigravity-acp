@@ -122,6 +122,22 @@ export function liveHostConfig(config: AntigravityPluginConfig): AntigravityHost
 /** 官方思考档位；与 runtime/agy-cli.ts 的 AGY_REASONING_EFFORTS 一致。 */
 export const MODEL_EFFORTS = ['low', 'medium', 'high'] as const
 
+/**
+ * modelOverrides 的 schema。
+ *
+ * TS2742 规避：`Schema.dict` 的推断类型引用 schemastery 依赖的 cosmokit
+ * `Dict`；npm ci 在版本分叉时会把 cosmokit 嵌套进
+ * `@deepseek-ai/schemastery/node_modules`，导出类型无法命名该路径（本机
+ * 扁平提升才看不出来）。末尾的显式标注把 Config 的类型收敛到本包
+ * `ModelOverride`，只经过可移植路径。
+ */
+const ModelOverrideSchema = Schema.object({
+  enabled: Schema.boolean().default(true).description('是否出现在 DSH 模型选择器'),
+  effort: Schema.union(MODEL_EFFORTS).description('默认思考档位：low / medium / high'),
+  name: Schema.string().description('显示名覆盖'),
+  target: Schema.string().description('映射到的官方模型 ID，优先于家族 + 档位路由'),
+})
+
 export const Config = Schema.object({
   maxConcurrentSessions: Schema.natural().min(1).max(4).default(2).description('最大并发 ACP 连接数（1–4），按需启动；不同对话互不占用工具审批回合'),
   queueTimeoutMs: Schema.natural().min(1000).default(120000).description('等待空闲 ACP 连接的最长时间（毫秒），排队期间可取消'),
@@ -136,12 +152,11 @@ export const Config = Schema.object({
   authTimeoutMs: Schema.natural().default(300_000).description('authenticate（需人工在浏览器完成 OAuth 授权）的等待上限（毫秒）'),
   promptTimeoutMs: Schema.natural().default(1_800_000).description('单轮 session/prompt 的等待上限（毫秒）'),
   bridgeParkSettleMs: Schema.natural().default(50).description('并发 MCP tools/call 的聚合窗口（毫秒）'),
-  modelOverrides: Schema.dict(Schema.object({
-    enabled: Schema.boolean().default(true).description('是否出现在 DSH 模型选择器'),
-    effort: Schema.union(MODEL_EFFORTS).description('默认思考档位：low / medium / high'),
-    name: Schema.string().description('显示名覆盖'),
-    target: Schema.string().description('映射到的官方模型 ID，优先于家族 + 档位路由'),
-  })).default({}).volatile().description('按模型 ID 的目录设置（是否显示、默认思考档位、显示名、官方模型 ID 映射）；只作用于目录中已存在的模型'),
+  modelOverrides: Schema.dict(ModelOverrideSchema).default({}).volatile().description('按模型 ID 的目录设置（是否显示、默认思考档位、显示名、官方模型 ID 映射）；只作用于目录中已存在的模型') as Schema<
+    Record<string, ModelOverride>,
+    Record<string, ModelOverride>,
+    'volatile-defined'
+  >,
   proxyUrl: Schema.string().volatile().description('官方进程出网代理，如 http://127.0.0.1:7890（缺 scheme 按 http 处理）。留空继承宿主代理，宿主也未配置时才直连'),
   proxyBypass: Schema.string().volatile().description('代理排除列表，逗号分隔，如 example.internal,*.internal；不支持 CIDR。localhost/127.0.0.1/::1 始终自动排除'),
   reuseSessions: Schema.boolean().default(true).volatile().description('复用同一个 ACP 会话，后续回合只发送新增消息；历史被压缩/回退或模型、工具目录变化时自动重建。关闭则每轮新会话并重放全部历史'),
