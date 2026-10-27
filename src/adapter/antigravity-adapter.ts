@@ -36,6 +36,8 @@ import {
 import type { AgyReasoningEffort } from '../runtime/agy-cli.js'
 import { findModelSelector, toModelCatalog } from './model-catalog.js'
 import type { ModelSelector } from './model-catalog.js'
+import { applyModelSettings, modelDisplayName, modelSettingFor, normalizeModelSettings, resolveModelTarget } from './model-settings.js'
+import type { ModelSetting } from './model-settings.js'
 import { buildPromptDeltaWithImages, buildPromptWithImages, buildToolResultContent } from './image-content.js'
 import type { ImageReader } from './image-content.js'
 import { AGY_TURN_ERROR, PromptTurn } from './prompt-turn.js'
@@ -44,6 +46,7 @@ import { ContinuationState } from './continuation-state.js'
 import { incrementalMessages, outputHash, outputMatches, prefixHash, prefixMatches, reusableSessionKey, routeFingerprint } from './session-reuse.js'
 import { SessionMapStore } from '../runtime/session-map.js'
 import type { SessionMapEntry } from '../runtime/session-map.js'
+import type { ModelOverride } from '../settings.js'
 
 /** DSH 侧 provider 标识符；与 cordis.patch.yml 的 id 及文档保持一致。 */
 export const AGY_PROVIDER_ID = 'antigravity-acp'
@@ -89,8 +92,11 @@ export interface AntigravityAcpAdapterOptions {
   parkSettleMs?: number
   /** session/new 使用的工作目录；缺省为进程 cwd。 */
   cwd?: string
-  /** 占位模型 server-default 映射到的官方模型 id；空则沿用会话默认。 */
-  preferredModel?: string
+  /**
+   * 按模型 ID 的目录设置：显示开关、默认思考档位、显示名与官方模型 ID 映射。
+   * 只作用于目录中已存在的条目，不新增自造模型。
+   */
+  modelOverrides?: Record<string, ModelOverride>
   /**
    * 冷启动目录读取（磁盘缓存）。返回 undefined 表示没有可用缓存；**不得**抛错。
    * 元数据方法不得触网，因此这里只能读本地文件。
@@ -135,7 +141,7 @@ export interface AntigravityAcpAdapterOptions {
   /** 所有 worker 共享的映射存储（含键所有权与串行提交）。 */
   sessionStore?: SessionMapStore
   /** Capture live preferences only between ACP turns, never during tool continuation. */
-  readSettings?: () => Pick<AntigravityAcpAdapterOptions, 'preferredModel' | 'reuseSessions' | 'resumeSessions' | 'keepProcessAfterCancel' | 'cancelGraceMs' | 'idleRecycleMs' | 'sessionStore'>
+  readSettings?: () => Pick<AntigravityAcpAdapterOptions, 'modelOverrides' | 'reuseSessions' | 'resumeSessions' | 'keepProcessAfterCancel' | 'cancelGraceMs' | 'idleRecycleMs' | 'sessionStore'>
   /** 独立 adapter 的兼容读取回调；连接池必须改用共享 sessionStore。 */
   loadSessionMap?: () => Promise<Record<string, SessionMapEntry>>
   /** 保存 ACP 会话映射；失败由实现方吞掉。 */
@@ -220,7 +226,8 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   readonly #promptTimeoutMs: number
   readonly #parkSettleMs: number
   readonly #cwd: string
-  #preferredModel: string
+  /** 用户模型设置的只读快照；每次读取设置时整体替换。 */
+  #modelSettings: ReadonlyMap<string, ModelSetting> = new Map()
   readonly #readSettings?: AntigravityAcpAdapterOptions['readSettings']
   readonly #loadCachedCatalog?: AntigravityAcpAdapterOptions['loadCachedCatalog']
   readonly #saveCatalog?: AntigravityAcpAdapterOptions['saveCatalog']
@@ -304,7 +311,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     this.#promptTimeoutMs = options.promptTimeoutMs ?? DEFAULT_PROMPT_TIMEOUT_MS
     this.#parkSettleMs = options.parkSettleMs ?? DEFAULT_PARK_SETTLE_MS
     this.#cwd = options.cwd ?? process.cwd()
-    this.#preferredModel = options.preferredModel?.trim() ?? ''
+    this.#modelSettings = normalizeModelSettings(options.modelOverrides)
     this.#readSettings = options.readSettings
     this.#loadCachedCatalog = options.loadCachedCatalog
     this.#saveCatalog = options.saveCatalog
@@ -399,10 +406,20 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     }
   }
 
+  /**
+   * 当前用户模型设置。目录与路由都可能先于下一次预热读取（例如宿主刚保存
+   * 设置就刷新目录），因此这里按需从 live 引用取最新值，而不是只用构造时的快照。
+   */
+  #modelSettingsSnapshot(): ReadonlyMap<string, ModelSetting> {
+    const settings = this.#readSettings?.()
+    if (settings) this.#modelSettings = normalizeModelSettings(settings.modelOverrides)
+    return this.#modelSettings
+  }
+
   #refreshSettings(): void {
     const settings = this.#readSettings?.()
     if (!settings) return
-    this.#preferredModel = settings.preferredModel?.trim() ?? ''
+    this.#modelSettings = normalizeModelSettings(settings.modelOverrides)
     this.#reuseSessions = settings.reuseSessions ?? true
     this.#resumeSessions = settings.resumeSessions ?? false
     this.#keepProcessAfterCancel = settings.keepProcessAfterCancel ?? false
@@ -515,15 +532,8 @@ export class AntigravityAcpAdapter extends LlmAdapter {
    */
   override async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
     const folded = await this.#foldCatalog(_provider)
-    const models = [...folded.models]
-    // 不再广告「首次对话登录」占位项；旧会话的 server-default 路由仍兼容。
-    // 自定义 ID 由用户明确配置，加入目录但不伪称已经过官方验证。
-    const preferred = this.#readSettings ? this.#readSettings().preferredModel?.trim() ?? '' : this.#preferredModel
-    if (preferred && preferred !== AGY_PLACEHOLDER_MODEL_ID && !models.some((model) => model.id === preferred)) {
-      models.unshift({ id: preferred, name: preferred, description: '用户配置的模型 ID，尚未验证可用性' })
-    } else if (preferred) {
-      models.sort((a, b) => Number(b.id === preferred) - Number(a.id === preferred))
-    }
+    // 用户设置只作用于已观测到的条目：停用的不列入选择器，显示名可覆盖。
+    const models = applyModelSettings(this.#modelSettingsSnapshot(), folded.models)
     return [
       ...models.map((model) => ({
         provider: _provider,
@@ -641,13 +651,16 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     // 不要退化成裸 id。
     const known = this.#catalog.find((entry) => entry.id === model)
       ?? families.get(model)
+    // 显示名覆盖对已知与未知路由键都生效：用户在设置页改了名字，选择器与
+    // 会话标题都要一致，不能只在 listModels 里生效。
+    const displayName = modelDisplayName(this.#modelSettingsSnapshot(), model, known?.name ?? model)
     // 上下文容量只在**实测**过（usage_update.size）或缓存过时才声明；官方目录
     // 不报告容量，绝不填猜测值。缺省时不带 context，压缩引擎按未知处理。
     const contextWindow = this.#contextWindows.get(model)
     return {
       provider,
       id: model,
-      name: known?.name ?? model,
+      name: displayName,
       ...(this.#inputModalities() === undefined ? {} : { inputModalities: this.#inputModalities() }),
       ...(known?.description === undefined ? {} : { description: known.description }),
       ...(contextWindow === undefined ? {} : { context: { contextWindow } }),
@@ -668,7 +681,11 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         id: ReasoningEffortId(effort),
         name: AGY_REASONING_EFFORT_NAMES[effort],
       }))
-    const fallback = efforts.find((entry) => entry.id === ReasoningEffortId(DEFAULT_AGY_REASONING_EFFORT))
+    // 默认档位：用户为该模型配置的档位优先，其次官方默认（medium）。
+    // 配置的档位未被官方声明时退回官方默认，不指向不存在的选项。
+    const preferred = modelSettingFor(this.#modelSettingsSnapshot(), modelFamilyId(model)).effort
+    const fallback = (preferred === undefined ? undefined : efforts.find((entry) => entry.id === ReasoningEffortId(preferred)))
+      ?? efforts.find((entry) => entry.id === ReasoningEffortId(DEFAULT_AGY_REASONING_EFFORT))
     return { efforts, ...(fallback ? { defaultEffort: fallback.id } : {}) }
   }
 
@@ -1533,10 +1550,11 @@ export class AntigravityAcpAdapter extends LlmAdapter {
    * `session/new` → `set_config_option` → `session/prompt`（initialize 响应
    * 不携带 configOptions，没有「new 之前设置」的通道）。
    *
-   * **家族 + 思考强度路由**（2026-10-16 用户指示）：模型选择只出家族
-   * （`claude-opus-5-5`），思考强度菜单（low/medium/high）决定路由到哪个
-   * 官方档位模型（`claude-opus-5-5-high`）。未选强度且配置里显式钉了档位时
-   * 尊重钉住的档位；否则走默认档位（medium）。
+   * **优先级**：设置页的官方模型 ID 映射（`modelOverrides[id].target`）→ 家族 +
+   * 思考强度路由。模型选择只出家族（`claude-opus-5-5`），思考强度菜单
+   * （low/medium/high）决定路由到哪个官方档位模型（`claude-opus-5-5-high`）；
+   * 未选强度时用该模型的默认档位，再退回官方默认（medium）。显式钉住档位 id
+   * 时尊重该 id。
    */
   async #applyModelSelection(
     link: AgentLink,
@@ -1545,22 +1563,28 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     effort?: { toString(): string },
     signal?: AbortSignal,
   ): Promise<void> {
-    const base = model === AGY_PLACEHOLDER_MODEL_ID ? this.#preferredModel : model
-    if (!base) return
     // 档位表可能尚未建立（API 直调时选择器还没列过目录）：先折叠一次再路由。
     await withAbort(this.#foldCatalog(AGY_PROVIDER_ID), signal)
     throwIfAborted(signal)
-    const family = modelFamilyId(base)
-    const pinnedTier = tierForModelId(base)
+    const settings = this.#modelSettingsSnapshot()
+    // 旧会话的占位路由：只按显式映射处理，没有映射就沿用官方会话默认模型。
+    if (model === AGY_PLACEHOLDER_MODEL_ID && modelSettingFor(settings, model).target === undefined) return
+    const family = modelFamilyId(model)
+    const pinnedTier = tierForModelId(model)
     const effortTier = normalizeEffort(effort)
     const tiers = this.#familyTiers.get(family)
-    const requested = effortTier !== undefined
-      ? routeTieredModelId(family, effortTier, tiers)
-      : pinnedTier !== undefined
-        ? base
-        : tiers !== undefined && tiers.size > 0
-          ? routeTieredModelId(family, DEFAULT_AGY_REASONING_EFFORT, tiers)
-          : family
+    const requested = resolveModelTarget({
+      settings,
+      model,
+      effort: effortTier,
+      route: (tier) => tier !== undefined
+        ? routeTieredModelId(family, tier, tiers)
+        : pinnedTier !== undefined
+          ? model
+          : tiers !== undefined && tiers.size > 0
+            ? routeTieredModelId(family, DEFAULT_AGY_REASONING_EFFORT, tiers)
+            : family,
+    })
     const selector = this.#modelSelector
     if (!selector) {
       throw new LlmError(
@@ -1573,7 +1597,8 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     // 给的 id → 我们发出去的 configId/value」的地方）。
     this.#log?.info(
       `antigravity-acp: 模型路由 dsh=${model} → configId=${selector.configId} value=${requested}` +
-        `（family=${family}${effortTier ? ` effort=${effortTier}` : ''}${pinnedTier ? ' 档位已钉住' : ''}）`,
+        `（family=${family}${effortTier ? ` effort=${effortTier}` : ''}${pinnedTier ? ' 档位已钉住' : ''}` +
+        `${modelSettingFor(settings, model).target === undefined ? '' : ' 已按映射改写'}）`,
     )
     // 目录成员资格按 dsh-llm 语义是建议性的：未登记的 id 仍然照发，由 ACP
     // agent 自己判定是否接受，而不是在这里静默改写成别的模型。

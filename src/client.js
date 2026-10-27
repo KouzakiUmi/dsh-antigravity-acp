@@ -29,7 +29,6 @@ window.__ModuleLoader__.load({
     const FIELDS = [
       { key: 'autoWarmup', group: 'general', checkbox: true, defaultChecked: true, label: '启动时自动预热', hint: '提前启动并保留连接，不发送模型消息。保存后下次启用插件生效；本次可点击“立即预热”。' },
       { key: 'reuseSessions', group: 'general', checkbox: true, defaultChecked: true, label: '复用 ACP 会话（增量发送）', hint: '校验历史与实际输出后只发新增消息；变化的上下文仍发送，不一致时自动重建。' },
-      { key: 'preferredModel', group: 'model', label: '默认 / 自定义模型 ID', placeholder: '选择目录中的模型，或输入自定义 ID', hint: '保存后优先列出此模型；目录之外的 ID 标为自定义、未验证。不会替换当前会话已选模型。留空不指定默认项。' },
       { key: 'proxyUrl', group: 'network', label: '出网代理', placeholder: 'http://127.0.0.1:7890', hint: '此处配置优先；留空则继承宿主代理环境变量，宿主也未配置时才直连。支持 HTTP、HTTPS 与 SOCKS5。' },
       { key: 'proxyBypass', group: 'network', label: '代理排除列表', placeholder: '*.internal,example.internal', hint: '逗号分隔，支持域名与通配后缀，不支持 CIDR。localhost/127.0.0.1/::1 始终自动排除（私有 MCP 桥在 loopback）。' },
       { key: 'agyCliPath', group: 'network', label: '官方 CLI 路径（可选）', placeholder: '留空自动查找 agy', hint: '用于模型目录、套餐额度和 AI Credits。自定义安装位置可填写完整可执行文件路径；CLI 登录与 ACP 登录独立。' },
@@ -38,6 +37,57 @@ window.__ModuleLoader__.load({
       { key: 'cancelGraceMs', group: 'advanced', numeric: true, defaultValue: 30000, min: 0, max: 60000, label: '取消确认宽限（毫秒）', hint: '默认 30000；0 表示不等待并立即回收，不会复用未确认连接。仅开启取消后保留进程时生效。' },
       { key: 'idleRecycleMs', group: 'advanced', numeric: true, defaultValue: 300000, min: 0, max: 3600000, label: '进程空闲回收（毫秒）', hint: '默认 300000（5 分钟），0 禁用。聊天、预热、目录发现结束后统一计时；等待工具不算空闲。' },
     ]
+
+    /** 逐模型设置：键是 DSH 选择器里的模型 ID，值是开关、默认档位、显示名与官方 ID 映射。 */
+    const OVERRIDES_KEY = 'modelOverrides'
+    const OVERRIDES_LABEL = '模型列表设置'
+    const EFFORT_OPTIONS = [
+      { value: '', label: '跟随官方' },
+      { value: 'low', label: '低' },
+      { value: 'medium', label: '中' },
+      { value: 'high', label: '高' },
+    ]
+    const EFFORT_IDS = new Set(EFFORT_OPTIONS.map((entry) => entry.value).filter(Boolean))
+    const MODALITY_LABELS = { text: '文本', image: '图片', audio: '音频', video: '视频', file: '文件' }
+
+    /** 只保留有意义的字段：启用是默认值，空串等于未设置。 */
+    function canonicalOverride(row) {
+      const source = row && typeof row === 'object' ? row : {}
+      const result = {}
+      if (source.enabled === false) result.enabled = false
+      if (EFFORT_IDS.has(source.effort)) result.effort = source.effort
+      const name = typeof source.name === 'string' ? source.name.trim() : ''
+      if (name) result.name = name
+      const target = typeof source.target === 'string' ? source.target.trim() : ''
+      if (target) result.target = target
+      return result
+    }
+    /** 稳定序列化：键序不影响脏值判断。 */
+    function canonicalOverrides(value) {
+      const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+      const result = {}
+      for (const key of Object.keys(source).sort()) {
+        const row = canonicalOverride(source[key])
+        if (Object.keys(row).length > 0) result[key] = row
+      }
+      return result
+    }
+    function sameOverrides(a, b) {
+      return JSON.stringify(canonicalOverrides(a)) === JSON.stringify(canonicalOverrides(b))
+    }
+    function overrideFor(overrides, id) {
+      const row = overrides && typeof overrides === 'object' ? overrides[id] : undefined
+      return row && typeof row === 'object' ? row : {}
+    }
+    /** 目录条目 + 已配置但当前目录没有的 ID，都要能在此编辑。 */
+    function modelRows(models, overrides) {
+      const rows = models.map((model) => ({ id: model.id, name: model.name, inputModalities: model.inputModalities, inCatalog: true }))
+      const known = new Set(rows.map((row) => row.id))
+      for (const id of Object.keys(canonicalOverrides(overrides))) {
+        if (!known.has(id)) rows.push({ id, name: id, inCatalog: false })
+      }
+      return rows
+    }
 
     function unwrap(result) {
       if (result && typeof result === 'object' && 'ok' in result) {
@@ -157,6 +207,69 @@ window.__ModuleLoader__.load({
       }))
     }
 
+    /** 单行：显示开关 + 默认思考档位 + 显示名 + 官方 ID 映射。 */
+    function ModelOverrideRow({ row, override, disabled, onEdit }) {
+      const enabled = override.enabled !== false
+      const inputId = 'agy-model-' + row.id.replace(/[^\w.-]/g, '_')
+      const labelStyle = { fontSize: '11px', opacity: .6 }
+      const inputStyle = { ...ACTION, width: '100%', minWidth: 0, boxSizing: 'border-box', background: 'rgba(128,128,128,.035)', cursor: disabled ? 'not-allowed' : 'text' }
+      return h('div', { style: { display: 'grid', gap: '8px', padding: '12px', borderRadius: '10px', border: '1px solid rgba(128,128,128,.16)', opacity: enabled ? 1 : .62 } },
+        h('div', { style: { display: 'flex', alignItems: 'flex-start', gap: '10px' } },
+          h('label', { style: { display: 'flex', alignItems: 'flex-start', gap: '8px', flex: 1, minWidth: 0, cursor: disabled ? 'default' : 'pointer' } },
+            h('input', { name: 'model-enabled-' + row.id, type: 'checkbox', checked: enabled, disabled,
+              onChange: (event) => onEdit(row.id, { enabled: event.target.checked }),
+              style: { width: '15px', height: '15px', flex: '0 0 auto', margin: '2px 0 0', accentColor: '#177c55', cursor: disabled ? 'not-allowed' : 'pointer' } }),
+            h('span', { style: { display: 'grid', gap: '2px', minWidth: 0 } },
+              h('span', { style: { fontSize: '12px', fontWeight: 600, overflowWrap: 'anywhere' } }, row.name),
+              h('code', { style: { fontSize: '11px', opacity: .55, overflowWrap: 'anywhere' } }, row.id))),
+          row.inCatalog
+            ? (Array.isArray(row.inputModalities) && row.inputModalities.length
+              ? h('span', { style: { flex: '0 0 auto', fontSize: '10px', padding: '2px 7px', borderRadius: '99px', background: TRACK } }, row.inputModalities.map((modality) => MODALITY_LABELS[modality] ?? modality).join('、'))
+              : null)
+            : h('span', { title: '该 ID 来自已保存的设置，当前目录里没有；仍然可以修改或清除', style: { flex: '0 0 auto', fontSize: '10px', padding: '2px 7px', borderRadius: '99px', color: '#946200', background: 'rgba(217,155,40,.12)' } }, '不在当前目录')),
+        h('div', { style: { display: 'grid', gap: '6px', gridTemplateColumns: 'minmax(120px, 160px) minmax(0, 1fr)' } },
+          h('div', { style: { display: 'grid', gap: '4px', minWidth: 0 } },
+            h('label', { htmlFor: inputId + '-effort', style: labelStyle }, '默认思考档位'),
+            h('select', { id: inputId + '-effort', name: 'model-effort-' + row.id, disabled, value: EFFORT_IDS.has(override.effort) ? override.effort : '',
+              onChange: (event) => onEdit(row.id, { effort: event.target.value }),
+              style: { ...inputStyle, cursor: disabled ? 'not-allowed' : 'pointer' } },
+              ...EFFORT_OPTIONS.map((option) => h('option', { key: option.value, value: option.value }, option.label)))),
+          h('div', { style: { display: 'grid', gap: '4px', minWidth: 0 } },
+            h('label', { htmlFor: inputId + '-target', style: labelStyle }, '映射到官方模型 ID'),
+            h('input', { id: inputId + '-target', name: 'model-target-' + row.id, type: 'text', disabled, value: override.target ?? '',
+              placeholder: '留空按家族 + 档位自动路由', onChange: (event) => onEdit(row.id, { target: event.target.value }), style: inputStyle }))),
+        h('div', { style: { display: 'grid', gap: '4px' } },
+          h('label', { htmlFor: inputId + '-name', style: labelStyle }, '显示名'),
+          h('input', { id: inputId + '-name', name: 'model-name-' + row.id, type: 'text', disabled, value: override.name ?? '',
+            placeholder: row.inCatalog ? '留空使用「' + row.name + '」' : '留空显示模型 ID', onChange: (event) => onEdit(row.id, { name: event.target.value }), style: inputStyle })))
+    }
+
+    /**
+     * 模型列表：一次列出目录中的每个模型，改动在保存时合并成一份
+     * `modelOverrides` 提交，空项自动清除，不留空壳配置。
+     */
+    function ModelOverrideList({ rows, overrides, disabled, onEdit }) {
+      if (rows.length === 0) {
+        return h('p', { style: { margin: 0, fontSize: '12px', lineHeight: 1.6, opacity: .6 } },
+          '还没有模型目录。连接 / 登录 ACP 或刷新模型目录后，可在此逐项设置显示开关、默认思考档位与映射。')
+      }
+      const hidden = rows.filter((row) => overrideFor(overrides, row.id).enabled === false).length
+      return h('div', { style: { display: 'grid', gap: '10px' } },
+        h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '4px 12px', fontSize: '11px', opacity: .62 } },
+          h('span', null, rows.length + ' 个模型'),
+          hidden ? h('span', null, hidden + ' 个已从选择器隐藏') : null,
+          h('span', null, '映射与显示名保存后生效；当前会话已选模型不变')),
+        // 全部停用时本 provider 会从 DSH 选择器里消失，这里必须说清原因。
+        hidden === rows.length
+          ? h('p', { role: 'status', style: { margin: 0, fontSize: '11px', lineHeight: 1.6, color: '#946200' } },
+            '所有模型都已隐藏：保存后 Antigravity 将不出现在 DSH 模型选择器中，重新启用任一项即可恢复。')
+          : null,
+        ...rows.map((row) => h(ModelOverrideRow, {
+          key: row.id, row, override: overrideFor(overrides, row.id), disabled,
+          onEdit: (id, patch) => onEdit(id, patch),
+        })))
+    }
+
     function AntigravitySettingsCard(props) {
       const remote = props.remote
       const [account, setAccount] = React.useState(undefined)
@@ -239,6 +352,27 @@ window.__ModuleLoader__.load({
         setDraft(next)
       }, [])
 
+      /**
+       * 单条模型设置：合并成整份 modelOverrides 再交给通用编辑路径，
+       * 这样草稿、冲突与只提交改动项的行为和其它字段完全一致。
+       */
+      const editOverride = React.useCallback((id, patch) => {
+        if (savingRef.current) return
+        const current = overrideFor(draftRef.current[OVERRIDES_KEY], id)
+        const merged = canonicalOverride({ ...current, ...patch })
+        const overrides = canonicalOverrides(draftRef.current[OVERRIDES_KEY])
+        if (Object.keys(merged).length === 0) delete overrides[id]
+        else overrides[id] = merged
+        const value = overrides
+        const next = { ...draftRef.current, [OVERRIDES_KEY]: value }
+        draftRef.current = next
+        if (sameOverrides(value, baseline.current[OVERRIDES_KEY])) dirty.current.delete(OVERRIDES_KEY)
+        else dirty.current.add(OVERRIDES_KEY)
+        setDirtyKeys([...dirty.current])
+        setConflicts((previous) => previous.filter((field) => field !== OVERRIDES_KEY))
+        setDraft(next)
+      }, [])
+
       const reload = React.useCallback(async (preserveStatus = false) => {
         const version = ++settingsVersion.current
         // 同步段整体兜底：remote.<ns> 是代理属性，缺 inject 时连「读属性」都会抛；
@@ -264,13 +398,22 @@ window.__ModuleLoader__.load({
           setView(found ?? null)
           const current = found?.value && typeof found.value === 'object' ? found.value : {}
           const server = Object.fromEntries(FIELDS.map((field) => [field.key, field.checkbox ? (field.defaultChecked ? current[field.key] !== false : current[field.key] === true) : current[field.key] ?? field.defaultValue ?? '']))
+          // 整份 map 作为一个字段参与脏值比较；规范化后再比，避免键序或
+          // 「显式写回默认值」被误判为未保存修改。
+          server[OVERRIDES_KEY] = canonicalOverrides(current[OVERRIDES_KEY])
           const changed = []
           const next = { ...server }
           for (const key of dirty.current) {
-            if (draftRef.current[key] === server[key]) dirty.current.delete(key)
+            const same = key === OVERRIDES_KEY
+              ? sameOverrides(draftRef.current[key], server[key])
+              : draftRef.current[key] === server[key]
+            if (same) dirty.current.delete(key)
             else {
               next[key] = draftRef.current[key]
-              if (baseline.current[key] !== server[key]) changed.push(key)
+              const beforeSame = key === OVERRIDES_KEY
+                ? sameOverrides(baseline.current[key], server[key])
+                : baseline.current[key] === server[key]
+              if (!beforeSame) changed.push(key)
             }
           }
           baseline.current = server
@@ -301,7 +444,10 @@ window.__ModuleLoader__.load({
         setSaving(true)
         setStatus({ kind: 'busy', text: '保存中…' })
         // 只提交用户改动过的字段，空串也是有效改动；未编辑字段遵循最新服务端值。
-        const ops = FIELDS.filter((field) => dirty.current.has(field.key)).map((field) => ({ op: 'set', path: [field.key], value: draftRef.current[field.key] }))
+        // modelOverrides 是整份 map 一个字段，按同样方式提交。
+        const ops = [...FIELDS.map((field) => field.key), OVERRIDES_KEY]
+          .filter((key) => dirty.current.has(key))
+          .map((key) => ({ op: 'set', path: [key], value: draftRef.current[key] }))
         try {
           unwrap(await remote.settings.mutate(ENTRY_ID, ops, view.revision))
           if (!alive.current) return
@@ -341,9 +487,8 @@ window.__ModuleLoader__.load({
         }
       }, [reload, remote])
 
-      const selectedModel = models.find((model) => model.id === draft.preferredModel)
-      const modalityLabels = { text: '文本', image: '图片', audio: '音频', video: '视频', file: '文件' }
-      const selectedModalities = selectedModel?.inputModalities
+      // 目录条目 + 已配置但目录里暂时没有的 ID：正在编辑的映射不能因为目录刷新而消失。
+      const rows = modelRows(models, draft[OVERRIDES_KEY])
       const editingDisabled = loading || saving || !view || !writable
       const discardDraft = () => {
         if (savingRef.current) return
@@ -388,20 +533,11 @@ window.__ModuleLoader__.load({
             ['connecting', 'cancelling'].includes(account?.state) ? h('button', { type: 'button', style: ACTION, disabled: account?.state === 'cancelling', onClick: () => accountAction('cancel') }, account?.state === 'cancelling' ? '正在取消…' : '取消连接') : null),
           h('p', { style: { opacity: .55, fontSize: '11px', lineHeight: 1.6, margin: '10px 0 0' } }, '预热不会发送聊天消息。仅在需要登录时打开官方授权页面；思考强度仍由会话菜单设置。')),
 
-        h('section', { style: PANEL, 'aria-label': '模型管理' },
-          h(SectionHeading, { eyebrow: '02 · 模型', title: '默认模型', description: '选择新对话优先使用的模型，不改变当前会话。',
+        h('section', { style: PANEL, 'aria-label': '模型列表' },
+          h(SectionHeading, { eyebrow: '02 · 模型', title: '模型列表', description: '目录中的模型是否出现在 DSH 选择器，以及各自的默认思考档位与官方 ID 映射。',
             action: h('button', { type: 'button', title: '从官方 CLI 或 ACP 会话重新读取模型目录', 'aria-busy': modelBusy || undefined, style: { ...ACTION, flex: '0 0 auto', whiteSpace: 'nowrap' }, disabled: modelBusy || !props.control, onClick: () => pullModels(true) }, modelBusy ? '正在刷新…' : '刷新模型目录') }),
-          h('div', { style: { display: 'grid', gap: '14px' } },
-            h('label', { style: { display: 'grid', gap: '6px', fontSize: '12px', fontWeight: 550 } }, '从模型目录选择',
-              h('select', { 'aria-label': '从目录选择默认模型', disabled: editingDisabled, value: models.some((m) => m.id === draft.preferredModel) ? draft.preferredModel : '', onChange: (event) => { if (event.target.value) editField('preferredModel', event.target.value) }, style: { ...ACTION, width: '100%', boxSizing: 'border-box', background: 'rgba(128,128,128,.035)' } },
-                h('option', { value: '' }, models.length ? '选择一个模型，或在下方输入 ID' : '暂无目录，可手动输入模型 ID'),
-                ...models.map((model) => h('option', { key: model.id, value: model.id }, model.name + ' · ' + model.id)))),
-            h(SettingsFields, { ...fieldProps, fields: fieldsFor('model') })),
-          h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '5px 10px', marginTop: '10px', fontSize: '11px', opacity: .6 } },
-            h('span', null, models.length + ' 个模型'),
-            Array.isArray(selectedModalities) && selectedModalities.length ? h('span', null, '支持输入：' + selectedModalities.map((modality) => modalityLabels[modality] ?? modality).join('、')) : null,
-            draft.preferredModel && !selectedModel ? h('span', null, '自定义 ID · 尚未验证') : null),
-          modelMessage ? h('p', { role: 'status', style: { fontSize: '11px', lineHeight: 1.6, opacity: .65, margin: '8px 0 0', overflowWrap: 'anywhere' } }, modelMessage) : null),
+          h(ModelOverrideList, { rows: rows, overrides: draft[OVERRIDES_KEY], disabled: editingDisabled, onEdit: editOverride }),
+          modelMessage ? h('p', { role: 'status', style: { fontSize: '11px', lineHeight: 1.6, opacity: .65, margin: '10px 0 0', overflowWrap: 'anywhere' } }, modelMessage) : null),
 
         h('section', { style: PANEL, 'aria-label': '常用设置' },
           h(SectionHeading, { eyebrow: '03 · 偏好', title: '常用设置', description: '适合大多数使用场景；其它选项保持默认即可。' }),
@@ -426,7 +562,7 @@ window.__ModuleLoader__.load({
             account?.runtime ? RuntimeDetails({ runtime: account.runtime }) : h('p', { style: { margin: 0, fontSize: '12px', opacity: .6 } }, '连接后显示生命周期、并发容量与分阶段耗时。'))),
 
         h('footer', { style: { display: 'grid', gap: '10px', padding: '4px 2px 0' } },
-          conflicts.length ? h('p', { role: 'alert', style: { margin: 0, fontSize: '12px', lineHeight: 1.6, color: '#946200' } }, '其他位置更新了以下设置，已保留你的输入：' + conflicts.map((key) => FIELDS.find((field) => field.key === key)?.label ?? key).join('、') + '。请核对后再保存。') : null,
+          conflicts.length ? h('p', { role: 'alert', style: { margin: 0, fontSize: '12px', lineHeight: 1.6, color: '#946200' } }, '其他位置更新了以下设置，已保留你的输入：' + conflicts.map((key) => key === OVERRIDES_KEY ? OVERRIDES_LABEL : FIELDS.find((field) => field.key === key)?.label ?? key).join('、') + '。请核对后再保存。') : null,
           h(StatusNotice, { status }),
           h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '8px', alignItems: 'center' } },
             h('button', { type: 'button', onClick: save, disabled: editingDisabled || dirtyKeys.length === 0, style: PRIMARY }, saving ? '保存中…' : '保存'),

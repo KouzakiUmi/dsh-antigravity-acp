@@ -94,8 +94,12 @@ async function mountPill(readQuota: unknown) {
 function button(renderer: ReactTestRenderer, label: string): ReactTestInstance {
   return renderer.root.findAllByType('button').find((node) => node.children.join('') === label)!
 }
-function modelInput(renderer: ReactTestRenderer): ReactTestInstance {
-  return renderer.root.findByProps({ placeholder: '选择目录中的模型，或输入自定义 ID' })
+function fieldInput(renderer: ReactTestRenderer, name: string): ReactTestInstance {
+  return renderer.root.findByProps({ name })
+}
+/** 逐模型列表里某一行的控件。 */
+function modelControl(renderer: ReactTestRenderer, kind: 'enabled' | 'effort' | 'target' | 'name', id: string): ReactTestInstance {
+  return renderer.root.findByProps({ name: `model-${kind}-${id}` })
 }
 function renderedText(renderer: ReactTestRenderer): string { return JSON.stringify(renderer.toJSON()) }
 
@@ -131,12 +135,20 @@ describe('quota pill with real React state and effects', () => {
 })
 
 describe('settings card with real React state and effects', () => {
-  it('所有设置控件都来自宿主实际可投影的 volatile 字段，并可修改、保存、回读', async () => {
+  /** 目录桩：两个模型，供逐模型设置渲染。 */
+  const catalog = () => ({ status: 'ok' as const, models: [
+    { id: 'gemini-3-pro', name: 'Gemini 3 Pro', inputModalities: ['text', 'image'] },
+    { id: 'claude-sonnet-5-5', name: 'Claude Sonnet' },
+  ] })
+  const controlWith = (models: unknown = catalog(), account: Record<string, unknown> = { state: 'idle', message: 'ready' }) =>
+    vi.fn(async (method: string) => method === 'account' ? account : models)
+
+  it('普通设置控件都来自宿主可投影的 volatile 字段，并可与逐模型设置一起保存、回读', async () => {
     const fields = Object.entries(Config.dict ?? {}).filter(([, field]) => field.meta.volatile).map(([key]) => key)
     expect([...fields].sort()).toEqual([...LIVE_SETTING_KEYS].sort())
     const values = liveHostConfig(Config({ autoWarmup: false }))
-    const projected = Object.fromEntries(fields.map(key => [key, Reflect.get(values, key)]))
-    const service = transport({ writable: true, namespaces: fields.length ? document(projected).namespaces : [] })
+    const projected: Record<string, unknown> = Object.fromEntries(fields.map(key => [key, Reflect.get(values, key)]))
+    const service = transport(document(projected))
     service.mutate.mockImplementation(async (_ns, ops, revision) => {
       expect(revision).toBe(1)
       for (const value of ops) {
@@ -147,38 +159,83 @@ describe('settings card with real React state and effects', () => {
       service.change(document(projected, 2))
       return { ok: true, value: undefined }
     })
-    const { renderer } = await mount(service.remote)
-    const inputs = renderer.root.findAllByType('input')
-    expect(inputs).toHaveLength(LIVE_SETTING_KEYS.length)
+    const { renderer } = await mount(service.remote, controlWith())
+    // modelOverrides 由逐模型行渲染，不是普通输入框。
+    const plain = fields.filter(key => key !== 'modelOverrides')
+    const inputs = renderer.root.findAllByType('input').filter(input => !String(input.props.name).startsWith('model-'))
+    expect(inputs).toHaveLength(plain.length)
     expect(inputs.every(input => input.props.disabled === false)).toBe(true)
     await act(async () => {
       for (const input of inputs) input.props.onChange({ target: input.props.type === 'checkbox'
         ? { checked: !input.props.checked }
         : { value: input.props.type === 'number' ? '0' : 'test-value' } })
+      modelControl(renderer, 'enabled', 'gemini-3-pro').props.onChange({ target: { checked: false } })
+      modelControl(renderer, 'effort', 'claude-sonnet-5-5').props.onChange({ target: { value: 'high' } })
     })
     expect(button(renderer, '保存').props.disabled).toBe(false)
     await act(async () => { await button(renderer, '保存').props.onClick() })
     expect(service.mutate).toHaveBeenCalledTimes(1)
-    expect(service.mutate.mock.calls[0]![1]).toHaveLength(LIVE_SETTING_KEYS.length)
+    const ops = service.mutate.mock.calls[0]![1] as Array<{ path: string[]; value: unknown }>
+    expect(ops.map(op => op.path[0]).sort()).toEqual([...plain, 'modelOverrides'].sort())
+    expect(ops.find(op => op.path[0] === 'modelOverrides')!.value).toEqual({
+      'claude-sonnet-5-5': { effort: 'high' },
+      'gemini-3-pro': { enabled: false },
+    })
     expect(button(renderer, '保存').props.disabled).toBe(true)
-    expect(modelInput(renderer).props.value).toBe('test-value')
+    expect(fieldInput(renderer, 'proxyUrl').props.value).toBe('test-value')
     expect(renderedText(renderer)).toContain('会话偏好从下一轮生效')
+  })
+
+  it('逐模型设置只提交有意义的字段，清空的项从配置里移除', async () => {
+    const service = transport(document({
+      modelOverrides: { 'gemini-3-pro': { enabled: false, effort: 'low', name: '旧名', target: 'gemini-3-pro-high' } },
+    }))
+    const { renderer } = await mount(service.remote, controlWith())
+    expect(modelControl(renderer, 'enabled', 'gemini-3-pro').props.checked).toBe(false)
+    expect(modelControl(renderer, 'effort', 'gemini-3-pro').props.value).toBe('low')
+    expect(modelControl(renderer, 'name', 'gemini-3-pro').props.value).toBe('旧名')
+    await act(async () => {
+      modelControl(renderer, 'enabled', 'gemini-3-pro').props.onChange({ target: { checked: true } })
+      modelControl(renderer, 'effort', 'gemini-3-pro').props.onChange({ target: { value: '' } })
+      modelControl(renderer, 'name', 'gemini-3-pro').props.onChange({ target: { value: '  ' } })
+      modelControl(renderer, 'target', 'gemini-3-pro').props.onChange({ target: { value: '' } })
+    })
+    await act(async () => { await button(renderer, '保存').props.onClick() })
+    expect(service.mutate).toHaveBeenCalledWith('llm-antigravity-acp', [{ op: 'set', path: ['modelOverrides'], value: {} }], 1)
+  })
+
+  it('全部模型被隐藏时提示 provider 会从选择器消失，重新启用后提示消失', async () => {
+    const service = transport(document({ modelOverrides: { 'gemini-3-pro': { enabled: false }, 'claude-sonnet-5-5': { enabled: false } } }))
+    const { renderer } = await mount(service.remote, controlWith())
+    expect(renderedText(renderer)).toContain('所有模型都已隐藏')
+    await act(async () => { modelControl(renderer, 'enabled', 'gemini-3-pro').props.onChange({ target: { checked: true } }) })
+    expect(renderedText(renderer)).not.toContain('所有模型都已隐藏')
+    expect(renderedText(renderer)).toContain('1 个已从选择器隐藏')
+  })
+
+  it('已经保存但当前目录没有的模型 ID 仍可编辑，并标注不在目录', async () => {
+    const service = transport(document({ modelOverrides: { 'retired-model': { target: 'retired-model-high' } } }))
+    const { renderer } = await mount(service.remote, controlWith())
+    expect(modelControl(renderer, 'target', 'retired-model').props.value).toBe('retired-model-high')
+    expect(renderedText(renderer)).toContain('不在当前目录')
+    expect(renderedText(renderer)).toContain('3 个模型')
   })
 
   it('缺少设置 namespace 时解释禁用原因，宿主恢复后重新启用控件', async () => {
     const service = transport({ writable: true, namespaces: [] })
     const { renderer } = await mount(service.remote)
-    expect(modelInput(renderer).props.disabled).toBe(true)
+    expect(fieldInput(renderer, 'proxyUrl').props.disabled).toBe(true)
     expect(renderedText(renderer)).toContain('尚未提供 Antigravity ACP 的可编辑设置')
-    await act(async () => { service.change(document({ preferredModel: 'restored' })) })
-    expect(modelInput(renderer).props.disabled).toBe(false)
+    await act(async () => { service.change(document({ proxyUrl: 'http://restored:7890' })) })
+    expect(fieldInput(renderer, 'proxyUrl').props.disabled).toBe(false)
     expect(renderedText(renderer)).not.toContain('尚未提供 Antigravity ACP 的可编辑设置')
   })
 
   it('respects read-only settings instead of offering a save that will fail', async () => {
-    const service = transport(document({ preferredModel: 'old-model' }, 1, false))
-    const { renderer } = await mount(service.remote)
-    expect(modelInput(renderer).props.disabled).toBe(true)
+    const service = transport(document({ proxyUrl: 'http://old:7890' }, 1, false))
+    const { renderer } = await mount(service.remote, controlWith())
+    expect(fieldInput(renderer, 'proxyUrl').props.disabled).toBe(true)
+    expect(modelControl(renderer, 'enabled', 'gemini-3-pro').props.disabled).toBe(true)
     expect(button(renderer, '保存').props.disabled).toBe(true)
     expect(renderedText(renderer)).toContain('当前设置为只读')
     await act(async () => { await button(renderer, '保存').props.onClick() })
@@ -186,13 +243,16 @@ describe('settings card with real React state and effects', () => {
   })
 
   it('preserves edited fields and merges untouched fields after an external update', async () => {
-    const service = transport(document({ preferredModel: 'old-model', proxyUrl: 'http://old:7890' }))
-    const { renderer } = await mount(service.remote)
-    await act(async () => { modelInput(renderer).props.onChange({ target: { value: 'my-model' } }) })
-    await act(async () => { service.change(document({ preferredModel: 'other-model', proxyUrl: 'http://new:7890' }, 2)) })
-    expect(modelInput(renderer).props.value).toBe('my-model')
-    expect(renderer.root.findByProps({ placeholder: 'http://127.0.0.1:7890' }).props.value).toBe('http://new:7890')
+    const service = transport(document({ proxyUrl: 'http://old:7890', modelOverrides: { 'gemini-3-pro': { effort: 'low' } } }))
+    const { renderer } = await mount(service.remote, controlWith())
+    await act(async () => { modelControl(renderer, 'target', 'gemini-3-pro').props.onChange({ target: { value: 'custom-target' } }) })
+    // 外部同时改了代理和同一个模型的档位：草稿里的映射必须保留并提示冲突。
+    await act(async () => { service.change(document({ proxyUrl: 'http://new:7890', modelOverrides: { 'gemini-3-pro': { effort: 'high' } } }, 2)) })
+    expect(modelControl(renderer, 'target', 'gemini-3-pro').props.value).toBe('custom-target')
+    expect(modelControl(renderer, 'effort', 'gemini-3-pro').props.value).toBe('low')
+    expect(fieldInput(renderer, 'proxyUrl').props.value).toBe('http://new:7890')
     expect(renderedText(renderer)).toContain('已保留你的输入')
+    expect(renderedText(renderer)).toContain('模型列表设置')
     expect(renderedText(renderer)).toContain('有 1 项未保存的修改')
     expect(button(renderer, '保存').props.disabled).toBe(false)
   })
@@ -201,75 +261,78 @@ describe('settings card with real React state and effects', () => {
     const service = transport()
     const first = deferred<SettingsDocument>()
     service.describe.mockImplementationOnce(() => first.promise)
-    const { renderer } = await mount(service.remote)
-    await act(async () => { service.change(document({ preferredModel: 'latest-model' }, 3)) })
-    await act(async () => { first.resolve(document({ preferredModel: 'stale-model' }, 1)) })
-    expect(modelInput(renderer).props.value).toBe('latest-model')
+    const { renderer } = await mount(service.remote, controlWith())
+    await act(async () => { service.change(document({ proxyUrl: 'http://latest:7890' }, 3)) })
+    await act(async () => { first.resolve(document({ proxyUrl: 'http://stale:7890' }, 1)) })
+    expect(fieldInput(renderer, 'proxyUrl').props.value).toBe('http://latest:7890')
     expect(button(renderer, '保存').props.disabled).toBe(true)
   })
 
   it('can discard a conflicted draft and restore the latest server settings', async () => {
-    const service = transport(document({ preferredModel: 'old-model' }))
-    const { renderer } = await mount(service.remote)
-    await act(async () => { modelInput(renderer).props.onChange({ target: { value: 'my-model' } }) })
-    await act(async () => { service.change(document({ preferredModel: 'latest-model' }, 2)) })
+    const service = transport(document({ modelOverrides: { 'gemini-3-pro': { effort: 'low' } } }))
+    const { renderer } = await mount(service.remote, controlWith())
+    await act(async () => { modelControl(renderer, 'effort', 'gemini-3-pro').props.onChange({ target: { value: 'high' } }) })
+    await act(async () => { service.change(document({ modelOverrides: { 'gemini-3-pro': { effort: 'medium' } } }, 2)) })
     await act(async () => { button(renderer, '撤销未保存修改').props.onClick() })
-    expect(modelInput(renderer).props.value).toBe('latest-model')
+    expect(modelControl(renderer, 'effort', 'gemini-3-pro').props.value).toBe('medium')
     expect(button(renderer, '保存').props.disabled).toBe(true)
     expect(renderedText(renderer)).not.toContain('其他位置更新了以下设置')
     expect(service.mutate).not.toHaveBeenCalled()
   })
 
   it('serializes save clicks and submits only edited fields, including a cleared value', async () => {
-    const service = transport(document({ preferredModel: 'old-model', proxyUrl: 'http://proxy:7890' }))
+    const service = transport(document({ proxyUrl: 'http://proxy:7890' }))
     const saved = deferred<{ ok: boolean; value: undefined }>()
     service.mutate.mockImplementationOnce(() => saved.promise)
-    const { renderer } = await mount(service.remote)
-    await act(async () => { modelInput(renderer).props.onChange({ target: { value: '' } }) })
+    const { renderer } = await mount(service.remote, controlWith())
+    await act(async () => { fieldInput(renderer, 'proxyUrl').props.onChange({ target: { value: '' } }) })
     const save = button(renderer, '保存').props.onClick as () => Promise<void>
     await act(async () => { void save(); void save() })
     expect(service.mutate).toHaveBeenCalledTimes(1)
-    expect(service.mutate).toHaveBeenCalledWith('llm-antigravity-acp', [{ op: 'set', path: ['preferredModel'], value: '' }], 1)
+    expect(service.mutate).toHaveBeenCalledWith('llm-antigravity-acp', [{ op: 'set', path: ['proxyUrl'], value: '' }], 1)
     expect(button(renderer, '保存中…').props.disabled).toBe(true)
-    expect(modelInput(renderer).props.disabled).toBe(true)
+    expect(fieldInput(renderer, 'proxyUrl').props.disabled).toBe(true)
     await act(async () => {
-      service.change(document({ preferredModel: '', proxyUrl: 'http://proxy:7890' }, 2))
+      service.change(document({ proxyUrl: '' }, 2))
       saved.resolve({ ok: true, value: undefined })
     })
-    expect(modelInput(renderer).props.value).toBe('')
+    expect(fieldInput(renderer, 'proxyUrl').props.value).toBe('')
     expect(button(renderer, '保存').props.disabled).toBe(true)
     expect(renderedText(renderer)).not.toContain('项未保存的修改')
   })
 
   it('preserves the draft and refreshes the revision after a rejected mutation', async () => {
-    const service = transport(document({ preferredModel: 'old-model' }))
+    const service = transport(document({ proxyUrl: 'http://old:7890' }))
     service.mutate.mockRejectedValueOnce(new Error('revision conflict'))
-    const { renderer } = await mount(service.remote)
-    await act(async () => { modelInput(renderer).props.onChange({ target: { value: 'my-model' } }) })
-    service.set(document({ preferredModel: 'other-model' }, 2))
+    const { renderer } = await mount(service.remote, controlWith())
+    await act(async () => { fieldInput(renderer, 'proxyUrl').props.onChange({ target: { value: 'http://mine:7890' } }) })
+    service.set(document({ proxyUrl: 'http://other:7890' }, 2))
     await act(async () => { await button(renderer, '保存').props.onClick() })
-    expect(modelInput(renderer).props.value).toBe('my-model')
+    expect(fieldInput(renderer, 'proxyUrl').props.value).toBe('http://mine:7890')
     expect(renderedText(renderer)).toContain('revision conflict')
     expect(renderedText(renderer)).toContain('已保留你的输入')
     expect(button(renderer, '保存').props.disabled).toBe(false)
-    service.set(document({ preferredModel: 'my-model' }, 3))
+    service.set(document({ proxyUrl: 'http://mine:7890' }, 3))
     await act(async () => { await button(renderer, '保存').props.onClick() })
     expect(service.mutate.mock.calls[1]?.[2]).toBe(2)
   })
 
-  it('refreshes the model selector when the backend catalog revision changes', async () => {
-    const service = transport(document({ preferredModel: 'example-model' }))
+  it('目录变化时刷新逐模型列表，手动列目录也能读到新条目', async () => {
+    const service = transport()
     let revision = 1
-    const control = vi.fn(async (method: string) => method === 'account'
-      ? { state: 'idle', message: 'ready', runtime: { phase: 'ready', modelCatalogRevision: revision } }
-      : { status: 'ok', models: revision === 1 ? [] : [{ id: 'example-model', name: 'Example', inputModalities: ['text', 'image'] }] })
+    const control = vi.fn(async (method: string, request?: { force?: boolean }) => {
+      if (method === 'account') return { state: 'idle', message: 'ready', runtime: { phase: 'ready', modelCatalogRevision: revision } }
+      if (request?.force) return { status: 'ok', models: [{ id: 'fresh-model', name: 'Fresh' }] }
+      return revision === 1 ? { status: 'ok', models: [] } : catalog()
+    })
     const { renderer, intervals } = await mount(service.remote, control)
-    const before = control.mock.calls.filter(([method]) => method === 'models').length
+    expect(renderedText(renderer)).toContain('还没有模型目录')
     revision = 2
     await act(async () => { for (const timer of intervals.values()) if (timer.delay === 2000) timer.callback() })
-    expect(control.mock.calls.filter(([method]) => method === 'models').length).toBeGreaterThan(before)
-    expect(renderer.root.findAllByType('option').some((option) => option.props.value === 'example-model')).toBe(true)
-    expect(renderedText(renderer)).toContain('支持输入：文本、图片')
+    expect(modelControl(renderer, 'target', 'gemini-3-pro').props.value).toBe('')
+    expect(renderedText(renderer)).toContain('文本、图片')
+    await act(async () => { await button(renderer, '刷新模型目录').props.onClick() })
+    expect(modelControl(renderer, 'enabled', 'fresh-model')).toBeDefined()
   })
 
   it('后台目录通知不覆盖手动拉取的等待状态和失败原因，可再次点击重试', async () => {
@@ -295,7 +358,7 @@ describe('settings card with real React state and effects', () => {
     expect(button(renderer, '刷新模型目录').props.disabled).toBe(false)
     fail = false
     await act(async () => { await button(renderer, '刷新模型目录').props.onClick() })
-    expect(renderer.root.findAllByType('option').some((option) => option.props.value === 'new-model')).toBe(true)
+    expect(modelControl(renderer, 'enabled', 'new-model')).toBeDefined()
   })
 
   it('shows session switches and submits timers as numbers, preserving zero', async () => {

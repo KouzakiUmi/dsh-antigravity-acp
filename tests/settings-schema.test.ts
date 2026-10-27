@@ -4,10 +4,10 @@ import { Config, LIVE_SETTING_KEYS, liveHostConfig } from '../src/settings.js'
 
 describe('live settings schema and runtime references', () => {
   it('宿主提交即时引用后可读取下一次操作配置，同时保持已捕获快照不变', () => {
-    const parsed = Config({ autoWarmup: false, preferredModel: 'before', proxyUrl: 'http://old:7890' })
+    const parsed = Config({ autoWarmup: false, modelOverrides: { before: { enabled: false } }, proxyUrl: 'http://old:7890' })
     const config = liveHostConfig(parsed)
     const snapshot = { ...config }
-    const next = Config({ autoWarmup: false, preferredModel: 'after', proxyUrl: '', reuseSessions: false, resumeSessions: true, keepProcessAfterCancel: true, cancelGraceMs: 0, idleRecycleMs: 0, agyCliPath: '/new/agy', proxyBypass: '*.internal' })
+    const next = Config({ autoWarmup: false, modelOverrides: { after: { effort: 'high', target: 'gemini-3-pro-high' } }, proxyUrl: '', reuseSessions: false, resumeSessions: true, keepProcessAfterCancel: true, cancelGraceMs: 0, idleRecycleMs: 0, agyCliPath: '/new/agy', proxyBypass: '*.internal' })
     for (const key of LIVE_SETTING_KEYS) {
       const beforeRef = parsed[key]
       const afterRef = next[key]
@@ -19,8 +19,8 @@ describe('live settings schema and runtime references', () => {
       updateVolatile(beforeRef, afterRef)
       expect(parsed[key]).toBe(beforeRef)
     }
-    expect(config).toMatchObject({ preferredModel: 'after', proxyUrl: '', reuseSessions: false, resumeSessions: true, keepProcessAfterCancel: true, cancelGraceMs: 0, idleRecycleMs: 0, agyCliPath: '/new/agy', proxyBypass: '*.internal' })
-    expect(snapshot.preferredModel).toBe('before')
+    expect(config).toMatchObject({ modelOverrides: { after: { enabled: true, effort: 'high', target: 'gemini-3-pro-high' } }, proxyUrl: '', reuseSessions: false, resumeSessions: true, keepProcessAfterCancel: true, cancelGraceMs: 0, idleRecycleMs: 0, agyCliPath: '/new/agy', proxyBypass: '*.internal' })
+    expect(snapshot.modelOverrides).toEqual({ before: { enabled: false } })
     expect(snapshot.proxyUrl).toBe('http://old:7890')
   })
 
@@ -35,5 +35,13 @@ describe('live settings schema and runtime references', () => {
     expect(config.maxConcurrentSessions).toBe(2)
     expect(config.handshakeTimeoutMs).toBe(120000)
     expect(config.extraArgs).toEqual([])
+    expect(config.modelOverrides).toEqual({})
+  })
+
+  it('模型设置缺省启用，未知档位由 schema 拒绝而不是静默改写成别的值', () => {
+    expect(Config({ modelOverrides: { 'gemini-3-pro': {} } }).modelOverrides.get()).toEqual({ 'gemini-3-pro': { enabled: true } })
+    // 配置可能来自手写 JSON，档位拼错必须在装载期失败，不能静默退回默认档位。
+    const mistyped = { modelOverrides: { 'gemini-3-pro': { effort: 'max' } } } as unknown as Parameters<typeof Config>[0]
+    expect(() => Config(mistyped)).toThrow()
   })
 })

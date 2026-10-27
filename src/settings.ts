@@ -6,6 +6,18 @@ import Schema from '@deepseek-ai/schemastery'
 import type { Volatile } from '@deepseek-ai/cordis'
 import { DEFAULT_ACP_SERVER_VERSION } from './runtime/binary.js'
 
+/** 单个模型目录条目上的用户设置；键是 DSH 模型选择器里的模型 ID。 */
+export interface ModelOverride {
+  /** 是否出现在 DSH 模型选择器；省略等同启用。停用不删除目录条目，仍可被会话请求。 */
+  enabled?: boolean
+  /** 该模型的默认思考档位；未在 DSH 思考强度菜单选择时使用，省略按官方默认（medium）。 */
+  effort?: 'low' | 'medium' | 'high'
+  /** 显示名覆盖；省略用官方目录名称。 */
+  name?: string
+  /** 映射到官方模型 ID，原样写入 ACP 会话，优先于家族 + 档位路由。 */
+  target?: string
+}
+
 export interface AntigravityHostConfig {
   /** Maximum independent ACP workers, started on demand. */
   maxConcurrentSessions?: number
@@ -37,10 +49,10 @@ export interface AntigravityHostConfig {
   /** 并发 MCP tools/call 的聚合窗口（毫秒），决定同一轮携带多少 tool-call block。 */
   bridgeParkSettleMs?: number
   /**
-   * 默认/自定义模型 id：在目录中优先显示，目录外 id 标为用户配置、未验证。
-   * 旧会话的 server-default 路由仍映射到此值；留空不指定默认项。
+   * 按模型 ID 的目录设置：是否出现在 DSH 模型选择器、默认思考档位、显示名、
+   * 官方模型 ID 映射。只作用于目录中已存在的条目，不新增自造模型。
    */
-  preferredModel?: string
+  modelOverrides?: Record<string, ModelOverride>
   /**
    * 官方进程出网代理（如 http://127.0.0.1:7890）。留空继承宿主代理，宿主未配置才直连；
    * 填入后同时注入大小写两套 *_PROXY 与 NO_PROXY。
@@ -76,7 +88,7 @@ export interface AntigravityHostConfig {
 
 // Only fields owned by the custom settings card are live. Ordinary launch/pool
 // configuration remains ordinary, so editing it still follows the host lifecycle.
-export const LIVE_SETTING_KEYS = ['autoWarmup', 'reuseSessions', 'preferredModel', 'proxyUrl', 'proxyBypass', 'agyCliPath', 'resumeSessions', 'keepProcessAfterCancel', 'cancelGraceMs', 'idleRecycleMs'] as const
+export const LIVE_SETTING_KEYS = ['autoWarmup', 'reuseSessions', 'modelOverrides', 'proxyUrl', 'proxyBypass', 'agyCliPath', 'resumeSessions', 'keepProcessAfterCancel', 'cancelGraceMs', 'idleRecycleMs'] as const
 export type LiveSettingKey = typeof LIVE_SETTING_KEYS[number]
 export type AntigravityPluginConfig = Omit<AntigravityHostConfig, LiveSettingKey> & {
   [K in LiveSettingKey]?: AntigravityHostConfig[K] | Volatile<AntigravityHostConfig[K]>
@@ -85,8 +97,9 @@ export type AntigravityPluginConfig = Omit<AntigravityHostConfig, LiveSettingKey
 function readSetting(value: string | Volatile<string | undefined> | undefined): string | undefined
 function readSetting(value: boolean | Volatile<boolean | undefined> | undefined): boolean | undefined
 function readSetting(value: number | Volatile<number | undefined> | undefined): number | undefined
-function readSetting(value: string | boolean | number | Volatile<string | boolean | number | undefined> | undefined): string | boolean | number | undefined {
-  return typeof value === 'object' ? value.get() : value
+function readSetting(value: Record<string, ModelOverride> | Volatile<Record<string, ModelOverride> | undefined> | undefined): Record<string, ModelOverride> | undefined
+function readSetting(value: string | boolean | number | Record<string, ModelOverride> | Volatile<string | boolean | number | Record<string, ModelOverride> | undefined> | undefined): string | boolean | number | Record<string, ModelOverride> | undefined {
+  return typeof value === 'object' && value !== null && 'get' in value ? (value as Volatile<unknown>).get() as Record<string, ModelOverride> : value as string | boolean | number | Record<string, ModelOverride> | undefined
 }
 
 /** Keep references live; callers may spread this view to capture one operation. */
@@ -95,7 +108,7 @@ export function liveHostConfig(config: AntigravityPluginConfig): AntigravityHost
     ...config,
     get autoWarmup() { return readSetting(config.autoWarmup) },
     get reuseSessions() { return readSetting(config.reuseSessions) },
-    get preferredModel() { return readSetting(config.preferredModel) },
+    get modelOverrides() { return readSetting(config.modelOverrides) },
     get proxyUrl() { return readSetting(config.proxyUrl) },
     get proxyBypass() { return readSetting(config.proxyBypass) },
     get agyCliPath() { return readSetting(config.agyCliPath) },
@@ -105,6 +118,9 @@ export function liveHostConfig(config: AntigravityPluginConfig): AntigravityHost
     get idleRecycleMs() { return readSetting(config.idleRecycleMs) },
   }
 }
+
+/** 官方思考档位；与 runtime/agy-cli.ts 的 AGY_REASONING_EFFORTS 一致。 */
+export const MODEL_EFFORTS = ['low', 'medium', 'high'] as const
 
 export const Config = Schema.object({
   maxConcurrentSessions: Schema.natural().min(1).max(4).default(2).description('最大并发 ACP 连接数（1–4），按需启动；不同对话互不占用工具审批回合'),
@@ -120,7 +136,12 @@ export const Config = Schema.object({
   authTimeoutMs: Schema.natural().default(300_000).description('authenticate（需人工在浏览器完成 OAuth 授权）的等待上限（毫秒）'),
   promptTimeoutMs: Schema.natural().default(1_800_000).description('单轮 session/prompt 的等待上限（毫秒）'),
   bridgeParkSettleMs: Schema.natural().default(50).description('并发 MCP tools/call 的聚合窗口（毫秒）'),
-  preferredModel: Schema.string().volatile().description('默认/自定义模型 ID，优先列入目录；目录外 ID 未验证。兼容旧 server-default 路由，留空不指定默认项'),
+  modelOverrides: Schema.dict(Schema.object({
+    enabled: Schema.boolean().default(true).description('是否出现在 DSH 模型选择器'),
+    effort: Schema.union(MODEL_EFFORTS).description('默认思考档位：low / medium / high'),
+    name: Schema.string().description('显示名覆盖'),
+    target: Schema.string().description('映射到的官方模型 ID，优先于家族 + 档位路由'),
+  })).default({}).volatile().description('按模型 ID 的目录设置（是否显示、默认思考档位、显示名、官方模型 ID 映射）；只作用于目录中已存在的模型'),
   proxyUrl: Schema.string().volatile().description('官方进程出网代理，如 http://127.0.0.1:7890（缺 scheme 按 http 处理）。留空继承宿主代理，宿主也未配置时才直连'),
   proxyBypass: Schema.string().volatile().description('代理排除列表，逗号分隔，如 example.internal,*.internal；不支持 CIDR。localhost/127.0.0.1/::1 始终自动排除'),
   reuseSessions: Schema.boolean().default(true).volatile().description('复用同一个 ACP 会话，后续回合只发送新增消息；历史被压缩/回退或模型、工具目录变化时自动重建。关闭则每轮新会话并重放全部历史'),

@@ -482,7 +482,8 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
     try { ctx.emit('llm/adapters-updated') } catch { /* Observers cannot veto catalog updates. */ }
   }
   ctx.on('loader/volatile-update', (paths) => {
-    if (paths.some(([key]) => key === 'preferredModel')) catalogChanged()
+    // 模型显示开关、默认档位与映射都会改变选择器与路由，需要通知宿主刷新目录。
+    if (paths.some(([key]) => key === 'modelOverrides')) catalogChanged()
   })
   let attachmentStore: AttachmentStore | undefined
 
@@ -552,7 +553,7 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
       },
       promptTimeoutMs: config.promptTimeoutMs,
       parkSettleMs: config.bridgeParkSettleMs,
-      preferredModel: config.preferredModel,
+      modelOverrides: config.modelOverrides,
       readSettings: () => ({ ...config, sessionStore: config.resumeSessions ? sessionStore : undefined }),
       // ACP 会话复用：同一条 DSH 对话的后续回合只发增量；重启恢复默认关闭。
       reuseSessions: config.reuseSessions,

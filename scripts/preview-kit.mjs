@@ -56,6 +56,6 @@ const settings = render('antigravity-acp', {
     startup: { elapsedMs: 7120, timings: { binary: 20, credentials: 2100, spawn: 10, initialize: 4990 } },
     round: { model: 'gemini-3.8-flash-low', elapsedMs: 4800, timings: { connection: 1, session: 1200, model: 10 }, firstChunkMs: 1800, firstToolMs: 2100, continuations: 2, lastContinuationMs: 1200 },
   } }, 1: models,
-  4: { revision: 1 }, 5: true, 6: { autoWarmup: true, reuseSessions: true, preferredModel: 'gemini-3.8-flash', proxyUrl: '', proxyBypass: '', agyCliPath: '' }, 8: false, 9: true,
+  4: { revision: 1 }, 5: true, 6: { autoWarmup: true, reuseSessions: true, proxyUrl: '', proxyBypass: '', agyCliPath: '', modelOverrides: { 'gemini-4-argon': { effort: 'high' }, 'claude-sonnet-5-5': { name: 'Claude Sonnet（长上下文）' } } }, 8: false, 9: true,
 }, { remote: {}, control() {} })
 export { quota, models, settings, pill, render, escape }

@@ -225,7 +225,8 @@ describe('browser client module', () => {
     const tree = card({ remote: {}, control, readQuota })
     const text = texts(tree).join(' ')
     expect(text).toContain('01 · 连接')
-    expect(text).toContain('默认 / 自定义模型 ID')
+    expect(text).toContain('02 · 模型')
+    expect(text).toContain('模型列表')
     expect(text).not.toContain('首次')
     expect(control.mock.calls.some(([, request]) => request?.action === 'login')).toBe(false)
     const click = (label: string) => {
@@ -249,6 +250,8 @@ describe('browser client module', () => {
     const text = texts(tree).join(' ')
     for (const label of ['01 · 连接', '02 · 模型', '03 · 偏好', '高级设置', '连接诊断']) expect(text).toContain(label)
     expect(text).toContain('额度药丸中查看')
+    // 默认模型由 DSH 自己的模型选择器负责，设置页不再重复维护。
+    expect(text).not.toContain('默认模型')
     expect(text).not.toContain('套餐额度管理')
     expect(elements(tree).filter((item) => item.props['aria-label'] === 'AI Credits 余额')).toHaveLength(0)
     expect(elements(tree).filter((item) => item.type === 'details')).toHaveLength(2)
@@ -338,7 +341,7 @@ describe('browser client module', () => {
             value: {
               writable: true,
               namespaces: [
-                { ns: 'llm-antigravity-acp', revision: 7, value: { preferredModel: 'gemini-3-pro', proxyUrl: '' } },
+                { ns: 'llm-antigravity-acp', revision: 7, value: { proxyUrl: '', modelOverrides: { 'gemini-3-pro': { effort: 'high' } } } },
               ],
             },
           }

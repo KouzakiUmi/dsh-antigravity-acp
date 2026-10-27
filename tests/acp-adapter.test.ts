@@ -18,6 +18,7 @@ import {
 import type { GenerateOptions, RequestMessage, StreamChunk, ToolSchema } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, RequestPermissionRequest, SessionConfigOption } from '@agentclientprotocol/sdk'
 import { AntigravityAcpAdapter, AGY_PROVIDER_ID, AGY_PLACEHOLDER_MODEL_ID, AGY_ADAPTER_ERROR } from '../src/adapter/antigravity-adapter.js'
+import type { ModelOverride } from '../src/settings.js'
 import type { AdapterLog, AntigravityAcpAdapterOptions } from '../src/adapter/antigravity-adapter.js'
 import type { ImageReader } from '../src/adapter/image-content.js'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
@@ -87,7 +88,7 @@ afterEach(async () => {
 function createHarness(
   options: {
     parkSettleMs?: number
-    preferredModel?: string
+    modelOverrides?: Record<string, ModelOverride>
     readSettings?: AntigravityAcpAdapterOptions['readSettings']
     log?: AdapterLog
     configOptions?: SessionConfigOption[] | null
@@ -156,7 +157,7 @@ function createHarness(
   let inflight: Promise<AgentLink> | undefined
   let bridgeTeardown: (() => Promise<void>) | undefined
   const adapter = new AntigravityAcpAdapter({
-    preferredModel: options.preferredModel,
+    modelOverrides: options.modelOverrides,
     readSettings: options.readSettings,
     getLink: async (handlers, _signal, purpose) => {
       options.onGetLink?.(purpose)
@@ -309,16 +310,19 @@ async function connectAgentMcpClient(harness: Harness): Promise<Client> {
 }
 
 describe('模型目录来自 ACP 会话配置', () => {
-  it('默认模型的即时配置更新和清空会反映在目录，不需要重建 adapter', async () => {
-    let preferredModel = 'custom-before'
-    const harness = createHarness({ readSettings: () => ({ preferredModel }) })
-    expect((await harness.adapter.listModels(AGY_PROVIDER_ID))[0]?.id).toBe('custom-before')
-    preferredModel = 'custom-after'
+  it('即时配置的开关与显示名更新直接反映在目录，不需要重建 adapter', async () => {
+    let modelOverrides: Record<string, ModelOverride> = { 'gemini-test': { enabled: false } }
+    const harness = createHarness({
+      readSettings: () => ({ modelOverrides }),
+      loadCliCatalog: async () => [{ id: 'gemini-test', name: 'Gemini' }, { id: 'claude-test', name: 'Claude' }],
+    })
+    expect((await harness.adapter.listModels(AGY_PROVIDER_ID)).map(model => model.id)).toEqual(['claude-test'])
+    modelOverrides = { 'gemini-test': { name: '改名后' } }
     const models = await harness.adapter.listModels(AGY_PROVIDER_ID)
-    expect(models[0]?.id).toBe('custom-after')
-    expect(models.some(model => model.id === 'custom-before')).toBe(false)
-    preferredModel = ''
-    expect((await harness.adapter.listModels(AGY_PROVIDER_ID)).some(model => model.id === 'custom-after')).toBe(false)
+    expect(models.map(model => model.id)).toEqual(['gemini-test', 'claude-test'])
+    expect(models[0]?.name).toBe('改名后')
+    modelOverrides = {}
+    expect((await harness.adapter.listModels(AGY_PROVIDER_ID)).map(model => model.name)).toEqual(['Gemini', 'Claude'])
     expect(harness.agent.requestsFor('session/prompt')).toHaveLength(0)
   })
 
@@ -429,20 +433,45 @@ describe('模型目录来自 ACP 会话配置', () => {
     expect(agent.requestsFor('initialize')).toHaveLength(1)
     expect(harness.recycles()).toBe(0)
   })
-  it('用户自定义模型加入目录且不伪称已验证，旧默认路由仍兼容', async () => {
-    const harness = createHarness({ preferredModel: 'custom-model-v1' })
-    expect(await harness.adapter.listModels(AGY_PROVIDER_ID)).toEqual([
-      expect.objectContaining({ id: 'custom-model-v1', description: expect.stringContaining('尚未验证') }),
-    ])
+  it('用户停用的模型不列入选择器，也不新增自造条目', async () => {
+    const harness = createHarness({
+      modelOverrides: { 'gemini-test': { enabled: false } },
+      loadCliCatalog: async () => [{ id: 'gemini-test', name: 'Gemini' }, { id: 'claude-test', name: 'Claude' }],
+    })
+    expect((await harness.adapter.listModels(AGY_PROVIDER_ID)).map((row) => row.id)).toEqual(['claude-test'])
     expect(harness.agent.requests).toHaveLength(0)
-    expect(await harness.adapter.resolveModel(AGY_PROVIDER_ID, AGY_PLACEHOLDER_MODEL_ID)).toMatchObject({ id: AGY_PLACEHOLDER_MODEL_ID })
   })
 
-  it('目录中的默认模型优先列出，不制造重复项', async () => {
-    const harness = createHarness({ preferredModel: 'claude-test', loadCliCatalog: async () => [
-      { id: 'gemini-test', name: 'Gemini' }, { id: 'claude-test', name: 'Claude' },
-    ] })
-    expect((await harness.adapter.listModels(AGY_PROVIDER_ID)).map((row) => row.id)).toEqual(['claude-test', 'gemini-test'])
+  it('目录外的映射目标不作为模型新增，目录条目保持官方清单', async () => {
+    const harness = createHarness({
+      modelOverrides: { 'claude-test': { target: 'claude-test-high' } },
+      loadCliCatalog: async () => [{ id: 'gemini-test', name: 'Gemini' }, { id: 'claude-test', name: 'Claude' }],
+    })
+    expect((await harness.adapter.listModels(AGY_PROVIDER_ID)).map((row) => row.id)).toEqual(['gemini-test', 'claude-test'])
+  })
+
+  it('显示名覆盖同时作用于目录与会话解析', async () => {
+    const harness = createHarness({
+      modelOverrides: { 'gemini-test': { name: '自定义名称' } },
+      loadCliCatalog: async () => [{ id: 'gemini-test', name: 'Gemini' }],
+    })
+    expect((await harness.adapter.listModels(AGY_PROVIDER_ID))[0]?.name).toBe('自定义名称')
+    expect((await harness.adapter.resolveModel(AGY_PROVIDER_ID, 'gemini-test')).name).toBe('自定义名称')
+  })
+
+  it('设置的默认档位成为该模型的 reasoning 缺省档位，未声明的档位退回官方默认', async () => {
+    const harness = createHarness({
+      modelOverrides: { 'claude-test': { effort: 'high' }, 'gemini-test': { effort: 'low' } },
+      loadCliCatalog: async () => [
+        { id: 'claude-test-low', name: 'Claude (Low)' },
+        { id: 'claude-test-high', name: 'Claude (High)' },
+        { id: 'gemini-test-medium', name: 'Gemini (Medium)' },
+      ],
+    })
+    const reasoning = (await harness.adapter.resolveModel(AGY_PROVIDER_ID, 'claude-test')).reasoning
+    expect(reasoning?.defaultEffort?.toString()).toBe('high')
+    // 官方只声明 medium 时，用户配置的 low 不能指向不存在的选项。
+    expect((await harness.adapter.resolveModel(AGY_PROVIDER_ID, 'gemini-test')).reasoning?.defaultEffort?.toString()).toBe('medium')
   })
 
   it('session/new 的 model select 配置项被映射为 LlmModelInfo 目录', async () => {
@@ -742,6 +771,62 @@ describe('模型目录来自 ACP 会话配置', () => {
       .filter((request) => request.method === 'session/set_config_option')
       .map((request) => (request.params as { value: string }).value)
     expect(requested).toContain('gemini-4-argon-medium')
+  })
+
+  it('映射到官方 ID 时原样写入，优先于家族 + 档位路由', async () => {
+    const harness = createHarness({
+      modelOverrides: { 'gemini-4-argon': { target: 'gemini-4-argon-preview-x' } },
+      loadCliCatalog: async () => [
+        { id: 'gemini-4-argon-low', name: 'Gemini 4 Argon (Low)' },
+        { id: 'gemini-4-argon-high', name: 'Gemini 4 Argon (High)' },
+      ],
+    })
+    const streaming = collect(harness.adapter.stream(baseOptions({ model: 'gemini-4-argon', reasoningEffort: 'high' as never })))
+    await waitForRequest(harness.agent, 'session/set_config_option')
+    await harness.agent.reply('session/prompt', { stopReason: 'end_turn' })
+    await streaming
+    const requested = harness.agent.requests
+      .filter((request) => request.method === 'session/set_config_option')
+      .map((request) => (request.params as { value: string }).value)
+    // 映射目标优先：显式选了 high 也不改写用户明确配置的目标。
+    expect(requested).toEqual(['gemini-4-argon-preview-x'])
+  })
+
+  it('默认思考档位设置决定未选强度时的路由结果', async () => {
+    const harness = createHarness({
+      modelOverrides: { 'gemini-4-argon': { effort: 'high' } },
+      loadCliCatalog: async () => [
+        { id: 'gemini-4-argon-low', name: 'Gemini 4 Argon (Low)' },
+        { id: 'gemini-4-argon-medium', name: 'Gemini 4 Argon (Medium)' },
+        { id: 'gemini-4-argon-high', name: 'Gemini 4 Argon (High)' },
+      ],
+    })
+    const streaming = collect(harness.adapter.stream(baseOptions({ model: 'gemini-4-argon' })))
+    await waitForRequest(harness.agent, 'session/set_config_option')
+    await harness.agent.reply('session/prompt', { stopReason: 'end_turn' })
+    await streaming
+    const requested = harness.agent.requests
+      .filter((request) => request.method === 'session/set_config_option')
+      .map((request) => (request.params as { value: string }).value)
+    expect(requested).toEqual(['gemini-4-argon-high'])
+  })
+
+  it('设置里映射的占位路由按映射写入，未映射时沿用会话默认', async () => {
+    // 会话当前 value 是 gemini-3-pro；映射到别的 ID 才会产生一次 RPC。
+    const mapped = createHarness({
+      modelOverrides: { [AGY_PLACEHOLDER_MODEL_ID]: { target: 'gemini-3-flash' } },
+    })
+    const streaming = collect(mapped.adapter.stream(baseOptions({ model: AGY_PLACEHOLDER_MODEL_ID })))
+    await waitForRequest(mapped.agent, 'session/set_config_option')
+    expect(mapped.agent.requestsFor('session/set_config_option')[0]?.params).toMatchObject({ value: 'gemini-3-flash' })
+    await mapped.agent.reply('session/prompt', { stopReason: 'end_turn' })
+    await streaming
+    const unmapped = createHarness()
+    const second = collect(unmapped.adapter.stream(baseOptions({ model: AGY_PLACEHOLDER_MODEL_ID })))
+    await waitForRequest(unmapped.agent, 'session/prompt')
+    expect(unmapped.agent.requestsFor('session/set_config_option')).toHaveLength(0)
+    await unmapped.agent.reply('session/prompt', { stopReason: 'end_turn' })
+    await second
   })
 
   it('配置显式钉住档位且未选强度时，尊重钉住的档位', async () => {

@@ -2,7 +2,7 @@
 
 [返回主页](../README.md) · [配置](configuration.md) · [更新记录](changelog.md) · [开发与验证](development.md)
 
-本文对应 `dsh-bundle-antigravity-host` **0.1.28**。安装或连接成功不等于真实模型生成、图片识别或所有平台已验收。
+本文对应 `dsh-bundle-antigravity-host` **0.1.30**。安装或连接成功不等于真实模型生成、图片识别或所有平台已验收。
 
 ## 安装与更新
 
@@ -59,8 +59,9 @@ dsh plugin --profile web add ./dsh-bundle-antigravity-host-0.1.24.tgz
 模型目录来自会话 `configOptions`、`config_option_update` 与官方 CLI 的只读 `agy models`。`initialize` 本身不是无需登录即可获取完整模型目录的接口。没有缓存时目录可以为空，应先显式连接或刷新。
 
 - 观测目录写入 `$DSH_HOME/cache/antigravity-acp/catalog.json`，只含模型信息，不含凭据；CLI 目录使用同目录的 `cli-models.json`。版本不符或损坏的缓存不作为有效目录。
-- `preferredModel` 可以从目录选择或手填。目录外 ID 标为用户配置、未验证；不会自动替换当前会话的选择。
-- 旧 `server-default` 路由仍兼容：映射到 `preferredModel`，留空沿用上游默认；不再新增占位选择项。
+- 设置页的模型列表可逐项关闭某个模型在选择器中的显示、设置默认思考档位、覆盖显示名，或把该 ID 映射到官方模型 ID。停用不删除目录条目；映射目标原样写入 ACP 会话，由官方 agent 判定是否接受，未登记 ID 不会被静默改写成别的模型。
+- 映射优先于家族 + 档位路由；没有映射时才按「显式选择 → 该模型默认档位 → 官方默认档位」决定最终模型。默认档位未被官方声明时退回官方默认，不指向不存在的选项。
+- 旧 `server-default` 路由仍兼容：默认沿用上游模型，配置了映射时才写入映射目标；不再新增占位选择项。
 - 官方将思考档位编码进 ID 时，选择器折叠为模型家族；DSH 思考强度低 / 中 / 高路由至 `-low` / `-medium` / `-high`。缺档取最近档位，未指定通常使用 `medium`；显式钉住档位 ID 时尊重该 ID。`gpt-oss-120b` 家族不列入选择器。
 - 上下文容量不填猜测值。收到官方 `usage_update.size` 后才记录到模型上下文并缓存；首次观测前未知。
 - 模型、容量与图片能力在 worker 间同步；不因增加 worker 就虚构新模型权益。
@@ -117,7 +118,7 @@ ACP fs / terminal 与未知原生权限请求始终拒绝并记录，但不因�
 
 ### 额度药丸与 AI Credits
 
-只在选中 `antigravity-acp` 时显示。药丸位于模型选择器左侧，随模型匹配 Gemini、Claude/GPT、Gemini 4 Argon 额度组；未知型号与旧 `server-default` 不借用其它模型数字。
+只在选中 `antigravity-acp` 时显示。药丸位于模型选择器左侧，随模型匹配 Gemini、Claude/GPT、Gemini 4 Argon 额度组；未知型号与旧 `server-default` 不借用其它模型数字（模型改名的显示名不影响分组，分组按 ID 判断）。
 
 展开固定展示三个组；缺数据标为未提供，显示每窗剩余百分比、重置时间、当前模型、缓存状态与刷新。支持深浅主题、Escape 与外部点击关闭。
 
@@ -169,7 +170,7 @@ onefile 临时展开使用用户级根目录内独立的 `runtime/instance-*`，
 
 客户端先挂载贡献型 remote。`remote.settings` / `remote.llm` 是宿主已有服务，必须声明依赖；本包的 `remote.agyQuota` 需等挂载后出现，不能预先作为硬依赖阻止自身挂载。
 
-设置草稿与远端快照分离，只提交已修改字段，支持清空。外部更新产生冲突时提示并可恢复远端值；保存失败保留草稿。加载、只读与保存期间禁用相应编辑，不提供账户切换、模型删除 / 禁用或付费开关。
+设置草稿与远端快照分离，只提交已修改字段，支持清空。模型列表整份 `modelOverrides` 作为一个字段参与脏值与冲突判断，规范化后比较，避免键序或写回默认值被误判为未保存修改。外部更新产生冲突时提示并可恢复远端值；保存失败保留草稿。加载、只读与保存期间禁用相应编辑，不提供账户切换、目录条目删除或付费开关。
 
 ## 已知限制与绕过
 

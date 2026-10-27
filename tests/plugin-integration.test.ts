@@ -155,20 +155,20 @@ afterEach(async () => {
 })
 
 describe('apply wiring with real pool and SettingsControl', () => {
-  it('passes live preferences to existing workers and notifies the host picker on a saved model', () => {
+  it('passes live preferences to existing workers and notifies the host picker on saved model settings', () => {
     const instance = harness()
-    const parsed = Config({ preferredModel: 'before' })
+    const parsed = Config({ modelOverrides: { before: { enabled: false } } })
     apply(instance.ctx, parsed)
-    const next = Config({ preferredModel: 'after', reuseSessions: false })
-    for (const key of ['preferredModel', 'reuseSessions'] as const) {
+    const next = Config({ modelOverrides: { after: { effort: 'high' } }, reuseSessions: false })
+    for (const key of ['modelOverrides', 'reuseSessions'] as const) {
       const before = parsed[key]
       const after = next[key]
       if (!isVolatile(before) || !isVolatile(after)) throw new Error('Expected live setting')
       updateVolatile(before, after)
     }
-    expect(external.workers[0]!.options.readSettings?.()).toMatchObject({ preferredModel: 'after', reuseSessions: false })
+    expect(external.workers[0]!.options.readSettings?.()).toMatchObject({ modelOverrides: { after: { enabled: true, effort: 'high' } }, reuseSessions: false })
     const beforeRevision = instance.control().account().runtime!.modelCatalogRevision!
-    instance.updateSettings([['preferredModel']])
+    instance.updateSettings([['modelOverrides']])
     expect(instance.control().account().runtime!.modelCatalogRevision).toBe(beforeRevision + 1)
     expect(instance.emit).toHaveBeenCalledWith('llm/adapters-updated')
     instance.updateSettings([['proxyUrl']])
