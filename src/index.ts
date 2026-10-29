@@ -33,7 +33,7 @@ import {
   defaultAgentArgs,
 } from './runtime/binary.js'
 import type { RuntimeDirectoryLease } from './runtime/binary.js'
-import { resolveProxy } from './runtime/proxy-env.js'
+import { ProxyConfigError, resolveProxy } from './runtime/proxy-env.js'
 import { createLiveProxiedFetch, createProxiedFetch } from './runtime/proxied-fetch.js'
 import type { ResolvedProxy } from './runtime/proxy-env.js'
 import { ensureAcpCredentials } from './runtime/credentials.js'
@@ -202,7 +202,7 @@ export async function ensureAcpRuntime(
   if (active.inflight) return active.inflight
   if (active.link) {
     if (!active.link.closed) { active.lifecycle?.reused(); return active.link }
-    // 链路自己关了（协议违规 / 流读取失败 / 回收中途失败）但子进程可能仍活着、
+    // 链路自己关了（对端断流 / 流读取失败 / 回收中途失败）但子进程可能仍活着、
     // handle.done 不会触发：不能把这条死链永久交给调用方，否则之后每个回合都会
     // 在 session/new 上报「ACP 链路已关闭」直到重启。终止旧进程并全新启动。
   }
@@ -248,7 +248,16 @@ async function startAcpRuntime(
   }
   const subprocess: SubprocessRuntime = ctx.subprocess
   active.abort ??= new AbortController()
-  const downloadProxy = resolveProxy({ url: config.proxyUrl, bypass: config.proxyBypass })
+  // 非法代理在启动这一层转成带 AGY_ 前缀的 LlmError：既给出可行动文案，也不会
+  // 命中宿主的默认可重试词表（整步重放会重复 spawn 与 OAuth）。
+  const downloadProxy = (() => {
+    try {
+      return resolveProxy({ url: config.proxyUrl, bypass: config.proxyBypass })
+    } catch (error) {
+      if (!(error instanceof ProxyConfigError)) throw error
+      throw new LlmError(`代理配置无效，无法启动 ACP：${error.message}`, 'AGY_INVALID_PROXY')
+    }
+  })()
   const startupSignal = AbortSignal.any([active.abort.signal, ...(deps.signal ? [deps.signal] : [])])
   startupSignal.throwIfAborted()
   const ownedFetch = deps.fetchImpl ? undefined : createProxiedFetch(downloadProxy)
@@ -468,12 +477,34 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
   // 代理规则与官方 ACP 进程一致：**配置的 proxyUrl 优先，其次宿主环境自身导出的
   // 代理**。CLI 每次启动都会做登录/配置刷新，缺代理会一直挂在网络上（实测），
   // 表现为额度药丸永远停在「额度…」。地址非法时以 AGY_INVALID_PROXY 明确失败。
+  // 代理地址非法时不能让整个插件装载失败：设置卡片本身由本插件贡献，装载一失败，
+  // 用户就没有任何界面修正这个值，只能去翻宿主配置文件。这里只告警、留痕，真正的
+  // 非法地址在每次使用代理的操作里各自失败（连不上 / ProxyConfigError），并在设置页
+  // 保持可编辑。已经带 userinfo 的地址不回显，只报可行动原因。
+  const validateInitialProxy = (): void => {
+    try {
+      resolveProxy({ url: config.proxyUrl, bypass: config.proxyBypass })
+    } catch (error) {
+      if (!(error instanceof ProxyConfigError)) throw error
+      ctx.logger?.warn?.(
+        `antigravity-acp: 代理配置无效，插件已加载但不会使用该代理（请到设置页修正后重载宿主）：${error.message}`,
+      )
+    }
+  }
+  validateInitialProxy()
   const readProxy = () => resolveProxy({ url: config.proxyUrl, bypass: config.proxyBypass })
-  // Validate the initial route before registering resources. Subsequent operations
-  // capture the latest settings; existing ACP processes keep their launch env.
-  readProxy()
   const pluginFetch = createLiveProxiedFetch(readProxy)
-  const cliRun: ReturnType<typeof createSubprocessCliRun> = (request) => createSubprocessCliRun(ctx.subprocess, readProxy())(request)
+  // 代理地址可能刚被改坏：按 Promise 契约返回 rejected，让调用方各自的
+  // 「取数失败折叠成可读错误」路径生效，而不是同步抛进调度器。
+  const cliRun: ReturnType<typeof createSubprocessCliRun> = (request) => {
+    let proxy: ResolvedProxy | undefined
+    try {
+      proxy = readProxy()
+    } catch (error) {
+      return Promise.reject(error)
+    }
+    return createSubprocessCliRun(ctx.subprocess, proxy)(request)
+  }
   const findCli = () => agyCliCandidates(process.env, undefined, config.agyCliPath).find((candidate) => existsSync(candidate))
   let modelCatalogRevision = 0
   const catalogChanged = (): void => {

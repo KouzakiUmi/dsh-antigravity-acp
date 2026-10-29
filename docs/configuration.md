@@ -2,7 +2,7 @@
 
 [返回主页](../README.md) · [使用与排障](reference.md) · [开发与验证](development.md)
 
-以下对应 **0.1.30**，以 [`src/settings.ts`](https://github.com/KouzakiUmi/dsh-antigravity-acp/blob/main/src/settings.ts) 的 Config 为准。字段均位于 `llm-antigravity-acp` 插件配置根级，不需要额外包装一层对象。设置页只展示常用项，其余可通过宿主提供的配置面编辑。
+以下对应 **0.1.31**，以 [`src/settings.ts`](https://github.com/KouzakiUmi/dsh-antigravity-acp/blob/main/src/settings.ts) 的 Config 为准。字段均位于 `llm-antigravity-acp` 插件配置根级，不需要额外包装一层对象。设置页只展示常用项，其余可通过宿主提供的配置面编辑。
 
 ## 配置清单
 
@@ -74,7 +74,7 @@ ACP 官方 agent 在同一会话内会保留上下文（2026-10-23 真机验证�
 
 工具回合尚未结束时保存偏好，其有效续轮以及不兼容续轮触发的 ACP prompt 重建仍沿用原回合快照；新值可能延至后续空闲新轮生效，不通过保存设置中断当前工具执行。
 
-需要代理时先保存再连接。非法代理在初次装载或后续使用时抛 `ProxyConfigError`；即时保存后使用失败可直接回到设置页修正，初次装载失败则需要通过宿主通用配置面修复。不要把刷新网页当成 Host 已更新。
+需要代理时先保存再连接。非法代理不会让插件装载失败：装载期只记一条告警并继续加载，因此设置卡片仍可打开、修正并保存；真正用到代理的操作各自失败——启动 ACP 报 `AGY_INVALID_PROXY`，下载 / 换发 / 额度取数折叠成各自的可读错误。修正保存后下一次操作即读取新值，已有 ACP 进程保留原启动环境。不要把刷新网页当成 Host 已更新。
 
 ## 环境变量
 
@@ -95,6 +95,8 @@ ACP 官方 agent 在同一会话内会保留上下文（2026-10-23 真机验证�
 ### 路径选择顺序
 
 **ACP 程序：** `binaryPath` → `AGY_ACP_BIN` → 对应版本缓存 → 自动下载。手动覆盖先于自动平台映射，未知自动下载平台可使用明确指定的兼容程序。
+
+自动下载的 zip 解压受三道上限约束：条目数 2000、单条目 512MB、解压总量 1GB。官方包解压后约 200–300MB、条目数十个，正常下载不会触及；超过任一道即报 `AGY_ARCHIVE_TOO_LARGE` 并放弃本次安装，不留半成品。这是下载域名白名单之外的压缩炸弹纵深防御。
 
 **CLI：** `agyCliPath` → `AGY_CLI_BIN` → PATH → 平台默认位置。显式覆盖与候选读取细节以 [`agy-cli.ts`](https://github.com/KouzakiUmi/dsh-antigravity-acp/blob/main/src/runtime/agy-cli.ts) 为准；手动刷新会重新探测，不要求插件加载时 CLI 就已安装。
 

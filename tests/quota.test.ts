@@ -139,6 +139,26 @@ describe('OAuth client 元数据提取', () => {
     expect(parseOAuthClientFromBinary(CLIENT_ID)).toBeUndefined()
     expect(parseOAuthClientFromBinary(CLIENT_SECRET)).toBeUndefined()
   })
+
+  it('多份元数据存在时按相邻出现配对，不把不同 client 的 id/secret 拼在一起', () => {
+    const otherId = ['9876543210', '-zzzzzz.apps.googleusercontent.com'].join('')
+    const otherSecret = ['GOCSPX-', 'ZzYyXxWwVvUuTtSsRrQqPpOoNn01'].join('')
+    // 第一对在前、第二对在后：应取最后一对（与官方 CLI 同源的那份）。
+    const text = `${CLIENT_ID} ${CLIENT_SECRET} ... ${otherId} ${otherSecret} ... tail`
+    expect(parseOAuthClientFromBinary(text)).toEqual({ clientId: otherId, clientSecret: otherSecret })
+    // 顺序交错（id 与 secret 不同行排列）时依然按最近距离配对。
+    const interleaved = `${otherId} ${CLIENT_SECRET} ${CLIENT_ID} ${otherSecret}`
+    expect(parseOAuthClientFromBinary(interleaved)).toEqual({ clientId: CLIENT_ID, clientSecret: otherSecret })
+  })
+
+  it('同一 secret 重复出现时仍配上 anchor 之后的那一份', () => {
+    const otherId = ['9876543210', '-zzzzzz.apps.googleusercontent.com'].join('')
+    const shared = ['GOCSPX-', 'ZzYyXxWwVvUuTtSsRrQqPpOoNn01'].join('')
+    // 两个 client 共用同一 secret：只看「首次出现」会落在 otherId 之前，
+    // 把本该配给 CLIENT_ID 的那份误判成「在 id 之前」。
+    const text = `${otherId} ${shared} ... ${CLIENT_ID} ${shared} ... tail`
+    expect(parseOAuthClientFromBinary(text)).toEqual({ clientId: CLIENT_ID, clientSecret: shared })
+  })
 })
 
 describe('token 换发', () => {
@@ -349,6 +369,132 @@ describe('fetchQuotaSnapshot 链路', () => {
     expect(snapshot.status).toBe('error')
     expect(snapshot.error?.code).toBe('request-failed')
     expect(JSON.stringify(snapshot)).not.toContain(ACCESS_TOKEN)
+  })
+
+  it('HTTP 请求超时折叠成可读的 request-failed，不留悬空请求', async () => {
+    const file = memoryTokenFile({ token: validTokenFile })
+    // 模拟一个永不 settle 的请求，只在收到 abort 信号时以其拒绝结束。
+    const fetchImpl: typeof fetch = (_input, init) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => {
+        const error = new Error('This operation was aborted')
+        error.name = 'TimeoutError'
+        reject(error)
+      }, { once: true })
+    })
+    const started = Date.now()
+    const snapshot = await fetchQuotaSnapshot({}, {
+      ...file.deps,
+      fetchImpl,
+      binaryPaths: [],
+      httpTimeoutMs: 20,
+      now: () => Date.parse('2026-10-16T00:00:00Z'),
+    })
+    expect(snapshot.status).toBe('error')
+    expect(snapshot.error?.code).toBe('request-failed')
+    // 不足 1 秒的预算要报成毫秒：`Math.round(20/1000)` 会写成「超过 0 秒」。
+    expect(snapshot.error?.message).toContain('20 毫秒未完成')
+    expect(snapshot.error?.message).not.toContain('0 秒')
+    expect(Date.now() - started).toBeLessThan(2_000)
+  })
+
+  it('换发 token 超时同样折叠为 refresh-failed', async () => {
+    const fetchImpl: typeof fetch = (_input, init) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => {
+        const error = new Error('This operation was aborted')
+        error.name = 'TimeoutError'
+        reject(error)
+      }, { once: true })
+    })
+    await expect(refreshAccessToken(
+      { refreshToken: REFRESH_TOKEN, expiry: '2026-10-01T00:00:00Z' },
+      { clientId: CLIENT_ID, clientSecret: CLIENT_SECRET },
+      { fetchImpl, httpTimeoutMs: 20 },
+    )).rejects.toMatchObject({ code: 'refresh-failed', status: undefined })
+  })
+
+  it('非正数超时配置回落默认预算，而不是静默关掉超时', async () => {
+    // 传 0 若被当成「禁用超时」，并发 read() 又会合并到一个永不结束的在途
+    // promise 上——那正是这条超时要修的故障。这里不等待默认的 20s：只要请求
+    // 仍带 signal（而不是 undefined）就说明超时保护没有被关掉。
+    let sawSignal: AbortSignal | undefined
+    const fetchImpl: typeof fetch = async (_input, init) => {
+      sawSignal = init?.signal ?? undefined
+      return json({ access_token: 'fresh-token', expires_in: 3600 })
+    }
+    await refreshAccessToken(
+      { refreshToken: REFRESH_TOKEN, expiry: '2026-10-01T00:00:00Z' },
+      { clientId: CLIENT_ID, clientSecret: CLIENT_SECRET },
+      { fetchImpl, httpTimeoutMs: 0 },
+    )
+    expect(sawSignal).toBeInstanceOf(AbortSignal)
+  })
+
+  it('主动中止与真实超时的文案分开，不把取消报成超时', async () => {
+    // AbortError 与 TimeoutError 混为一谈会让排查方向错到网络上去。
+    const fetchImpl: typeof fetch = async () => {
+      const error = new Error('The operation was aborted')
+      error.name = 'AbortError'
+      throw error
+    }
+    await expect(refreshAccessToken(
+      { refreshToken: REFRESH_TOKEN, expiry: '2026-10-01T00:00:00Z' },
+      { clientId: CLIENT_ID, clientSecret: CLIENT_SECRET },
+      { fetchImpl },
+    )).rejects.toMatchObject({
+      code: 'refresh-failed',
+      message: expect.stringContaining('被中止'),
+    })
+    await expect(refreshAccessToken(
+      { refreshToken: REFRESH_TOKEN, expiry: '2026-10-01T00:00:00Z' },
+      { clientId: CLIENT_ID, clientSecret: CLIENT_SECRET },
+      { fetchImpl },
+    )).rejects.not.toMatchObject({ message: expect.stringContaining('请求超过') })
+  })
+
+  it('401 重试按状态码判断，不依赖错误文案', async () => {
+    const file = memoryTokenFile({ token: validTokenFile })
+    let attempts = 0
+    const { fetchImpl } = fakeFetch(quotaRoutes([
+      { match: (url) => url === OAUTH_TOKEN_URL, respond: () => json({ access_token: 'fresh', expires_in: 3600 }) },
+      {
+        match: (url) => url.endsWith(':loadCodeAssist'),
+        respond: () => {
+          attempts += 1
+          // 故意不给常见文案：旧实现靠 message.includes('HTTP 401') 才能重试。
+          return attempts === 1 ? new Response('denied', { status: 401, statusText: 'Unauthorized' }) : json({ cloudaicompanionProject: 'proj-1' })
+        },
+      },
+    ]))
+    const snapshot = await fetchQuotaSnapshot({}, {
+      ...file.deps,
+      fetchImpl,
+      env: { AGY_OAUTH_CLIENT_ID: CLIENT_ID, AGY_OAUTH_CLIENT_SECRET: CLIENT_SECRET },
+      binaryPaths: [],
+      now: () => Date.parse('2026-10-16T00:00:00Z'),
+    })
+    expect(snapshot.status).toBe('ok')
+    expect(attempts).toBe(2)
+  })
+
+  it('非 401/403 的请求失败不触发换发重试', async () => {
+    const file = memoryTokenFile({ token: validTokenFile })
+    let loadCalls = 0
+    const { fetchImpl, calls } = fakeFetch(quotaRoutes([
+      {
+        match: (url) => url.endsWith(':loadCodeAssist'),
+        respond: () => { loadCalls += 1; return new Response('boom', { status: 500 }) },
+      },
+    ]))
+    const snapshot = await fetchQuotaSnapshot({}, {
+      ...file.deps,
+      fetchImpl,
+      env: { AGY_OAUTH_CLIENT_ID: CLIENT_ID, AGY_OAUTH_CLIENT_SECRET: CLIENT_SECRET },
+      binaryPaths: [],
+      now: () => Date.parse('2026-10-16T00:00:00Z'),
+    })
+    expect(snapshot.status).toBe('error')
+    expect(loadCalls).toBe(1)
+    expect(calls.some((call) => call.url === OAUTH_TOKEN_URL)).toBe(false)
   })
 
   it('成功快照在缓存有效期内不再触网；force 会绕过缓存', async () => {

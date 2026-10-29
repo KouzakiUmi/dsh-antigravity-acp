@@ -115,4 +115,20 @@ describe('共享 SessionMapStore 所有权与串行提交', () => {
     expect(await store.claim('chat', b)).toEqual(entry(3))
     expect(disk.chat).toEqual(entry(3))
   })
+
+  it('unclaim 只归还所有权并保留条目，失败路径不会把键永久挂在本 worker 名下', async () => {
+    const disk = { chat: entry(1) } as Record<string, SessionMapEntry>
+    const store = new SessionMapStore({ load: async () => disk, save: rows => { Object.assign(disk, rows) } })
+    const a = Symbol(), b = Symbol()
+    expect(await store.claim('chat', a)).toEqual(entry(1))
+    expect(store.owns('chat', a)).toBe(true)
+    store.unclaim('chat', a)
+    expect(store.owns('chat', a)).toBe(false)
+    // 另一个 worker 立刻可以接管同一条目（条目内容没被否定）。
+    expect(await store.claim('chat', b)).toEqual(entry(1))
+    expect(store.owns('chat', b)).toBe(true)
+    // 非 owner 的 unclaim 是空操作，不会抢走当前所有权。
+    store.unclaim('chat', a)
+    expect(store.owns('chat', b)).toBe(true)
+  })
 })

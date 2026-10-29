@@ -5,6 +5,7 @@ import { AttachmentId } from '@deepseek-ai/dsh-attachment'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { PooledAcpAdapter, type AcpWorker } from '../src/pool/pooled-adapter.js'
 import type { AcpLifecycleSnapshot } from '../src/runtime/lifecycle.js'
+import { AGY_TURN_ERROR } from '../src/adapter/prompt-turn.js'
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -42,7 +43,7 @@ class FakeWorker implements AcpWorker {
       if (this.preparationGate) {
         let abort!: () => void
         const cancelled = new Promise<never>((_resolve, reject) => {
-          abort = () => reject(Object.assign(new Error('Preparation cancelled'), { code: 'AGY_TURN_ABORTED' }))
+          abort = () => reject(Object.assign(new Error('Preparation cancelled'), { code: AGY_TURN_ERROR.ABORTED }))
           signal?.addEventListener('abort', abort, { once: true })
           if (signal?.aborted) abort()
         })
@@ -294,11 +295,12 @@ describe('PooledAcpAdapter scheduling with independent fake workers', () => {
     const active = run(pool, request('active'))
     const already = new AbortController()
     already.abort()
-    expect(await outcome(run(pool, request('already', { signal: already.signal })))).toMatchObject({ ok: false, error: { code: 'AGY_TURN_ABORTED' } })
+    // 对外契约钉字面量：不能因为实现与测试引用同一常量，就把码字改坏也测不出来。
+    expect(await outcome(run(pool, request('already', { signal: already.signal })))).toMatchObject({ ok: false, error: { code: 'AGY_ABORTED' } })
     const controller = new AbortController()
     const waiting = outcome(run(pool, request('waiting', { signal: controller.signal })))
     controller.abort()
-    expect(await waiting).toMatchObject({ ok: false, error: { code: 'AGY_TURN_ABORTED' } })
+    expect(await waiting).toMatchObject({ ok: false, error: { code: 'AGY_ABORTED' } })
     expect(pool.read().queue?.waiting).toBe(0)
     expect(workers[0]!.calls).toHaveLength(1)
     workers[0]!.calls[0]!.complete('finish')
@@ -482,7 +484,7 @@ describe('PooledAcpAdapter scheduling with independent fake workers', () => {
     await flush()
     controller.abort()
     await flush()
-    expect(result).toMatchObject({ ok: false, error: { code: 'AGY_TURN_ABORTED' } })
+    expect(result).toMatchObject({ ok: false, error: { code: 'AGY_ABORTED' } })
     expect(workers[0]!.adapter.prepareCall).toHaveBeenCalledTimes(1)
     workers[0]!.preparationGate.resolve()
     expect((await first).model.id).toBe('model')
@@ -505,10 +507,10 @@ describe('PooledAcpAdapter scheduling with independent fake workers', () => {
     await flush()
     const sharedSignal = workers[0]!.preparationSignals[0]!
     firstController.abort()
-    expect(await first).toMatchObject({ ok: false, error: { code: 'AGY_TURN_ABORTED' } })
+    expect(await first).toMatchObject({ ok: false, error: { code: 'AGY_ABORTED' } })
     expect(sharedSignal.aborted).toBe(false)
     lastController.abort()
-    expect(await last).toMatchObject({ ok: false, error: { code: 'AGY_TURN_ABORTED' } })
+    expect(await last).toMatchObject({ ok: false, error: { code: 'AGY_ABORTED' } })
     expect(sharedSignal.aborted).toBe(true)
     await flush()
     expect(pool.read().queue?.active).toBe(0)

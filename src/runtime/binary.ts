@@ -11,7 +11,7 @@ import { access, chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rena
 import { randomUUID } from 'node:crypto'
 import { homedir as osHomedir, tmpdir } from 'node:os'
 import { dirname, join, normalize, resolve, sep, win32 } from 'node:path'
-import { Readable } from 'node:stream'
+import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import yauzl from 'yauzl'
 
@@ -25,6 +25,17 @@ export const DOWNLOAD_HOST_WHITELIST = 'dl.google.com'
 export const CACHE_SUBPATH = ['cache', 'antigravity-acp'] as const
 /** 可执行文件安装根目录的目录名。 */
 export const INSTALL_DIR_NAME = 'dsh-antigravity-host'
+/**
+ * 解压上限（压缩炸弹纵深防御）。
+ *
+ * 官方 zip 解压后约 200–300MB、条目数十个；给 4 倍余量既不误伤正常包，也挡住
+ * 「几 KB 的 zip 解出几十 GB」这类攻击。下载源已限定 https + dl.google.com +
+ * 拒绝重定向，因此这一层是纯纵深防御，不是唯一屏障。
+ */
+export const MAX_EXTRACT_ENTRIES = 2_000
+export const MAX_EXTRACT_BYTES = 1_024 * 1_024 * 1024
+/** 单个条目上限：官方最大条目就是主程序本身。 */
+export const MAX_EXTRACT_ENTRY_BYTES = 512 * 1_024 * 1_024
 /** 覆盖可执行文件安装根目录的环境变量名。 */
 export const INSTALL_ROOT_ENV = 'AGY_ACP_HOME'
 
@@ -45,6 +56,8 @@ export const AGY_BINARY_ERROR = {
   ARCHIVE_LAYOUT: 'AGY_ARCHIVE_LAYOUT',
   /** zip 打开或读取失败。 */
   ARCHIVE_READ: 'AGY_ARCHIVE_READ',
+  /** zip 条目数或解压后大小超过上限（压缩炸弹防护）。 */
+  ARCHIVE_TOO_LARGE: 'AGY_ARCHIVE_TOO_LARGE',
   /** 所有解析顺序都未找到二进制且未启用自动下载。 */
   BINARY_MISSING: 'AGY_BINARY_MISSING',
   /** 当前平台/架构无法映射出已知的下载坐标。 */
@@ -519,8 +532,18 @@ export async function ensureExecutable(file: string, flavor: ExecutableFlavor): 
   }
 }
 
+/** 解压上限；默认取文件顶部常量，测试可注入小值验证守卫本身。 */
+export interface ExtractLimits {
+  maxEntries?: number
+  maxTotalBytes?: number
+  maxEntryBytes?: number
+}
+
 /** 用 yauzl 把 zip 安全解到 destDir；返回全部已校验的相对条目路径。 */
-export async function extractZipSafely(zipPath: string, destDir: string): Promise<readonly string[]> {
+export async function extractZipSafely(zipPath: string, destDir: string, limits: ExtractLimits = {}): Promise<readonly string[]> {
+  const maxEntries = limits.maxEntries ?? MAX_EXTRACT_ENTRIES
+  const maxTotalBytes = limits.maxTotalBytes ?? MAX_EXTRACT_BYTES
+  const maxEntryBytes = limits.maxEntryBytes ?? MAX_EXTRACT_ENTRY_BYTES
   const zip = await new Promise<yauzl.ZipFile>((resolveOpen, rejectOpen) => {
     yauzl.open(zipPath, { lazyEntries: true, autoClose: true }, (error, file) => {
       if (error) rejectOpen(new AgyBinaryError(AGY_BINARY_ERROR.ARCHIVE_READ, `无法打开 zip: ${zipPath}`, { cause: error }))
@@ -528,6 +551,8 @@ export async function extractZipSafely(zipPath: string, destDir: string): Promis
     })
   })
   const extracted: string[] = []
+  let entryCount = 0
+  let totalBytes = 0
   try {
     for (;;) {
       const entry = await new Promise<yauzl.Entry | null>((resolveNext, rejectNext) => {
@@ -567,6 +592,28 @@ export async function extractZipSafely(zipPath: string, destDir: string): Promis
         zip.readEntry()
       })
       if (!entry) break
+      // 上限判定先于任何写盘：解压炸弹必须在产生磁盘副作用之前拦住。
+      entryCount += 1
+      if (entryCount > maxEntries) {
+        throw new AgyBinaryError(
+          AGY_BINARY_ERROR.ARCHIVE_TOO_LARGE,
+          `zip 条目数超过上限 ${maxEntries}：${zipPath}`,
+        )
+      }
+      const declared = entry.uncompressedSize
+      if (declared > maxEntryBytes) {
+        throw new AgyBinaryError(
+          AGY_BINARY_ERROR.ARCHIVE_TOO_LARGE,
+          `zip 条目声明大小超过上限 ${maxEntryBytes} 字节：${entry.fileName}`,
+        )
+      }
+      totalBytes += declared
+      if (totalBytes > maxTotalBytes) {
+        throw new AgyBinaryError(
+          AGY_BINARY_ERROR.ARCHIVE_TOO_LARGE,
+          `zip 解压后总大小超过上限 ${maxTotalBytes} 字节：${zipPath}`,
+        )
+      }
       const safeRelative = validateZipEntryPath(entry.fileName)
       // 双保险：join 后的绝对路径必须仍限定在 destDir 内。
       const target = resolve(destDir, safeRelative)
@@ -578,16 +625,40 @@ export async function extractZipSafely(zipPath: string, destDir: string): Promis
         continue
       }
       await mkdir(dirname(target), { recursive: true })
+      // 中央目录里声明的 uncompressedSize 可以撒谎（zip 允许缺失/伪造）。
+      // 当前 yauzl 默认开启 validateEntrySizes，声明不符会在流内就报错，所以
+      // 正常情况下走不到这里的上限；它守的是「该校验被关掉或换实现」的纵深，
+      // 以及单条目合规但累计超限时必须按实际字节即时中止。
+      let written = 0
+      const budget = Math.min(maxEntryBytes, maxTotalBytes - (totalBytes - declared))
+      const guard = new Transform({
+        transform(chunk: Buffer, _encoding, callback) {
+          written += chunk.length
+          if (written > budget) {
+            callback(new AgyBinaryError(
+              AGY_BINARY_ERROR.ARCHIVE_TOO_LARGE,
+              `zip 条目实际大小超过上限 ${budget} 字节：${entry.fileName}`,
+            ))
+            return
+          }
+          callback(null, chunk)
+        },
+      })
       await new Promise<void>((resolveWrite, rejectWrite) => {
         zip.openReadStream(entry, (error, stream) => {
           if (error || !stream) {
             rejectWrite(new AgyBinaryError(AGY_BINARY_ERROR.ARCHIVE_READ, `读取条目内容失败: ${entry.fileName}`, { cause: error }))
             return
           }
-          // yauzl 的 openReadStream 产出 node Readable，直接 pipe。
-          pipeline(stream, createWriteStream(target))
-            .then(() => resolveWrite())
-            .catch((cause) => rejectWrite(new AgyBinaryError(AGY_BINARY_ERROR.ARCHIVE_READ, `写出条目失败: ${entry.fileName}`, { cause })))
+          // yauzl 的 openReadStream 产出 node Readable；经 guard 后写盘。
+          pipeline(stream, guard, createWriteStream(target))
+            // 把预检时按「声明值」记的账改成「实际写出值」：声明偏大时不把没写出的
+            // 字节算作已用，避免后续条目被虚假的累计量挤掉。夹到非负，防止异常
+            // 时序下 totalBytes 漂成负数后反过来放宽上限。
+            .then(() => { totalBytes = Math.max(0, totalBytes - declared + written); resolveWrite() })
+            .catch((cause) => rejectWrite(cause instanceof AgyBinaryError
+              ? cause
+              : new AgyBinaryError(AGY_BINARY_ERROR.ARCHIVE_READ, `写出条目失败: ${entry.fileName}`, { cause })))
         })
       })
       extracted.push(safeRelative)

@@ -114,6 +114,8 @@ function createHarness(
     saveSessionMap?: (entries: Record<string, SessionMapEntry>) => Promise<void> | void
     /** 假 agent 是否声明 loadSession 能力。 */
     loadSessionCapability?: boolean
+    /** 让第 n 次 getLink 直接失败：模拟启动失败，而不是会话恢复失败。 */
+    failGetLinkOnce?: () => boolean
     keepProcessAfterCancel?: boolean
     cancelGraceMs?: number
     idleRecycleMs?: number
@@ -161,6 +163,7 @@ function createHarness(
     readSettings: options.readSettings,
     getLink: async (handlers, _signal, purpose) => {
       options.onGetLink?.(purpose)
+      if (options.failGetLinkOnce?.()) throw new Error('ACP 启动失败')
       if (link) return link
       // 与生产 ensureAcpRuntime 一样 single-flight，让并发测试覆盖 adapter 而非假连接抢锁。
       inflight ??= (async () => {
@@ -2636,6 +2639,25 @@ describe('ACP 会话复用与跨进程恢复', () => {
   function savedEntry(options = baseOptions({ sessionId: DSH_SESSION, messages: secondRoundMessages() })): SessionMapEntry {
     return { sessionId: 'saved-acp', cwd: process.cwd(), sentCount: 1, sentHash: prefixHash(options.messages, 1), outputHash: outputHash([{ type: 'text', text: '第一轮回答' }]), route: routeFingerprint(options), updatedAt: Date.now() }
   }
+
+  it('恢复阶段启动失败时归还磁盘 claim，别的 worker 仍能接管该条目', async () => {
+    const sessionStore = new SessionMapStore({ load: async () => ({}), save: () => undefined })
+    const entry = savedEntry()
+    const owner = Symbol()
+    await sessionStore.claim(`${DSH_SESSION}::chat`, owner)
+    sessionStore.set(`${DSH_SESSION}::chat`, owner, entry)
+    sessionStore.unclaim(`${DSH_SESSION}::chat`, owner)
+    // 让本轮 getLink 失败一次：session/load 之前就中止，属于「认领了但没起进程」。
+    let failed = false
+    const harness = createHarness({
+      resumeSessions: true, sessionStore,
+      failGetLinkOnce: () => { if (failed) return false; failed = true; return true },
+    })
+    await expect(collect(harness.adapter.stream(baseOptions({ sessionId: DSH_SESSION, messages: secondRoundMessages() }))))
+      .rejects.toThrow()
+    // claim 必须已经归还：另一个 owner 能立即接管同一条目。
+    expect(await sessionStore.claim(`${DSH_SESSION}::chat`, Symbol())).toEqual(entry)
+  })
 
   for (const restored of [false, true]) {
     it(`${restored ? '磁盘恢复' : '内存复用'}没有可发送增量时完整重建，不发空 prompt`, async () => {

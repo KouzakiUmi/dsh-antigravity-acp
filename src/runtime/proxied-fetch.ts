@@ -70,7 +70,14 @@ export function createLiveProxiedFetch(readProxy: () => ResolvedProxy | undefine
   let closed = false
   const request: typeof fetch = (input, init) => {
     if (closed) return Promise.reject(new ProxyConfigError('代理传输已关闭；请求未发送'))
-    const proxy = readProxy()
+    let proxy: ResolvedProxy | undefined
+    try {
+      proxy = readProxy()
+    } catch (error) {
+      // readProxy 会按当前设置重新解析；地址被改坏时按 fetch 契约返回 rejected
+      // promise 而不是同步抛，避免调用方在 `.catch()` 上拿到 undefined。
+      return Promise.reject(error)
+    }
     const key = JSON.stringify(proxy ?? null)
     let route = routes.get(key)
     if (!route) { route = createProxiedFetch(proxy, deps); routes.set(key, route) }

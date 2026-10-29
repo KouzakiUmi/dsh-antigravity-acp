@@ -360,6 +360,8 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       onRequestPermission: (request) => (!this.#disposed ? this.#turn?.handleRequestPermission(request) : undefined)
         ?? { outcome: { outcome: 'cancelled' } },
       onUnexpectedAgentRequest: (method, request) => this.#handleUnexpectedRequest(method, request),
+      onProtocolViolation: (detail) =>
+        this.#log?.warn(`antigravity-acp: 已丢弃无法路由的 JSON-RPC 帧（链路与在途请求不受影响）：${detail}`),
     }
   }
 
@@ -768,7 +770,15 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     if (!outputMatches(options.messages.slice(entry.sentCount), entry.outputHash)) return discard('上一轮输出已变化或来自其他会话')
     if (options.messages.slice(entry.sentCount).some((message) => message.role === 'tool')) return discard('新增消息包含工具结果')
     if (incrementalMessages(options.messages, entry.sentCount).length === 0) return discard('没有可发送的增量，按完整历史重建')
-    const link = await this.#getLink(this.#handlers, options.signal)
+    // 启动失败/取消时不能把 claim 留在本 worker 名下：条目内容本身没被否定
+    // （只是这次没能起进程），下一个 worker 仍可以尝试接管它。
+    let link: AgentLink
+    try {
+      link = await this.#getLink(this.#handlers, options.signal)
+    } catch (error) {
+      this.#sessionStore?.unclaim(key, this.#sessionOwner)
+      throw error
+    }
     this.#observeCapabilities(link)
     const tools = options.tools ?? []
     let mcpServers: AcpMcpServer[] = []
@@ -1205,12 +1215,18 @@ export class AntigravityAcpAdapter extends LlmAdapter {
           ` 本轮新增=${options.messages.length - reused.sentCount}`,
       )
     } else {
-      const prepared = await this.#prepareRound(options, key).catch((error: unknown) => {
+      try {
+        const prepared = await this.#prepareRound(options, key)
+        link = prepared.link
+        sessionId = prepared.session.sessionId
+      } catch (error) {
+        // 认领成功但本轮没走到 prompt 在途：磁盘条目的 claim 必须归还，否则它
+        // 会一直挂在本 worker 名下直到卸载（跨 worker 会覆盖旧 owner，但 owner
+        // 映射本身会残留）。条目内容是否仍然有效由恢复校验决定，这里不动它。
+        if (key !== undefined) this.#sessionStore?.unclaim(key, this.#sessionOwner)
         this.#lifecycle?.failed(error)
         throw error
-      })
-      link = prepared.link
-      sessionId = prepared.session.sessionId
+      }
     }
 
     const turn = new PromptTurn(sessionId, {

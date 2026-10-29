@@ -56,7 +56,12 @@ export const AGY_LINK_ERROR = {
   AUTH_TIMEOUT: 'AGY_AUTH_TIMEOUT',
   /** 链接已关闭后再发起请求，或链接对端断开。 */
   LINK_CLOSED: 'AGY_LINK_CLOSED',
-  /** 收到无法路由/结构非法的消息。 */
+  /**
+   * 收到无法路由/结构非法的消息。
+   *
+   * 单帧畸形只丢弃并通过 `onProtocolViolation` 留痕，不再以此码关闭链路；
+   * 保留该码供诊断与既有调用方识别语义。
+   */
   PROTOCOL_VIOLATION: 'AGY_PROTOCOL_VIOLATION',
   /** 对端以 JSON-RPC error 显式拒绝。 */
   AGENT_REFUSED: 'AGY_AGENT_REFUSED',
@@ -99,6 +104,12 @@ export interface AgentLinkHandlers {
    * 记录「非预期原生活动」并终止回合。
    */
   onUnexpectedAgentRequest?(method: string, request: AnyRequest): void | Promise<void>
+  /**
+   * 收到无法路由的 JSON-RPC 消息（对端 bug 或版本漂移）。
+   *
+   * 该帧被丢弃，链路与在途请求都不受影响；回调只用于留痕。
+   */
+  onProtocolViolation?(detail: string): void
 }
 
 export interface AgentLinkOptions {
@@ -140,6 +151,20 @@ const DEFAULT_HANDSHAKE_TIMEOUT_MS = 15_000
 /** 认证默认上限：人工点浏览器授权的时间尺度，与普通请求超时分开。 */
 const DEFAULT_AUTH_TIMEOUT_MS = 5 * 60_000
 
+/**
+ * 畸形帧的诊断预览：只用于定位，不进入模型上下文。
+ *
+ * 截断长度并压成单行，避免把一条超大/多行的坏消息整段写进日志。
+ * 环形引用等序列化异常也在这里兜住。
+ */
+function safeMessagePreview(message: unknown): string {
+  try {
+    return JSON.stringify(message).slice(0, 200)
+  } catch {
+    return '<无法序列化的消息>'
+  }
+}
+
 /** 官方 client 实现信息（initialize 上报）。 */
 export const AGY_CLIENT_INFO: Implementation = { name: 'dsh-bundle-antigravity-host', version: readPackageVersion() }
 
@@ -166,6 +191,8 @@ export class AgentLink {
   #authTimeoutMs: number
   #handlers: AgentLinkHandlers
   #closeTimeoutMs: number
+  /** 无法路由的畸形帧只留痕并丢弃，不据此关闭链路（见 #route）。 */
+  readonly #onProtocolViolation: ((detail: string) => void) | undefined
   #closePromise?: Promise<void>
 
   #pending = new Map<JsonRpcId, PendingEntry>()
@@ -188,9 +215,10 @@ export class AgentLink {
     this.#authTimeoutMs = options.authTimeoutMs ?? DEFAULT_AUTH_TIMEOUT_MS
     this.#handlers = options.handlers ?? {}
     this.#closeTimeoutMs = options.closeTimeoutMs ?? 250
+    this.#onProtocolViolation = options.handlers?.onProtocolViolation
   }
 
-  /** 链路是否已关闭（主动 close、对端断流或协议违规都会置位）；已关闭的链路不可复用。 */
+  /** 链路是否已关闭（主动 close 或对端断流会置位）；已关闭的链路不可复用。 */
   get closed(): boolean {
     return this.#closed
   }
@@ -249,7 +277,36 @@ export class AgentLink {
       this.#routeResponse(message as AnyResponse)
       return
     }
-    throw new AgentLinkError(AGY_LINK_ERROR.PROTOCOL_VIOLATION, `无法路由的 JSON-RPC 消息: ${JSON.stringify(message).slice(0, 200)}`)
+    // 带 id 却没有 result/error：这是「形状非法的响应」，而不是无关垃圾帧。
+    // 命中在途请求时必须立即按协议违规拒绝它——丢弃会让那个请求白等到
+    // requestTimeoutMs（默认 30s）才报超时。
+    // 上面两个分支已把 AnyMessage 的联合类型窄到 never，这里按原始形状取值。
+    // 带 method 的帧上面已归入请求/通知，所以到这里必然没有 method；此时若还带着
+    // 我方 pending id，只可能是在回应那个请求（只是形状坏了）。不必再验证其它响应
+    // 侧字段——那会漏掉「只有 id」这种最常见的畸形形态。
+    const malformedId = (message as { id?: JsonRpcId | null }).id
+    if (malformedId !== undefined && malformedId !== null) {
+      const entry = this.#pending.get(malformedId)
+      if (entry) {
+        this.#pending.delete(malformedId)
+        clearTimeout(entry.timer)
+        entry.reject(new AgentLinkError(
+          AGY_LINK_ERROR.PROTOCOL_VIOLATION,
+          `ACP 响应缺少 result/error (${entry.method}): ${safeMessagePreview(message)}`,
+        ))
+        return
+      }
+    }
+    // 单条畸形消息不足以判定整条链路失效：抛错会沿 #pump 关闭链路并让所有在途
+    // 请求以 LINK_CLOSED 失败。这里只记录（截断、不含正文之外的材料）并丢弃这一帧，
+    // 真正的断流仍由 `reader.read()` 的 done/异常路径处理。
+    // 回调属于上层（adapter）逻辑，与 #routeNotification 一样必须隔离：它抛错会
+    // 沿 #pump 重新把整条链路判死，正好抵消这条修复。
+    try {
+      this.#onProtocolViolation?.(`无法路由的 JSON-RPC 消息: ${safeMessagePreview(message)}`)
+    } catch {
+      // 留痕失败不影响丢弃该帧。
+    }
   }
 
   async #routeInboundRequest(request: AnyRequest): Promise<void> {
@@ -380,8 +437,13 @@ export class AgentLink {
       // 响应 deadline 同时覆盖管道 backpressure；不能先无限等待 write。
       return await Promise.race([sent, pending])
     } catch (error) {
-      // 写入是否已完整送达无法确认时，不允许复用这条连接。
-      if (!writeCompleted) void this.close()
+      // 写入是否已完整送达无法确认时，不允许复用这条连接。但「对端已经回过帧」
+      // 本身就是送达证据：AGENT_REFUSED 与 PROTOCOL_VIOLATION 只可能来自收到的
+      // 响应（哪怕形状非法）。不排除这两种时，一个畸形响应会在 write 尚未落定
+      // 的时序下把链路误关掉，等于把这次修复又撤销了。
+      const answeredByPeer = error instanceof AgentLinkError
+        && (error.code === AGY_LINK_ERROR.AGENT_REFUSED || error.code === AGY_LINK_ERROR.PROTOCOL_VIOLATION)
+      if (!writeCompleted && !answeredByPeer) void this.close()
       // 写出失败（对端断流、链路关闭）时 pending 条目没有人消费：必须当场摘除并
       // 清掉超时定时器，否则它会一直留在表里，定时器到期后写出多余的
       // $/cancel_request，并 reject 一个无人等待的 promise。

@@ -44,6 +44,23 @@ describe('explicit proxy safety', () => {
     expect(fallbackCalls).toBe(0)
   })
 
+  it('rejects instead of throwing synchronously when the saved proxy becomes invalid', async () => {
+    // readProxy 按最新设置解析；用户把地址改坏后，下一次取数必须拿到 rejected
+    // promise（fetch 契约），否则调用方的 .catch()/.then(onError) 收不到它。
+    const invalid = (): never => { throw new Error('代理地址无法解析') }
+    const request = createLiveProxiedFetch(invalid, { fallback: async () => new Response('host route') })
+    let thrown: unknown
+    let pending: Promise<Response> | undefined
+    try {
+      pending = request('https://example.invalid/')
+    } catch (error) {
+      thrown = error
+    }
+    expect(thrown).toBeUndefined()
+    await expect(pending).rejects.toThrow('代理地址无法解析')
+    await request.close()
+  })
+
   it('closes a lazily created dispatcher exactly once', async () => {
     let closeCount = 0
     const request = createProxiedFetch({ url: 'http://localhost:7890', bypass: '' }, {

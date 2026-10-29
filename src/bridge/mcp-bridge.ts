@@ -21,7 +21,7 @@
  * 测试友好性：`attach(transport)` 接受任意 MCP Transport，因此测试用 SDK 自带
  * 的 `InMemoryTransport.createLinkedPair()` 在进程内直连，不占端口。
  */
-import { randomBytes, randomUUID } from 'node:crypto'
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { createServer } from 'node:http'
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
@@ -58,6 +58,22 @@ export const BRIDGE_MCP_SERVER_NAME = 'dsh-tools'
 export const BRIDGE_AUTH_HEADER = 'authorization'
 /** MCP Streamable HTTP 规范的会话头名（客户端 initialize 之后必须回带）。 */
 export const BRIDGE_SESSION_HEADER = 'mcp-session-id'
+
+/**
+ * 常数时间比较 Bearer 头与桥 token。
+ *
+ * 桥绑定 loopback、token 为 32 字节随机值，普通字符串比较的实际风险极低；
+ * 这里仍用 `timingSafeEqual` 作为纵深防御，代价是一次 Buffer 分配。
+ * 长度不同直接返回 false（`timingSafeEqual` 对不等长会抛错），长度差异本身
+ * 不构成可利用信息——token 长度是固定且公开的。
+ */
+export function matchesBridgeToken(header: string | string[] | undefined, token: string): boolean {
+  if (typeof header !== 'string') return false
+  const expected = Buffer.from(`Bearer ${token}`, 'utf8')
+  const actual = Buffer.from(header, 'utf8')
+  if (actual.length !== expected.length) return false
+  return timingSafeEqual(actual, expected)
+}
 
 /** 一次被 park 的 `tools/call`。 */
 export interface BridgeParkedCall {
@@ -364,7 +380,7 @@ export class McpToolBridge {
 
   async #handleHttp(req: IncomingMessage, res: ServerResponse): Promise<void> {
     // 鉴权先于任何 MCP 处理：随机 token 是唯一凭证，且地址只对 loopback 开放。
-    if (req.headers[BRIDGE_AUTH_HEADER] !== `Bearer ${this.#token}`) {
+    if (!matchesBridgeToken(req.headers[BRIDGE_AUTH_HEADER], this.#token)) {
       res.statusCode = 401
       res.setHeader('content-type', 'application/json')
       res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32001, message: AGY_BRIDGE_ERROR.UNAUTHORIZED }, id: null }))

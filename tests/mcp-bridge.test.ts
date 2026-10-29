@@ -15,6 +15,7 @@ import {
   BRIDGE_AUTH_HEADER,
   BRIDGE_MCP_SERVER_NAME,
   BRIDGE_SESSION_HEADER,
+  matchesBridgeToken,
   McpToolBridge,
 } from '../src/bridge/mcp-bridge.js'
 
@@ -286,5 +287,18 @@ describe('MCP 桥多会话隔离', () => {
     expect((await client.listTools()).tools.map((tool) => tool.name)).toEqual(['read_file'])
     // 运行期 HTTP 错误没有被静默丢弃（健康时应为 undefined）。
     expect(bridge.lastHttpError).toBeUndefined()
+  })
+
+  it('Bearer 头按常数时间比较，长度/内容不符与缺失头部一律拒绝', () => {
+    const token = 'a'.repeat(64)
+    expect(matchesBridgeToken(`Bearer ${token}`, token)).toBe(true)
+    // 缺头、重复头（数组）、前缀正确但值不同、长度不同都要拒绝。
+    expect(matchesBridgeToken(undefined, token)).toBe(false)
+    expect(matchesBridgeToken([`Bearer ${token}`], token)).toBe(false)
+    expect(matchesBridgeToken(`Bearer ${'b'.repeat(64)}`, token)).toBe(false)
+    expect(matchesBridgeToken(`Bearer ${'a'.repeat(63)}`, token)).toBe(false)
+    expect(matchesBridgeToken(token, token)).toBe(false)
+    // 不能因为前缀相同就放行（旧实现用严格相等，这里防止回归到 startsWith 之类）。
+    expect(matchesBridgeToken(`Bearer ${token}x`, token)).toBe(false)
   })
 })

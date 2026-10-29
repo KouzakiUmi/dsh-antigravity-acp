@@ -34,6 +34,14 @@ export const TOKEN_SUBPATH = ['.gemini', 'antigravity-cli', 'antigravity-oauth-t
 export const TOKEN_EXPIRY_MARGIN_MS = 60_000
 /** 额度快照的内存缓存时长（毫秒）。 */
 export const QUOTA_CACHE_MS = 300_000
+/**
+ * 单次 HTTP 取数（换发 token 与 Cloud Code Assist 请求）的上限（毫秒）。
+ *
+ * 缺这条会让「代理不通 / 网络挂起」变成永久失败：`quota-remote` 把并发的
+ * `read()` 合并到同一个在途 promise 上，挂死的请求会让额度药丸一直停在
+ * 「读取中」，连手动刷新也救不回来（它只是在等同一个 promise）。
+ */
+export const QUOTA_HTTP_TIMEOUT_MS = 20_000
 
 export type QuotaErrorCode =
   | 'token-missing'
@@ -125,6 +133,8 @@ export interface QuotaDeps {
   acpVersion?: string
   baseUrl?: string
   tokenUrl?: string
+  /** 单次 HTTP 请求上限（毫秒）；缺省 {@link QUOTA_HTTP_TIMEOUT_MS}。 */
+  httpTimeoutMs?: number
 }
 
 function defaultReadFile(path: string): Promise<string> {
@@ -140,6 +150,43 @@ function defaultReadBinary(path: string): Promise<string> {
   return readFile(path, 'latin1')
 }
 
+/**
+ * 本次请求实际生效的超时（毫秒）。非正数视为「未设置」并回落到默认值。
+ *
+ * 不做「传 0 就等于关掉超时」的开关：关掉后并发 read() 又会合并到一个挂死的
+ * 在途 promise 上，额度药丸永久停在读取中——那正是这条超时要修的故障。
+ */
+function effectiveTimeoutMs(deps: QuotaDeps): number {
+  const configured = deps.httpTimeoutMs
+  return configured !== undefined && configured > 0 ? configured : QUOTA_HTTP_TIMEOUT_MS
+}
+
+/**
+ * 取数请求的超时信号。宿主 Node 都带 `AbortSignal.timeout`；测试环境的
+ * fetch 替身不接信号时也不会受影响（它自己立即返回）。
+ */
+function timeoutSignal(deps: QuotaDeps): AbortSignal {
+  return AbortSignal.timeout(effectiveTimeoutMs(deps))
+}
+
+/** 毫秒转人类可读时长：不足 1 秒时保留毫秒，避免出现「超过 0 秒」。 */
+function formatTimeout(ms: number): string {
+  return ms >= 1_000 ? `${Math.round(ms / 1_000)} 秒` : `${ms} 毫秒`
+}
+
+/** 超时与网络异常都归一成可读文本；不含请求 URL（可能带 userinfo）。 */
+function describeRequestError(method: string, error: unknown, deps: QuotaDeps): string {
+  // `AbortSignal.timeout()` 抛的是 TimeoutError；AbortError 则可能来自调用方主动
+  // 取消。两者都不该报成「超时」，否则排查时会去查网络而漏掉真正的取消来源。
+  if (error instanceof Error && error.name === 'TimeoutError') {
+    return `${method} 请求超过 ${formatTimeout(effectiveTimeoutMs(deps))}未完成；请检查网络或代理设置`
+  }
+  if (error instanceof Error && error.name === 'AbortError') {
+    return `${method} 请求在完成前被中止`
+  }
+  return `请求 ${method} 失败：${describeError(error)}`
+}
+
 /** 解析登录态文件：兼容嵌套 `token.{...}` 与平铺两种历史形态。 */
 export function parseTokenState(raw: unknown): QuotaTokenState {
   const root = isRecord(raw) ? raw : {}
@@ -152,10 +199,14 @@ export function parseTokenState(raw: unknown): QuotaTokenState {
     const value = root[key]
     return typeof value === 'string' && value.length > 0 ? value : undefined
   }
+  // 平铺形态下 token === root，`pick` 已经覆盖外层；再去查一次是纯重复。
+  // 三个字段统一走这条路径，否则只有 accessToken 被优化、另两个仍会重复查询。
+  const readOuter = (key: string): string | undefined => (token === root ? undefined : outer(key))
+  const first = (nested: string, flat: string): string | undefined => pick(nested) ?? readOuter(flat)
   return {
-    accessToken: pick('access_token') ?? pick('AccessToken') ?? outer('access_token') ?? outer('AccessToken'),
-    refreshToken: pick('refresh_token') ?? outer('refresh_token'),
-    expiry: pick('expiry') ?? outer('expiry'),
+    accessToken: pick('access_token') ?? pick('AccessToken') ?? readOuter('access_token') ?? readOuter('AccessToken'),
+    refreshToken: first('refresh_token', 'refresh_token'),
+    expiry: first('expiry', 'expiry'),
   }
 }
 
@@ -168,19 +219,29 @@ export function isTokenUsable(state: QuotaTokenState, nowMs: number, marginMs = 
   return expiresAt - nowMs > marginMs
 }
 
-
-
-
-
 /** 从官方二进制文本里提取 client 元数据（正则即时编译匹配，不留模块级全局状态）；取不到返回 undefined（不猜值）。 */
 export function parseOAuthClientFromBinary(text: string): OAuthClientMeta | undefined {
   const ids = text.match(/\d+-[a-z0-9]+\.apps\.googleusercontent\.com/g) ?? []
   const secrets = text.match(/GOCSPX-[A-Za-z0-9_-]{28}/g) ?? []
-  // 与官方 CLI 同源的最后一条 client id 最可能是当前在用的；secret 只有一个候选即用。
-  for (const clientId of [...ids].reverse()) {
-    for (const clientSecret of secrets) return { clientId, clientSecret }
-  }
-  return undefined
+  if (ids.length === 0 || secrets.length === 0) return undefined
+  // 与官方 CLI 同源的最后一条 client id 最可能是当前在用的。
+  const clientId = ids[ids.length - 1] as string
+  // 多份元数据同时存在时必须按「相邻出现」配对，不能固定取第一条 secret：
+  // 那样配出来的 id/secret 可能来自不同的 client，换发会被 OAuth 端点拒绝。
+  // 单份元数据时（实测官方 CLI 就是这种）本规则退化为直接命中。
+  const anchor = text.lastIndexOf(clientId)
+  // 同一 secret 在二进制里可能出现多次（多个 client 共用或打包重复）：只取首次
+  // 出现会落到 anchor 之前，让本该配上的那份被误判成「在 id 之前」。因此先找
+  // anchor 之后的出现位置，找不到再回退到首次出现。
+  const positions = secrets.map((secret) => {
+    const afterAnchor = text.indexOf(secret, anchor + 1)
+    return { secret, at: afterAnchor >= 0 ? afterAnchor : text.indexOf(secret) }
+  })
+  // 同一份元数据里 secret 紧跟 id；多份时按文档顺序取该 id 之后的第一个 secret，
+  // 之后没有了才回退到它之前的最后一个（极少数只写 secret 的打包形态）。
+  const after = positions.filter((entry) => entry.at > anchor).sort((a, b) => a.at - b.at)[0]
+  const chosen = after ?? positions.filter((entry) => entry.at >= 0).sort((a, b) => b.at - a.at)[0]
+  return chosen === undefined ? undefined : { clientId, clientSecret: chosen.secret }
 }
 
 /**
@@ -256,13 +317,20 @@ export async function refreshAccessToken(
     grant_type: 'refresh_token',
     refresh_token: state.refreshToken,
   })
-  const response = await fetchImpl(tokenUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: body.toString(),
-  })
+  let response: Response
+  try {
+    response = await fetchImpl(tokenUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+      signal: timeoutSignal(deps),
+    })
+  } catch (error) {
+    // 不把 tokenUrl 带进消息：URL 本身不带凭据，但错误文本只保留可行动信息。
+    throw new QuotaError('refresh-failed', describeRequestError('换发 access token', error, deps))
+  }
   if (!response.ok) {
-    throw new QuotaError('refresh-failed', `换发 access token 失败（HTTP ${response.status}）`)
+    throw new QuotaError('refresh-failed', `换发 access token 失败（HTTP ${response.status}）`, response.status)
   }
   const payload = await readJson(response)
   const issued = isRecord(payload) ? payload : {}
@@ -281,10 +349,20 @@ export async function refreshAccessToken(
 /** 带错误码的取数失败；message 里不含凭据。 */
 export class QuotaError extends Error {
   readonly code: QuotaErrorCode
-  constructor(code: QuotaErrorCode, message: string) {
+  /**
+   * 上游 HTTP 状态码（换发 token 与 Cloud Code Assist 请求）。
+   *
+   * 401/403 后的「换发再试一次」必须按这个字段判断，不能去匹配 message：
+   * 文案随时会改，改一次就静默丢掉重试。非 HTTP 失败（网络、JSON、缺字段）
+   * 为 undefined。
+   */
+  readonly status: number | undefined
+
+  constructor(code: QuotaErrorCode, message: string, status?: number) {
     super(message)
     this.name = 'QuotaError'
     this.code = code
+    this.status = status
   }
 }
 
@@ -387,10 +465,8 @@ async function fetchQuotaSnapshotUncached(deps: QuotaDeps): Promise<QuotaSnapsho
       }
     } catch (error) {
       // 401/403：token 被上游拒绝（可能刚换发也失效），换发一次再试。
-      if (error instanceof QuotaError && error.code === 'request-failed' && error.message.includes('HTTP 401')) {
-        return retryAfterRefresh(state, stamp, deps)
-      }
-      if (error instanceof QuotaError && error.code === 'request-failed' && error.message.includes('HTTP 403')) {
+      if (error instanceof QuotaError && error.code === 'request-failed'
+        && (error.status === 401 || error.status === 403)) {
         return retryAfterRefresh(state, stamp, deps)
       }
       return failure(stamp(), errorCodeOf(error), describeError(error))
@@ -445,12 +521,13 @@ async function postCodeAssist(
         Accept: 'application/json',
       },
       body: JSON.stringify(payload),
+      signal: timeoutSignal(deps),
     })
   } catch (error) {
-    throw new QuotaError('request-failed', `请求 ${method} 失败：${describeError(error)}`)
+    throw new QuotaError('request-failed', describeRequestError(method, error, deps))
   }
   if (!response.ok) {
-    throw new QuotaError('request-failed', `${method} 失败（HTTP ${response.status}）`)
+    throw new QuotaError('request-failed', `${method} 失败（HTTP ${response.status}）`, response.status)
   }
   const body = await readJson(response)
   return isRecord(body) ? body : {}

@@ -3,7 +3,7 @@
  * 临时文件失败清理。全部使用注入的 fake fetch / 真实临时目录，无网络。
  */
 import { describe, expect, it } from 'vitest'
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -243,6 +243,67 @@ describe('extractZipSafely', () => {
     } finally {
       await rm(dest, { recursive: true, force: true })
       await rm(join(dest, '..', escapeName), { recursive: true, force: true })
+    }
+  })
+
+  it('条目数超过上限时整包拒绝，且在写盘前就报 ARCHIVE_TOO_LARGE', async () => {
+    const dest = await mkdtemp(join(tmpdir(), 'agy-extract-'))
+    try {
+      // 注入小上限验证守卫本身，不依赖"真实上限正好比官方包大"这种巧合。
+      const inputs = Array.from({ length: 4 }, (_, index) => ({ name: `f${index}.bin`, data: Buffer.alloc(0) }))
+      const archive = await zipToFile(inputs, join(dest, 'many.zip'))
+      await expect(extractZipSafely(archive, dest, { maxEntries: 3 }))
+        .rejects.toMatchObject({ code: AGY_BINARY_ERROR.ARCHIVE_TOO_LARGE })
+      // 恰好等于上限时仍允许。
+      expect(await extractZipSafely(archive, dest, { maxEntries: 4 })).toHaveLength(4)
+    } finally {
+      await rm(dest, { recursive: true, force: true })
+    }
+  })
+
+  it('单条目与总量超限时拒绝，正常包在上限内照常解出', async () => {
+    const dest = await mkdtemp(join(tmpdir(), 'agy-extract-'))
+    try {
+      const archive = await zipToFile(
+        [
+          { name: 'a.bin', data: Buffer.alloc(2_048, 7) },
+          { name: 'b.bin', data: Buffer.alloc(2_048, 8) },
+        ],
+        join(dest, 'sized.zip'),
+      )
+      // 单条目超限（第一个条目就拦住，不写后续）。
+      await expect(extractZipSafely(archive, dest, { maxEntryBytes: 1_024 }))
+        .rejects.toMatchObject({ code: AGY_BINARY_ERROR.ARCHIVE_TOO_LARGE })
+      // 每个条目都合规，但累计超限。
+      await expect(extractZipSafely(archive, dest, { maxEntryBytes: 4_096, maxTotalBytes: 3_000 }))
+        .rejects.toMatchObject({ code: AGY_BINARY_ERROR.ARCHIVE_TOO_LARGE })
+      // 上限足够时全部解出，证明失败来自上限而非其它解析问题。
+      expect(await extractZipSafely(archive, dest, { maxEntryBytes: 4_096, maxTotalBytes: 8_192 }))
+        .toEqual(['a.bin', 'b.bin'])
+    } finally {
+      await rm(dest, { recursive: true, force: true })
+    }
+  })
+
+  it('中央目录谎报解压大小时被拒绝，不会写出超出实际数据量', async () => {
+    const dest = await mkdtemp(join(tmpdir(), 'agy-extract-'))
+    try {
+      // 真实 4KB 条目，但两处头都把 uncompressedSize 改小成 1：
+      // 预检以"1 字节"放行，后续必须靠校验/实际字节守卫拒绝。
+      const archive = await zipToFile([{ name: 'liar.bin', data: Buffer.alloc(4_096, 3) }], join(dest, 'liar.zip'))
+      const raw = await readFile(archive)
+      raw.writeUInt32LE(1, 22) // 本地文件头 uncompressedSize
+      const central = raw.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]))
+      expect(central).toBeGreaterThan(0)
+      raw.writeUInt32LE(1, central + 24) // 中央目录 uncompressedSize
+      await writeFile(archive, raw)
+
+      // 无论由 yauzl 的 validateEntrySizes 还是我们的字节守卫拦下，
+      // 都必须失败——绝不能当成功处理。
+      await expect(extractZipSafely(archive, dest)).rejects.toBeInstanceOf(AgyBinaryError)
+      expect(await readdir(dest)).not.toContain('liar.bin')
+    } finally {
+      await rm(dest, { recursive: true, force: true })
     }
   })
 })

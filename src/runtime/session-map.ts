@@ -205,6 +205,17 @@ export class SessionMapStore {
     this.#enqueue()
   }
 
+  /**
+   * 只归还单个键的所有权，保留可恢复条目。
+   *
+   * 用于「认领了但这一轮没能走到 prompt 在途」的失败路径：条目本身没被否定
+   * （例如恢复只是启动失败），下一个 worker 仍可以尝试接管它。
+   */
+  unclaim(key: string, owner: symbol): void {
+    if (this.#owners.get(key) !== owner) return
+    this.#owners.delete(key)
+  }
+
   /** 卸载释放内存所有权但保留可恢复条目。 */
   release(owner: symbol): void {
     for (const [key, current] of this.#owners) if (current === owner) this.#owners.delete(key)

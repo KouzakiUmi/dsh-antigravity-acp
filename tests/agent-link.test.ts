@@ -293,6 +293,85 @@ describe('AgentLink 事件与会话', () => {
     await link.close()
   })
 
+  it('无法路由的畸形帧只留痕并丢弃，链路与在途请求都不受影响', async () => {
+    const pair = fakePair()
+    const violations: string[] = []
+    pumpAgent(pair, async (message, reply) => {
+      if (message.method === 'initialize') {
+        await reply({ jsonrpc: '2.0', id: message.id!, result: { protocolVersion: 1 } })
+        // 对端 bug：既没有 method 也不是合法响应形状的帧。
+        await pair.agentOut.write({ jsonrpc: '2.0', id: 999, nonsense: true } as unknown as AnyMessage)
+        await pair.agentOut.write({ jsonrpc: '2.0' } as unknown as AnyMessage)
+        return
+      }
+      if (message.method === 'session/list') {
+        await reply({ jsonrpc: '2.0', id: message.id!, result: { sessions: [] } })
+      }
+    })
+    const link = new AgentLink({
+      stream: pair.stream,
+      requestTimeoutMs: 2_000,
+      handlers: { onProtocolViolation: (detail) => void violations.push(detail) },
+    })
+    link.start()
+    await link.initialize()
+    // 链路仍然存活：畸形帧之后发出的普通请求照常完成。
+    await expect(link.request('session/list', {})).resolves.toMatchObject({ sessions: [] })
+    expect(link.closed).toBe(false)
+    await vi.waitFor(() => expect(violations).toHaveLength(2))
+    expect(violations[0]).toContain('无法路由的 JSON-RPC 消息')
+    await link.close()
+  })
+
+  it('留痕回调自身抛错也不关闭链路', async () => {
+    // 回调来自 adapter；它抛错若没被隔离，就会沿消息泵把整条链路判死，
+    // 正好抵消「单帧畸形不判死」这条修复。
+    const pair = fakePair()
+    pumpAgent(pair, async (message, reply) => {
+      if (message.method === 'initialize') {
+        await reply({ jsonrpc: '2.0', id: message.id!, result: { protocolVersion: 1 } })
+        await pair.agentOut.write({ jsonrpc: '2.0' } as unknown as AnyMessage)
+        return
+      }
+      if (message.method === 'session/list') {
+        await reply({ jsonrpc: '2.0', id: message.id!, result: { sessions: [] } })
+      }
+    })
+    const link = new AgentLink({
+      stream: pair.stream,
+      requestTimeoutMs: 2_000,
+      handlers: { onProtocolViolation: () => { throw new Error('写日志失败') } },
+    })
+    link.start()
+    await link.initialize()
+    await expect(link.request('session/list', {})).resolves.toMatchObject({ sessions: [] })
+    expect(link.closed).toBe(false)
+    await link.close()
+  })
+
+  it('形状非法的响应立即按协议违规拒绝对应请求，不白等请求超时', async () => {
+    // 带 id、却既无 result 也无 error 的帧命中在途请求时必须立刻失败：
+    // 单纯丢弃会让那个请求等到 requestTimeoutMs（默认 30s）才报超时。
+    const pair = fakePair()
+    pumpAgent(pair, async (message, reply) => {
+      if (message.method === 'initialize') {
+        await reply({ jsonrpc: '2.0', id: message.id!, result: { protocolVersion: 1 } })
+        return
+      }
+      if (message.method === 'session/list') {
+        // 对端 bug：只回 id，不给 result/error。
+        await pair.agentOut.write({ jsonrpc: '2.0', id: message.id } as unknown as AnyMessage)
+      }
+    })
+    // 超时设得很长：若走的是超时路径，本用例会明显挂住而不是失败。
+    const link = new AgentLink({ stream: pair.stream, requestTimeoutMs: 30_000 })
+    link.start()
+    await link.initialize()
+    await expect(link.request('session/list', {})).rejects.toMatchObject({ code: AGY_LINK_ERROR.PROTOCOL_VIOLATION })
+    expect(link.closed).toBe(false)
+    await link.close()
+  })
+
   it('session/cancel 以无 id 通知发出', async () => {
     const pair = fakePair()
     const notifications: AnyMessage[] = []

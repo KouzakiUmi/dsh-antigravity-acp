@@ -32,8 +32,9 @@ vi.mock('../src/runtime/binary.js', async (original) => ({
   resolveInstallRoot: () => '/fake/install',
   ensureAgentBinary: external.download,
 }))
+// 代理解析保持真实实现：装载期对非法代理的容错本身是被测行为（见下方用例）。
 vi.mock('../src/runtime/proxy-env.js', async (original) => ({
-  ...await original<typeof import('../src/runtime/proxy-env.js')>(), resolveProxy: () => undefined,
+  ...await original<typeof import('../src/runtime/proxy-env.js')>(),
 }))
 vi.mock('../src/runtime/proxied-fetch.js', () => ({
   createLiveProxiedFetch: () => Object.assign(external.fetch, { close: external.fetchClose }),
@@ -230,5 +231,18 @@ describe('apply wiring with real pool and SettingsControl', () => {
     expect(instance.unregister).toHaveBeenCalledTimes(1)
     expect(external.events.indexOf('fetch-close')).toBeGreaterThan(external.events.indexOf('worker-1'))
     expect(() => instance.control().account()).toThrow('已卸载')
+  })
+
+  it('keeps the plugin loadable when the saved proxy is invalid, so the card can fix it', () => {
+    const instance = harness()
+    // 非法代理不能让 apply 抛穿：一旦装载失败，本插件贡献的设置卡片也跟着消失，
+    // 用户只剩手改宿主配置文件这一条路。
+    expect(() => apply(instance.ctx, { proxyUrl: 'ftp://127.0.0.1:21' })).not.toThrow()
+    expect(instance.registered()).toBeInstanceOf(PooledAcpAdapter)
+    expect(instance.control().account().state).toBe('idle')
+    const warned = (instance.ctx.logger as unknown as { warn: Mock }).warn.mock.calls.map(([message]) => String(message))
+    expect(warned.some((message) => message.includes('代理配置无效'))).toBe(true)
+    // 告警只报原因，不回显地址里的认证信息。
+    expect(warned.join('\n')).not.toContain('ftp://127.0.0.1:21')
   })
 })
