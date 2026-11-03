@@ -94,9 +94,14 @@ export function outputMatches(fresh: readonly RequestMessage[], expected: string
   return outputHash(blocks) === expected
 }
 
-export function routeFingerprint(options: Pick<GenerateOptions, 'provider' | 'model' | 'reasoningEffort' | 'system' | 'tools'>): string {
+export function routeFingerprint(
+  options: Pick<GenerateOptions, 'provider' | 'model' | 'reasoningEffort' | 'system' | 'tools'>,
+  override?: { target?: string; effort?: string },
+): string {
   return createHash('sha256').update(stable({
     provider: options.provider, model: options.model, effort: options.reasoningEffort?.toString(),
+    // 公开模型 ID 不变时，设置页的官方映射或默认档位仍可能改变实际路由。
+    override,
     system: options.system ?? '',
     tools: [...(options.tools ?? [])].sort((a, b) => a.name.localeCompare(b.name)),
   })).digest('hex')

@@ -191,7 +191,7 @@ describe('额度失败保留旧值', () => {
       return { exitCode: 0, stdout: USAGE, stderr: '' }
     }
     const ctx = new Context()
-    ctx.plugin(AgYQuotaService, { cli: { run, cliPath: '/fake/agy' } })
+    ctx.plugin(AgYQuotaService, { cli: { run, cliPath: '/fake/agy' }, cliQuotaEnabled: () => true })
     await new Promise((resolve) => setTimeout(resolve, 0))
     const service = (ctx as unknown as Record<string, { read(r?: { force?: boolean }): Promise<{ status: string; stale?: boolean; staleReason?: string; groups: unknown[] }> }>)[AGY_QUOTA_SERVICE]!
     expect((await service.read({ force: true })).stale).toBeUndefined()
@@ -253,7 +253,7 @@ describe('额度失败保留旧值', () => {
       return { exitCode: 0, stdout: USAGE, stderr: '' }
     }
     const ctx = new Context()
-    ctx.plugin(AgYQuotaService, { cli: { run, cliPath: '/fake/agy' } })
+    ctx.plugin(AgYQuotaService, { cli: { run, cliPath: '/fake/agy' }, cliQuotaEnabled: () => true })
     await new Promise((resolve) => setTimeout(resolve, 0))
     const service = (ctx as unknown as Record<string, { read(r?: { force?: boolean }): Promise<{ status: string; groups: unknown[] }> }>)[AGY_QUOTA_SERVICE]!
     await service.read()

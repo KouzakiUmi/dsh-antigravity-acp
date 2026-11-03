@@ -100,7 +100,7 @@ async function mountPill(readQuota: unknown) {
 }
 
 function button(renderer: ReactTestRenderer, label: string): ReactTestInstance {
-  return renderer.root.findAllByType('button').find((node) => node.children.join('') === label)!
+  return renderer.root.findAllByType('button').find((node) => node.children.join('') === label || node.props['aria-label'] === label)!
 }
 function fieldInput(renderer: ReactTestRenderer, name: string): ReactTestInstance {
   return renderer.root.findByProps({ name })
@@ -172,6 +172,17 @@ describe('quota pill with real React state and effects', () => {
     expect(renderer.root.findByProps({ role: 'progressbar' }).props['aria-valuenow']).toBe(42)
   })
 
+  it('跨家族官方映射使用实际路由模型的额度组', async () => {
+    const renderer = await mountPill(async () => ({
+      status: 'ok', requestedModel: 'gemini-flash', routeModel: 'claude-opus-5-5-low',
+      groups: [
+        { name: 'Gemini', buckets: [{ window: '5h', remainingPct: 81 }] },
+        { name: 'Claude and GPT models', buckets: [{ window: '5h', remainingPct: 42 }] },
+      ],
+    }))
+    expect(renderer.root.findByProps({ role: 'progressbar' }).props['aria-valuenow']).toBe(42)
+  })
+
   it('失败信封转成可读错误，不把异常抛出组件', async () => {
     const renderer = await mountPill(async () => ({ ok: false, error: { message: 'remote denied' } }))
     expect(renderer.root.findByProps({ 'aria-haspopup': 'dialog' }).props['aria-label']).toContain('额度读取失败')
@@ -226,14 +237,15 @@ describe('settings card with real React state and effects', () => {
     const service = transport(document())
     const { renderer } = await mount(service.remote)
     const bar = renderer.root.findByProps({ 'aria-label': '设置保存操作' })
-    expect(bar.props.style).toMatchObject({ position: 'sticky', top: 0 })
+    expect(bar.props.style).toMatchObject({ position: 'sticky', top: 0, display: 'none' })
     expect(bar.findAllByType('button').filter(node => node.children.join('') === '保存')).toHaveLength(1)
     expect(button(renderer, '保存').props.disabled).toBe(true)
     await act(async () => { fieldInput(renderer, 'proxyUrl').props.onChange({ target: { value: 'http://127.0.0.1:7890' } }) })
     expect(renderedText(renderer)).toContain('1 项未保存')
+    expect(bar.props.style.display).toBe('grid')
     expect(button(renderer, '保存').props.disabled).toBe(false)
-    await act(async () => { button(renderer, '撤销未保存修改').props.onClick() })
-    expect(renderedText(renderer)).toContain('没有未保存的修改')
+    await act(async () => { button(renderer, '撤销').props.onClick() })
+    expect(renderedText(renderer)).not.toContain('项未保存')
     expect(button(renderer, '保存').props.disabled).toBe(true)
   })
 
@@ -242,7 +254,7 @@ describe('settings card with real React state and effects', () => {
     const proxyControl = vi.fn(async () => ({ snapshot: { phase: 'pending-login', connectionStage: 'authorizing', revision: 0, message: '等待授权' } }))
     const { renderer } = await mount(service.remote, undefined, proxyControl)
     await act(async () => { fieldInput(renderer, 'proxyUrl').props.onChange({ target: { value: 'http://127.0.0.1:7890' } }) })
-    expect(renderedText(renderer)).toContain('网络设置尚未保存')
+    expect(renderedText(renderer)).toContain('请先保存网络设置')
     expect(button(renderer, '取消登录').props.disabled).toBe(false)
     await act(async () => { await button(renderer, '取消登录').props.onClick() })
     expect(proxyControl).toHaveBeenCalledWith('account', { action: 'cancel' })
@@ -256,7 +268,7 @@ describe('settings card with real React state and effects', () => {
       return { snapshot, message: snapshot.message, ...(request.action === 'login' ? { authorizationUrl: 'https://accounts.google.com/synthetic' } : {}) }
     })
     const { renderer, intervals } = await mount(service.remote, controlWith(), proxyControl)
-    expect(renderedText(renderer)).toContain('无需安装 agy CLI')
+    expect(renderedText(renderer)).toContain('无需 agy CLI')
     await act(async () => { await button(renderer, '连接代理账户').props.onClick() })
     const link = renderer.root.findByType('a')
     expect(link.children.join('')).toBe('打开 Google 授权页')
@@ -299,7 +311,7 @@ describe('settings card with real React state and effects', () => {
     await act(async () => { service.change(document({ proxyMode: false }, 2)) })
     await act(async () => { pending.resolve({ status: 'ok', groups: [{ name: 'former-account', buckets: [{ remainingPct: 99 }] }] }); await request })
     expect(renderedText(renderer)).not.toContain('former-account')
-    expect(renderedText(renderer)).toContain('尚未拉取')
+    expect(renderedText(renderer)).toContain('尚未查询')
     expect(button(renderer, '拉取额度').props.disabled).toBe(false)
   })
   it('模式草稿不冒充已生效模式，代理模式保存后显示对应连接控件', async () => {
@@ -310,13 +322,13 @@ describe('settings card with real React state and effects', () => {
     const { renderer } = await mount(service.remote, control)
     await act(async () => { fieldInput(renderer, 'proxyMode').props.onChange({ target: { checked: true } }) })
     expect(service.mutate).not.toHaveBeenCalled()
-    expect(renderedText(renderer)).toContain('模式修改尚未保存')
-    expect(renderedText(renderer)).not.toContain('代理模式已开启：生成与额度都使用该账户')
+    expect(renderedText(renderer)).toContain('保存后切换到代理模式')
+    expect(renderedText(renderer)).not.toContain('生成与套餐额度使用此账户')
     expect(button(renderer, '连接 / 登录 ACP')).toBeDefined()
     await act(async () => { service.change(document({ proxyMode: true }, 2)) })
     expect(button(renderer, '连接 / 登录 ACP')).toBeUndefined()
     expect(button(renderer, '立即预热')).toBeUndefined()
-    expect(renderedText(renderer)).toContain('代理模式已开启：生成与额度都使用该账户')
+    expect(renderedText(renderer)).toContain('生成与套餐额度使用此账户')
   })
 
   it('代理组件缺席时仍停用 ACP，不提供任何 ACP 连接操作', async () => {
@@ -325,11 +337,11 @@ describe('settings card with real React state and effects', () => {
       ? { state: 'idle', message: 'ready', generationMode: { requested: 'proxy', active: 'acp', proxyRouterReady: false } }
       : { status: 'ok', models: [] })
     const { renderer } = await mount(service.remote, control)
-    expect(renderedText(renderer)).toContain('代理路由组件尚未就绪，ACP 功能保持停用')
+    expect(renderedText(renderer)).toContain('代理路由未就绪，ACP 保持停用')
     expect(renderedText(renderer)).toContain('未注册')
-    expect(renderedText(renderer)).toContain('代理模式已开启：生成与额度都使用该账户')
+    expect(renderedText(renderer)).toContain('生成与套餐额度使用此账户')
     expect(button(renderer, '连接 / 登录 ACP')).toBeUndefined()
-    expect(renderer.root.findAllByProps({ name: 'agyCliPath' })).toHaveLength(0)
+    expect(renderer.root.findAllByProps({ name: 'agyCliPath' })).toHaveLength(1)
     expect(renderer.root.findAllByProps({ name: 'binaryPath' })).toHaveLength(0)
   })
 
@@ -430,7 +442,7 @@ describe('settings card with real React state and effects', () => {
     // modelOverrides 由逐模型行渲染，不是普通输入框。
     const plain = fields.filter(key => key !== 'modelOverrides')
     const inputs = [...renderer.root.findAllByType('input'), ...renderer.root.findAllByType('textarea')]
-      .filter(input => !String(input.props.name).startsWith('model-'))
+      .filter(input => fields.includes(input.props.name))
     expect(inputs).toHaveLength(plain.length)
     expect(inputs.every(input => input.props.disabled === false)).toBe(true)
     await act(async () => {
@@ -452,7 +464,8 @@ describe('settings card with real React state and effects', () => {
     })
     expect(button(renderer, '保存').props.disabled, renderedText(renderer)).toBe(true)
     expect(fieldInput(renderer, 'proxyUrl').props.value).toBe('test-value')
-    expect(renderedText(renderer)).toContain('会话偏好从下一轮生效')
+    expect(fieldInput(renderer, 'cliQuotaEnabled').props.type).toBe('checkbox')
+    expect(renderedText(renderer)).toContain('已保存并切换模式')
   })
 
   it('逐模型设置只提交有意义的字段，清空的项从配置里移除', async () => {
@@ -476,10 +489,10 @@ describe('settings card with real React state and effects', () => {
   it('全部模型被隐藏时提示 provider 会从选择器消失，重新启用后提示消失', async () => {
     const service = transport(document({ modelOverrides: { 'gemini-3-pro': { enabled: false }, 'claude-sonnet-5-5': { enabled: false } } }))
     const { renderer } = await mount(service.remote, controlWith())
-    expect(renderedText(renderer)).toContain('所有模型都已隐藏')
+    expect(renderedText(renderer)).toContain('全部隐藏后')
     await act(async () => { modelControl(renderer, 'enabled', 'gemini-3-pro').props.onChange({ target: { checked: true } }) })
-    expect(renderedText(renderer)).not.toContain('所有模型都已隐藏')
-    expect(renderedText(renderer)).toContain('1 个已从选择器隐藏')
+    expect(renderedText(renderer)).not.toContain('全部隐藏后')
+    expect(renderedText(renderer)).toContain('已隐藏 1')
   })
 
   it('已经保存但当前目录没有的模型 ID 仍可编辑，并标注不在目录', async () => {
@@ -487,7 +500,24 @@ describe('settings card with real React state and effects', () => {
     const { renderer } = await mount(service.remote, controlWith())
     expect(modelControl(renderer, 'target', 'retired-model').props.value).toBe('retired-model-high')
     expect(renderedText(renderer)).toContain('不在当前目录')
-    expect(renderedText(renderer)).toContain('3 个模型')
+    expect(renderedText(renderer)).toContain('全部 3')
+  })
+
+  it('模型可搜索并按启停筛选，折叠的高级映射仍可编辑', async () => {
+    const service = transport(document({ modelOverrides: { 'gemini-3-pro': { enabled: false } } }))
+    const { renderer } = await mount(service.remote, controlWith())
+    const search = renderer.root.findByProps({ 'aria-label': '搜索模型' })
+    await act(async () => { search.props.onChange({ target: { value: 'claude' } }) })
+    expect(renderer.root.findAllByProps({ name: 'model-enabled-gemini-3-pro' })).toHaveLength(0)
+    expect(modelControl(renderer, 'enabled', 'claude-sonnet-5-5')).toBeDefined()
+    await act(async () => { search.props.onChange({ target: { value: '' } }) })
+    const filter = renderer.root.findByProps({ 'aria-label': '筛选模型' })
+    await act(async () => { filter.props.onChange({ target: { value: 'hidden' } }) })
+    expect(modelControl(renderer, 'enabled', 'gemini-3-pro').props.checked).toBe(false)
+    expect(renderer.root.findAllByProps({ name: 'model-enabled-claude-sonnet-5-5' })).toHaveLength(0)
+    await act(async () => { button(renderer, '全部启用').props.onClick() })
+    await act(async () => { filter.props.onChange({ target: { value: 'all' } }) })
+    expect(modelControl(renderer, 'enabled', 'gemini-3-pro').props.checked).toBe(true)
   })
 
   it('缺少设置 namespace 时解释禁用原因，宿主恢复后重新启用控件', async () => {
@@ -506,7 +536,7 @@ describe('settings card with real React state and effects', () => {
     expect(fieldInput(renderer, 'proxyUrl').props.disabled).toBe(true)
     expect(modelControl(renderer, 'enabled', 'gemini-3-pro').props.disabled).toBe(true)
     expect(button(renderer, '保存').props.disabled).toBe(true)
-    expect(renderedText(renderer)).toContain('当前设置为只读')
+    expect(renderedText(renderer)).toContain('只读设置')
     await act(async () => { await button(renderer, '保存').props.onClick() })
     expect(service.mutate).not.toHaveBeenCalled()
   })
@@ -542,7 +572,7 @@ describe('settings card with real React state and effects', () => {
     const { renderer } = await mount(service.remote, controlWith())
     await act(async () => { modelControl(renderer, 'effort', 'gemini-3-pro').props.onChange({ target: { value: 'high' } }) })
     await act(async () => { service.change(document({ modelOverrides: { 'gemini-3-pro': { effort: 'medium' } } }, 2)) })
-    await act(async () => { button(renderer, '撤销未保存修改').props.onClick() })
+    await act(async () => { button(renderer, '撤销').props.onClick() })
     expect(modelControl(renderer, 'effort', 'gemini-3-pro').props.value).toBe('medium')
     expect(button(renderer, '保存').props.disabled).toBe(true)
     expect(renderedText(renderer)).not.toContain('其他位置更新了以下设置')
@@ -595,11 +625,11 @@ describe('settings card with real React state and effects', () => {
       return revision === 1 ? { status: 'ok', models: [] } : catalog()
     })
     const { renderer, intervals } = await mount(service.remote, control)
-    expect(renderedText(renderer)).toContain('还没有模型目录')
+    expect(renderedText(renderer)).toContain('暂无模型')
     revision = 2
     await act(async () => { for (const timer of intervals.values()) if (timer.delay === 2000) timer.callback() })
     expect(modelControl(renderer, 'target', 'gemini-3-pro').props.value).toBe('')
-    expect(renderedText(renderer)).toContain('文本、图片')
+    expect(renderedText(renderer)).toContain('文本 · 图片')
     await act(async () => { await button(renderer, '刷新模型目录').props.onClick() })
     expect(modelControl(renderer, 'enabled', 'fresh-model')).toBeDefined()
   })

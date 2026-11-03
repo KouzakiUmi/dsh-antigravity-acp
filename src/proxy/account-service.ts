@@ -86,6 +86,8 @@ export class ProxyAccountService implements ProxyCredentialSource {
           throw new ProxyOAuthError('credential-save-failed', 'Google 授权已完成，但本地登录态保存失败，请检查缓存目录权限后重新连接')
         }
         this.setStatus({ phase: 'signed-in', message: '代理模式登录完成', ...(token.email ? { email: token.email } : {}), source: 'login' })
+        // 每次显式 OAuth 都可能换成另一账户；普通 token 刷新才保持原代际。
+        this.publishedAccount = false
         this.publishAccount()
         return credential
       },
@@ -106,7 +108,9 @@ export class ProxyAccountService implements ProxyCredentialSource {
       const refreshed = await this.refresh(signal)
       if (refreshed) return this.prepareCredential(refreshed, generation, signal)
     }
-    const imported = await importCliCredential(this.cliTokenPath(), this.now())
+    // 只有没有既有代理账户时才允许导入 CLI。已有账户刷新失败不能静默改用
+    // CLI 中可能完全不同的另一账户；显式重登会继续走 OAuth。
+    const imported = current ? undefined : await importCliCredential(this.cliTokenPath(), this.now())
     if (imported && generation === this.generation) {
       let usable = imported
       if (!isProxyCredentialUsable(usable, this.now())) {
@@ -119,6 +123,7 @@ export class ProxyAccountService implements ProxyCredentialSource {
       usable = { ...usable, projectId: await resolveProxyProject(usable.accessToken, this.projectTransport, signal) }
       if (!await this.saveCredential(usable, generation, signal) || generation !== this.generation || signal?.aborted) return undefined
       this.setStatus({ phase: 'signed-in', message: '已导入官方 CLI 登录态', source: 'cli-import' })
+      this.publishedAccount = false
       this.publishAccount()
       return usable
     }

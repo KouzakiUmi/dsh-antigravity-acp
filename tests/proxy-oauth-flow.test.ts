@@ -35,11 +35,12 @@ async function isolated() {
       return listener
     },
   }
+  let now = Date.now()
   const tokenFetch = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({
     access_token: 'synthetic-access', refresh_token: 'synthetic-refresh', expires_in: 3600,
   })))
   const project = vi.fn<ProxyTransport['request']>(async () => new Response(JSON.stringify({ cloudaicompanionProject: { id: 'synthetic-project' } })))
-  const options = { cacheDir, cliTokenPath: join(cacheDir, 'missing-cli-token'), fetchImpl: tokenFetch,
+  const options = { cacheDir, cliTokenPath: join(cacheDir, 'missing-cli-token'), fetchImpl: tokenFetch, now: () => now,
     projectTransport: { request: project }, oauthOptions: { listenerFactory } }
   const service = new ProxyAccountService(options)
   cleanups.push(() => service.dispose())
@@ -47,7 +48,7 @@ async function isolated() {
     const state = new URL(url).searchParams.get('state')!
     return sendCallback(port, new URLSearchParams({ state, ...query }).toString())
   }
-  return { cacheDir, options, service, callback, tokenFetch, project, port: () => port }
+  return { cacheDir, options, service, callback, tokenFetch, project, port: () => port, advanceTime: (ms: number) => { now += ms } }
 }
 
 function sendCallback(port: number, query: string, host = 'localhost:51121') {
@@ -119,6 +120,23 @@ describe('无 CLI 的实际 OAuth 与 loopback 账户闭环', () => {
     expect(reloaded.status().phase).toBe('signed-in')
     expect(tokenFetch).toHaveBeenCalledOnce()
     expect(project).toHaveBeenCalledOnce()
+  })
+
+  it('失效后不退出直接 OAuth 重登也发布新账户代际', async () => {
+    const fixture = await isolated()
+    const changed = vi.fn()
+    fixture.service.subscribe(changed)
+    const first = await fixture.service.login()
+    expect((await fixture.callback(first.authorizationUrl!)).status).toBe(200)
+    expect(fixture.service.revision()).toBe(1)
+
+    fixture.advanceTime(2 * 3600_000)
+    fixture.tokenFetch.mockImplementationOnce(async () => new Response('{}', { status: 500 }))
+    const second = await fixture.service.login()
+    expect(second.authorizationUrl).toBeDefined()
+    expect((await fixture.callback(second.authorizationUrl!)).status).toBe(200)
+    expect(fixture.service.revision()).toBe(2)
+    expect(changed).toHaveBeenCalledTimes(2)
   })
 
   it('无效 Host 和旧 state 不消耗流程，拒绝或缺授权码后可重新授权', async () => {

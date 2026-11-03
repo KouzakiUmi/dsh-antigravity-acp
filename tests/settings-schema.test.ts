@@ -30,6 +30,8 @@ describe('live settings schema and runtime references', () => {
     expect(config.reuseSessions).toBe(true)
     expect(config.resumeSessions).toBe(false)
     expect(config.keepProcessAfterCancel).toBe(false)
+    expect(config.cliQuotaEnabled).toBe(false)
+    expect(config.proxyMode).toBe(false)
     expect(config.cancelGraceMs).toBe(0)
     expect(config.idleRecycleMs).toBe(0)
     expect(config.maxConcurrentSessions).toBe(2)

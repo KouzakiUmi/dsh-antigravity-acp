@@ -660,7 +660,8 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
     connect: async (signal) => {
       await adapter.discoverModels(signal)
     },
-    modelSource: () => modeBus.current(),
+    // 目录缓存同时按模式和代理账户代际隔离；退出或换账户后的失败不能复用旧账户目录。
+    modelSource: () => modeBus.current() ? `proxy:${proxyAccount.revision()}` : 'acp',
     generationMode: () => ({ requested: modeBus.requested() ? 'proxy' : 'acp', active: modeBus.current() ? 'proxy' : 'acp', proxyRouterReady: modeBus.routerReady() }),
     acpEnabled: () => !modeBus.requested(),
     models: async (force) => {
@@ -725,17 +726,19 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
   })
 
   // 额度监控：套餐额度取数服务 + Typert remote（供浏览器端药丸读取）。
-  // 首选官方 CLI 的 /usage（本账户唯一可用来源）；没有 CLI 时退回
-  // Cloud Code Assist HTTP 线（需账号开通 companion 项目）。取数只读，
-  // 凭据不写回、不进日志。
+  // 默认不调用本机 agy：ACP 模式走 Cloud Code Assist HTTP，代理模式走代理账户。
+  // 仅当设置显式开启 cliQuotaEnabled 时才 spawn `agy -p /usage` 与 `/credits`
+  // （AI Credits 只能这样读）。取数只读，凭据不写回、不进日志。
   registerAgYQuotaRemote(ctx)
   ctx.plugin(AgYQuotaService, {
     control,
     // HTTP 回退路径要从对应版本的缓存二进制里提取 OAuth client 元数据。
     deps: { cacheDir, acpVersion, cliPath: config.agyCliPath, fetchImpl: pluginFetch },
+    cliQuotaEnabled: () => config.cliQuotaEnabled === true,
     resolveCli: () => { const cliPath = findCli(); return cliPath ? { run: cliRun, cliPath } : undefined },
     // 额度取数跟随当前生成模式：代理模式用代理账户 + agy 线传输。
     mode: () => (modeBus.current() ? 'proxy' : 'acp'),
+    modelTarget: (model) => config.modelOverrides?.[model]?.target?.trim() || model,
     proxyQuota: { credential: proxyAccount, transport: proxyQuotaTransport },
     // 取数打点：浏览器侧无法写宿主日志，这条是「药丸有没有真的发请求、结果如何」的唯一现场。
     log: {

@@ -12,7 +12,7 @@ const usage = () => success({ status: 'SUCCESS', command: { name: 'usage', data:
 
 async function service(run?: CliRun) {
   const ctx = new Context()
-  ctx.plugin(AgYQuotaService, run ? { cli: { run, cliPath: '/fake/agy' } } : {
+  ctx.plugin(AgYQuotaService, run ? { cli: { run, cliPath: '/fake/agy' }, cliQuotaEnabled: () => true } : {
     deps: { homedir: () => '/fake/home', readFileImpl: async () => { throw new Error('ENOENT') }, fetchImpl: async () => { throw new Error('unexpected network') } },
   })
   await new Promise((resolve) => setTimeout(resolve, 0))

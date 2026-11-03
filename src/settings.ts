@@ -92,11 +92,19 @@ export interface AntigravityHostConfig {
    * 关闭（默认）时一切行为与现在相同：生成走官方 ACP。
    */
   proxyMode?: boolean
+  /**
+   * 是否允许额度取数调用本机官方 agy CLI（默认关闭）。
+   * 关闭时任何模式都不 spawn agy：代理模式套餐额度用代理账户，ACP 模式走
+   * Cloud Code Assist HTTP，AI Credits 不查询。
+   * 开启后 ACP 模式才运行 `agy -p /usage` 与 `agy -p /credits`；代理模式
+   * 套餐额度仍用代理账户，只有 AI Credits 调用 `agy -p /credits`。
+   */
+  cliQuotaEnabled?: boolean
 }
 
 // Only fields owned by the custom settings card are live. Ordinary launch/pool
 // configuration remains ordinary, so editing it still follows the host lifecycle.
-export const LIVE_SETTING_KEYS = ['autoWarmup', 'reuseSessions', 'modelOverrides', 'proxyUrl', 'proxyBypass', 'agyCliPath', 'resumeSessions', 'keepProcessAfterCancel', 'cancelGraceMs', 'idleRecycleMs', 'proxyMode'] as const
+export const LIVE_SETTING_KEYS = ['autoWarmup', 'reuseSessions', 'modelOverrides', 'proxyUrl', 'proxyBypass', 'agyCliPath', 'resumeSessions', 'keepProcessAfterCancel', 'cancelGraceMs', 'idleRecycleMs', 'proxyMode', 'cliQuotaEnabled'] as const
 export type LiveSettingKey = typeof LIVE_SETTING_KEYS[number]
 export type AntigravityPluginConfig = Omit<AntigravityHostConfig, LiveSettingKey> & {
   [K in LiveSettingKey]?: AntigravityHostConfig[K] | Volatile<AntigravityHostConfig[K]>
@@ -125,6 +133,7 @@ export function liveHostConfig(config: AntigravityPluginConfig): AntigravityHost
     get cancelGraceMs() { return readSetting(config.cancelGraceMs) },
     get idleRecycleMs() { return readSetting(config.idleRecycleMs) },
     get proxyMode() { return readSetting(config.proxyMode) },
+    get cliQuotaEnabled() { return readSetting(config.cliQuotaEnabled) },
   }
 }
 
@@ -174,4 +183,5 @@ export const Config = Schema.object({
   cancelGraceMs: Schema.natural().max(60_000).default(30_000).volatile().description('取消后等待 agent 确认停止的上限（毫秒）；0 表示不等待、立即回收'),
   idleRecycleMs: Schema.natural().max(3_600_000).default(300_000).volatile().description('保留进程的最长空闲时间（毫秒），超时回收；0 表示不设上限。默认 5 分钟是本插件的资源回收策略，不代表上游缓存 TTL'),
   proxyMode: Schema.boolean().default(false).volatile().description('代理模式（默认关闭）：开启后模型生成改由本 bundle 的代理路由直连上游（自有 OAuth 登录态 + agy 线身份），并停用官方 ACP 路由；关闭恢复 ACP 模式'),
+  cliQuotaEnabled: Schema.boolean().default(false).volatile().description('允许额度取数调用本机 agy CLI（默认关闭）。关闭时不启动 agy，套餐额度走内置直连，AI Credits 不查询。开启后 ACP 模式运行 agy -p /usage 与 agy -p /credits；代理模式套餐额度仍用代理账户，仅 AI Credits 调用 agy -p /credits'),
 })

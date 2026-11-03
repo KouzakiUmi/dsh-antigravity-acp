@@ -228,13 +228,12 @@ describe('browser client module', () => {
     const card = loadRegistrations().get('antigravity-acp')!.component
     const tree = card({ remote: {}, control, readQuota })
     const text = texts(tree).join(' ')
-    expect(text).toContain('01 · 连接')
-    expect(text).toContain('02 · 模型')
-    expect(text).toContain('模型列表')
+    expect(text).toContain('ACP 账户与连接')
+    expect(elements(tree).some(item => item.props['aria-label'] === '模型列表')).toBe(true)
     expect(text).not.toContain('首次')
     expect(control.mock.calls.some(([, request]) => request?.action === 'login')).toBe(false)
     const click = (label: string) => {
-      const target = elements(tree).find((item) => item.type === 'button' && texts(item).join('') === label)
+      const target = elements(tree).find((item) => item.type === 'button' && (texts(item).join('') === label || item.props['aria-label'] === label))
       expect(target, label).toBeDefined()
       ;(target!.props.onClick as () => void)()
     }
@@ -252,14 +251,14 @@ describe('browser client module', () => {
   it('设置页按任务分区，额度可手动拉取且不重复默认模型设置', () => {
     const tree = loadCard()({ remote: {} })
     const text = texts(tree).join(' ')
-    for (const label of ['01 · 连接', '02 · 模型', '03 · 偏好', '高级设置', '连接诊断']) expect(text).toContain(label)
+    for (const label of ['连接', '模型', '额度', '高级', '会话偏好', '网络与 CLI', '连接诊断']) expect(text).toContain(label)
     expect(text).toContain('拉取额度')
-    expect(text).toContain('打开设置页不会自动查询额度')
+    expect(text).toContain('尚未查询')
     // 默认模型由 DSH 自己的模型选择器负责，设置页不再重复维护。
     expect(text).not.toContain('默认模型')
     expect(text).not.toContain('套餐额度管理')
     expect(elements(tree).filter((item) => item.props['aria-label'] === 'AI Credits 余额')).toHaveLength(0)
-    expect(elements(tree).filter((item) => item.type === 'details')).toHaveLength(2)
+    expect(elements(tree).filter((item) => item.type === 'details')).toHaveLength(6)
   })
 
   it('目录冷启动超过 60 秒时客户端继续等待 Host，而不是提前报超时', async () => {
@@ -298,7 +297,7 @@ describe('browser client module', () => {
 
   it('代理说明明确留空继承宿主环境，不承诺强制直连', () => {
     const tree = loadCard()({ remote: {} })
-    expect(texts(tree).join('')).toContain('留空则继承宿主代理环境变量')
+    expect(texts(tree).join('')).toContain('留空继承宿主代理环境')
   })
 
   it('returns its plugin exports when the DSH loader supplies only require', () => {
@@ -395,13 +394,13 @@ describe('browser client module', () => {
     await Promise.resolve()
 
     // 没有真实目录来源时，卡片如实说明「未找到本路由」，而不是编造模型列表。
-    expect(texts(tree).join('\n')).toContain('Antigravity ACP')
+    expect(texts(tree).join('\n')).toContain('ACP 模式')
   })
 
   it('宿主缺少 settings.describe 时降级为可读提示而不是崩溃', () => {
     const Card = loadCard()
     const tree = Card({ remote: {} })
-    expect(texts(tree).join('\n')).toContain('Antigravity ACP')
+    expect(texts(tree).join('\n')).toContain('ACP 模式')
   })
 
   it('remote.<ns> 属性访问抛「without inject」时降级，绝不把异常抛出组件', () => {
@@ -423,7 +422,7 @@ describe('browser client module', () => {
     // 异常若穿出组件，React 侧会击穿 settings.section 卡片并弄坏设置页。
     expect(() => Card({ remote })).not.toThrow()
     const tree = Card({ remote })
-    expect(texts(tree).join('\n')).toContain('Antigravity ACP')
+    expect(texts(tree).join('\n')).toContain('ACP 模式')
   })
 })
 
@@ -431,7 +430,9 @@ describe('AI Credits 展示', () => {
   it.each([
     [{ status: 'ok', remainingCredits: 0 }, '0'],
     [{ status: 'ok', remainingCredits: 42 }, '42'],
-    [{ status: 'unavailable', error: { message: '未提供此账户信息' } }, '未提供'],
+    // unavailable 现在的主因是「没打开 agy CLI 取数」这个可开启的功能，
+    // 与「查询成功但上游没给数字」区分开；具体原因由 credits.error.message 说明。
+    [{ status: 'unavailable', error: { message: '未提供此账户信息' } }, '未启用'],
     [{ status: 'error', error: { message: '查询超时' } }, '查询失败'],
     [{ status: 'ok' }, '未提供'],
   ])('余额状态独立呈现且不混淆零与未知', (credits, expected) => {
@@ -520,8 +521,8 @@ describe('额度药丸（conversation.input.right）', () => {
   })
 
   it('窄屏靠左的药丸展开时把弹层夹在视口内', () => {
-    const pill = loadRegistrations({ stateOverrides: { 2: true }, refStateBindings: { 2: 3 }, refOverrides: {
-      3: { getBoundingClientRect: () => ({ right: 75, top: 760, bottom: 786 }) },
+    const pill = loadRegistrations({ stateOverrides: { 2: true }, refStateBindings: { 3: 3 }, refOverrides: {
+      4: { getBoundingClientRect: () => ({ right: 75, top: 760, bottom: 786 }) },
     } }).get('antigravity-quota')!.component
     pill({ store: modelStore('antigravity-acp') })
     expect(lastStateCalls).toContainEqual(expect.objectContaining({ position: 'fixed', left: 12, width: 340, bottom: 92 }))

@@ -116,7 +116,7 @@ describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
     let mode: 'acp' | 'proxy' = 'acp'
     const run: CliRun = async request => ({ exitCode: 0, stderr: '', stdout: JSON.stringify(request.argv.includes('/credits') ? CREDITS_JSON : USAGE_JSON) })
     const fiber = await ctx.plugin(AgYQuotaService, {
-      cli: { run, cliPath: '/fake/agy' }, mode: () => mode,
+      cli: { run, cliPath: '/fake/agy' }, cliQuotaEnabled: () => true, mode: () => mode,
       proxyQuota: { credential: { credential: async () => undefined }, transport: { request: async () => { throw new Error('unexpected network') } } },
     })
     try {
@@ -138,7 +138,7 @@ describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
     }
     const credential = vi.fn(async () => undefined)
     const fiber = await ctx.plugin(AgYQuotaService, {
-      cli: { run, cliPath: '/fake/agy' }, mode: () => mode,
+      cli: { run, cliPath: '/fake/agy' }, cliQuotaEnabled: () => true, mode: () => mode,
       proxyQuota: { credential: { credential }, transport: { request: async () => { throw new Error('unexpected network') } } },
     })
     try {
@@ -152,6 +152,30 @@ describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
       }
       expect(credential).toHaveBeenCalled()
     } finally { release(); await fiber.dispose(); await ctx.fiber.dispose() }
+  })
+
+  it('额度响应携带公开模型与已保存的官方路由，供药丸匹配实际家族', async () => {
+    const ctx = new Context()
+    const run: CliRun = async request => ({ exitCode: 0, stderr: '', stdout: JSON.stringify(request.argv.includes('/credits') ? CREDITS_JSON : USAGE_JSON) })
+    const fiber = await ctx.plugin(AgYQuotaService, { cli: { run, cliPath: '/fake/agy' }, cliQuotaEnabled: () => true,
+      modelTarget: model => model === 'gemini-public' ? 'claude-official' : model })
+    try {
+      const service = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
+      expect(await service.read({ model: 'gemini-public' })).toMatchObject({ requestedModel: 'gemini-public', routeModel: 'claude-official' })
+    } finally { await fiber.dispose(); await ctx.fiber.dispose() }
+  })
+
+  it('请求来源与当前模式不一致时拒绝，不把另一模式额度误标给旧模型', async () => {
+    const ctx = new Context()
+    const run = vi.fn<CliRun>(async request => ({ exitCode: 0, stderr: '', stdout: JSON.stringify(request.argv.includes('/credits') ? CREDITS_JSON : USAGE_JSON) }))
+    const fiber = await ctx.plugin(AgYQuotaService, { mode: () => 'proxy', cli: { run, cliPath: '/fake/agy' }, cliQuotaEnabled: () => true,
+      proxyQuota: { credential: { credential: async () => undefined }, transport: { request: async () => new Response('{}') } } })
+    try {
+      const service = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
+      await expect(service.read({ source: 'acp' })).rejects.toThrow('重新选择模型')
+      expect(run).not.toHaveBeenCalled()
+      expect((await service.read({ source: 'proxy' })).status).toBe('error')
+    } finally { await fiber.dispose(); await ctx.fiber.dispose() }
   })
 
   it('设置控制面可经真实 Cordis 代理调用，非法 action 不能变成登录', async () => {
@@ -190,7 +214,7 @@ describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
     const logs: string[] = []
     const ctx = new Context()
     ctx.plugin(AgYQuotaService, {
-      cli: { run, cliPath: '/fake/agy' },
+      cli: { run, cliPath: '/fake/agy' }, cliQuotaEnabled: () => true,
       log: { info: (m: string) => logs.push(m), warn: (m: string) => logs.push(`WARN ${m}`) },
     })
     await new Promise((resolve) => setTimeout(resolve, 0))
@@ -218,7 +242,7 @@ describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
         return { exitCode: 0, stdout: JSON.stringify(request.argv.includes('/credits') ? CREDITS_JSON : USAGE_JSON), stderr: '' }
       }
       const ctx = new Context()
-      ctx.plugin(AgYQuotaService, { cli: { run, cliPath: '/fake/agy' } })
+      ctx.plugin(AgYQuotaService, { cli: { run, cliPath: '/fake/agy' }, cliQuotaEnabled: () => true })
       await vi.advanceTimersByTimeAsync(0)
       const service = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
       await service.read()
@@ -238,7 +262,7 @@ describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
       return { exitCode: 0, stdout: JSON.stringify(request.argv.includes('/credits') ? CREDITS_JSON : USAGE_JSON), stderr: '' }
     }
     const ctx = new Context()
-    ctx.plugin(AgYQuotaService, { cli: { run, cliPath: '/fake/agy' } })
+    ctx.plugin(AgYQuotaService, { cli: { run, cliPath: '/fake/agy' }, cliQuotaEnabled: () => true })
     await new Promise((resolve) => setTimeout(resolve, 0))
     const service = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
     await service.read({ force: true })
@@ -258,7 +282,7 @@ describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
       return { exitCode: 0, stdout: JSON.stringify(request.argv.includes('/credits') ? CREDITS_JSON : USAGE_JSON), stderr: '' }
     }
     const ctx = new Context()
-    ctx.plugin(AgYQuotaService, { cli: { run, cliPath: '/fake/agy' } })
+    ctx.plugin(AgYQuotaService, { cli: { run, cliPath: '/fake/agy' }, cliQuotaEnabled: () => true })
     await new Promise((resolve) => setTimeout(resolve, 0))
     const service = (ctx as unknown as Record<string, { read(r?: { force?: boolean }): Promise<{ status: string }> }>)[AGY_QUOTA_SERVICE]!
     const first = service.read({ force: true })
@@ -268,5 +292,67 @@ describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
     const results = await Promise.all([first, second, third])
     expect(runs).toBe(2) // 并发读取合并：/usage 与 /credits 各一次。
     expect(results.map((item) => item.status)).toEqual(['ok', 'ok', 'ok'])
+  })
+
+  it('默认不调用 agy：有 CLI 但开关关闭时走内置直连，Credits 为 unavailable', async () => {
+    const run = vi.fn<CliRun>(async () => { throw new Error('不应 spawn agy') })
+    const fetchImpl = vi.fn(async () => { throw new Error('ENOENT-token') })
+    const ctx = new Context()
+    ctx.plugin(AgYQuotaService, {
+      cli: { run, cliPath: '/fake/agy' },
+      deps: { homedir: () => '/fake/home', readFileImpl: async () => { throw new Error('ENOENT') }, fetchImpl },
+    })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const service = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
+    const snapshot = await service.read()
+    expect(run).not.toHaveBeenCalled()
+    expect(snapshot.credits).toMatchObject({ status: 'unavailable', error: { code: 'cli-unavailable' } })
+    expect(snapshot.credits?.error?.message).toContain('未开启 agy CLI 取数')
+  })
+
+  it('代理模式取数不依赖 agy：默认只走代理账户，打开开关后仅 Credits 调用 CLI', async () => {
+    let enabled = false
+    const run = vi.fn<CliRun>(async (request) => ({ exitCode: 0, stderr: '', stdout: JSON.stringify(request.argv.includes('/credits') ? CREDITS_JSON : USAGE_JSON) }))
+    const request = vi.fn(async ({ url }: { url: string }) => new Response(JSON.stringify(url.includes('loadCodeAssist')
+      ? { cloudaicompanionProject: 'synthetic-project' }
+      : { groups: [{ displayName: 'proxy-account', buckets: [{ remainingFraction: 0.5 }] }] })))
+    const ctx = new Context()
+    ctx.plugin(AgYQuotaService, {
+      cli: { run, cliPath: '/fake/agy' }, cliQuotaEnabled: () => enabled, mode: () => 'proxy',
+      proxyQuota: { credential: { credential: async () => ({ accessToken: 'synthetic', projectId: 'synthetic-project', source: 'login' as const, updatedAt: 'x' }), revision: () => 1 }, transport: { request } },
+    })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const service = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
+    // 默认关闭：本机有没有 agy 都不影响，套餐额度来自代理账户，一次都不 spawn。
+    const off = await service.read()
+    expect(off.groups[0]?.name).toBe('proxy-account')
+    expect(off.credits).toMatchObject({ status: 'unavailable', error: { code: 'cli-unavailable' } })
+    expect(run).not.toHaveBeenCalled()
+    // 打开开关：只有 AI Credits 走 CLI；套餐额度仍由代理账户提供，不被 CLI 账户顶替。
+    enabled = true
+    const on = await service.read()
+    expect(on.groups[0]?.name).toBe('proxy-account')
+    expect(on.credits).toMatchObject({ status: 'ok', remainingCredits: 200 })
+    expect(run.mock.calls.map(([call]) => call.argv)).toEqual([expect.arrayContaining(['/credits'])])
+  })
+
+  it('打开开关后才 spawn agy；关掉后旧 CLI 快照失效且不再 spawn', async () => {
+    let enabled = false
+    const run = vi.fn<CliRun>(async (request) => ({ exitCode: 0, stderr: '', stdout: JSON.stringify(request.argv.includes('/credits') ? CREDITS_JSON : USAGE_JSON) }))
+    const ctx = new Context()
+    ctx.plugin(AgYQuotaService, { cli: { run, cliPath: '/fake/agy' }, cliQuotaEnabled: () => enabled })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const service = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
+    expect((await service.read()).credits?.status).toBe('unavailable')
+    expect(run).not.toHaveBeenCalled()
+    enabled = true
+    const fresh = await service.read()
+    expect(fresh.status).toBe('ok')
+    expect(fresh.credits).toMatchObject({ status: 'ok', remainingCredits: 200 })
+    expect(run).toHaveBeenCalledTimes(2)
+    enabled = false
+    const closed = await service.read()
+    expect(closed.credits?.status).toBe('unavailable')
+    expect(run).toHaveBeenCalledTimes(2)
   })
 })

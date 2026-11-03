@@ -29,6 +29,21 @@ describe('设置页账户与目录控制', () => {
     expect(await old).toMatchObject({ status: 'error', models: [] })
     await control.dispose()
   })
+  it('代理账户代际变化后清空旧目录，刷新失败也不回退到前账户', async () => {
+    let revision = 1
+    const control = new SettingsControl({
+      connect: async () => {}, modelSource: () => `proxy:${revision}`,
+      models: async () => {
+        if (revision !== 1) throw new Error('signed out')
+        return [{ id: 'account-a', name: 'Account A' }]
+      },
+    })
+    expect((await control.models()).models[0]?.id).toBe('account-a')
+    revision = 2
+    expect(await control.models(true)).toMatchObject({ status: 'error', models: [] })
+    await control.dispose()
+  })
+
   it('预热调用共享连接入口，状态读取可带实时快照且不会重新启动', async () => {
     const gate = deferred()
     const warmup = vi.fn(async () => gate.promise)

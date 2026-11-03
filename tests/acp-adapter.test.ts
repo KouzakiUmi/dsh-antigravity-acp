@@ -2407,6 +2407,29 @@ describe('ACP 会话复用与跨进程恢复', () => {
     expect(harness.agent.requestsFor('session/new')).toHaveLength(1)
   })
 
+  it.each([
+    { kind: 'target' as const, before: { target: 'gemini-3-pro' }, after: { target: 'gemini-3-flash' }, expected: 'gemini-3-flash' },
+    { kind: 'effort' as const, before: { effort: 'low' as const }, after: { effort: 'high' as const }, expected: 'gemini-3-pro-high' },
+  ])('会话复用时 $kind 变化会重建并采用新官方路由', async ({ before, after, expected }) => {
+    let modelOverrides: Record<string, ModelOverride> = { 'gemini-3-pro': before }
+    const configOptions = MODEL_CONFIG_OPTIONS.map(option => option.id === 'model' && option.type === 'select'
+      ? { ...option, options: [...option.options.flatMap(item => 'value' in item ? [item] : []), { value: 'gemini-3-pro-low', name: 'Pro Low' }, { value: 'gemini-3-pro-high', name: 'Pro High' }] }
+      : option)
+    const harness = createHarness({ readSettings: () => ({ modelOverrides }), configOptions })
+    const first = collect(harness.adapter.stream(baseOptions({ sessionId: DSH_SESSION })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    await replyWithText(harness, '第一轮回答')
+    await first
+
+    modelOverrides = { 'gemini-3-pro': after }
+    const second = collect(harness.adapter.stream(baseOptions({ sessionId: DSH_SESSION, messages: secondRoundMessages() })))
+    await waitForRequest(harness.agent, 'session/new', 2)
+    await replyWithText(harness, '第二轮回答', 1)
+    await second
+    expect(harness.agent.requestsFor('session/new')).toHaveLength(2)
+    expect(harness.agent.requestsFor('session/set_config_option').at(-1)?.params.value).toBe(expected)
+  })
+
   it('同一对话换模型时重建，不复用旧会话', async () => {
     const harness = createHarness()
     const first = collect(harness.adapter.stream(baseOptions({ sessionId: DSH_SESSION })))

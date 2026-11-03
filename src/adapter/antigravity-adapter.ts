@@ -752,6 +752,17 @@ export class AntigravityAcpAdapter extends LlmAdapter {
 
   /* ── ACP 会话复用 ─────────────────────────────────────────────────── */
 
+  /** 只把真正影响官方路由的覆盖项纳入指纹，改名和显示开关不触发无谓重建。 */
+  #sessionRouteFingerprint(options: GenerateOptions): string {
+    const setting = modelSettingFor(this.#modelSettingsSnapshot(), options.model)
+    const override = setting.target !== undefined
+      ? { target: setting.target }
+      : options.reasoningEffort === undefined && setting.effort !== undefined
+        ? { effort: setting.effort }
+        : undefined
+    return routeFingerprint(options, override)
+  }
+
   /**
    * 跨进程恢复：重启后若磁盘上还留着该对话的 ACP 会话映射，尝试 `session/load`。
    * 只信任「路由一致 + 历史仍以已发送前缀开头」；其余情况回退重建，不猜测。
@@ -764,7 +775,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       return undefined
     }
     if (entry.cwd !== this.#cwd) return discard('会话工作目录与当前不一致')
-    if (entry.route !== routeFingerprint(options)) return discard('模型、系统提示或工具目录已变化')
+    if (entry.route !== this.#sessionRouteFingerprint(options)) return discard('模型、系统提示或工具目录已变化')
     if (options.messages.length <= entry.sentCount) return discard('没有新增消息')
     if (!prefixMatches(options.messages, entry.sentCount, entry.sentHash)) return discard('历史不是已发送前缀的追加')
     if (!outputMatches(options.messages.slice(entry.sentCount), entry.outputHash)) return discard('上一轮输出已变化或来自其他会话')
@@ -838,7 +849,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       this.#dropSession(record, 'ACP 链接已关闭')
       return undefined
     }
-    if (record.route !== routeFingerprint(options)) {
+    if (record.route !== this.#sessionRouteFingerprint(options)) {
       this.#dropSession(record, '模型、系统提示或工具目录已变化')
       return undefined
     }
@@ -880,7 +891,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       link,
       sentCount: options.messages.length,
       sentHash: prefixHash(options.messages),
-      route: routeFingerprint(options),
+      route: this.#sessionRouteFingerprint(options),
       usesTools: (options.tools?.length ?? 0) > 0,
     }
     this.#sessions.set(key, record)

@@ -5,7 +5,8 @@
  * - 传输：{@link ProxyTransport} 的 agy 线形态（与生成请求同一伪装口径）；
  * - 失败折叠成 `status: 'error'` 快照，401/403 换发一次重试一次。
  *
- * AI Credits 仍走官方 CLI 只读命令（与模式无关），本模块不改动它。
+ * AI Credits 默认不查询；只有显式开启 `cliQuotaEnabled` 后，才由额度服务另行
+ * 运行官方 CLI 只读命令，与本模块无关，本模块也不 spawn 任何官方进程。
  */
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import { buildAntigravityLoadCodeAssistMetadata } from '@cortexkit/antigravity-auth-core'

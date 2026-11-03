@@ -296,6 +296,19 @@ describe('代理账户连接流程', () => {
     await service.dispose()
   })
 
+  it('已有账户刷新失败时不静默导入 CLI 的另一账户', async () => {
+    cli.raw = JSON.stringify({ access_token: 'cli-account-b', expiry: new Date(Date.now() + 3600_000).toISOString() })
+    const memory = memoryStore()
+    const project = vi.fn(async () => new Response('{}'))
+    const service = new ProxyAccountService({ cacheDir: '/unused', cliTokenPath: '/synthetic-cli', store: memory.store,
+      oauthFlow: oauth, fetchImpl: async () => new Response('{}', { status: 500 }), projectTransport: { request: project } })
+    expect(await service.credential()).toBeUndefined()
+    expect(memory.save).not.toHaveBeenCalled()
+    expect(memory.store.peek()).toMatchObject({ accessToken: 'synthetic-old', refreshToken: 'synthetic-refresh' })
+    expect(project).not.toHaveBeenCalled()
+    await service.dispose()
+  })
+
   it('CLI 刷新失败允许 OAuth，不保存无效导入也不循环宣称成功', async () => {
     cli.raw = JSON.stringify({ access_token: 'synthetic-expired', refresh_token: 'synthetic-bad', expiry: '2000-01-01T00:00:00Z' })
     const memory = memoryStore()

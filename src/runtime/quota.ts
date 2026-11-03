@@ -95,6 +95,9 @@ export interface QuotaSnapshot {
   /** 订阅档位名（loadCodeAssist 的 paidTier/currentTier.name）。 */
   plan?: string
   groups: QuotaGroup[]
+  /** 药丸请求中的公开模型与实际路由模型；仅用于选择对应额度组。 */
+  requestedModel?: string
+  routeModel?: string
   credits?: CreditsSnapshot
   error?: { code: QuotaErrorCode; message: string }
 }

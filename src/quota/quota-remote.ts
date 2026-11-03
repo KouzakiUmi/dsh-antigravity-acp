@@ -31,9 +31,11 @@ export const PACKAGE_NAME = 'dsh-bundle-antigravity-host'
 /** Typert service / wire namespace。 */
 export const AGY_QUOTA_SERVICE = 'agyQuota'
 
-/** `read` 的请求体：`force` 绕过内存缓存重新取数。 */
+/** `read` 的请求体：`force` 绕过缓存；`source` 防止旧模型误领新模式的额度。 */
 export interface AgYQuotaRequest {
   force?: boolean
+  source?: 'acp' | 'proxy'
+  model?: string
 }
 
 /** 结构化校验：失败抛 TypeError，交由 Gateway 转成 RemoteError。 */
@@ -42,8 +44,12 @@ function parseRequest(value: unknown): AgYQuotaRequest | undefined {
   if (typeof value !== 'object' || Array.isArray(value)) throw new TypeError('Invalid AgYQuotaRequest')
   const record = value as Record<string, unknown>
   const force = record.force
+  const source = record.source
   if (force !== undefined && typeof force !== 'boolean') throw new TypeError('Invalid AgYQuotaRequest.force')
-  return force === undefined ? {} : { force }
+  if (source !== undefined && source !== 'acp' && source !== 'proxy') throw new TypeError('Invalid AgYQuotaRequest.source')
+  const model = record.model
+  if (model !== undefined && (typeof model !== 'string' || !model.trim())) throw new TypeError('Invalid AgYQuotaRequest.model')
+  return { ...(force === undefined ? {} : { force }), ...(source === undefined ? {} : { source }), ...(model === undefined ? {} : { model }) }
 }
 
 function parseResult(value: unknown): QuotaSnapshot {
@@ -165,14 +171,18 @@ export interface AgYQuotaServiceOptions {
   deps?: QuotaDeps
   /**
    * 官方 CLI 只读取数通道（`agy -p /usage` 与 `agy -p /credits`）。
-   * 给了就优先用它：本账户上 Cloud Code Assist 是企业授权产品（403 #3501），
-   * 官方 CLI 是套餐额度的唯一可用来源。
+   * 仅当 {@link cliQuotaEnabled} 返回 true 时才会被使用；缺省 / 关闭时
+   * 任何模式都不 spawn agy（套餐额度走内置直连，AI Credits 不查询）。
    */
   cli?: { run: CliRun; cliPath: string }
   /** Re-detect installations without restarting the host. */
   resolveCli?: () => { run: CliRun; cliPath: string } | undefined
+  /** 是否允许调用本机 agy CLI 取数；默认不允许（实时读取，可随设置即时切换）。 */
+  cliQuotaEnabled?: () => boolean
   /** 当前生成模式；代理模式下套餐额度改走代理账户取数。 */
   mode?: () => 'acp' | 'proxy'
+  /** 已保存的官方模型映射，供药丸按实际家族选择额度组。 */
+  modelTarget?: (model: string) => string | undefined
   /** 代理模式额度取数面（凭据 + agy 线传输）；缺省时代理模式回落 ACP 口径。 */
   proxyQuota?: { credential: ProxyCredentialSource & { revision?(): number }; transport: ProxyTransport }
   /** 宿主日志（index.ts 接 `ctx.logger`）；用于记录每次取数的来源与结果。 */
@@ -192,7 +202,9 @@ export class AgYQuotaService extends TypertRemoteService {
   private readonly _deps: QuotaDeps
   private readonly _cli: { run: CliRun; cliPath: string } | undefined
   private readonly _resolveCli: AgYQuotaServiceOptions['resolveCli']
+  private readonly _cliQuotaEnabled: AgYQuotaServiceOptions['cliQuotaEnabled']
   private readonly _mode: AgYQuotaServiceOptions['mode']
+  private readonly _modelTarget: AgYQuotaServiceOptions['modelTarget']
   private readonly _proxyQuota: AgYQuotaServiceOptions['proxyQuota']
   private readonly _log: AgYQuotaServiceOptions['log']
   private readonly _control: SettingsControl | undefined
@@ -213,7 +225,9 @@ export class AgYQuotaService extends TypertRemoteService {
     this._deps = options.deps ?? {}
     this._cli = options.cli
     this._resolveCli = options.resolveCli
+    this._cliQuotaEnabled = options.cliQuotaEnabled
     this._mode = options.mode
+    this._modelTarget = options.modelTarget
     this._proxyQuota = options.proxyQuota
     this._log = options.log
     this._control = options.control
@@ -231,6 +245,11 @@ export class AgYQuotaService extends TypertRemoteService {
 
   /** 客户端药丸的取数入口；并发调用合并为同一次取数。 */
   async read(request?: AgYQuotaRequest): Promise<QuotaSnapshot> {
+    // 会话可刻意保留旧 provider 的已选模型；此时不能把全局新模式的额度
+    // 按旧 provider 广播给药丸。显式来源不匹配就失败，而不是错误归因。
+    if (request?.source !== undefined && request.source !== this.currentMode()) {
+      throw new Error('模型所属模式与当前生成模式不一致，请在会话中重新选择模型')
+    }
     const force = request?.force === true
     while (this._inflight) {
       const existing = this._inflight
@@ -239,7 +258,7 @@ export class AgYQuotaService extends TypertRemoteService {
       // 命中缓存的即时返回，必须等它结束后另行取数，否则刷新会拿到旧缓存。
       if (mode === this._inflightMode && (!force || this._inflightBypassed)) {
         const result = await existing
-        if (mode === this.currentAccountKey()) return result
+        if (mode === this.currentAccountKey()) return this.withModelRoute(result, request)
       } else await existing.catch(() => undefined)
     }
     if (force) {
@@ -262,25 +281,46 @@ export class AgYQuotaService extends TypertRemoteService {
     } finally {
       if (this._inflight === run) this._inflight = undefined
     }
-    return mode === this.currentAccountKey() ? result : this.read(request)
+    return mode === this.currentAccountKey() ? this.withModelRoute(result, request) : this.read(request)
+  }
+
+  private withModelRoute(result: QuotaSnapshot, request?: AgYQuotaRequest): QuotaSnapshot {
+    if (!request?.model) return result
+    return { ...result, requestedModel: request.model, routeModel: this._modelTarget?.(request.model) || request.model }
   }
 
   private currentMode(): 'acp' | 'proxy' {
     return this._mode?.() === 'proxy' && this._proxyQuota !== undefined ? 'proxy' : 'acp'
   }
 
+  /** 用户是否显式允许调用本机 agy CLI 取数；默认不允许。 */
+  private cliQuotaOn(): boolean {
+    return this._cliQuotaEnabled?.() === true
+  }
+
+  /**
+   * 缓存身份纳入 CLI 开关：开关翻转后套餐额度与 Credits 都属于另一条取数
+   * 口径（代理模式还意味着是否会 spawn agy），旧快照必须立即失效重取。
+   */
   private currentAccountKey(): string {
-    return this.currentMode() === 'proxy' ? `proxy:${this._proxyQuota?.credential.revision?.() ?? 0}` : 'acp'
+    const cliOn = this.cliQuotaOn()
+    return this.currentMode() === 'proxy'
+      ? `proxy:${this._proxyQuota?.credential.revision?.() ?? 0}:${cliOn ? 1 : 0}`
+      : `acp:${cliOn ? 1 : 0}`
   }
 
   private async _read(request?: AgYQuotaRequest): Promise<QuotaSnapshot> {
     const accountKey = this.currentAccountKey()
     // 这条日志让「药丸到底有没有把请求发到 Host」可证：浏览器侧完全无法写宿主日志。
-    const cli = this._resolveCli?.() ?? this._cli
+    // 只有显式开启 CLI 取数时才解析并可能 spawn 官方 agy；默认零 agy 调用。
+    const cliOn = this.cliQuotaOn()
+    const cli = cliOn ? (this._resolveCli?.() ?? this._cli) : undefined
     const proxyMode = this.currentMode() === 'proxy'
     const source = proxyMode
       ? 'proxy-account（代理模式）'
-      : cli ? `cli=${redactSensitiveText(cli.cliPath)}` : 'http（未找到 agy CLI）'
+      : cli ? `cli=${redactSensitiveText(cli.cliPath)}`
+        : cliOn ? 'http（已开启 CLI 取数但未找到 agy CLI）'
+          : 'http（未开启 agy CLI 取数）'
     this._log?.info(`antigravity-acp: 额度取数请求（force=${request?.force === true}，来源 ${source}）`)
     try {
       const now = Date.now()
@@ -316,7 +356,12 @@ export class AgYQuotaService extends TypertRemoteService {
             : fetchQuotaSnapshot(this._cache, this._deps),
         creditsCached ? Promise.resolve(previousCredits!) : cli
           ? fetchAgyCredits(cli.run, cli.cliPath)
-          : Promise.resolve<CreditsSnapshot>({ status: 'unavailable', updatedAt: new Date().toISOString(), error: { code: 'cli-unavailable', message: '未找到官方 agy CLI，无法查询 AI Credits' } }),
+          : Promise.resolve<CreditsSnapshot>({ status: 'unavailable', updatedAt: new Date().toISOString(), error: {
+            code: 'cli-unavailable',
+            message: cliOn
+              ? '未找到官方 agy CLI，无法查询 AI Credits'
+              : '未开启 agy CLI 取数，不查询 AI Credits。在设置页「额度」打开「用 agy CLI 查询额度」并保存后才会调用本机 agy。',
+          } }),
       ])
       // 账户/模式变化后的结果交由 read 重取，不能写入新账户缓存或充当 stale。
       if (accountKey !== this.currentAccountKey()) return fresh
