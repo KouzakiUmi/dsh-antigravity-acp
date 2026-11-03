@@ -84,11 +84,19 @@ export interface AntigravityHostConfig {
   cancelGraceMs?: number
   /** 保留进程的最长空闲时间（毫秒），超时回收；0 表示不设上限。 */
   idleRecycleMs?: number
+  /**
+   * 代理模式开关（默认关闭）：开启后本 bundle 的第二行组件
+   * `antigravity-proxy-router` 接管模型生成——直接持有 OAuth 凭据、
+   * 以 agy CLI 线身份直连 Cloud Code Assist，不再经过官方 ACP 进程；
+   * 同时宿主行注销 `antigravity-acp` 路由，两种模式互斥。
+   * 关闭（默认）时一切行为与现在相同：生成走官方 ACP。
+   */
+  proxyMode?: boolean
 }
 
 // Only fields owned by the custom settings card are live. Ordinary launch/pool
 // configuration remains ordinary, so editing it still follows the host lifecycle.
-export const LIVE_SETTING_KEYS = ['autoWarmup', 'reuseSessions', 'modelOverrides', 'proxyUrl', 'proxyBypass', 'agyCliPath', 'resumeSessions', 'keepProcessAfterCancel', 'cancelGraceMs', 'idleRecycleMs'] as const
+export const LIVE_SETTING_KEYS = ['autoWarmup', 'reuseSessions', 'modelOverrides', 'proxyUrl', 'proxyBypass', 'agyCliPath', 'resumeSessions', 'keepProcessAfterCancel', 'cancelGraceMs', 'idleRecycleMs', 'proxyMode'] as const
 export type LiveSettingKey = typeof LIVE_SETTING_KEYS[number]
 export type AntigravityPluginConfig = Omit<AntigravityHostConfig, LiveSettingKey> & {
   [K in LiveSettingKey]?: AntigravityHostConfig[K] | Volatile<AntigravityHostConfig[K]>
@@ -116,6 +124,7 @@ export function liveHostConfig(config: AntigravityPluginConfig): AntigravityHost
     get keepProcessAfterCancel() { return readSetting(config.keepProcessAfterCancel) },
     get cancelGraceMs() { return readSetting(config.cancelGraceMs) },
     get idleRecycleMs() { return readSetting(config.idleRecycleMs) },
+    get proxyMode() { return readSetting(config.proxyMode) },
   }
 }
 
@@ -164,4 +173,5 @@ export const Config = Schema.object({
   keepProcessAfterCancel: Schema.boolean().default(false).volatile().description('用户取消后保留官方进程：宽限内确认 agent 已停止就只丢弃会话，下一轮不必冷启动；默认关闭'),
   cancelGraceMs: Schema.natural().max(60_000).default(30_000).volatile().description('取消后等待 agent 确认停止的上限（毫秒）；0 表示不等待、立即回收'),
   idleRecycleMs: Schema.natural().max(3_600_000).default(300_000).volatile().description('保留进程的最长空闲时间（毫秒），超时回收；0 表示不设上限。默认 5 分钟是本插件的资源回收策略，不代表上游缓存 TTL'),
+  proxyMode: Schema.boolean().default(false).volatile().description('代理模式（默认关闭）：开启后模型生成改由本 bundle 的代理路由直连上游（自有 OAuth 登录态 + agy 线身份），并停用官方 ACP 路由；关闭恢复 ACP 模式'),
 })

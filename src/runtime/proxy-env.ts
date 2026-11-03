@@ -95,6 +95,18 @@ export function resolveProxy(settings: ProxySettings | undefined): ResolvedProxy
   return { url, bypass: resolveProxyBypass(settings?.bypass) }
 }
 
+/** 固定 HTTPS 上游的出网选择：显式配置优先，留空继承宿主代理环境。 */
+export function resolveHttpsProxy(
+  settings: ProxySettings | undefined,
+  parent: Readonly<Record<string, string | undefined>> = process.env,
+): ResolvedProxy | undefined {
+  const ambient = ambientProxyEnv(parent)
+  return resolveProxy({
+    url: normalizeProxyUrl(settings?.url) ?? ambient?.HTTPS_PROXY ?? ambient?.HTTP_PROXY,
+    bypass: settings?.bypass ?? ambient?.NO_PROXY,
+  })
+}
+
 /**
  * 生成注入官方子进程的代理环境变量；无代理时返回 undefined。
  *

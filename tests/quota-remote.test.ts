@@ -7,7 +7,7 @@
 import { Context } from '@deepseek-ai/cordis'
 import { describe, expect, it, vi } from 'vitest'
 import type { CliRun } from '../src/runtime/agy-cli.js'
-import { AgYQuotaService, AGY_QUOTA_SERVICE, AGY_QUOTA_INVOCATIONS } from '../src/quota/quota-remote.js'
+import { AgYQuotaService, AGY_QUOTA_SERVICE, AGY_QUOTA_INVOCATIONS, registerAgYQuotaRemote } from '../src/quota/quota-remote.js'
 
 import { SettingsControl } from '../src/quota/control.js'
 
@@ -26,6 +26,134 @@ const USAGE_JSON = {
 }
 
 describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
+  it('同一 package-face 只注册一次，同时贡献额度与代理账户两个命名空间', () => {
+    const register = vi.fn((_contribution: unknown) => () => {})
+    const scope = { get: () => ({ register }), effect: (callback: () => unknown) => callback() }
+    const ctx = { inject: (_services: string[], callback: (scope: unknown) => void) => callback(scope) } as unknown as Context
+    registerAgYQuotaRemote(ctx)
+    expect(register).toHaveBeenCalledOnce()
+    const contribution = register.mock.calls[0]![0] as unknown as { package: string; face: string; invocations: { namespace: string; method: string }[] }
+    expect(contribution).toMatchObject({ package: 'dsh-bundle-antigravity-host', face: 'host' })
+    expect(new Set(contribution.invocations.map(item => item.namespace))).toEqual(new Set(['agyQuota', 'agyProxyAccount']))
+    expect(contribution.invocations.filter(item => item.namespace === 'agyProxyAccount').map(item => item.method)).toEqual(['account'])
+  })
+
+  it('首次导入提高 revision 后只重取一次，后续读取可命中缓存', async () => {
+    const ctx = new Context()
+    let revision = 0
+    const credential = vi.fn(async () => {
+      revision = 1
+      return { accessToken: 'synthetic', source: 'login' as const, updatedAt: 'x' }
+    })
+    let summaries = 0
+    const request = vi.fn(async ({ url }: { url: string }) => {
+      if (url.includes('loadCodeAssist')) return new Response('{"cloudaicompanionProject":"synthetic-project"}')
+      summaries++
+      return new Response('{"groups":[{"displayName":"synthetic","buckets":[]}]}')
+    })
+    const fiber = await ctx.plugin(AgYQuotaService, { mode: () => 'proxy', proxyQuota: {
+      credential: { credential, revision: () => revision }, transport: { request } } })
+    try {
+      const service = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
+      expect((await service.read()).status).toBe('ok')
+      expect(summaries).toBe(2)
+      expect((await service.read()).status).toBe('ok')
+      expect(summaries).toBe(2)
+    } finally { await fiber.dispose(); await ctx.fiber.dispose() }
+  })
+  it('同 proxy 模式退出/重登后丢弃旧账户额度与 stale 回退', async () => {
+    const ctx = new Context()
+    let revision = 1
+    let signedIn = true
+    const credential = vi.fn(async () => signedIn ? { accessToken: 'synthetic', projectId: 'synthetic-project', source: 'login' as const, updatedAt: 'x' } : undefined)
+    const request = vi.fn(async ({ url }: { url: string }) => new Response(JSON.stringify(url.includes('loadCodeAssist')
+      ? { cloudaicompanionProject: 'synthetic-project' }
+      : { groups: [{ displayName: `account-${revision}`, buckets: [{ remainingFraction: 0.5 }] }] })))
+    const fiber = await ctx.plugin(AgYQuotaService, { mode: () => 'proxy',
+      proxyQuota: { credential: { credential, revision: () => revision }, transport: { request } } })
+    try {
+      const service = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
+      expect((await service.read()).groups[0]?.name).toBe('account-1')
+      signedIn = false; revision++
+      const signedOut = await service.read()
+      expect(signedOut).toMatchObject({ status: 'error', groups: [], error: { code: 'token-missing' } })
+      expect(signedOut.stale).not.toBe(true)
+      signedIn = true; revision++
+      expect((await service.read()).groups[0]?.name).toBe('account-3')
+    } finally { await fiber.dispose(); await ctx.fiber.dispose() }
+  })
+
+  it('同模式账户 revision 在途改变时旧结果不返回、不写缓存', async () => {
+    const ctx = new Context()
+    let revision = 1
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    let entered!: () => void
+    const started = new Promise<void>(resolve => { entered = resolve })
+    let summaries = 0
+    const request = vi.fn(async ({ url }: { url: string }) => {
+      if (url.includes('loadCodeAssist')) return new Response(JSON.stringify({ cloudaicompanionProject: 'synthetic-project' }))
+      const captured = revision
+      if (++summaries === 1) { entered(); await gate }
+      return new Response(JSON.stringify({ groups: [{ displayName: `account-${captured}`, buckets: [] }] }))
+    })
+    const fiber = await ctx.plugin(AgYQuotaService, { mode: () => 'proxy', proxyQuota: {
+      credential: { credential: async () => ({ accessToken: 'synthetic', source: 'login', updatedAt: 'x' }), revision: () => revision }, transport: { request } } })
+    try {
+      const service = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
+      const old = service.read()
+      await started
+      revision++
+      const current = service.read()
+      release()
+      for (const result of await Promise.all([old, current])) expect(result.groups[0]?.name).toBe('account-2')
+      expect((await service.read()).groups[0]?.name).toBe('account-2')
+      expect(summaries).toBe(2)
+    } finally { release(); await fiber.dispose(); await ctx.fiber.dispose() }
+  })
+  it('切换模式后的取数失败不会返回另一账户的旧额度', async () => {
+    const ctx = new Context()
+    let mode: 'acp' | 'proxy' = 'acp'
+    const run: CliRun = async request => ({ exitCode: 0, stderr: '', stdout: JSON.stringify(request.argv.includes('/credits') ? CREDITS_JSON : USAGE_JSON) })
+    const fiber = await ctx.plugin(AgYQuotaService, {
+      cli: { run, cliPath: '/fake/agy' }, mode: () => mode,
+      proxyQuota: { credential: { credential: async () => undefined }, transport: { request: async () => { throw new Error('unexpected network') } } },
+    })
+    try {
+      const service = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
+      expect((await service.read()).groups).toHaveLength(1)
+      mode = 'proxy'
+      expect(await service.read()).toMatchObject({ status: 'error', groups: [], error: { code: 'token-missing' } })
+    } finally { await fiber.dispose(); await ctx.fiber.dispose() }
+  })
+
+  it('切换时仍在途的旧模式读取不会被新模式请求复用，也不会把旧结果交给药丸', async () => {
+    const ctx = new Context()
+    let mode: 'acp' | 'proxy' = 'acp'
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const run: CliRun = async request => {
+      await gate
+      return { exitCode: 0, stderr: '', stdout: JSON.stringify(request.argv.includes('/credits') ? CREDITS_JSON : USAGE_JSON) }
+    }
+    const credential = vi.fn(async () => undefined)
+    const fiber = await ctx.plugin(AgYQuotaService, {
+      cli: { run, cliPath: '/fake/agy' }, mode: () => mode,
+      proxyQuota: { credential: { credential }, transport: { request: async () => { throw new Error('unexpected network') } } },
+    })
+    try {
+      const service = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
+      const old = service.read()
+      mode = 'proxy'
+      const current = service.read()
+      release()
+      for (const result of await Promise.all([old, current])) {
+        expect(result).toMatchObject({ status: 'error', groups: [], error: { code: 'token-missing' } })
+      }
+      expect(credential).toHaveBeenCalled()
+    } finally { release(); await fiber.dispose(); await ctx.fiber.dispose() }
+  })
+
   it('设置控制面可经真实 Cordis 代理调用，非法 action 不能变成登录', async () => {
     let connected = 0
     let warmed = 0

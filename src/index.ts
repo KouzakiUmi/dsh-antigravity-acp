@@ -33,7 +33,7 @@ import {
   defaultAgentArgs,
 } from './runtime/binary.js'
 import type { RuntimeDirectoryLease } from './runtime/binary.js'
-import { ProxyConfigError, resolveProxy } from './runtime/proxy-env.js'
+import { ProxyConfigError, resolveHttpsProxy, resolveProxy } from './runtime/proxy-env.js'
 import { createLiveProxiedFetch, createProxiedFetch } from './runtime/proxied-fetch.js'
 import type { ResolvedProxy } from './runtime/proxy-env.js'
 import { ensureAcpCredentials } from './runtime/credentials.js'
@@ -48,6 +48,13 @@ import { SettingsControl } from './quota/control.js'
 import { AcpLifecycle } from './runtime/lifecycle.js'
 import { liveHostConfig } from './settings.js'
 import type { AntigravityHostConfig, AntigravityPluginConfig } from './settings.js'
+import { ProxyAccountService } from './proxy/account-service.js'
+import { AgYProxyAccountService } from './proxy/account-remote.js'
+import { createProxyModeBus } from './proxy/mode-bus.js'
+import type { ProxyModeBus } from './proxy/mode-bus.js'
+import { fetchProxyQuotaSnapshot } from './proxy/quota-source.js'
+import { createProxyTransport } from './proxy/transport.js'
+import type { ProxyModelCatalog } from './proxy/adapter.js'
 
 export { AGY_PROVIDER_ID } from './adapter/antigravity-adapter.js'
 export { Config } from './settings.js'
@@ -642,13 +649,26 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
       }
     })
   })
+  const modeBus = createProxyModeBus({
+    mode: () => config.proxyMode === true,
+    proxySettings: () => ({ url: config.proxyUrl, bypass: config.proxyBypass }),
+    modelSettings: () => ({ modelOverrides: config.modelOverrides }),
+  })
   const control = new SettingsControl({
     runtime: () => ({ ...adapter.read(), modelCatalogRevision }),
     warmup: (signal) => adapter.warmup(signal),
     connect: async (signal) => {
       await adapter.discoverModels(signal)
     },
+    modelSource: () => modeBus.current(),
+    generationMode: () => ({ requested: modeBus.requested() ? 'proxy' : 'acp', active: modeBus.current() ? 'proxy' : 'acp', proxyRouterReady: modeBus.routerReady() }),
+    acpEnabled: () => !modeBus.requested(),
     models: async (force) => {
+      if (modeBus.current()) {
+        const catalog = ctx.get('antigravityProxyCatalog') as ProxyModelCatalog | undefined
+        if (!catalog) throw new LlmError('代理模型目录尚未就绪，请启用代理路由组件后重试', 'AGY_PROXY_UNAVAILABLE')
+        return catalog.models(force)
+      }
       if (force) {
         if (findCli()) await loadCliModels(true)
         // 排队、启动握手和 session/new 各自已有超时，不再用普通请求预算截断整个冷启动。
@@ -657,7 +677,52 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
       return adapter.listModels(AGY_PROVIDER_ID)
     },
   })
+
+  // ------------------------------------------------------------- 代理模式
+  // 模式总线：proxyMode 的当前值只从 volatile 配置读；两行组件各自订阅。
+  const unprovideMode = ctx.provide('antigravityProxyMode', modeBus)
+  const readProxyModeProxy = () => resolveHttpsProxy({ url: config.proxyUrl, bypass: config.proxyBypass })
+  const proxyQuotaTransport = createProxyTransport({ resolveProxy: readProxyModeProxy })
+  const proxyAccountFetch = createLiveProxiedFetch(readProxyModeProxy)
+  // 代理账户服务：登录态副本、CLI 导入与 loopback 登录都在宿主行持有
+  // （需要 cacheDir 与代理感知 fetch）；代理行经 inject 消费。
+  const proxyAccount = new ProxyAccountService({
+    cacheDir,
+    fetchImpl: proxyAccountFetch,
+    projectTransport: proxyQuotaTransport,
+    log: {
+      info: (message) => ctx.logger?.info?.(message),
+      warn: (message, error) => ctx.logger?.warn?.(redactSensitiveText(`${message}${error ? `: ${error instanceof Error ? error.message : String(error)}` : ''}`)),
+    },
+  })
+  const unprovideAuth = ctx.provide('antigravityProxyAuth', proxyAccount)
+  const unsubscribeAccount = proxyAccount.subscribe(catalogChanged)
+  ctx.plugin(AgYProxyAccountService, proxyAccount)
+
   const registration = ctx.llm.registerAdapter([AGY_PROVIDER_ID], adapter)
+  // 互斥切换：代理模式开启时把 ACP 路由原子替换为空集（registration 保留，
+  // 关闭时 replace 回来）；代理路由的注册/注销由代理行订阅同一总线完成。
+  let acpRoutesHeld = true
+  const syncModeRoutes = (proxyMode: boolean): void => {
+    if (proxyMode && acpRoutesHeld) {
+      registration.replace([])
+      acpRoutesHeld = false
+      ctx.logger?.info?.('antigravity-acp: 代理模式已开启，官方 ACP 路由已注销')
+    } else if (!proxyMode && !acpRoutesHeld) {
+      registration.replace([AGY_PROVIDER_ID])
+      acpRoutesHeld = true
+      ctx.logger?.info?.('antigravity-acp: 已切回 ACP 模式，官方 ACP 路由已恢复')
+    }
+    try { ctx.emit('llm/adapters-updated') } catch { /* 观察者不能否决目录更新 */ }
+  }
+  syncModeRoutes(modeBus.current())
+  const unsubscribeModeBus = modeBus.subscribe((mode) => { syncModeRoutes(mode); catalogChanged() })
+  const unsubscribeMode = ctx.on('loader/volatile-update', (paths) => {
+    if (!paths.some(([key]) => key === 'proxyMode')) return
+    if (config.proxyMode === true) control.account('cancel')
+    modeBus.notify()
+    catalogChanged()
+  })
 
   // 额度监控：套餐额度取数服务 + Typert remote（供浏览器端药丸读取）。
   // 首选官方 CLI 的 /usage（本账户唯一可用来源）；没有 CLI 时退回
@@ -669,6 +734,9 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
     // HTTP 回退路径要从对应版本的缓存二进制里提取 OAuth client 元数据。
     deps: { cacheDir, acpVersion, cliPath: config.agyCliPath, fetchImpl: pluginFetch },
     resolveCli: () => { const cliPath = findCli(); return cliPath ? { run: cliRun, cliPath } : undefined },
+    // 额度取数跟随当前生成模式：代理模式用代理账户 + agy 线传输。
+    mode: () => (modeBus.current() ? 'proxy' : 'acp'),
+    proxyQuota: { credential: proxyAccount, transport: proxyQuotaTransport },
     // 取数打点：浏览器侧无法写宿主日志，这条是「药丸有没有真的发请求、结果如何」的唯一现场。
     log: {
       info: (message: string) => ctx.logger?.info?.(message),
@@ -690,15 +758,22 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
 
   // cordis 4.x 的规范 dispose 挂点：generator effect，卸载时逆序执行。
   ctx.effect(function* () {
+    yield () => { unsubscribeMode(); unsubscribeModeBus(); unsubscribeAccount(); unprovideMode(); unprovideAuth() }
     yield () => registration()
     yield async () => control.dispose()
     yield async () => {
       try { await adapter.dispose() }
-      finally { try { await sessionStore?.close() } finally { await pluginFetch.close() } }
+      finally {
+        try { await sessionStore?.close() }
+        finally {
+          try { await proxyAccount.dispose() }
+          finally { try { await proxyAccountFetch.close() } finally { await pluginFetch.close() } }
+        }
+      }
     }
   }, 'antigravity-acp 生命周期清理')
-  if (config.autoWarmup === true) control.account('warmup')
-  else if (config.autoWarmup === false) void prefetchAgentBinary(config, ctx)
+  if (config.autoWarmup === true && config.proxyMode !== true) control.account('warmup')
+  else if (config.autoWarmup === false && config.proxyMode !== true) void prefetchAgentBinary(config, ctx)
 }
 
 /**

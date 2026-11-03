@@ -120,6 +120,7 @@ function loadRegistrations(options: QuotaStubOptions = {}): Map<string, SlotRegi
   }
 
   const registrations = new Map<string, SlotRegistration>()
+  const mountedPackages = new Set<string>()
   const slots = {
     inject: (_name: string, factory: () => unknown) => {
       factory()
@@ -150,7 +151,10 @@ function loadRegistrations(options: QuotaStubOptions = {}): Map<string, SlotRegi
     remote: new Proxy(
       {
         $mount: (declaration: unknown) => {
-          lastMountCalls.push(declaration as (typeof lastMountCalls)[number])
+            const descriptor = declaration as (typeof lastMountCalls)[number]
+            if (!descriptor.package || mountedPackages.has(descriptor.package)) throw new Error('typert: Remote package is already registered')
+            mountedPackages.add(descriptor.package)
+            lastMountCalls.push(descriptor)
           return Promise.resolve(() => {})
         },
       },
@@ -245,11 +249,12 @@ describe('browser client module', () => {
     expect(texts(tree).join(' ')).not.toContain('AI Credits 余额')
   })
 
-  it('设置页按任务分区，额度只在药丸中展示', () => {
+  it('设置页按任务分区，额度可手动拉取且不重复默认模型设置', () => {
     const tree = loadCard()({ remote: {} })
     const text = texts(tree).join(' ')
     for (const label of ['01 · 连接', '02 · 模型', '03 · 偏好', '高级设置', '连接诊断']) expect(text).toContain(label)
-    expect(text).toContain('额度药丸中查看')
+    expect(text).toContain('拉取额度')
+    expect(text).toContain('打开设置页不会自动查询额度')
     // 默认模型由 DSH 自己的模型选择器负责，设置页不再重复维护。
     expect(text).not.toContain('默认模型')
     expect(text).not.toContain('套餐额度管理')
@@ -275,12 +280,12 @@ describe('browser client module', () => {
     } finally { vi.useRealTimers() }
   })
 
-  it('设置页不订阅额度；药丸刷新仍通知其它药丸视图', async () => {
+  it('设置页和药丸使用同一额度读取器，刷新可通知其它视图', async () => {
     const snapshot = { status: 'ok', groups: [] }
     const registrations = loadRegistrations({ quotaRead: async () => ({ ok: true, value: snapshot }) })
     const settings = registrations.get('antigravity-acp')!.row.inject!('')
     const pill = registrations.get('antigravity-quota')!.row.inject!('s')
-    expect(settings.readQuota).toBeUndefined()
+    expect(settings.readQuota).toBe(pill.readQuota)
     const reader = pill.readQuota as ((force: boolean) => Promise<unknown>) & { subscribe(fn: (value: unknown) => void): () => void }
     const changed = vi.fn()
     const off = reader.subscribe(changed)
@@ -448,33 +453,14 @@ describe('AI Credits 展示', () => {
 })
 
 describe('额度药丸（conversation.input.right）', () => {
-  it('药丸旁的预热按钮复用设置控制入口，不发送模型请求', async () => {
-    const control = vi.fn(async (_method: string, request: { action: string }) => ({
-      state: request.action === 'warmup' ? 'connecting' : 'idle', message: 'test',
-    }))
+  it('药丸只有单个紧凑额度按钮，不轮询或启动 ACP', () => {
+    const control = vi.fn()
     const { component } = loadPill()
     const tree = component({ store: modelStore('antigravity-acp'), control })
-    const button = elements(tree).find((item) => item.props['aria-label'] === '预热 ACP')!
-    expect(texts(button)).toEqual(['预热'])
-    expect(button.props.disabled).toBe(false)
-    ;(button.props.onClick as () => void)()
-    await new Promise((resolve) => setTimeout(resolve, 0))
-    expect(control).toHaveBeenCalledWith('account', { action: 'warmup' })
-    expect(control.mock.calls.every(([method]) => method === 'account')).toBe(true)
-  })
-
-  it.each([
-    [{ state: 'connecting' }, '预热中…'],
-    [{ state: 'connected', runtime: { phase: 'ready' } }, '已预热'],
-    [{ state: 'connected', runtime: { phase: 'waiting-tools' } }, '运行中'],
-  ])('启动中或正在使用的 ACP 不重复启动：%s', (account, label) => {
-    const control = vi.fn(async () => account)
-    const { component } = loadRegistrations({ stateOverrides: { 4: account } }).get('antigravity-quota')!
-    const tree = component({ store: modelStore('antigravity-acp'), control })
-    const button = elements(tree).find((item) => item.props['aria-label'] === '预热 ACP')!
-    expect(texts(button)).toEqual([label])
-    expect(button.props.disabled).toBe(true)
-    expect(control.mock.calls).toHaveLength(1)
+    const buttons = elements(tree).filter((item) => item.type === 'button')
+    expect(buttons).toHaveLength(1)
+    expect(buttons[0]?.props.style).toMatchObject({ minHeight: '26px', maxWidth: 'min(46vw, 240px)' })
+    expect(control).not.toHaveBeenCalled()
   })
 
   it('其他 provider 不显示预热按钮，也不读取 ACP 状态', () => {
@@ -483,10 +469,9 @@ describe('额度药丸（conversation.input.right）', () => {
     expect(control).not.toHaveBeenCalled()
   })
 
-  it('药丸与设置页注入同一个预热控制器', () => {
+  it('药丸不注入 ACP 设置控制器', () => {
     const entries = loadRegistrations()
-    expect(entries.get('antigravity-quota')!.row.inject!('session').control)
-      .toBe(entries.get('antigravity-acp')!.row.inject!('').control)
+    expect(entries.get('antigravity-quota')!.row.inject!('session')).not.toHaveProperty('control')
   })
 
   const completeQuota = { status: 'ok', groups: [
@@ -495,18 +480,23 @@ describe('额度药丸（conversation.input.right）', () => {
     { name: 'Gemini 4 Argon', buckets: [{ window: 'weekly', remainingPct: 12 }] },
   ] }
 
-  it('药丸只显示选中模型的迷你条；展开完整三个额度组和余额未知说明', () => {
+  it('药丸只显示选中模型的迷你条与简短状态；展开完整额度组和余额', () => {
     const props = { store: { ...modelStore('antigravity-acp'), getSnapshot: () => ({ current: { provider: 'antigravity-acp', model: 'gemini-4-argon-high' } }) } }
     const closed = loadRegistrations({ quotaSnapshot: completeQuota }).get('antigravity-quota')!.component(props)
-    expect(texts(closed)).toEqual([])
+    expect(texts(closed)).toEqual(['偏少'])
     const bars = elements(closed).filter((item) => item.props.role === 'progressbar')
     expect(bars).toHaveLength(1)
     expect(bars[0]?.props['aria-valuenow']).toBe(12)
     const opened = loadRegistrations({ quotaSnapshot: completeQuota, stateOverrides: { 2: true } }).get('antigravity-quota')!.component(props)
     const text = texts(opened).join(' ')
-    for (const label of ['Gemini', 'Claude / GPT', 'Gemini 4 Argon', 'AI Credits 余额', '未提供']) expect(text).toContain(label)
+    for (const label of ['Gemini', 'Claude / GPT', 'Gemini 4 Argon', 'AI Credits', '未提供']) expect(text).toContain(label)
     expect(elements(opened).filter((item) => item.props.role === 'dialog')).toHaveLength(1)
-    expect(elements(opened).filter((item) => item.props.role === 'progressbar')).toHaveLength(5)
+    const openBars = elements(opened).filter((item) => item.props.role === 'progressbar')
+    expect(openBars).toHaveLength(5)
+    expect(openBars.slice(1).every((item) => (item.props.style as { height?: string }).height === '4px')).toBe(true)
+    const gemini = elements(opened).find((item) => item.props['aria-label'] === 'Gemini额度')!
+    expect(gemini.props.style).toMatchObject({ padding: '9px 0' })
+    expect(elements(gemini).some((item) => (item.props.style as { gridTemplateColumns?: string } | undefined)?.gridTemplateColumns === 'repeat(auto-fit, minmax(120px, 1fr))')).toBe(true)
   })
 
   it('未知自定义模型不借用其它模型额度；缓存状态与禁用窗口有明确语义', () => {
@@ -530,8 +520,8 @@ describe('额度药丸（conversation.input.right）', () => {
   })
 
   it('窄屏靠左的药丸展开时把弹层夹在视口内', () => {
-    const pill = loadRegistrations({ stateOverrides: { 2: true }, refStateBindings: { 1: 3 }, refOverrides: {
-      2: { getBoundingClientRect: () => ({ right: 75, top: 760, bottom: 786 }) },
+    const pill = loadRegistrations({ stateOverrides: { 2: true }, refStateBindings: { 2: 3 }, refOverrides: {
+      3: { getBoundingClientRect: () => ({ right: 75, top: 760, bottom: 786 }) },
     } }).get('antigravity-quota')!.component
     pill({ store: modelStore('antigravity-acp') })
     expect(lastStateCalls).toContainEqual(expect.objectContaining({ position: 'fixed', left: 12, width: 340, bottom: 92 }))
@@ -728,8 +718,14 @@ describe('额度药丸：remote 回包拆信封', () => {
 describe('额度药丸：remote 客户端挂载', () => {
   it('apply 时以本包名义 $mount，且 descriptor 指向 agyQuota/read', () => {
     loadRegistrations()
-    expect(lastMountCalls.length).toBeGreaterThan(0)
+    expect(lastMountCalls).toHaveLength(1)
     const call = lastMountCalls[0]!
+    expect(call.descriptors?.map(item => item.id)).toEqual([
+      'dsh-bundle-antigravity-host#agyQuota/read',
+      'dsh-bundle-antigravity-host#agyQuota/account',
+      'dsh-bundle-antigravity-host#agyQuota/models',
+      'dsh-bundle-antigravity-host#agyProxyAccount/account',
+    ])
     expect(call.package).toBe('dsh-bundle-antigravity-host')
     expect(call.descriptors?.[0]?.id).toBe('dsh-bundle-antigravity-host#agyQuota/read')
     expect(call.descriptors?.[0]?.method).toBe('read')

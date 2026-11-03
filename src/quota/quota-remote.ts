@@ -22,6 +22,10 @@ import { fetchAgyUsage } from '../runtime/agy-cli.js'
 import type { CliRun } from '../runtime/agy-cli.js'
 import type { SettingsControl, AccountSnapshot, ModelSnapshot } from './control.js'
 import { redactSensitiveText } from '../runtime/redact.js'
+import { fetchProxyQuotaSnapshot } from '../proxy/quota-source.js'
+import type { ProxyCredentialSource } from '../proxy/adapter.js'
+import type { ProxyTransport } from '../proxy/transport.js'
+import { AGY_PROXY_ACCOUNT_INVOCATIONS } from '../proxy/account-remote.js'
 
 export const PACKAGE_NAME = 'dsh-bundle-antigravity-host'
 /** Typert service / wire namespace。 */
@@ -140,7 +144,7 @@ export function registerAgYQuotaRemote(ctx: Context): void {
           face: 'host',
           schemas: [],
           model: { services: [], events: [], objects: [] },
-          invocations: AGY_QUOTA_INVOCATIONS,
+          invocations: [...AGY_QUOTA_INVOCATIONS, ...AGY_PROXY_ACCOUNT_INVOCATIONS],
         })
       } catch (error) {
         ctx.logger?.warn?.('antigravity-acp: 额度 remote 注册失败', error)
@@ -167,6 +171,10 @@ export interface AgYQuotaServiceOptions {
   cli?: { run: CliRun; cliPath: string }
   /** Re-detect installations without restarting the host. */
   resolveCli?: () => { run: CliRun; cliPath: string } | undefined
+  /** 当前生成模式；代理模式下套餐额度改走代理账户取数。 */
+  mode?: () => 'acp' | 'proxy'
+  /** 代理模式额度取数面（凭据 + agy 线传输）；缺省时代理模式回落 ACP 口径。 */
+  proxyQuota?: { credential: ProxyCredentialSource & { revision?(): number }; transport: ProxyTransport }
   /** 宿主日志（index.ts 接 `ctx.logger`）；用于记录每次取数的来源与结果。 */
   log?: { info(message: string): void; warn(message: string, error?: unknown): void }
 }
@@ -184,22 +192,29 @@ export class AgYQuotaService extends TypertRemoteService {
   private readonly _deps: QuotaDeps
   private readonly _cli: { run: CliRun; cliPath: string } | undefined
   private readonly _resolveCli: AgYQuotaServiceOptions['resolveCli']
+  private readonly _mode: AgYQuotaServiceOptions['mode']
+  private readonly _proxyQuota: AgYQuotaServiceOptions['proxyQuota']
   private readonly _log: AgYQuotaServiceOptions['log']
   private readonly _control: SettingsControl | undefined
   /** 在途取数：并发调用（多会话药丸 / 定时器 + 手动刷新）共享同一次取数，而不是各起一个进程。 */
   private _inflight: Promise<QuotaSnapshot> | undefined
+  private _inflightMode: string | undefined
   /** 在途取数是否真的绕过了缓存（而非「命中缓存」的即时返回）；force 的合并判定依据。 */
   private _inflightBypassed = false
   /** _read 在首个 await 前同步写入，供 read() 判断在途请求是否真正全量刷新。 */
   private _readCacheStatus = { quota: true, credits: true }
   /** 上次实际执行的 force 是否要求两路绕过缓存（在调用 _read 前失效）。 */
   private _forcedRead = false
+  /** 额度缓存所属的生成模式：跨模式的旧额度不展示（账户不同）。 */
+  private _cacheMode: string | undefined
 
   constructor(ctx: Context, options: AgYQuotaServiceOptions = {}) {
     super(ctx, AGY_QUOTA_SERVICE)
     this._deps = options.deps ?? {}
     this._cli = options.cli
     this._resolveCli = options.resolveCli
+    this._mode = options.mode
+    this._proxyQuota = options.proxyQuota
     this._log = options.log
     this._control = options.control
   }
@@ -219,10 +234,13 @@ export class AgYQuotaService extends TypertRemoteService {
     const force = request?.force === true
     while (this._inflight) {
       const existing = this._inflight
+      const mode = this.currentAccountKey()
       // force 只并入「确实在取新数」的在途读取（结果即新数据）；在途读取若只是
       // 命中缓存的即时返回，必须等它结束后另行取数，否则刷新会拿到旧缓存。
-      if (!force || this._inflightBypassed) return existing
-      await existing.catch(() => undefined)
+      if (mode === this._inflightMode && (!force || this._inflightBypassed)) {
+        const result = await existing
+        if (mode === this.currentAccountKey()) return result
+      } else await existing.catch(() => undefined)
     }
     if (force) {
       // 必须在调用 _read 前失效：旧的部分读取即使刚完成，也不能把新 force
@@ -231,25 +249,49 @@ export class AgYQuotaService extends TypertRemoteService {
       delete this._creditsCache.at
     }
     this._forcedRead = force
+    const mode = this.currentAccountKey()
     const run = this._read(request)
     this._inflight = run
+    this._inflightMode = mode
     // 只有「两路都取新数据」的在途读取才能吸收后续强制刷新。若其中一路命中
     // 缓存，让 force 等本轮结束后再单独补刷，避免把手动刷新静默降级成旧值。
     this._inflightBypassed = !this._readCacheStatus.quota && !this._readCacheStatus.credits
+    let result: QuotaSnapshot
     try {
-      return await run
+      result = await run
     } finally {
       if (this._inflight === run) this._inflight = undefined
     }
+    return mode === this.currentAccountKey() ? result : this.read(request)
+  }
+
+  private currentMode(): 'acp' | 'proxy' {
+    return this._mode?.() === 'proxy' && this._proxyQuota !== undefined ? 'proxy' : 'acp'
+  }
+
+  private currentAccountKey(): string {
+    return this.currentMode() === 'proxy' ? `proxy:${this._proxyQuota?.credential.revision?.() ?? 0}` : 'acp'
   }
 
   private async _read(request?: AgYQuotaRequest): Promise<QuotaSnapshot> {
+    const accountKey = this.currentAccountKey()
     // 这条日志让「药丸到底有没有把请求发到 Host」可证：浏览器侧完全无法写宿主日志。
     const cli = this._resolveCli?.() ?? this._cli
-    const source = cli ? `cli=${redactSensitiveText(cli.cliPath)}` : 'http（未找到 agy CLI）'
+    const proxyMode = this.currentMode() === 'proxy'
+    const source = proxyMode
+      ? 'proxy-account（代理模式）'
+      : cli ? `cli=${redactSensitiveText(cli.cliPath)}` : 'http（未找到 agy CLI）'
     this._log?.info(`antigravity-acp: 额度取数请求（force=${request?.force === true}，来源 ${source}）`)
     try {
       const now = Date.now()
+      // 模式切换后账户不同：旧模式的额度缓存不跨模式展示，直接失效。
+      const mode = accountKey
+      if (this._cacheMode !== undefined && this._cacheMode !== mode) {
+        delete this._cache.value
+        delete this._cache.at
+        delete this._creditsCache.at
+      }
+      this._cacheMode = mode
       // 双路 CLI 的完成时间可能不同：本轮时间戳必须一致，且不能早于请求开始。
       // 否则后到结果的时间戳会被另一路覆盖，使缓存提前过期或 force 后立即重读。
       const fetchedAt = Math.max(now, this._cache.at ?? 0, this._creditsCache.at ?? 0)
@@ -267,13 +309,17 @@ export class AgYQuotaService extends TypertRemoteService {
       const previous = this._cache.value
       // 两个只读命令并发且各有超时，不把 45s + 45s 串成超过客户端 60s 的请求。
       const [fresh, freshCredits] = await Promise.all([
-        quotaCached ? Promise.resolve(cached!) : cli
-          ? fetchAgyUsage(cli.run, cli.cliPath)
-          : fetchQuotaSnapshot(this._cache, this._deps),
+        quotaCached ? Promise.resolve(cached!) : proxyMode
+          ? fetchProxyQuotaSnapshot({ credential: this._proxyQuota!.credential, transport: this._proxyQuota!.transport, log: this._log })
+          : cli
+            ? fetchAgyUsage(cli.run, cli.cliPath)
+            : fetchQuotaSnapshot(this._cache, this._deps),
         creditsCached ? Promise.resolve(previousCredits!) : cli
           ? fetchAgyCredits(cli.run, cli.cliPath)
           : Promise.resolve<CreditsSnapshot>({ status: 'unavailable', updatedAt: new Date().toISOString(), error: { code: 'cli-unavailable', message: '未找到官方 agy CLI，无法查询 AI Credits' } }),
       ])
+      // 账户/模式变化后的结果交由 read 重取，不能写入新账户缓存或充当 stale。
+      if (accountKey !== this.currentAccountKey()) return fresh
       const credits: CreditsSnapshot = freshCredits.status === 'error' && previousCredits?.status === 'ok'
         ? { ...previousCredits, stale: true, staleReason: freshCredits.error?.message ?? '余额刷新失败' }
         : freshCredits

@@ -8,6 +8,27 @@ function deferred() {
 }
 
 describe('设置页账户与目录控制', () => {
+  it('切换目录来源后失败不显示旧模式的目录，在途旧结果也不会覆盖新模式', async () => {
+    let source = 'acp'
+    let release!: (value: Array<{ id: string; name: string }>) => void
+    const gate = new Promise<Array<{ id: string; name: string }>>(resolve => { release = resolve })
+    let pending = false
+    const control = new SettingsControl({
+      connect: async () => {}, modelSource: () => source,
+      models: async () => {
+        if (source === 'proxy') throw new Error('proxy unavailable')
+        return pending ? gate : [{ id: 'acp', name: 'ACP' }]
+      },
+    })
+    expect((await control.models()).models).toHaveLength(1)
+    pending = true
+    const old = control.models()
+    source = 'proxy'
+    expect(await control.models()).toMatchObject({ status: 'error', models: [] })
+    release([{ id: 'old', name: 'Old' }])
+    expect(await old).toMatchObject({ status: 'error', models: [] })
+    await control.dispose()
+  })
   it('预热调用共享连接入口，状态读取可带实时快照且不会重新启动', async () => {
     const gate = deferred()
     const warmup = vi.fn(async () => gate.promise)
@@ -81,6 +102,17 @@ describe('设置页账户与目录控制', () => {
     control.account('cancel')
     await vi.waitFor(() => expect(control.account().state).toBe('cancelled'))
     expect(connect).not.toHaveBeenCalled()
+    await control.dispose()
+  })
+
+  it('代理模式从控制层拒绝 ACP 登录与预热', async () => {
+    const connect = vi.fn(async () => {})
+    const warmup = vi.fn(async () => {})
+    const control = new SettingsControl({ connect, warmup, acpEnabled: () => false, models: async () => [] })
+    expect(() => control.account('login')).toThrow('ACP 连接与预热功能已停用')
+    expect(() => control.account('warmup')).toThrow('ACP 连接与预热功能已停用')
+    expect(connect).not.toHaveBeenCalled()
+    expect(warmup).not.toHaveBeenCalled()
     await control.dispose()
   })
 

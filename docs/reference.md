@@ -116,17 +116,42 @@ ACP fs / terminal 与未知原生权限请求始终拒绝并记录，但不因�
 
 凭据文件使用临时文件与重命名写入，POSIX 请求 `0600`；Windows 依赖目录 ACL，不宣称文件加密或仅靠 mode 就完成隔离。OAuth client 元数据来自显式环境变量或本机官方分发物，这是兼容性取数路径，不保证官方内部格式永远稳定。
 
+### 代理模式认证（默认关闭）
+
+在设置页「运行模式」勾选并保存 `proxyMode`，启用插件页第二组件 `antigravity-proxy-router`，连接代理账户，随后在会话模型选择器中选择 `antigravity-proxy` 的模型。保存代理模式即撤下 ACP 并停用其连接、预热、目录发现与二进制预读；组件缺席、卸载或注册失败也不会回退 ACP，设置页会说明代理不可用原因。未保存的草稿不改变当前运行模式。
+
+- 登录态副本：缓存目录 `proxy-account.json`（原子写、尽力 `0600`），保存 access / refresh / 过期 / 项目 / 邮箱 / 来源；官方 CLI 登录态文件保持只读，换发结果只写副本。
+- 导入优先：连接代理账户时先只读导入 `~/.gemini/antigravity-cli/antigravity-oauth-token`；无可用登录态才启动 PKCE + loopback（`localhost:51121/oauth-callback`，只绑 127.0.0.1，5 分钟 TTL，state 不匹配不消耗在途 flow）。
+- 无需安装 agy CLI：没有登录文件时直接点击「连接代理账户 → 打开 Google 授权页」，在运行 DSH 的同一台电脑上授权。插件自行处理回调、换码、已有项目检测和保存；账户需已有 Antigravity 使用权限。AI Credits 查询仍依赖可选 CLI，缺少它不影响代理登录、目录、套餐额度与聊天。
+- 成功条件：过期 access 先刷新，被拒绝的登录态允许重新授权。连接还会通过 `loadCodeAssist` 只读检测已有项目；缺失时提供可读错误，检测完成后才显示已连接。请点击返回的 Google 授权链接完成登录；失败或过期后可以重连，轮询状态不回传授权链接。
+- 取消登录也覆盖回调后的 token 交换；退出时使旧刷新失效并清除副本，本次插件生命周期内保持退出，用户显式连接后才恢复自动取凭据。
+- 页面区分检查登录态、等待浏览器、完成登录；取消也覆盖授权前的凭据换发与项目请求。失败显示授权、项目或保存的具体原因。授权链接过期或遗失时取消后重连；端口占用时先结束占用端口的旧授权流程。
+- 线身份：User-Agent 为 `antigravity/cli/<version> (aidev_client; os_type=…; arch=…; cl=…; auth_method=consumer)`（取自 `@cortexkit/antigravity-auth-core` 3.0.14 的审计实现），头顺序 Host → User-Agent → (Transfer-Encoding|Content-Length) → Authorization → Content-Type → Accept-Encoding；`:streamGenerateContent` 固定 chunked。端点白名单仅 Cloud Code Assist 的 `streamGenerateContent` / `generateContent` / `fetchAvailableModels` / `loadCodeAssist` / `retrieveUserQuotaSummary` 与 `oauth2.googleapis.com/token`。
+- 与参考实现（dsh-tool-antigravity）的差异：不携带 DSH 归属第二头（归属 User-Agent 与 agy 伪装互斥，代理模式是用户显式开启的功能）；SOCKS 代理在代理模式明确报错而非静默直连；单账户，429 不轮转。
+- 图片输入：宿主附件服务在场时经 `readImageRequest` 有界投影（单图 4MP / 1MB）转 `inlineData`；整请求 12MB 内联预算，超预算报 `IMAGE_OFFLOAD_REQUIRED` 并按最旧优先协商 offload；已 offload 的图片投影为占位文本。附件服务缺席时报 `UNSUPPORTED_MODALITY`。输出含图片的型号（图像生成类）不在代理路由内；上游对文本模型返回媒体输出按协议漂移拒绝。
+- 工具调用：同一响应中的多个完整 `functionCall` 分别交给 DSH，即使上游省略调用 ID 也保持独立；同一 ID 的字符串参数分片继续组装为一条调用。工具响应即使附带 `STOP` 也进入工具续轮。文本与思考块的后到签名随历史回放保留，模型映射或档位改变后不误用旧签名；未收到完成标记就断开会报告传输错误。
+- 目录刷新：设置页按实际生效模式读取目录，登录完成和退出自动刷新。代理模式的手动刷新重取上游目录；失败仅保留同账户已观测目录。模型隐藏、改名、默认思考档位、映射均用于实际代理调用，隐藏条目仍可在设置页重新启用。
+- 服务挂载：本包的额度与代理账户使用一次 Host Typert contribution 和一次客户端 `$mount`，合并两个命名空间；重复注册相同包身份会被宿主拒绝。
+- 连接卡在准备授权或目录刷新时，检查「高级设置 → 出网代理」。0.1.33 起，留空会继承 Host 的 HTTPS / ALL / HTTP 代理环境，OAuth 和原生 TLS 请求使用相同解析规则；仅有其它插件配置的全局 fetch 代理时，可在此显式填写 HTTP(S) 代理地址。连接失败不退回直连，排除列表只在命中目标时绕过代理。
+
 ### 额度药丸与 AI Credits
 
-只在选中 `antigravity-acp` 时显示。药丸位于模型选择器左侧，随模型匹配 Gemini、Claude/GPT、Gemini 4 Argon 额度组；未知型号与旧 `server-default` 不借用其它模型数字（模型改名的显示名不影响分组，分组按 ID 判断）。
+选中 `antigravity-acp` 或 `antigravity-proxy` 时显示；药丸保留原尺寸，只显示一个额度入口，不再并排显示 ACP 预热按钮，预热集中在 ACP 设置页。展开详情按模型组分隔，各时间窗口在可用宽度内并排显示百分比、细进度条与重置时间，Credits 和底部刷新采用紧凑布局。代理模式标题带「代理」标记。药丸位于模型选择器左侧，随模型匹配 Gemini、Claude/GPT、Gemini 4 Argon 额度组；未知型号与旧 `server-default` 不借用其它模型数字（模型改名的显示名不影响分组，分组按 ID 判断）。
 
 展开固定展示三个组；缺数据标为未提供，显示每窗剩余百分比、重置时间、当前模型、缓存状态与刷新。支持深浅主题、Escape 与外部点击关闭。
+
+药丸外观交互参考 [dsh-subusage](https://github.com/KouzakiUmi/dsh-subusage) 0.23.0（MIT）：正常只显示当前模型窗口的迷你条，额度偏少、用尽、缓存或失败时增加简短状态，详情有关闭按钮。本插件独立取数，不依赖 subusage 服务，也不读取其它订阅。
+
+设置页新增「套餐额度 → 拉取额度」，只在点击时读取，与药丸共享刷新结果。账户或实际模式变化时清除旧显示，迟到结果不覆盖新账户；设置页关闭时代理药丸也轮询脱敏账户状态以失效旧数据。顶部保存栏随滚动可见，修改网络设置后先保存再连接。
+
+ACP / 代理模式切换时，药丸清空旧模式的额度并立即重新读取；退出或重新连接同模式账户也失效旧套餐额度，在途旧结果不覆盖新状态。代理模型 ID 的 `antigravity-` 前缀不影响 Gemini、Claude/GPT 与 Argon 额度组匹配。AI Credits 始终来自官方 CLI 登录账户，可能与代理账户不同。
 
 | 数据 | 优先来源 | 回退 / 限制 |
 |---|---|---|
 | 套餐额度 | `agy -p /usage --output-format json` 的 `command.data.groups[].buckets[]` | 无 CLI 时尝试 Cloud Code Assist HTTP；产品授权不匹配可能返回 403 |
-| AI Credits | `agy -p /credits --output-format json` 的 `command.data.remaining_credits`，可选 `plan_name` | 无 CLI 不提供，不从套餐额度推算 |
-| 模型目录 | 会话观测与 `agy models` | 手动强制刷新无 CLI 时尝试非交互 ACP 发现 |
+| 套餐额度（代理模式） | 代理账户的 `loadCodeAssist` + `retrieveUserQuotaSummary`（agy 线传输） | 未登录代理账户时报 `token-missing`；401/403 换发一次重试 |
+| AI Credits | `agy -p /credits --output-format json` 的 `command.data.remaining_credits`，可选 `plan_name` | 无 CLI 不提供，不从套餐额度推算；与模式无关 |
+| 模型目录 | 会话观测与 `agy models` | 手动强制刷新无 CLI 时尝试非交互 ACP 发现；代理模式为审计快照 ∩ `fetchAvailableModels` |
 
 ACP 目录发现沿用排队、握手与会话请求各阶段的超时，不再额外套用普通请求或客户端 60 秒总期限。预热、目录发现和能力准备优先复用已有空闲 worker，不因聊天粘性额外扩容。
 

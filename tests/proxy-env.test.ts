@@ -5,6 +5,7 @@ import {
   normalizeProxyUrl,
   ProxyConfigError,
   resolveProxy,
+  resolveHttpsProxy,
   resolveProxyBypass,
 } from '../src/runtime/proxy-env.js'
 
@@ -83,6 +84,26 @@ describe('resolveProxy', () => {
       url: 'http://127.0.0.1:7890',
       bypass: '10.0.0.0/8,localhost,127.0.0.1,::1',
     })
+  })
+})
+
+describe('resolveHttpsProxy', () => {
+  it('未配置代理地址时继承 HTTPS_PROXY，并保留 NO_PROXY 与 loopback', () => {
+    expect(resolveHttpsProxy({ url: '' }, { HTTPS_PROXY: 'http://127.0.0.1:7890', NO_PROXY: '*.internal' })).toEqual({
+      url: 'http://127.0.0.1:7890', bypass: '*.internal,localhost,127.0.0.1,::1',
+    })
+  })
+  it('显式地址和排除列表优先，清空地址恢复环境代理', () => {
+    const env = { HTTPS_PROXY: 'http://ambient:7890', NO_PROXY: '*.internal' }
+    expect(resolveHttpsProxy({ url: 'explicit:8080', bypass: '' }, env)).toEqual({ url: 'http://explicit:8080', bypass: 'localhost,127.0.0.1,::1' })
+    expect(resolveHttpsProxy({ url: '   ' }, env)?.url).toBe('http://ambient:7890')
+  })
+  it('按小写 HTTPS、大写 HTTPS、ALL_PROXY、HTTP_PROXY 顺序选择，均缺失才直连', () => {
+    expect(resolveHttpsProxy({}, { https_proxy: 'http://lower:1', HTTPS_PROXY: 'http://upper:2', ALL_PROXY: 'http://all:3' })?.url).toBe('http://lower:1')
+    expect(resolveHttpsProxy({}, { ALL_PROXY: 'http://all:3', HTTP_PROXY: 'http://http:4' })?.url).toBe('http://all:3')
+    expect(resolveHttpsProxy({}, { HTTP_PROXY: 'http://http:4' })?.url).toBe('http://http:4')
+    expect(resolveHttpsProxy({}, {})).toBeUndefined()
+    expect(() => resolveHttpsProxy({}, { HTTPS_PROXY: 'ftp://bad:21' })).toThrow(ProxyConfigError)
   })
 })
 
