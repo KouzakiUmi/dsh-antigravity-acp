@@ -430,10 +430,9 @@ describe('AI Credits 展示', () => {
   it.each([
     [{ status: 'ok', remainingCredits: 0 }, '0'],
     [{ status: 'ok', remainingCredits: 42 }, '42'],
-    // unavailable 现在的主因是「没打开 agy CLI 取数」这个可开启的功能，
-    // 与「查询成功但上游没给数字」区分开；具体原因由 credits.error.message 说明。
-    [{ status: 'unavailable', error: { message: '未提供此账户信息' } }, '未启用'],
-    [{ status: 'error', error: { message: '查询超时' } }, '查询失败'],
+    // 开关已开但 CLI 缺失/上游无数据都是可排查故障，必须显示而不是静默隐藏。
+    [{ status: 'unavailable', error: { code: 'cli-unavailable', message: '未找到官方 agy CLI' } }, '未提供'],
+    [{ status: 'error', error: { code: 'request-failed', message: '查询超时' } }, '查询失败'],
     [{ status: 'ok' }, '未提供'],
   ])('余额状态独立呈现且不混淆零与未知', (credits, expected) => {
     const data = { status: 'ok', groups: [], credits }
@@ -441,6 +440,21 @@ describe('AI Credits 展示', () => {
     const card = elements(tree).find((item) => item.props['aria-label'] === 'AI Credits 余额')!
     expect(texts(card)).toContain(expected)
     if (expected !== '0') expect(texts(card)).not.toContain('0')
+  })
+
+  it('未开启 CLI 积分查询（cli-disabled）时隐藏 AI Credits 区块', () => {
+    const data = { status: 'ok', groups: [], credits: { status: 'unavailable', error: { code: 'cli-disabled', message: '未开启 agy CLI 取数，不查询 AI Credits。' } } }
+    const tree = loadRegistrations({ quotaSnapshot: data, stateOverrides: { 2: true } }).get('antigravity-quota')!.component({ store: modelStore('antigravity-acp') })
+    expect(elements(tree).filter((item) => item.props['aria-label'] === 'AI Credits 余额')).toHaveLength(0)
+    expect(texts(tree).join('')).not.toContain('未开启 agy CLI 取数')
+  })
+
+  it('开关已开但 CLI 缺失（cli-unavailable）时保留 AI Credits 区块便于排查', () => {
+    const data = { status: 'ok', groups: [], credits: { status: 'unavailable', error: { code: 'cli-unavailable', message: '未找到官方 agy CLI，无法查询 AI Credits' } } }
+    const tree = loadRegistrations({ quotaSnapshot: data, stateOverrides: { 2: true } }).get('antigravity-quota')!.component({ store: modelStore('antigravity-acp') })
+    const card = elements(tree).find((item) => item.props['aria-label'] === 'AI Credits 余额')!
+    expect(card).toBeTruthy()
+    expect(texts(card).join('')).toContain('未找到官方 agy CLI')
   })
 
   it('缓存余额只在药丸详情显示旧值与独立错误', () => {

@@ -138,8 +138,20 @@ describe('套餐额度与余额独立状态/缓存', () => {
   })
 
   it('CLI 缺失时余额明确 unavailable，不从 HTTP 配额推算', async () => {
+    // 夹具未传 cliQuotaEnabled，开关默认关闭，产出 cli-disabled（客户端隐藏）。
     const result = await (await service()).read()
-    expect(result.credits).toMatchObject({ status: 'unavailable', error: { code: 'cli-unavailable' } })
+    expect(result.credits).toMatchObject({ status: 'unavailable', error: { code: 'cli-disabled' } })
     expect(result.credits?.remainingCredits).toBeUndefined()
+  })
+
+  it('开关已开但 CLI 缺失时为 cli-unavailable，客户端可排查', async () => {
+    // 只声明开关、不注入 cli：开关开着但解析不到官方 agy，属可排查故障。
+    const ctx = new Context()
+    ctx.plugin(AgYQuotaService, { cliQuotaEnabled: () => true })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const api = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
+    const result = await api.read()
+    expect(result.credits).toMatchObject({ status: 'unavailable', error: { code: 'cli-unavailable' } })
+    expect(result.credits?.error?.message).toContain('未找到官方 agy CLI')
   })
 })

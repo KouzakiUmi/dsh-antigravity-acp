@@ -2,7 +2,7 @@
 
 [返回主页](../README.md) · [配置](configuration.md) · [更新记录](changelog.md) · [开发与验证](development.md)
 
-本文对应 `dsh-bundle-antigravity-host` **0.1.36**。安装或连接成功不等于真实模型生成、图片识别或所有平台已验收。
+本文对应 `dsh-bundle-antigravity-host` **0.1.37**。安装或连接成功不等于真实模型生成、图片识别或所有平台已验收。
 
 ## 安装与更新
 
@@ -138,11 +138,11 @@ ACP fs / terminal 与未知原生权限请求始终拒绝并记录，但不因�
 
 选中 `antigravity-acp` 或 `antigravity-proxy` 时显示；药丸保留原尺寸，只显示一个额度入口，不再并排显示 ACP 预热按钮，预热集中在 ACP 设置页。展开详情按模型组分隔，各时间窗口在可用宽度内并排显示百分比、细进度条与重置时间，Credits 和底部刷新采用紧凑布局。代理模式标题带「代理」标记。药丸位于模型选择器左侧，按已保存的官方映射匹配 Gemini、Claude/GPT、Gemini 4 Argon 额度组；未知型号与旧 `server-default` 不借用其它模型数字（显示名不影响分组）。
 
-展开固定展示三个组；缺数据标为未提供，显示每窗剩余百分比、重置时间、当前模型、缓存状态与刷新。支持深浅主题、Escape 与外部点击关闭。
+展开固定展示三个组；缺数据标为未提供，显示每窗剩余百分比、重置时间、当前模型、缓存状态与刷新。未开启 CLI 积分查询时 AI Credits 区块整体隐藏，开启后的查询失败仍展示；支持深浅主题、Escape 与外部点击关闭。
 
 药丸外观交互参考 [dsh-subusage](https://github.com/KouzakiUmi/dsh-subusage) 0.23.0（MIT）：正常只显示当前模型窗口的迷你条，额度偏少、用尽、缓存或失败时增加简短状态，详情有关闭按钮。本插件独立取数，不依赖 subusage 服务，也不读取其它订阅。
 
-设置页新增「套餐额度 → 拉取额度」，只在点击时读取，与药丸共享刷新结果。账户或实际模式变化时清除旧显示，迟到结果不覆盖新账户；设置页关闭时代理药丸也轮询脱敏账户状态以失效旧数据。顶部保存栏随滚动可见，修改网络设置后先保存再连接。
+设置页新增「套餐额度 → 拉取额度」，只在点击时读取，与药丸共享刷新结果。账户或实际模式变化时清除旧显示，迟到结果不覆盖新账户；设置页关闭时代理药丸也轮询脱敏账户状态以失效旧数据。顶部保存栏随滚动可见，外观与其它面板一致，修改网络设置后先保存再连接。
 
 ACP / 代理模式切换时，药丸清空旧模式的额度并立即重新读取；若当前会话仍保留另一模式的旧模型，读取会明确报模式不匹配，不会把新账户额度误标给旧模型。退出、重新连接同模式账户，或翻转「用 agy CLI 查询额度」，也会失效旧快照，在途旧结果不覆盖新状态。代理模型 ID 的 `antigravity-` 前缀不影响 Gemini、Claude/GPT 与 Argon 额度组匹配。AI Credits 默认不查询；打开开关后才来自官方 CLI 登录账户，可能与代理账户不同。
 
@@ -151,7 +151,7 @@ ACP / 代理模式切换时，药丸清空旧模式的额度并立即重新读�
 | 套餐额度（默认） | ACP 模式走 Cloud Code Assist HTTP；代理模式走代理账户 | 不 spawn `agy`。HTTP 产品授权不匹配可能返回 403 |
 | 套餐额度（打开 CLI 取数） | `agy -p /usage --output-format json` 的 `command.data.groups[].buckets[]` | 两种模式都走 CLI；未找到 agy 时 ACP 回落 HTTP |
 | 套餐额度（代理模式，默认） | 代理账户的 `loadCodeAssist` + `retrieveUserQuotaSummary`（agy 线传输，不启动 agy 程序） | 未登录代理账户时报 `token-missing`；401/403 换发一次重试 |
-| AI Credits | 仅当 `cliQuotaEnabled` 为真时：`agy -p /credits --output-format json` 的 `command.data.remaining_credits`，可选 `plan_name` | 默认不查询（`cli-unavailable`），不从套餐额度推算 |
+| AI Credits | 仅当 `cliQuotaEnabled` 为真时：`agy -p /credits --output-format json` 的 `command.data.remaining_credits`，可选 `plan_name` | 默认不查询（`cli-disabled`，界面隐藏区块）；开关开启但 CLI 缺失等故障以 `cli-unavailable` 等错误码显示，不从套餐额度推算 |
 | 模型目录 | 会话观测与 `agy models` | 手动强制刷新无 CLI 时尝试非交互 ACP 发现；代理模式为审计快照 ∩ `fetchAvailableModels` |
 
 ACP 目录发现沿用排队、握手与会话请求各阶段的超时，不再额外套用普通请求或客户端 60 秒总期限。预热、目录发现和能力准备优先复用已有空闲 worker，不因聊天粘性额外扩容。

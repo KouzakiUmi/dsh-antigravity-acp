@@ -356,8 +356,10 @@ export class AgYQuotaService extends TypertRemoteService {
             : fetchQuotaSnapshot(this._cache, this._deps),
         creditsCached ? Promise.resolve(previousCredits!) : cli
           ? fetchAgyCredits(cli.run, cli.cliPath)
+          // 开关关闭是「用户主动不看」（客户端隐藏区块）；开关开着但找不到 agy 是
+          // 可排查故障（cli-unavailable），客户端必须显示，不能静默吞掉。
           : Promise.resolve<CreditsSnapshot>({ status: 'unavailable', updatedAt: new Date().toISOString(), error: {
-            code: 'cli-unavailable',
+            code: cliOn ? 'cli-unavailable' : 'cli-disabled',
             message: cliOn
               ? '未找到官方 agy CLI，无法查询 AI Credits'
               : '未开启 agy CLI 取数，不查询 AI Credits。在设置页「额度」打开「用 agy CLI 查询额度」并保存后才会调用本机 agy。',

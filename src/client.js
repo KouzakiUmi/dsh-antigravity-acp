@@ -673,14 +673,15 @@ window.__ModuleLoader__.load({
       const saveVisible = dirtyKeys.length > 0 || loading || readonly || conflicts.length > 0 || Boolean(status)
 
       return h('div', { className: 'antigravity-settings-card', style: { padding: '12px', display: 'flex', flexDirection: 'column', gap: '10px', maxWidth: '760px', boxSizing: 'border-box', lineHeight: 1.5 } },
-        h('div', { role: 'region', 'aria-label': '设置保存操作', style: { position: 'sticky', top: 0, zIndex: 20, flexShrink: 0, background: 'var(--dsh-surface, Canvas)', color: 'var(--dsh-text, CanvasText)', padding: '4px 0', display: saveVisible ? 'grid' : 'none', gap: '6px' } },
+        h('div', { role: 'region', 'aria-label': '设置保存操作', style: { position: 'sticky', top: 0, zIndex: 20, flexShrink: 0, margin: '-6px -6px 0', padding: '6px 0', display: saveVisible ? 'grid' : 'none', gap: '6px', background: 'var(--dsh-surface, Canvas)' } },
+          h('div', { style: { display: 'grid', gap: '6px', padding: '10px 12px', borderRadius: '12px', border: '1px solid rgba(128,128,128,.16)', background: 'rgba(128,128,128,.025)' } },
           h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '7px', alignItems: 'center' } },
             h('button', { type: 'button', onClick: save, disabled: editingDisabled || dirtyKeys.length === 0, style: { ...PRIMARY, minHeight: '30px', padding: '4px 10px' } }, saving ? '保存中…' : '保存'),
             dirtyKeys.length ? h('button', { type: 'button', disabled: loading || saving, onClick: discardDraft, style: { ...ACTION, minHeight: '30px', padding: '4px 9px' } }, '撤销') : null,
             h('span', { role: 'status', 'aria-live': 'polite', style: { fontSize: '11px', opacity: .7 } }, dirtyKeys.length ? dirtyKeys.length + ' 项未保存' : loading ? '正在读取…' : readonly ? '只读设置' : ''),
             h('button', { type: 'button', title: '重新读取配置并保留草稿', disabled: loading || saving, onClick: () => reload(), style: { ...ACTION, minHeight: '30px', padding: '4px 8px', borderColor: 'transparent', background: 'transparent', opacity: .7, marginLeft: 'auto' } }, loading ? '刷新中…' : '刷新')),
           conflicts.length ? h('p', { role: 'alert', style: { margin: 0, fontSize: '12px', lineHeight: 1.5 } }, '以下内容已在其他位置更新，已保留你的输入：' + conflicts.map((key) => key === OVERRIDES_KEY ? OVERRIDES_LABEL : FIELDS.find((field) => field.key === key)?.label ?? key).join('、')) : null,
-          h(StatusNotice, { status })),
+          h(StatusNotice, { status }))),
 
         connectionSettingsDirty ? h(StatusNotice, { status: { kind: 'busy', text: '请先保存网络设置，再连接或登录。' } }) : null,
         proxyUnavailable ? h(StatusNotice, { status: { kind: 'error', text: '代理路由未就绪，ACP 保持停用。请启用 Antigravity Proxy Router 组件。' } }) : null,
@@ -855,8 +856,11 @@ window.__ModuleLoader__.load({
       return { data: currentSource.current === source ? data : null, refreshing, load }
     }
     function CreditsDetails({ credits, pending }) {
+      // 只隐藏「未开启」这一种主动关闭状态；开关已开但 CLI 缺失/不支持/上游无数据
+      // 都是可排查故障，必须显示，不能静默吞掉。
+      if (credits?.error?.code === 'cli-disabled') return null
       const valid = credits?.status === 'ok' && Number.isSafeInteger(credits.remainingCredits) && credits.remainingCredits >= 0
-      const label = valid ? credits.remainingCredits.toLocaleString() : pending ? '正在读取…' : credits?.status === 'error' ? '查询失败' : credits?.status === 'unavailable' ? '未启用' : '未提供'
+      const label = valid ? credits.remainingCredits.toLocaleString() : pending ? '正在读取…' : credits?.status === 'error' ? '查询失败' : '未提供'
       return h('section', { style: { padding: '9px 0', borderTop: '1px solid rgba(128,128,128,.16)' }, 'aria-label': 'AI Credits 余额' },
         h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: '12px' } },
           h('strong', { style: { fontSize: '12px' } }, 'AI Credits'),
@@ -934,7 +938,6 @@ window.__ModuleLoader__.load({
               h('div', { title: bucket.disabled ? bucket.description : bucket.resetTime, style: { display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden', fontSize: '10px', lineHeight: 1.35, opacity: .58, marginTop: '4px' } }, bucket.disabled ? bucket.description ?? '此窗口不可用' : resetCountdown(bucket.resetTime)))
           })) : h('span', { style: { opacity: .55, fontSize: '11px' } }, data ? '未提供额度数据' : '正在读取…'))),
         CreditsDetails({ credits: data?.credits, pending: !data }),
-        source === PROXY_PROVIDER ? h('small', { style: { opacity: .55, fontSize: '10px', lineHeight: 1.4, padding: '7px 0', borderBottom: '1px solid rgba(128,128,128,.14)' } }, '套餐额度属于代理账户。AI Credits 默认不查询；打开「用 agy CLI 查询额度」后才读取，且来自官方 CLI 账户，可能不是同一账户。') : null,
         h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', paddingTop: '8px' } },
           h('small', { style: { flex: 1, opacity: .5, minWidth: 0, fontSize: '10px' } }, data?.updatedAt ? '更新于 ' + new Date(data.updatedAt).toLocaleString() : '尚无成功快照'),
           load ? h('button', { type: 'button', disabled: refreshing, onClick: () => load(true), style: { ...ACTION, minHeight: '27px', padding: '3px 9px', fontSize: '11px' } }, refreshing ? '刷新中…' : '刷新额度') : null))

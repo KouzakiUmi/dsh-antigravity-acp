@@ -81,7 +81,7 @@ export interface CreditsSnapshot {
   planName?: string
   stale?: boolean
   staleReason?: string
-  error?: { code: 'cli-unavailable' | 'no-credit-info' | 'unsupported' | 'request-failed' | 'bad-response'; message: string }
+  error?: { code: 'cli-disabled' | 'cli-unavailable' | 'no-credit-info' | 'unsupported' | 'request-failed' | 'bad-response'; message: string }
 }
 
 /** 额度快照：成功带 groups/plan，失败带 error；credits 有独立状态。 */

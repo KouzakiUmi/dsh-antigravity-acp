@@ -306,7 +306,7 @@ describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
     const service = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
     const snapshot = await service.read()
     expect(run).not.toHaveBeenCalled()
-    expect(snapshot.credits).toMatchObject({ status: 'unavailable', error: { code: 'cli-unavailable' } })
+    expect(snapshot.credits).toMatchObject({ status: 'unavailable', error: { code: 'cli-disabled' } })
     expect(snapshot.credits?.error?.message).toContain('未开启 agy CLI 取数')
   })
 
@@ -326,7 +326,7 @@ describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
     // 默认关闭：本机有没有 agy 都不影响，套餐额度来自代理账户，一次都不 spawn。
     const off = await service.read()
     expect(off.groups[0]?.name).toBe('proxy-account')
-    expect(off.credits).toMatchObject({ status: 'unavailable', error: { code: 'cli-unavailable' } })
+    expect(off.credits).toMatchObject({ status: 'unavailable', error: { code: 'cli-disabled' } })
     expect(run).not.toHaveBeenCalled()
     // 打开开关：只有 AI Credits 走 CLI；套餐额度仍由代理账户提供，不被 CLI 账户顶替。
     enabled = true

@@ -293,7 +293,6 @@ describe('settings card with real React state and effects', () => {
     await act(async () => { await button(renderer, '拉取额度').props.onClick() })
     expect(readQuota).toHaveBeenCalledWith(true, 'antigravity-proxy')
     expect(renderedText(renderer)).toContain('73')
-    expect(renderedText(renderer)).toContain('套餐额度属于代理账户')
     readQuota.mockRejectedValueOnce(new Error('额度网络超时'))
     await act(async () => { await button(renderer, '拉取额度').props.onClick() })
     expect(renderedText(renderer)).toContain('73')

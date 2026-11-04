@@ -4,6 +4,12 @@
 
 记录源码与发布内容，不将本地构建、npm 发布和本机升级混为同一状态。日期采用 Asia/Hong_Kong。更早历史见 [Git 提交记录](https://github.com/KouzakiUmi/dsh-antigravity-acp/commits/main/)。
 
+## 0.1.37 · 2026-11-04
+
+- **AI Credits 未开启时整块隐藏**：药丸展开详情与设置页额度面板中，「用 agy CLI 查询额度」未开启（新错误码 `cli-disabled`）时不再渲染 AI Credits 区块，也不显示占位说明文字；开关已开但 CLI 缺失、CLI 不支持或上游无数据仍显示错误信息，便于排查。删除代理模式详情与设置页共用区块底部「套餐额度属于代理账户……」的整段说明。
+- **保存栏样式与面板统一**：设置页 sticky 保存操作不再以整块 `--dsh-surface` 底色呈现，改为与其它面板一致的圆角细边框浅底面板，sticky 层仅保留遮滚动内容的表面底色。
+- **验证**：类型检查、44 个文件 / 804+ 项测试、构建与离线预览截图生成通过；README 与参考文档版本行同步 0.1.37。保存栏视觉经脏状态离线渲染核验结构，未在运行中的 Desktop 上实机验收。
+
 ## 0.1.36 · 2026-11-04
 
 - **额度查询默认不再调用 agy**：新增即时开关 `cliQuotaEnabled`（默认关闭）。关闭时 ACP 套餐额度走内置 Cloud Code Assist 直连、代理模式走代理账户，两种模式都不 spawn `agy`，AI Credits 不查询。打开并保存后，ACP 模式才运行 `agy -p /usage` 与 `agy -p /credits`；代理模式套餐额度仍用代理账户，只有 AI Credits 调用 `agy -p /credits`。开关翻转后旧额度快照立即失效。
