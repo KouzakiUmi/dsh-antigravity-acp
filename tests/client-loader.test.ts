@@ -258,7 +258,10 @@ describe('browser client module', () => {
     expect(text).not.toContain('默认模型')
     expect(text).not.toContain('套餐额度管理')
     expect(elements(tree).filter((item) => item.props['aria-label'] === 'AI Credits 余额')).toHaveLength(0)
-    expect(elements(tree).filter((item) => item.type === 'details')).toHaveLength(6)
+    // 普通配置（并发/二进制/超时）不是即时字段，宿主拒绝在本卡片写入，改为指引块。
+    expect(text).toContain('普通配置（并发 / 二进制 / 超时）')
+    expect(text).toContain('maxConcurrentSessions')
+    expect(elements(tree).filter((item) => item.type === 'details')).toHaveLength(3)
   })
 
   it('目录冷启动超过 60 秒时客户端继续等待 Host，而不是提前报超时', async () => {

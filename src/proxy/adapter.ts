@@ -52,6 +52,9 @@ import type { ProxyAttachmentReader } from './image.js'
 import { iterateProxySse, proxyStatusError, readProxyText } from './transport.js'
 import type { ProxyTransport } from './transport.js'
 import { ProxyTransportError } from './transport.js'
+import { redactSensitiveText } from '../runtime/redact.js'
+import { cloakUpstreamFingerprints, describeFingerprintHits, scanUpstreamFingerprints } from './prompt-guard.js'
+import type { FingerprintHit } from './prompt-guard.js'
 import { PROXY_RESPONSE_HEADER_TIMEOUT_MS, PROXY_IDLE_TIMEOUT_MS, PROXY_TOTAL_TIMEOUT_MS, PROXY_RESPONSE_BYTES, PROXY_FRAME_BYTES } from './transport.js'
 import type { ProxyCredential } from './account-store.js'
 import type { AntigravityHostConfig } from '../settings.js'
@@ -82,7 +85,7 @@ export interface ProxyAdapterOptions {
   responseHeaderTimeoutMs?: number
   /** 宿主附件服务的惰性读取面；缺席时图片输入报 UNSUPPORTED_MODALITY，文本能力不受影响。 */
   attachments?: () => ProxyAttachmentReader | undefined
-  readSettings?: () => Pick<AntigravityHostConfig, 'modelOverrides'>
+  readSettings?: () => Pick<AntigravityHostConfig, 'modelOverrides' | 'cloakSensitiveWords'>
   log?: { info(message: string): void; warn(message: string, error?: unknown): void }
 }
 
@@ -264,17 +267,47 @@ export class AntigravityProxyAdapter extends LlmAdapter {
     let refreshed = false
     let refreshNext = false
     let networkRetries = 0
+    let fingerprintChecked = false
+    let fingerprintNote: string | undefined
+    // 打散只在开关打开时做一次（幂等：插入零宽后原文不再匹配同一短语），并覆盖
+    // 最终进入 systemInstruction 的**全部**文本——options.system 之外，messages 里
+    // role 为 system / developer 的文本也会被并进同一条 system 指令。
+    let effective = options
+    if (this.options.readSettings?.().cloakSensitiveWords === true) {
+      const cloaked = cloakGenerateOptions(options)
+      if (cloaked.hits.length > 0) effective = cloaked.options
+    }
+    const cloaked = effective !== options
     for (;;) {
       const credential = await this.readCredential(signal, refreshNext)
       refreshNext = false
       if (credential === undefined) throw new LlmError('代理模式需要登录：请在设置页连接代理账户', 'AUTH')
+      // 上游会把「请求文本里的已知客户端指纹」伪装成 429（magpie 生态的实测结论）。
+      // 诊断读的是**实际发出去的**文本，并且与打散状态一致（不会一边说已打散、
+      // 一边说"未改写"）。
+      if (!fingerprintChecked) {
+        fingerprintChecked = true
+        const hits = systemTexts(effective).flatMap((text) => scanUpstreamFingerprints(text))
+        if (hits.length > 0) {
+          fingerprintNote = describeFingerprintHits(hits)
+          this.options.log?.warn(cloaked
+            ? `antigravity-proxy: 已按 cloakSensitiveWords 打散 system 指令里的上游身份指纹 ${fingerprintNote}`
+            : `antigravity-proxy: system 指令命中上游已知指纹 ${fingerprintNote}；若出现恒定 429（换账号无效），这可能是原因，而不一定是额度耗尽。打开 cloakSensitiveWords 可在发送前打散`)
+        }
+      }
       let payload: Awaited<ReturnType<typeof buildProxyGeneratePayload>>
       try {
-        payload = await buildProxyGeneratePayload(options, credential, this.sessions, Date.now(), attachments, signal, wireModel)
+        payload = await buildProxyGeneratePayload(effective, credential, this.sessions, Date.now(), attachments, signal, wireModel)
       } catch (error) {
         if (signal?.aborted) throw new LlmError('代理模式请求已取消', 'CANCELLED')
+        // 图片准入与校验失败在 image.ts / payload.ts 里已经一律是 LlmError，这里
+        // 直接透传；非 LlmError 是构包期间的其它异常，不能伪装成附件问题。
         if (error instanceof LlmError) throw error
-        throw new LlmError('代理模式图片输入无法安全准入', 'UNSUPPORTED_MODALITY', { cause: error })
+        throw new LlmError(
+          `代理模式请求构造失败：${redactSensitiveText(error instanceof Error ? error.message : String(error))}`,
+          'AGY_PAYLOAD_BUILD',
+          { cause: error },
+        )
       }
       // 内联图片超预算：按「最旧优先」协商 offload，宿主卸载后重试本回合。
       const offload = requiredProxyImageOffload(options.messages, payload.sentImageBytes)
@@ -315,15 +348,36 @@ export class AntigravityProxyAdapter extends LlmAdapter {
       }
       const statusError = proxyStatusError(response.status)
       if (statusError !== undefined) {
-        if ((statusError.code === 'authentication' || statusError.code === 'forbidden') && !refreshed && !hasEmitted.value && !signal?.aborted) {
-          await cancelResponse(response)
-          refreshed = true
-          refreshNext = true
-          continue
+        if (statusError.code === 'authentication' || statusError.code === 'forbidden') {
+          // 先分辨「账号被上游停用」：换发登录态与重试都救不回来，第一次与刷新后的
+          // 第二次 403 都要认（magpie 记录这条形态也会出现在流内 error 事件里）。
+          const suspended = await suspendedAccountError(response, signal)
+          if (suspended !== undefined) throw suspended
+          if (!refreshed && !hasEmitted.value && !signal?.aborted) {
+            await cancelResponse(response)
+            refreshed = true
+            refreshNext = true
+            continue
+          }
         }
         if (statusError.code === 'rate-limited' && !hasEmitted.value) {
+          // 只有上游原话确实说配额/容量耗尽，才谈得上「可能是提示词指纹而不是额度」；
+          // 别的 429 就是限流本身（magpie #1425 的口径），否则会把用户引去改无关指令。
+          const body = await readProxyText(response, { signal }).catch(() => '')
           await cancelResponse(response)
-          throw new LlmError('代理模式账户被上游限流（429）；稍后重试或切换回 ACP 模式', 'RATE_LIMIT', { status: response.status })
+          const lowered = body.toLowerCase()
+          const exhausted = lowered.includes('resource has been exhausted') || lowered.includes('exhausted your capacity')
+          const detail = redactSensitiveText(body.trim().slice(0, 200))
+          throw new LlmError(
+            !exhausted
+              ? `代理模式请求被上游拒绝（429）${detail.length > 0 ? `：${detail}` : ''}；可稍后重试或切换回 ACP 模式`
+              : fingerprintNote === undefined
+                ? '代理模式账户被上游限流（429 Resource has been exhausted，配额或容量已耗尽）；稍后重试或切换回 ACP 模式'
+                : `代理模式请求被上游拒绝（429 Resource has been exhausted）：本轮 system 指令命中客户端身份指纹 ${fingerprintNote}。` +
+                  '若换账号、等额度都无效，原因通常是被拒绝的提示词指纹而不是额度耗尽；可改写这些指令后重试，或切换回 ACP 模式',
+            'RATE_LIMIT',
+            { status: response.status },
+          )
         }
         if ((response.status === 502 || response.status === 503 || response.status === 504) && networkRetries < MAX_NETWORK_RETRIES && !hasEmitted.value && !signal?.aborted) {
           await cancelResponse(response)
@@ -417,9 +471,20 @@ export class AntigravityProxyAdapter extends LlmAdapter {
         if (part.signature !== undefined) current.signature = part.signature
       }
     }
-    if (current !== undefined) yield endBlock(current)
+    if (current !== undefined) {
+      try {
+        yield endBlock(current)
+      } catch (error) {
+        // 上游已经给出错误事件（429 / SAFETY / 上下文超限）或本轮被取消时，半截
+        // 工具调用参数不该把真实原因盖成 PROTOCOL_DRIFT。
+        if (eventError === undefined && !options.signal?.aborted) throw error
+      }
+    }
     if (usage !== undefined) yield { type: 'usage', usage }
     if (eventError !== undefined) {
+      // 停用也会以流内 error 事件出现（magpie 记录过这条形态）：先认它，再谈别的。
+      const suspended = suspendedErrorFor(eventError.message ?? '', eventError.status)
+      if (suspended !== undefined) throw suspended
       yield finishChunk(
         'error',
         eventError.contextWindowExceeded === true ? CONTEXT_WINDOW_EXCEEDED_CODE : safeProviderErrorCode(eventError.code, eventError.status),
@@ -774,6 +839,72 @@ async function responseReportsContextWindowExceeded(response: Response, signal?:
     if (signal?.aborted || error instanceof ProxyTransportError && error.code === 'cancelled') throw new LlmError('代理模式请求已取消', 'CANCELLED')
     return false
   }
+}
+
+/** 会进入 systemInstruction 的消息角色：payload 把它们与 options.system 并成一条指令。 */
+const SYSTEM_INSTRUCTION_ROLES = new Set(['system', 'developer'])
+
+/** 最终进入 systemInstruction 的全部文本（options.system 与 system/developer 消息）。 */
+function systemTexts(options: GenerateOptions): string[] {
+  const texts: string[] = []
+  if (typeof options.system === 'string' && options.system.length > 0) texts.push(options.system)
+  for (const message of options.messages) {
+    if (!SYSTEM_INSTRUCTION_ROLES.has(message.role)) continue
+    for (const block of message.content) {
+      if (block.type === 'text' && typeof block.text === 'string' && block.text.length > 0) texts.push(block.text)
+    }
+  }
+  return texts
+}
+
+/** 打散全部 system 指令文本（用户消息不动）；没有命中时原样返回 options。 */
+function cloakGenerateOptions(options: GenerateOptions): { options: GenerateOptions; hits: FingerprintHit[] } {
+  const hits: FingerprintHit[] = []
+  const system = cloakUpstreamFingerprints(options.system)
+  hits.push(...system.hits)
+  let changed = system.hits.length > 0
+  const messages = options.messages.map((message) => {
+    if (!SYSTEM_INSTRUCTION_ROLES.has(message.role)) return message
+    let touched = false
+    const content = message.content.map((block) => {
+      if (block.type !== 'text' || typeof block.text !== 'string') return block
+      const cloaked = cloakUpstreamFingerprints(block.text)
+      if (cloaked.hits.length === 0) return block
+      hits.push(...cloaked.hits)
+      touched = true
+      return { ...block, text: cloaked.text }
+    })
+    if (!touched) return message
+    changed = true
+    return { ...message, content }
+  })
+  return changed ? { options: { ...options, system: system.text, messages }, hits } : { options, hits }
+}
+
+/** 上游对「账号被停用」的回答（magpie 记录的 Google 原话）：
+ * 403 `This service has been disabled in this account for violation of Terms of
+ * Service. Please submit an appeal …`。导出以便单测。
+ */
+export function isAccountSuspended(body: string): boolean {
+  const text = body.toLowerCase()
+  return text.includes('violation of terms of service') || text.includes('has been disabled in this account')
+}
+
+/** 命中「服务因违反条款被停用」时给出专门错误；否则 undefined。 */
+function suspendedErrorFor(body: string, status?: number): LlmError | undefined {
+  if (!isAccountSuspended(body)) return undefined
+  return new LlmError(
+    '代理模式账户已被上游停用：Antigravity 报告该账号违反了服务条款（violation of Terms of Service）。' +
+      '换发登录态或重试都无法恢复，请在 Google 账号侧申诉后再连接；期间可切回 ACP 模式',
+    'AGY_ACCOUNT_SUSPENDED',
+    { status },
+  )
+}
+
+/** 读一次有界响应体，判断它是不是「账号被停用」。 */
+async function suspendedAccountError(response: Response, signal?: AbortSignal): Promise<LlmError | undefined> {
+  const body = await readProxyText(response, { signal }).catch(() => '')
+  return suspendedErrorFor(body, response.status)
 }
 
 function toLlmError(error: unknown): LlmError {

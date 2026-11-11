@@ -143,11 +143,14 @@ export class ProxyAccountService implements ProxyCredentialSource {
   async refresh(signal?: AbortSignal): Promise<ProxyCredential | undefined> {
     signal?.throwIfAborted()
     if (this.signedOut) return undefined
-    if (this.refreshing) return this.refreshing
+    if (this.refreshing) return settleShared(this.refreshing, signal)
     const generation = this.generation
     const controller = new AbortController()
     this.refreshAbort = controller
-    const refreshSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal
+    // 共享换发只由内部生命周期中止（退出、切换账户、预算超时）。把调用者的
+    // signal 并进来会让「某一个请求被取消」把其他等待者一起判成未登录；各
+    // 调用者用 settleShared 单独表达自己的取消。
+    const refreshSignal = controller.signal
     const run = (async (): Promise<ProxyCredential | undefined> => {
       const current = this.store.peek() ?? await this.store.load()
       if (!current?.refreshToken || generation !== this.generation) return undefined
@@ -156,15 +159,27 @@ export class ProxyAccountService implements ProxyCredentialSource {
         const next = { ...current, ...issued, updatedAt: new Date(this.now()).toISOString() }
         return await this.saveCredential(next, generation, refreshSignal) ? next : undefined
       } catch (error) {
-        if (!refreshSignal.aborted) this.options.log?.warn('antigravity-proxy: 换发 access token 失败')
+        if (!refreshSignal.aborted) {
+          this.options.log?.warn('antigravity-proxy: 换发 access token 失败')
+          // 凭据还在但换发失败（网络/超时/上游拒绝）：把可读原因留在状态里，
+          // 不要只让请求侧报「需要登录」。
+          if (generation === this.generation && !this.signedOut) {
+            this.setStatus({ phase: 'signed-in', message: `登录态刷新失败：${toProxyAccountError(error).message}` })
+          }
+        }
         return undefined
       }
     })()
     this.refreshing = run
-    try { return await run } finally {
+    // 先挂 catch：run 万一拒绝（例如状态订阅回调抛错），不能让 finally 链产生
+    // 无 handler 的 rejection（Node 默认会终止进程）。
+    void run.catch(() => undefined).finally(() => {
+      // 调用者可能因自身取消先返回；清理必须等共享操作真正结束，否则下一个
+      // 调用者会重复发起同一次换发。
       if (this.refreshing === run) this.refreshing = undefined
       if (this.refreshAbort === controller) this.refreshAbort = undefined
-    }
+    })
+    return settleShared(run, signal)
   }
 
   async login(signal?: AbortSignal): Promise<{ authorizationUrl?: string; message: string }> {
@@ -335,6 +350,24 @@ export class ProxyAccountService implements ProxyCredentialSource {
       ...(patch.connectionStage === undefined ? {} : { connectionStage: patch.connectionStage }),
       updatedAt: new Date(this.now()).toISOString() }
   }
+}
+
+/**
+ * 等待共享在途操作，只让调用者自己的 signal 影响**本次等待**：调用者取消时
+ * 本次等待返回 undefined，共享操作本身继续完成并写回结果，不会把其他等待者
+ * 拖成同一个失败。
+ */
+function settleShared<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T | undefined> {
+  if (signal === undefined) return promise
+  if (signal.aborted) return Promise.resolve(undefined)
+  return new Promise<T | undefined>((resolve, reject) => {
+    const onAbort = (): void => { signal.removeEventListener('abort', onAbort); resolve(undefined) }
+    signal.addEventListener('abort', onAbort, { once: true })
+    promise.then(
+      (value) => { signal.removeEventListener('abort', onAbort); resolve(value) },
+      (error: unknown) => { signal.removeEventListener('abort', onAbort); reject(error) },
+    )
+  })
 }
 
 function oauthFailureMessage(oauth: ProxyOAuthStatus): string {

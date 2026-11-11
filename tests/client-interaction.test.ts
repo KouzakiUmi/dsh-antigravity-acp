@@ -3,7 +3,7 @@ import { runInNewContext } from 'node:vm'
 import React from 'react'
 import { act, create, type ReactTestInstance, type ReactTestRenderer } from 'react-test-renderer'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { Config, liveHostConfig } from '../src/settings.js'
+import { Config, LIVE_SETTING_KEYS, liveHostConfig } from '../src/settings.js'
 
 type SettingsDocument = { writable: boolean; namespaces: Array<{ ns: string; revision: number; value: Record<string, unknown> }> }
 
@@ -420,9 +420,12 @@ describe('settings card with real React state and effects', () => {
   const controlWith = (models: unknown = catalog(), account: Record<string, unknown> = { state: 'idle', message: 'ready' }) =>
     vi.fn(async (method: string) => method === 'account' ? account : models)
 
-  it('设置控件覆盖全部公开配置，可与逐模型设置一起保存、回读', async () => {
-    const fields = Object.keys(Config.dict ?? {}).filter(key => key !== 'modelOverrides' && key !== 'proxyBypass')
-    expect(fields).toEqual(expect.arrayContaining(['binaryPath', 'autoDownload', 'acpVersion', 'extraArgs', 'maxConcurrentSessions', 'queueTimeoutMs', 'requestTimeoutMs', 'handshakeTimeoutMs', 'authTimeoutMs', 'promptTimeoutMs', 'bridgeParkSettleMs']))
+  it('设置卡片只提交即时字段，普通配置以重载指引呈现', async () => {
+    const liveKeys: readonly string[] = [...LIVE_SETTING_KEYS]
+    const fields = liveKeys.filter(key => key !== 'modelOverrides' && key !== 'proxyBypass')
+    // 普通（非 volatile）配置：宿主既不投影也不接受写入，不能出现在可编辑控件里。
+    const plainFields = Object.keys(Config.dict ?? {}).filter(key => !liveKeys.includes(key))
+    expect(plainFields).toEqual(expect.arrayContaining(['binaryPath', 'autoDownload', 'acpVersion', 'extraArgs', 'maxConcurrentSessions', 'queueTimeoutMs', 'requestTimeoutMs', 'handshakeTimeoutMs', 'authTimeoutMs', 'promptTimeoutMs', 'bridgeParkSettleMs']))
     expect(fields).not.toContain('proxyBypass')
     const values = liveHostConfig(Config({ autoWarmup: false }))
     const projected: Record<string, unknown> = Object.fromEntries(fields.map(key => [key, Reflect.get(values, key)]))
@@ -439,11 +442,18 @@ describe('settings card with real React state and effects', () => {
     })
     const { renderer } = await mount(service.remote, controlWith())
     // modelOverrides 由逐模型行渲染，不是普通输入框。
-    const plain = fields.filter(key => key !== 'modelOverrides')
+    // 代理专属开关（proxyOnly）在 ACP 模式不渲染：卡片只显示当前模式所需的控制项。
+    const proxyOnly = ['cloakSensitiveWords']
+    const renderable = fields.filter(key => !proxyOnly.includes(key))
+    for (const key of proxyOnly) expect(renderer.root.findAllByProps({ name: key })).toHaveLength(0)
     const inputs = [...renderer.root.findAllByType('input'), ...renderer.root.findAllByType('textarea')]
       .filter(input => fields.includes(input.props.name))
-    expect(inputs).toHaveLength(plain.length)
+    expect(inputs).toHaveLength(renderable.length)
     expect(inputs.every(input => input.props.disabled === false)).toBe(true)
+    // 普通配置一个都不该变成输入框（否则保存必然被宿主拒绝）。
+    for (const key of plainFields) expect(renderer.root.findAllByProps({ name: key })).toHaveLength(0)
+    expect(renderedText(renderer)).toContain('普通配置（并发 / 二进制 / 超时）')
+    expect(renderedText(renderer)).toContain('maxConcurrentSessions')
     await act(async () => {
       for (const input of inputs) input.props.onChange({ target: input.props.type === 'checkbox'
         ? { checked: !input.props.checked }
@@ -455,8 +465,7 @@ describe('settings card with real React state and effects', () => {
     await act(async () => { await button(renderer, '保存').props.onClick() })
     expect(service.mutate).toHaveBeenCalledTimes(1)
     const ops = service.mutate.mock.calls[0]![1] as Array<{ path: string[]; value: unknown }>
-    expect(ops.map(op => op.path[0]).sort()).toEqual([...plain, 'modelOverrides'].sort())
-    expect(ops.find(op => op.path[0] === 'extraArgs')!.value).toEqual(['test-value'])
+    expect(ops.map(op => op.path[0]).sort()).toEqual([...renderable, 'modelOverrides'].sort())
     expect(ops.find(op => op.path[0] === 'modelOverrides')!.value).toEqual({
       'claude-sonnet-5-5': { effort: 'high' },
       'gemini-3-pro': { enabled: false },

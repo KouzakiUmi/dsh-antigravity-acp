@@ -134,13 +134,15 @@ describe('宿主兼容性声明', () => {
 
   it('客户端注入清单覆盖本包实际用到的客户端包', () => {
     const inject = manifest.dsh?.client?.inject ?? []
+    // 只声明实机存在的包：`@deepseek-ai/dsh-client-ui-slots` 不在 dsh 0.2.2-rc.1 的
+    // 部署里（宿主对 graph 里找不到的 inject 名静默跳过），留着是死声明。
     for (const pkg of [
-      '@deepseek-ai/dsh-client-ui-slots',
       '@deepseek-ai/dsh-client-ui-settings',
       '@deepseek-ai/dsh-client-ui-model-selection',
       '@deepseek-ai/dsh-api-remotes',
     ]) {
       expect(inject).toContain(pkg)
     }
+    expect(inject).not.toContain('@deepseek-ai/dsh-client-ui-slots')
   })
 })

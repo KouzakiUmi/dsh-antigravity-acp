@@ -50,6 +50,8 @@ export const AGY_BINARY_ERROR = {
   REDIRECT_REFUSED: 'AGY_DOWNLOAD_REDIRECT_REFUSED',
   /** 下载返回非 2xx（非 3xx）状态。 */
   BAD_STATUS: 'AGY_DOWNLOAD_BAD_STATUS',
+  /** 流式下载中途失败：断网、超时或写盘错误。 */
+  TRANSFER_FAILED: 'AGY_DOWNLOAD_TRANSFER_FAILED',
   /** zip 条目路径不安全（绝对路径、穿越、盘符等）。 */
   UNSAFE_ENTRY: 'AGY_UNSAFE_ZIP_ENTRY',
   /** zip 内找不到可执行文件等结构异常。 */
@@ -191,10 +193,17 @@ export async function downloadBinaryToFile(
       const nodeStream = Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0])
       await pipeline(nodeStream, createWriteStream(destPath))
       return
-    } catch {
-      // 流管道异常时回退到 arrayBuffer
+    } catch (error) {
+      // body 已经被流式读取消费，再调 `response.arrayBuffer()` 只会抛
+      // 「Body is unusable」，把断网/超时/写盘失败的真实原因盖掉。直接上报。
+      throw new AgyBinaryError(
+        AGY_BINARY_ERROR.TRANSFER_FAILED,
+        `下载中断（${url}）：${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
+      )
     }
   }
+  // 没有可读流（测试替身或探针响应）时才走整包读取。
   const bytes = new Uint8Array(await response.arrayBuffer())
   await writeFile(destPath, bytes)
 }
@@ -792,9 +801,16 @@ export async function ensureAgentBinary(options: AgentBinaryOptions = {}): Promi
     } catch (error) {
       // 另一个宿主可能刚提交了同版本；不得删除它正在使用的完整产物。
       const winner = await findExtractedExecutable(finalExtract, flavor)
-      if (!winner) throw error
-      await ensureExecutable(winner, flavor)
-      return { executablePath: winner, source: 'cache', version, checksumVerified: false }
+      if (winner) {
+        await ensureExecutable(winner, flavor)
+        return { executablePath: winner, source: 'cache', version, checksumVerified: false }
+      }
+      // 只有「目标已存在」这一类可自愈的失败才清掉旧目录重试：权限、跨设备
+      // 重命名、路径过长等错误把目录删掉再重试只会吞掉真实原因。
+      const code = (error as NodeJS.ErrnoException | null)?.code
+      if (code !== 'EEXIST' && code !== 'ENOTEMPTY') throw error
+      await rm(finalExtract, { recursive: true, force: true })
+      await rename(stagingExtract, finalExtract)
     }
     const executablePath = join(finalExtract, relative)
     await ensureExecutable(executablePath, flavor)

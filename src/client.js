@@ -29,6 +29,7 @@ window.__ModuleLoader__.load({
     /** Live fields owned by this card; ordinary fields stay in the host config editor. */
     const FIELDS = [
       { key: 'proxyMode', group: 'mode', checkbox: true, label: '使用代理模式', hint: '直连上游；需启用代理路由并连接代理账户。' },
+      { key: 'cloakSensitiveWords', group: 'mode', checkbox: true, proxyOnly: true, label: '打散身份指纹（代理模式）', hint: '上游对 Claude Code / Codex 身份句会恒定回 429；开启后只在 system 里插零宽空格。属于绕过上游识别，默认关闭。' },
       { key: 'cliQuotaEnabled', group: 'quota', checkbox: true, label: '使用 agy CLI 补充额度', hint: '默认不启动 agy；开启后才读取 AI Credits。' },
       { key: 'autoWarmup', group: 'general', checkbox: true, defaultChecked: true, acpOnly: true, label: '启动时自动预热', hint: '不发送消息；下次启用插件时生效。' },
       { key: 'reuseSessions', group: 'general', checkbox: true, defaultChecked: true, acpOnly: true, label: '复用 ACP 会话', hint: '只发送新增消息；上下文不一致时自动重建。' },
@@ -38,17 +39,28 @@ window.__ModuleLoader__.load({
       { key: 'keepProcessAfterCancel', group: 'advanced', checkbox: true, acpOnly: true, label: '取消后保留进程', hint: '仅在官方进程确认停止后保留。' },
       { key: 'cancelGraceMs', group: 'advanced', numeric: true, defaultValue: 30000, min: 0, max: 60000, acpOnly: true, label: '取消确认宽限（毫秒）', hint: '0 表示立即回收。' },
       { key: 'idleRecycleMs', group: 'advanced', numeric: true, defaultValue: 300000, min: 0, max: 3600000, acpOnly: true, label: '进程空闲回收（毫秒）', hint: '默认 5 分钟；0 表示禁用。' },
-      { key: 'binaryPath', group: 'launch', acpOnly: true, label: 'ACP Server 路径', placeholder: '留空自动解析或下载', hint: '优先于环境变量与缓存。' },
-      { key: 'autoDownload', group: 'launch', checkbox: true, defaultChecked: true, acpOnly: true, label: '自动下载 ACP Server', hint: '仅从官方 dl.google.com 下载。' },
-      { key: 'acpVersion', group: 'launch', acpOnly: true, label: 'ACP Server 版本', placeholder: '1.4.0', hint: '程序版本，不是 ACP 协议版本。' },
-      { key: 'extraArgs', group: 'launch', lines: true, acpOnly: true, label: 'ACP 额外启动参数', placeholder: '每行一个参数', hint: '按行原样传给官方进程。' },
-      { key: 'maxConcurrentSessions', group: 'pool', numeric: true, defaultValue: 2, min: 1, max: 4, acpOnly: true, label: '最大 ACP 连接数', hint: '范围 1–4。' },
-      { key: 'queueTimeoutMs', group: 'pool', numeric: true, defaultValue: 120000, min: 1000, acpOnly: true, label: '连接排队超时（毫秒）', hint: '最小 1000。' },
-      { key: 'requestTimeoutMs', group: 'timeouts', numeric: true, defaultValue: 30000, min: 0, acpOnly: true, label: '普通请求超时（毫秒）' },
-      { key: 'handshakeTimeoutMs', group: 'timeouts', numeric: true, defaultValue: 120000, min: 1000, acpOnly: true, label: '握手超时（毫秒）', hint: '冷启动建议至少 120000。' },
-      { key: 'authTimeoutMs', group: 'timeouts', numeric: true, defaultValue: 300000, min: 0, acpOnly: true, label: '浏览器登录超时（毫秒）' },
-      { key: 'promptTimeoutMs', group: 'timeouts', numeric: true, defaultValue: 1800000, min: 0, acpOnly: true, label: '单轮生成超时（毫秒）', hint: '默认 30 分钟。' },
-      { key: 'bridgeParkSettleMs', group: 'timeouts', numeric: true, defaultValue: 50, min: 0, acpOnly: true, label: '工具调用聚合窗口（毫秒）', hint: '不是工具执行超时。' },
+    ]
+
+    /**
+     * 普通（非 volatile）配置：并发、二进制与各段超时。
+     *
+     * 宿主只把 volatile 字段投影进 `settings.describe()`，并拒绝用 `mutate` 写非
+     * volatile 路径（`Config field "X" is not volatile`）。把它们渲染成可编辑输入
+     * 框只会得到「值不是真值、保存整批失败」，所以这里只在卡片上给出指引，实际
+     * 修改走插件的普通配置编辑器，保存后由宿主重载生效。
+     */
+    const PLAIN_FIELD_LABELS = [
+      '最大 ACP 连接数（maxConcurrentSessions）',
+      '连接排队超时（queueTimeoutMs）',
+      '普通请求超时（requestTimeoutMs）',
+      '握手超时（handshakeTimeoutMs）',
+      '浏览器登录超时（authTimeoutMs）',
+      '单轮生成超时（promptTimeoutMs）',
+      '工具调用聚合窗口（bridgeParkSettleMs）',
+      'ACP Server 路径（binaryPath）',
+      '自动下载 ACP Server（autoDownload）',
+      'ACP Server 版本（acpVersion）',
+      'ACP 额外启动参数（extraArgs）',
     ]
 
     /** 逐模型设置：键是 DSH 选择器里的模型 ID，值是开关、默认档位、显示名与官方 ID 映射。 */
@@ -660,7 +672,9 @@ window.__ModuleLoader__.load({
       }
 
       const connection = connectionStatus(account, registered)
-      const fieldsFor = (group) => FIELDS.filter((field) => field.group === group && (!effectiveProxyMode || !field.acpOnly))
+      const fieldsFor = (group) => FIELDS.filter((field) => field.group === group
+        && (!effectiveProxyMode || !field.acpOnly)
+        && (effectiveProxyMode || !field.proxyOnly))
       const fieldProps = { draft, dirtyKeys, conflicts, disabled: editingDisabled, editField }
       const pageStyle = (id) => ({ display: settingsPage === id ? 'flex' : 'none', flexDirection: 'column', gap: '14px' })
       const pageButton = (id, label) => h('button', {
@@ -733,10 +747,12 @@ window.__ModuleLoader__.load({
             h(SectionHeading, { title: '会话偏好' }),
             h(SettingsFields, { ...fieldProps, fields: fieldsFor('general') })) : null,
           h(SettingsGroup, { title: '网络与 CLI', fields: fieldsFor('network'), fieldProps, open: effectiveProxyMode }),
-          !effectiveProxyMode ? h(SettingsGroup, { title: 'ACP 启动', fields: fieldsFor('launch'), fieldProps }) : null,
-          !effectiveProxyMode ? h(SettingsGroup, { title: '连接池', fields: fieldsFor('pool'), fieldProps }) : null,
-          !effectiveProxyMode ? h(SettingsGroup, { title: '请求与工具超时', fields: fieldsFor('timeouts'), fieldProps }) : null,
           !effectiveProxyMode ? h(SettingsGroup, { title: '会话与进程', fields: fieldsFor('advanced'), fieldProps }) : null,
+          !effectiveProxyMode ? h('div', { style: { ...PANEL, padding: '12px 14px', fontSize: '11px', lineHeight: 1.6 }, 'aria-label': '普通配置说明' },
+            h('strong', { style: { display: 'block', fontSize: '13px', marginBottom: '4px' } }, '普通配置（并发 / 二进制 / 超时）'),
+            h('div', { style: { opacity: .75 } }, '这些不是即时配置：宿主只把即时字段投影到本卡片，也会拒绝在这里写入普通字段。请在插件的普通配置编辑器里修改，保存后由宿主重载生效。字段清单：'),
+            h('ul', { style: { margin: '5px 0 0', paddingLeft: '18px', opacity: .75 } },
+              ...PLAIN_FIELD_LABELS.map((label) => h('li', { key: label }, label)))) : null,
           !effectiveProxyMode ? h('details', { style: PANEL, 'aria-label': '连接诊断' },
             h('summary', { style: SUMMARY },
               h('span', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },

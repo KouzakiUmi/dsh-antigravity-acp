@@ -5,7 +5,7 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AnyMessage } from '@agentclientprotocol/sdk'
-import { AgentLink, AGY_LINK_ERROR, AgentLinkError, OAUTH_PERSONAL_AUTH_METHOD, agentStreamFromSubprocess, launchAcpAgent, officialAgentEnv } from '../src/protocol/agent-link.js'
+import { AgentLink, AGY_LINK_ERROR, AgentLinkError, OAUTH_PERSONAL_AUTH_METHOD, agentStreamFromSubprocess, boundedFrameStream, launchAcpAgent, officialAgentEnv } from '../src/protocol/agent-link.js'
 import type { Stream } from '@agentclientprotocol/sdk'
 
 /** client 侧 Stream 与 fake agent 侧读写端的交叉连接。 */
@@ -592,5 +592,47 @@ describe('AgentLink 请求写出失败', () => {
       await link.close()
     }
     expect(unhandled).toEqual([])
+  })
+})
+
+describe('ACP 单帧上限', () => {
+  const encode = (text: string): Uint8Array => new TextEncoder().encode(text)
+  const sourceOf = (...chunks: Uint8Array[]): ReadableStream<Uint8Array> =>
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(chunk)
+        controller.close()
+      },
+    })
+  const readAll = async (stream: ReadableStream<Uint8Array>): Promise<string> => {
+    const reader = stream.getReader()
+    const decoder = new TextDecoder()
+    let text = ''
+    for (;;) {
+      const { value, done } = await reader.read()
+      if (done) return text
+      text += decoder.decode(value, { stream: true })
+    }
+  }
+
+  it('换行会把帧计数归零，多帧拼接不会被误判超限', async () => {
+    const stream = boundedFrameStream(sourceOf(encode('{"a":1}\n{"b":2}\n')), 8)
+    expect(await readAll(stream)).toBe('{"a":1}\n{"b":2}\n')
+  })
+
+  it('单个 chunk 就超限时按协议违规报错，而不是无界缓冲', async () => {
+    const stream = boundedFrameStream(sourceOf(encode('x'.repeat(12))), 8)
+    const failure = await stream.getReader().read().catch((cause: unknown) => cause)
+    expect(failure).toBeInstanceOf(AgentLinkError)
+    expect((failure as AgentLinkError).code).toBe(AGY_LINK_ERROR.PROTOCOL_VIOLATION)
+    expect((failure as Error).message).toContain('单帧超过上限')
+  })
+
+  it('跨 chunk 累计的同一帧超限同样失败', async () => {
+    const stream = boundedFrameStream(sourceOf(encode('x'.repeat(6)), encode('y'.repeat(6))), 8)
+    const reader = stream.getReader()
+    await reader.read()
+    const failure = await reader.read().catch((cause: unknown) => cause)
+    expect((failure as AgentLinkError).code).toBe(AGY_LINK_ERROR.PROTOCOL_VIOLATION)
   })
 })

@@ -25,6 +25,7 @@
  * - 不硬编码任何账号/项目标识：`project_id` 只从既有文件继承或由注入的解析器取得。
  */
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
 import { homedir as osHomedir } from 'node:os'
 import { join } from 'node:path'
 import { parseTokenState, refreshAccessToken, resolveOAuthClient } from './quota.js'
@@ -197,9 +198,12 @@ async function renameWithRetry(source: string, target: string, maxRetries = 3, d
 }
 
 async function writeFileAtomic(path: string, data: string): Promise<void> {
-  const temp = `${path}.${process.pid}.${Date.now()}.tmp`
+  // 临时名必须唯一：`pid + 时间戳` 在同一进程的两个 worker 同毫秒写同一路径时
+  // 会撞名，后写者覆盖前者，先 rename 成功后另一个必然 ENOENT。'wx' 让撞名直接
+  // 失败而不是静默覆盖（与 catalog-cache / session-map 的写法一致）。
+  const temp = `${path}.${process.pid}.${randomUUID()}.tmp`
   try {
-    await writeFile(temp, data, { encoding: 'utf8', mode: 0o600 })
+    await writeFile(temp, data, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
     await renameWithRetry(temp, path)
   } catch (error) {
     await rm(temp, { force: true }).catch(() => undefined)

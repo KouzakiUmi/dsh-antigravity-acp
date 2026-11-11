@@ -17,6 +17,7 @@ import { AntigravityProxyAdapter, PROXY_PROVIDER_ID } from './adapter.js'
 import { createProxyTransport } from './transport.js'
 import type { ProxyTransport } from './transport.js'
 import { ProxyConfigError, resolveHttpsProxy } from '../runtime/proxy-env.js'
+import { redactSensitiveText } from '../runtime/redact.js'
 import type { ProxyModeBus } from './mode-bus.js'
 import type { ProxyAccountService } from './account-service.js'
 import type { ProxyAttachmentReader } from './image.js'
@@ -74,7 +75,7 @@ function mountProxyRouter(
     readSettings: () => bus.modelSettings?.() ?? {},
     log: {
       info: (message) => ctx.logger?.info?.(message),
-      warn: (message, error) => ctx.logger?.warn?.(`${message}${error ? `: ${error instanceof Error ? error.message : String(error)}` : ''}`),
+      warn: (message, error) => ctx.logger?.warn?.(redactSensitiveText(`${message}${error ? `: ${error instanceof Error ? error.message : String(error)}` : ''}`)),
     },
   })
 

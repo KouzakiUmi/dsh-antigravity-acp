@@ -256,7 +256,11 @@ export class AgentLink {
         this.#route(value)
       }
     } catch (error) {
-      this.#rejectAllPending(new AgentLinkError(AGY_LINK_ERROR.LINK_CLOSED, 'ACP 流读取失败，链接关闭', { cause: error }))
+      // 本模块自己抛出的协议错误（例如单帧超限）保留原错误码与说明：把
+      // 「对端吐了 64 MiB 以上的单帧」显示成通用的「链接关闭」会丢掉诊断。
+      this.#rejectAllPending(error instanceof AgentLinkError
+        ? error
+        : new AgentLinkError(AGY_LINK_ERROR.LINK_CLOSED, 'ACP 流读取失败，链接关闭', { cause: error }))
     } finally {
       reader.releaseLock()
       this.#closed = true
@@ -624,13 +628,50 @@ export class AgentLink {
   }
 }
 
+/**
+ * ACP 单帧上限（字节）。
+ *
+ * 对端若吐出一条永远不换行的超长行（畸形输出、二进制垃圾、被劫持的 stdout），
+ * SDK 的行缓冲没有上限，内存会一路涨到宿主被杀。这里设一个远大于任何合法
+ * 消息的上限（对齐社区 magpie / agy bridge 的 64 MiB 口径），超限即按协议
+ * 违规让链路失败——有界 + 可诊断，而不是静默无界增长。
+ */
+export const ACP_MAX_FRAME_BYTES = 64 * 1024 * 1024
+
+/**
+ * 按 `\n` 统计当前未完成帧的累计长度，超限时让流报错（调用方据此关闭链路）。
+ * `limitBytes` 可注入：生产用 {@link ACP_MAX_FRAME_BYTES}，测试用小上限验证边界。
+ */
+export function boundedFrameStream(source: ReadableStream<Uint8Array>, limitBytes: number = ACP_MAX_FRAME_BYTES): ReadableStream<Uint8Array> {
+  let pending = 0
+  return source.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      let frameStart = 0
+      for (let index = 0; index < chunk.byteLength; index += 1) {
+        if (chunk[index] !== 0x0a) continue
+        frameStart = index + 1
+        pending = 0
+      }
+      pending += chunk.byteLength - frameStart
+      if (pending > limitBytes) {
+        controller.error(new AgentLinkError(
+          AGY_LINK_ERROR.PROTOCOL_VIOLATION,
+          `ACP 单帧超过上限（>${String(limitBytes)} 字节），判定协议违规并关闭链路`,
+        ))
+        return
+      }
+      controller.enqueue(chunk)
+    },
+  }))
+}
+
 /** 把由 ctx.subprocess 启动的子进程 stdio 包装成 ACP JSON-RPC 双向流。 */
 export function agentStreamFromSubprocess(handle: SubprocessHandle): Stream {
   if (!handle.stdin || !handle.stdout) {
     throw new AgentLinkError(AGY_LINK_ERROR.LAUNCH_FAILED, '子进程 stdio 不完整（需要 stdin/stdout 均为 pipe），无法建立 ACP 链路')
   }
   const stdinWeb = Writable.toWeb(handle.stdin) as WritableStream<Uint8Array>
-  const stdoutWeb = Readable.toWeb(handle.stdout) as ReadableStream<Uint8Array>
+  const stdoutWeb = boundedFrameStream(Readable.toWeb(handle.stdout) as ReadableStream<Uint8Array>)
   return ndJsonStream(stdinWeb, stdoutWeb)
 }
 

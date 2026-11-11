@@ -249,7 +249,11 @@ describe('代理账户连接流程', () => {
     const entered = deferred<void>(); const gate = deferred<void>()
     memory.clear.mockImplementationOnce(async () => { entered.resolve(); await gate.promise; memory.store.peek = () => undefined })
     const start = vi.fn(oauth.start)
-    const service = new ProxyAccountService({ cacheDir: '/unused', cliTokenPath: '/synthetic-cli', store: memory.store, oauthFlow: { ...oauth, start } })
+    // 隔离网络：清除期间 load 仍会返回过期凭据，缺省 fetchImpl 会真去请求
+    // Google token 端点，让用例结果依赖运行环境的网络行为。
+    const service = new ProxyAccountService({ cacheDir: '/unused', cliTokenPath: '/synthetic-cli', store: memory.store,
+      fetchImpl: async () => { throw new Error('synthetic token endpoint unreachable') },
+      oauthFlow: { ...oauth, start } })
     const exiting = service.logout()
     await entered.promise
     const reconnect = service.login()

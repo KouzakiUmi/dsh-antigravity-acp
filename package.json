@@ -1,6 +1,6 @@
 {
   "name": "dsh-bundle-antigravity-host",
-  "version": "0.1.37",
+  "version": "0.1.38",
   "description": "DeepSeek Harness host bundle that talks to the official Antigravity ACP server over stdio (Agent Client Protocol v1).",
   "displayName": "Antigravity ACP",
   "keywords": [
@@ -39,7 +39,6 @@
     "client": {
       "platform": "web",
       "inject": [
-        "@deepseek-ai/dsh-client-ui-slots",
         "@deepseek-ai/dsh-client-ui-settings",
         "@deepseek-ai/dsh-client-ui-model-selection",
         "@deepseek-ai/dsh-api-remotes"
@@ -60,7 +59,7 @@
     "check": "npm run typecheck && npm run test && npm run build"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "~4.0.4 || 4.0.5-alpha.1 || 4.0.5-alpha.2",
+    "@deepseek-ai/cordis": ">=4.0.4 <5",
     "@deepseek-ai/dsh-llm": ">=0.2.0-rc.1 <0.2.1-0 || >=0.2.1-0 <0.3.0-0",
     "@deepseek-ai/dsh-subprocess": ">=0.2.0-rc.1 <0.2.1-0 || >=0.2.1-0 <0.3.0-0",
     "@deepseek-ai/dsh-typert-protocol": ">=0.2.0-rc.1 <0.2.1-0 || >=0.2.1-0 <0.3.0-0"

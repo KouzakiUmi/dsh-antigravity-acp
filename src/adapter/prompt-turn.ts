@@ -74,6 +74,12 @@ export interface PromptTurnOptions {
   promptTimeoutMs: number
   /** 并发 park 的聚合窗口（毫秒）。 */
   parkSettleMs: number
+  /**
+   * 一次性请求（标题生成、压缩）：调用方只消费 chunk，不会回喂工具结果。
+   * 这种回合里出现的工具调用必须立即失败，不能 park 等待一次永远不来的回喂
+   * ——那会让 worker 一直处于 busy，既不空闲回收也不释放池位。
+   */
+  oneShot?: boolean
   /** config_option_update 的观察者（用于刷新模型目录）。 */
   onConfigOptions?(options: readonly SessionConfigOption[]): void
   /**
@@ -104,6 +110,8 @@ export class PromptTurn {
   readonly #bridge: McpToolBridge
   readonly #promptTimeoutMs: number
   readonly #parkSettleMs: number
+  /** 一次性请求：不接受 park，出现工具调用时立即失败而不是等一次不会来的回喂。 */
+  readonly #oneShot: boolean
   readonly #queue: StreamChunk[] = []
   #waiters: Array<() => void> = []
   readonly #parked: BridgeParkedCall[] = []
@@ -140,6 +148,7 @@ export class PromptTurn {
     this.#bridge = options.bridge
     this.#promptTimeoutMs = options.promptTimeoutMs
     this.#parkSettleMs = options.parkSettleMs
+    this.#oneShot = options.oneShot === true
     this.#onConfigOptions = options.onConfigOptions
     this.#onNativeRefusal = options.onNativeRefusal
     this.#onPermissionDiagnostic = options.onPermissionDiagnostic
@@ -284,6 +293,12 @@ export class PromptTurn {
   /** 桥 park 了新调用：进入当前回合。 */
   handleParked(call: BridgeParkedCall): void {
     if (this.#terminated) return
+    if (this.#oneShot) {
+      // 一次性请求（标题生成、压缩）的调用方不会回喂工具结果：直接把这次调用
+      // 以错误结算，让 agent 立刻拿到工具失败，而不是把 worker 永久占住。
+      this.#bridge.resetPending('本回合是一次性请求（标题/压缩），不接受工具调用')
+      return
+    }
     if (this.#roundEnded) {
       this.#deferred.push({ kind: 'call', call })
       return

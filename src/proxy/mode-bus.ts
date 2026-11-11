@@ -15,7 +15,7 @@ export interface ProxyModeBus {
   subscribe(listener: (mode: boolean) => void): () => void
   /** 代理链路的出网代理设置（与官方进程同一套 proxyUrl / proxyBypass）。 */
   proxySettings(): { url?: string; bypass?: string }
-  modelSettings?(): { modelOverrides?: import('../settings.js').AntigravityHostConfig['modelOverrides'] }
+  modelSettings?(): { modelOverrides?: import('../settings.js').AntigravityHostConfig['modelOverrides']; cloakSensitiveWords?: boolean }
 }
 
 export type GenerationMode = 'acp' | 'proxy'
@@ -28,8 +28,10 @@ export interface ModeRegistrationPlan {
 }
 
 /**
- * 模式 → 注册计划。代理行未装载（服务缺失）时由调用方把 proxy 降为 false；
- * 这只表示代理路由不在册，ACP 仍按请求的模式保持注销，不回退。本函数只表达理想计划。
+ * 模式 → 注册计划：只表达「理想计划」，**没有生产调用点**（宿主行与代理行各自
+ * 用幂等的 sync 逻辑同步路由，见 `src/index.ts` 的 syncModeRoutes 与
+ * `src/proxy/index.ts` 的 syncRegistration）。它供测试表达模式语义，改动两处
+ * 同步逻辑时不要以它为准。
  */
 export function registrationPlan(mode: GenerationMode): ModeRegistrationPlan {
   return mode === 'proxy' ? { acp: false, proxy: true } : { acp: true, proxy: false }
@@ -43,11 +45,15 @@ export function modeFromFlag(proxyMode: boolean | undefined): GenerationMode {
 export function createProxyModeBus(read: {
   mode(): boolean | undefined
   proxySettings(): { url?: string; bypass?: string }
-  modelSettings?(): { modelOverrides?: import('../settings.js').AntigravityHostConfig['modelOverrides'] }
+  modelSettings?(): { modelOverrides?: import('../settings.js').AntigravityHostConfig['modelOverrides']; cloakSensitiveWords?: boolean }
 }): ProxyModeBus & { notify(): void } {
   const listeners = new Set<(mode: boolean) => void>()
   let ready = false
-  let last = false
+  // 初值必须来自当前配置：宿主行挂载时按 current() 直接同步路由（不经过
+  // notify），代理行缺席时也没人调用 setRouterReady 把 last 推上去。若 last
+  // 恒为 false，「加载时就是代理模式」的配置下第一次关闭 proxyMode 会被判成
+  // 「没有变化」而吞掉广播，ACP 路由永远不恢复。
+  let last = read.mode() === true
   const notify = (): void => {
     const next = read.mode() === true
     if (next === last) return

@@ -4,6 +4,26 @@
 
 记录源码与发布内容，不将本地构建、npm 发布和本机升级混为同一状态。日期采用 Asia/Hong_Kong。更早历史见 [Git 提交记录](https://github.com/KouzakiUmi/dsh-antigravity-acp/commits/main/)。
 
+## 0.1.38 · 2026-11-12
+
+- **无档位模型不再产出非法元数据**：目录里没有思考强度变体的家族 id 之前返回 `reasoning: { efforts: [] }`，宿主把空数组判为 `INVALID_MODEL_REASONING` 并让该模型完全不可用；现在改为省略 `reasoning`（不支持档位就是不声明菜单）。
+- **切回 ACP 一定恢复路由**：模式总线的「上次模式」改为按当前配置初始化。此前「加载时已是代理模式、且代理行缺席」时，第一次关闭 `proxyMode` 会被判成没有变化而吞掉广播，ACP 路由永久停在注销状态。
+- **设置卡片只编辑即时字段**：宿主只把 volatile 字段投影进设置文档，也会拒绝 `mutate` 非 volatile 路径；卡片原先把并发、二进制与各段超时渲染成输入框，结果是「显示的不是真值、一改就整批保存失败」。这些普通配置现在只在卡片里列出字段名，并指引到普通配置编辑器（保存后由宿主重载生效）。
+- **会话选模短路按会话判定**：`session/set_config_option` 的短路不再用连接级选择器的 `currentValue`（它可能来自别的会话或上一次 `session/new`），新会话省略 `configOptions` 时不会再静默跑在 agent 默认模型上。
+- **一次性请求不再占死 worker**：标题生成与压缩这类请求的调用方不会回喂工具结果；这类回合收到工具调用时立即以错误结算（而不是 park 等待一次永远不来的回喂），避免 worker 永久 busy、池位不释放。
+- **账户串行与失败语义**：并发取凭据时共享换发不再绑定先到者的 `AbortSignal`（一个请求被取消不再把其他等待者判成未登录）；换发失败会在状态里留下可读原因，不再出现「界面已登录、请求说未登录」而没有任何解释。
+- **工具结果不再被改写**：历史里出现没有匹配调用的工具结果时明确报错（`INVALID_ARGS`），不再把它当普通用户文本发给上游。
+- **错误原因与日志**：上游错误事件（429 / SAFETY / 上下文超限）不再被半截工具调用参数的 `PROTOCOL_DRIFT` 顶掉；代理模式构包失败的异常分类不再一律报成图片准入问题；代理行日志回调补上脱敏。
+- **资源回收与缓存自愈**：prompt 构造阶段失败时当场关闭刚建立的 ACP 会话并归还磁盘 claim；同版本二进制缓存损坏时可自愈（清掉损坏目录后重试一次）；流式下载中断上报真实原因（不再用 `arrayBuffer()` 二次失败掩盖）；凭据原子写的临时名改用 UUID + `'wx'`。
+- **ACP 单帧上限**：stdout 的行缓冲此前没有上限，对端吐出一条永不换行的超长行（畸形输出或二进制垃圾）会让内存一路增长；现在按 **64 MiB** 判定协议违规并关闭链路（口径对齐社区 magpie / agy bridge 实现），失败原因保留 `AGY_PROTOCOL_VIOLATION` 而不是笼统的「链接关闭」。
+- **工具 schema 的两处上游拒绝形态**：① DSH 的工具参数会带同一 schema 内部的本地引用，原实现把 `$ref` 当未知键丢掉，参数结构退化成空对象；现在按 JSON Pointer（`#/properties/…`）、`$defs` / `definitions` 名字展开，引用节点的 `description` 覆盖被引用节点，解析不到时退化为无字段 object，循环引用由深度上限截断。② 对象节点带**兄弟 union**（`{type:object, properties:{…}, oneOf:[{required:[…]}]}`，只表达字段互斥）时，原实现按类型联合会折叠掉整个对象、丢掉 `properties`，上游随即要求 `input_schema.type: object` 而 400；现在保留对象结构并丢弃该 union。两处口径都来自 magpie 直连实现对同一形态的处理（其 issue #4046/#4561）。
+- **上游指纹诊断（只读）**：magpie 生态的实测结论是 Antigravity 会把「请求文本里出现已知客户端指纹」（`x-anthropic-billing-header` 计费行、Claude Code / Agent SDK 身份句、`system-directive`、`RFC 2119` 等）的请求统一伪装成 `429 Resource has been exhausted`，换账号与等额度都无效；而 magpie 本体对 Code Assist 反而**保留**计费行（去掉它是为了别的厂商的前缀缓存命中率），两派做法互斥。本包不选边：代理模式只扫描本轮 system 并在命中时记一条诊断（仅规则 id 与次数），**不改写**任何请求内容；命中指纹时若上游回 429，错误文案会直接说明「可能是被拒绝的提示词指纹而不是额度耗尽」（magpie 对同一现象的态度也是如实告知，而不是让用户追着额度跑）。
+- **身份指纹打散（可选，默认关闭）**：新增即时开关 `cloakSensitiveWords`。照 magpie 的实测口径（其 `googleTurnsAway` 词表与 `antigravityCloak` 算法，输出逐字符对齐）：命中区间内的 ASCII 词段在首两个字符后各插一个零宽空格，只作用于 system 指令、不改用户消息，去掉零宽即还原原文。属于绕过上游识别，默认关闭。
+- **账号被停用不再当作「未授权」**：403 且上游写明 `violation of Terms of Service` / `disabled in this account` 时不再换发登录态重试，直接报 `AGY_ACCOUNT_SUSPENDED` 并说明需要申诉。
+- **三路静态审查后的修复**：① 指纹打散改用只降 ASCII 的小写（`toLowerCase` 对 `İ` 这类字符会变长，用降级串的下标切原串会错位，最坏情况是「日志说已打散、文本原样上行」）；② 打散与诊断覆盖整条 system 指令（`options.system` 与 `role: system/developer` 的消息——Codex 的身份句正是以后者进来的），且诊断读的是实际发出的文本、不再与打散状态自相矛盾；③ 429 只有在读到的上游原话确实是 `Resource has been exhausted` 时才做指纹归因，其余如实报限流并带上脱敏后的上游原话；④ 账号停用识别覆盖流内 error 事件与刷新后的第二次 403（payload 保留有界的上游 message）；⑤ 同版本二进制缓存自愈只在 `EEXIST`/`ENOTEMPTY` 时清目录重试，其余错误带原因抛出；⑥ 代理账户副本的原子写与凭据/缓存/会话映射统一用 UUID 临时名，共享换发的 `finally` 先挂 `catch`（不留无 handler 的 rejection），设置卡片的代理专属开关在 ACP 模式隐藏。
+- **DSH 兼容性核对**：对本机实机 **dsh 0.2.2-rc.1 / cordis 4.1.0** 逐个核对运行时导出——`LlmAdapter` 方法集、`registerAdapter().replace([])`、`LlmError`、品牌类型构造函数、`settings.describe/mutate`（含非 volatile 拒绝文案）、`attachments` 服务名与 `readImage` / `requestImageDimensions`、Typert 远程注册形状、客户端 `__ModuleLoader__.load` / `$mount` / `settings.section` 槽位——全部存在且签名一致；`cordis` peer 由 `~4.0.4 || 4.0.5-alpha.x` 放宽为 `>=4.0.4 <5` 以覆盖实机的 4.1.0，并删掉客户端 `inject` 里实机不存在的 `@deepseek-ai/dsh-client-ui-slots`。README 兼容性矩阵新增「实机运行时核对」一行。
+- **验证**：类型检查、47 个文件 / 843 项测试、构建通过。未在运行中的 Desktop 上实机验收，也未用真实 Google 账户复检。
+
 ## 0.1.37 · 2026-11-04
 
 - **AI Credits 未开启时整块隐藏**：药丸展开详情与设置页额度面板中，「用 agy CLI 查询额度」未开启（新错误码 `cli-disabled`）时不再渲染 AI Credits 区块，也不显示占位说明文字；开关已开但 CLI 缺失、CLI 不支持或上游无数据仍显示错误信息，便于排查。删除代理模式详情与设置页共用区块底部「套餐额度属于代理账户……」的整段说明。

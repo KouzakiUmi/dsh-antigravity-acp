@@ -10,6 +10,7 @@
  * 落盘位置：`<cacheDir>/proxy-account.json`，原子写（临时文件 + rename），
  * 尽力 chmod 600（Windows 上 chmod 语义有限，失败静默）。
  */
+import { randomUUID } from 'node:crypto'
 import { chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { parseTokenState } from '../runtime/quota.js'
@@ -147,7 +148,9 @@ export class ProxyAccountStore {
       const mk = this.deps.mkdirImpl ?? ((path: string) => mkdir(path, { recursive: true }))
       const mode = this.deps.chmodImpl ?? ((path: string, m: number) => chmod(path, m))
       await mk(this.deps.cacheDir)
-      const temp = `${this.path}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 10)}`
+      // 与 catalog-cache / session-map / credentials / binary 的写出对齐：临时名用
+      // 进程内有界的随机名（同进程写入已串行，这里是防跨进程/跨实例撞名）。
+      const temp = `${this.path}.tmp-${process.pid}-${randomUUID()}`
       await write(temp, `${JSON.stringify(credential, undefined, 2)}\n`)
       await mode(temp, 0o600).catch(() => undefined)
       await ren(temp, this.path)

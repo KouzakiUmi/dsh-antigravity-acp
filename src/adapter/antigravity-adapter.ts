@@ -52,9 +52,12 @@ import type { ModelOverride } from '../settings.js'
 export const AGY_PROVIDER_ID = 'antigravity-acp'
 
 /**
- * GUI 冷启动占位模型。DSH 模型选择器会丢掉 `options.length === 0` 的 provider
- * 分组，因此未观测 ACP 会话前必须至少广告一条目录，否则设置页看不到本路由。
- * 选中该 id 时不调用 session/set_config_option，沿用官方会话默认模型。
+ * 旧会话里可能留下的占位路由 id（`server-default`）。
+ *
+ * 现在**不再广告**这条目录项：未观测到官方目录时目录可以为空（见
+ * docs/reference.md），真实条目只在观测到 ACP 会话或 CLI 清单后出现。保留该
+ * 常量只为了识别历史会话/旧配置里的这个 id：命中且没有显式映射时不调用
+ * session/set_config_option，沿用官方会话默认模型。
  */
 export const AGY_PLACEHOLDER_MODEL_ID = 'server-default'
 
@@ -289,6 +292,19 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   #turnSubscription: { turn: PromptTurn; unsubscribe: () => void } | undefined
   #catalog: LlmModelInfo[] = []
   #modelSelector: ModelSelector | undefined
+  /**
+   * 已经为某个 ACP 会话确认写入过的模型值。`#modelSelector.currentValue` 是
+   * **连接级**缓存（可能来自别的会话、也可能来自上一次 `session/new`），新会话
+   * 省略 configOptions 时它不代表本会话的实际模型；用它短路会让新会话静默跑在
+   * agent 默认模型上。短路只认本会话自己确认过的值。
+   */
+  #sessionModelValues = new Map<string, string>()
+  /**
+   * 建立时**自己声明过** model 选择器的会话。只有这种会话才能用
+   * `#modelSelector.currentValue` 短路：会话省略 configOptions 时选择器仍留着
+   * 上一个会话的值，拿它短路会让新会话跑在 agent 默认模型上。
+   */
+  #sessionModelDeclared = new Set<string>()
   /** 模型目录的观察来源，用于列表页在真实会话之前就能给出缓存目录。 */
   #catalogObserved = false
   /** 目录缓存的惰性读取结果（只读一次）。 */
@@ -659,6 +675,8 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     // 上下文容量只在**实测**过（usage_update.size）或缓存过时才声明；官方目录
     // 不报告容量，绝不填猜测值。缺省时不带 context，压缩引擎按未知处理。
     const contextWindow = this.#contextWindows.get(model)
+    // 没有档位变体的模型必须省略 reasoning（宿主拒绝空 efforts）。
+    const reasoning = this.#reasoningInfo(model, tiers)
     return {
       provider,
       id: model,
@@ -668,15 +686,20 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       ...(contextWindow === undefined ? {} : { context: { contextWindow } }),
       // 思考强度菜单：官方把强度编码进模型 id 后缀，本 provider 只出家族条目，
       // 由菜单选择路由到对应档位（2026-10-16 用户指示）。
-      reasoning: this.#reasoningInfo(model, tiers),
+      ...(reasoning === undefined ? {} : { reasoning }),
     }
   }
 
-  /** 该路由可选的思考强度（low/medium/high，弱→强）；缺省档位为 medium。 */
-  #reasoningInfo(model: string, familyTiers = this.#familyTiers): LlmModelReasoningInfo {
+  /**
+   * 该路由可选的思考强度（low/medium/high，弱→强）；缺省档位为 medium。
+   * 返回 undefined 表示「此模型没有思考强度菜单」；宿主把 `efforts: []` 判为
+   * 非法元数据（INVALID_MODEL_REASONING）并使该模型不可用，所以不支持档位的
+   * 模型必须**省略 reasoning 字段**，不能给空数组。
+   */
+  #reasoningInfo(model: string, familyTiers = this.#familyTiers): LlmModelReasoningInfo | undefined {
     const tiers = familyTiers.get(modelFamilyId(model))
-    // 已知该 id 没有档位变体（目录里的普通 id）：强度菜单不适用，不显示。
-    if (tiers !== undefined && tiers.size === 0) return { efforts: [] }
+    // 已知该 id 没有档位变体（目录里的普通 id）：强度菜单不适用，不声明 reasoning。
+    if (tiers !== undefined && tiers.size === 0) return undefined
     const efforts = AGY_REASONING_EFFORTS
       .filter((effort) => tiers === undefined || tiers.has(effort))
       .map((effort) => ({
@@ -807,6 +830,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         _meta: { antigravity: { enabledTools: [], eagerMcpServers: tools.length > 0 ? [BRIDGE_MCP_SERVER_NAME] : [] } },
       }, { signal: options.signal, timeoutMs: Math.min(this.#promptTimeoutMs, 120_000) })
       this.observeSessionConfigOptions(response.configOptions)
+      if (findModelSelector(response.configOptions)) this.#rememberSessionModelSelector(entry.sessionId)
       await this.#applyModelSelection(link, entry.sessionId, options.model, options.reasoningEffort, options.signal)
       throwIfAborted(options.signal)
     } catch (error) {
@@ -918,11 +942,42 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     else this.#sessionStore?.delete(record.key, this.#sessionOwner)
   }
 
+  /**
+   * 记录某 ACP 会话已确认写入的模型值。上限与会话复用表一致（64），
+   * Map 保持插入序，超出时淘汰最早的一条，避免长进程里无界增长。
+   */
+  #rememberSessionModelValue(sessionId: string, value: string): void {
+    this.#sessionModelValues.delete(sessionId)
+    this.#sessionModelValues.set(sessionId, value)
+    while (this.#sessionModelValues.size > 64) {
+      const oldest = this.#sessionModelValues.keys().next().value
+      if (oldest === undefined) break
+      this.#sessionModelValues.delete(oldest)
+    }
+  }
+
+  /**
+   * 记录「本会话自己声明过 model 选择器」。与会话复用表同一上限，超出时淘汰
+   * 最早的一条并连带清掉它的模型值记录。
+   */
+  #rememberSessionModelSelector(sessionId: string): void {
+    this.#sessionModelDeclared.delete(sessionId)
+    this.#sessionModelDeclared.add(sessionId)
+    while (this.#sessionModelDeclared.size > 64) {
+      const oldest = this.#sessionModelDeclared.values().next().value
+      if (oldest === undefined) break
+      this.#sessionModelDeclared.delete(oldest)
+      this.#sessionModelValues.delete(oldest)
+    }
+  }
+
   /** 丢弃会话记录并关闭对端会话；失败忽略——记录本来就已经不可信。 */
   #dropSession(record: ReusedSession, reason: string): void {
     if (this.#sessions.get(record.key) !== record) return
     this.#sessions.delete(record.key)
     this.#sessionStore?.delete(record.key, this.#sessionOwner)
+    this.#sessionModelValues.delete(record.sessionId)
+    this.#sessionModelDeclared.delete(record.sessionId)
     this.#log?.info(`antigravity-acp: 放弃 ACP 会话复用（${reason}）`)
     this.#closeSession(record.link, record.sessionId)
   }
@@ -947,6 +1002,8 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     for (const record of [...this.#sessions.values()]) {
       if (link && record.link !== link) continue
       this.#sessions.delete(record.key)
+      this.#sessionModelValues.delete(record.sessionId)
+      this.#sessionModelDeclared.delete(record.sessionId)
       this.#log?.info(`antigravity-acp: 关闭 ACP 会话（${reason}）`)
       this.#closeSession(record.link, record.sessionId)
     }
@@ -1168,6 +1225,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       }, { signal: options.signal })
       check()
       this.observeSessionConfigOptions(session.configOptions)
+      if (findModelSelector(session.configOptions)) this.#rememberSessionModelSelector(session.sessionId)
       this.#lifecycle?.roundPhase('model')
       await this.#applyModelSelection(link, session.sessionId, options.model, options.reasoningEffort, options.signal)
       check()
@@ -1245,6 +1303,8 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       bridge: this.#bridge,
       promptTimeoutMs: purposeTimeoutMs(options.purpose, this.#promptTimeoutMs),
       parkSettleMs: this.#parkSettleMs,
+      // 标题生成与压缩这类一次性请求的调用方只消费 chunk，不会回喂工具结果。
+      oneShot: options.purpose !== undefined,
       onPromptSettled: (settledTurn, response) => {
         if (this.#cancelGrace?.turn === settledTurn) {
           if (response && ['cancelled', 'end_turn', 'max_tokens', 'max_turn_requests', 'refusal'].includes(response.stopReason)) {
@@ -1313,9 +1373,27 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         `${reused ? ' reused=true' : ''}`,
     )
     // 复用会话只发增量；否则全量重建（含 system、工具策略与历史强调块）。
-    const content = reused
-      ? await buildPromptDeltaWithImages(incrementalMessages(options.messages, reused.sentCount), this.#imageOptions(options.signal))
-      : await buildPromptWithImages(options.system, options.messages, tools, this.#imageOptions(options.signal))
+    let content: Awaited<ReturnType<typeof buildPromptWithImages>>
+    try {
+      content = reused
+        ? await buildPromptDeltaWithImages(incrementalMessages(options.messages, reused.sentCount), this.#imageOptions(options.signal))
+        : await buildPromptWithImages(options.system, options.messages, tools, this.#imageOptions(options.signal))
+    } catch (error) {
+      // prompt 还没发出去就失败（图片不可用 / 被取消 / 内容不支持）：刚建立的
+      // ACP 会话与磁盘 claim 必须当场回收，不能只靠空闲回收兜底。
+      this.#bridge.invalidateRound('prompt 构造失败')
+      this.#releaseTurnSubscription(turn)
+      if (this.#turn === turn) this.#turn = undefined
+      const ephemeral = this.#ephemeral.get(turn)
+      if (ephemeral) {
+        this.#ephemeral.delete(turn)
+        this.#closeSession(ephemeral, turn.sessionId)
+      }
+      if (reused) this.#dropSession(reused, 'prompt 构造失败')
+      else if (key !== undefined) this.#sessionStore?.unclaim(key, this.#sessionOwner)
+      this.#lifecycle?.failed(error)
+      throw error
+    }
     this.#lifecycle?.promptSent()
     // 全量重建后先把「已发送」记到本轮完整历史，之后才有资格复用。
     const record = reused ?? (key !== undefined && this.#reuseSessions
@@ -1619,7 +1697,10 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         AGY_ADAPTER_ERROR.NO_MODEL_SELECTOR,
       )
     }
-    if (selector.currentValue === requested) return
+    // 两种短路都只认本会话自己的证据：已确认写入过的值，或本会话建立时自己
+    // 声明的选择器当前值。连接级选择器可能来自别的会话，不能用。
+    if (this.#sessionModelValues.get(sessionId) === requested) return
+    if (this.#sessionModelDeclared.has(sessionId) && selector.currentValue === requested) return
     // 自诊断：把路由结果落进宿主日志（模型选择出问题时，这是唯一能看到「DSH
     // 给的 id → 我们发出去的 configId/value」的地方）。
     this.#log?.info(
@@ -1641,6 +1722,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     }
     // RPC 成功即接受选模；服务端可归一化模型 ID，不再额外要求回显逐字一致。
     // 缺少模型配置时保留现有目录，后续 config_option_update 仍可更新它。
+    this.#rememberSessionModelValue(sessionId, requested)
     if (findModelSelector(response.configOptions)) this.observeSessionConfigOptions(response.configOptions)
   }
 }

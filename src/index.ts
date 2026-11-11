@@ -652,7 +652,7 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
   const modeBus = createProxyModeBus({
     mode: () => config.proxyMode === true,
     proxySettings: () => ({ url: config.proxyUrl, bypass: config.proxyBypass }),
-    modelSettings: () => ({ modelOverrides: config.modelOverrides }),
+    modelSettings: () => ({ modelOverrides: config.modelOverrides, cloakSensitiveWords: config.cloakSensitiveWords === true }),
   })
   const control = new SettingsControl({
     runtime: () => ({ ...adapter.read(), modelCatalogRevision }),

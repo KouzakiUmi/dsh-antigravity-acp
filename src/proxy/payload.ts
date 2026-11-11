@@ -282,7 +282,7 @@ function rememberToolName(toolNames: Map<string, ToolCallState>, callId: unknown
 
 function consumeToolBinding(toolNames: Map<string, ToolCallState>, callId: unknown): ToolCallBinding {
   const state = toolNames.get(requireToolCallId(callId))
-  if (state === undefined) throw new LlmError('代理模式工具结果没有匹配的调用', 'INVALID_ARGS')
+  if (state === undefined) throw new LlmError('代理模式工具结果没有匹配的调用：会话历史已被裁剪或回退，请新建会话后重试', 'INVALID_ARGS')
   const next = state.pending.shift()
   return next ?? state.last
 }
@@ -314,17 +314,17 @@ async function mapMessage(
   let replayIndex = 0
   let emittedToolResponse = false
   if (message.role === 'tool' && typeof message.toolCallId === 'string' && message.toolCallId.length > 0) {
-    const binding = toolNames.has(message.toolCallId) ? consumeToolBinding(toolNames, message.toolCallId) : undefined
-    if (binding !== undefined) {
-      emittedToolResponse = true
-      parts.push({
-        functionResponse: {
-          ...(isClaude ? { id: binding.id } : {}),
-          name: binding.name,
-          response: toolResponsePayload(blocksToText(message.content), message.isError === true),
-        },
-      })
-    }
+    // 找不到匹配调用的工具结果（历史被裁剪/回退后残留）不能降级成普通用户
+    // 文本发上游——那是静默改写历史。这里明确失败，让历史重建流程接手。
+    const binding = consumeToolBinding(toolNames, message.toolCallId)
+    emittedToolResponse = true
+    parts.push({
+      functionResponse: {
+        ...(isClaude ? { id: binding.id } : {}),
+        name: binding.name,
+        response: toolResponsePayload(blocksToText(message.content), message.isError === true),
+      },
+    })
   }
   let sawClaudeFunctionCall = false
   for (const block of message.content) {
@@ -426,7 +426,7 @@ export interface ProxyProviderEvent {
   parts: readonly ProxyProviderPart[]
   usage?: TokenUsage
   finish?: string
-  error?: { status?: number; code?: string; contextWindowExceeded?: boolean }
+  error?: { status?: number; code?: string; contextWindowExceeded?: boolean; message?: string }
 }
 
 const MAX_PROVIDER_PARTS = 4096
@@ -523,10 +523,16 @@ function errorDetails(value: Record<string, unknown>): NonNullable<ProxyProvider
   const status = numberValue(value.status) ?? numberValue(value.code)
   const code = stringValue(value.status) ?? stringValue(value.code)
   const contextWindowExceeded = reportsContextWindowExceeded(value)
+  // 上游原话有界保留：判定「账号被停用」这类需要在流内 error 事件里认的形态时，
+  // 只有 code/status 不够（Google 把原因写在 message 里）。只留前 512 字符且拒绝
+  // 控制字符；展示路径仍会各自脱敏。
+  const raw = stringValue(value.message) ?? ''
+  const message = raw.length > 0 && raw.length <= 4096 && !containsControl(raw) ? raw.slice(0, 512) : undefined
   return {
     ...(status === undefined ? {} : { status }),
     ...(code === undefined ? {} : { code }),
     ...(contextWindowExceeded ? { contextWindowExceeded: true } : {}),
+    ...(message === undefined ? {} : { message }),
   }
 }
 
