@@ -27,7 +27,8 @@ import {
   resolveModelWithTier,
 } from '@cortexkit/antigravity-auth-core'
 import { LlmError } from '@deepseek-ai/dsh-llm'
-import type { ContentBlock, GenerateOptions, RequestMessage, TokenUsage } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, RequestMessage, TokenUsage } from '@deepseek-ai/dsh-llm'
+import type { AdapterRequestOptions } from '../adapter/request-options.js'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { buildProxyFunctionDeclarations, compatibleProxyReplayState, proxyModelFamily, PROXY_MAX_SIGNATURE_LENGTH } from './replay.js'
 import type { ProxyReplayBlock, ReplayBlockKind } from './replay.js'
@@ -56,7 +57,7 @@ export function createProxySessionStore(): AgyRequestSessionStore {
   return new AgyRequestSessionStore(PROXY_SESSION_STORE_KEY)
 }
 
-export function proxySessionKey(options: GenerateOptions): string {
+export function proxySessionKey(options: AdapterRequestOptions): string {
   return options.sessionId === undefined ? 'default' : `session:${fnv1a64Signed(String(options.sessionId))}`
 }
 
@@ -86,7 +87,7 @@ export function normalizeReasoningEffort(value: string | undefined): 'low' | 'me
 }
 
 export async function buildProxyGeneratePayload(
-  options: GenerateOptions,
+  options: AdapterRequestOptions,
   credential: ProxyCredentialForPayload,
   sessions: AgyRequestSessionStore,
   timestamp: number,
@@ -143,7 +144,7 @@ export async function buildProxyGeneratePayload(
 }
 
 /** 请求成功完成后推进会话步数（labels 的 last_step_index 连续性）。 */
-export function completeProxyExecution(sessions: AgyRequestSessionStore, options: GenerateOptions): void {
+export function completeProxyExecution(sessions: AgyRequestSessionStore, options: AdapterRequestOptions): void {
   sessions.completeExecution(proxySessionKey(options))
 }
 

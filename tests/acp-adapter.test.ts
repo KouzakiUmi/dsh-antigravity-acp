@@ -15,7 +15,8 @@ import {
   resolveRetryPolicy,
   ToolCallId,
 } from '@deepseek-ai/dsh-llm'
-import type { GenerateOptions, RequestMessage, StreamChunk, ToolSchema } from '@deepseek-ai/dsh-llm'
+import type { RequestMessage, StreamChunk, ToolSchema } from '@deepseek-ai/dsh-llm'
+import type { AdapterRequestOptions } from '../src/adapter/request-options.js'
 import type { ContentBlock, RequestPermissionRequest, SessionConfigOption } from '@agentclientprotocol/sdk'
 import { AntigravityAcpAdapter, AGY_PROVIDER_ID, AGY_PLACEHOLDER_MODEL_ID, AGY_ADAPTER_ERROR } from '../src/adapter/antigravity-adapter.js'
 import type { ModelOverride } from '../src/settings.js'
@@ -230,7 +231,7 @@ function createHarness(
   }
 }
 
-function baseOptions(overrides: Partial<GenerateOptions> = {}): GenerateOptions {
+function baseOptions(overrides: Partial<AdapterRequestOptions> = {}): AdapterRequestOptions {
   return {
     provider: AGY_PROVIDER_ID,
     model: 'gemini-3-pro',
@@ -1033,7 +1034,7 @@ describe('StreamChunk 序列映射', () => {
 })
 
 describe('不支持的请求项', () => {
-  const cases: Array<[string, Partial<GenerateOptions>]> = [
+  const cases: Array<[string, Partial<AdapterRequestOptions>]> = [
     ['temperature', { temperature: 0.5 }],
     ['stop', { stop: ['END'] }],
   ]
@@ -2210,7 +2211,7 @@ describe('prompt 重建与并发防御', () => {
 
 describe('干净失败后的会话复用', () => {
   it('空回复（clean 失败）后仍复用同一 ACP 会话，不重建', async () => {
-    const session = 'dsh-session-clean' as unknown as NonNullable<GenerateOptions['sessionId']>
+    const session = 'dsh-session-clean' as unknown as NonNullable<AdapterRequestOptions['sessionId']>
     const harness = createHarness()
     const first = collect(harness.adapter.stream(baseOptions({ sessionId: session })))
     await waitForRequest(harness.agent, 'session/prompt')
@@ -2365,7 +2366,7 @@ describe('取消排空与统一空闲租约回归', () => {
 
 describe('ACP 会话复用与跨进程恢复', () => {
   // dsh-llm 只导出 branded 类型、不导出 SessionId 构造函数：测试里直接断言。
-  const DSH_SESSION = 'dsh-session-reuse' as unknown as NonNullable<GenerateOptions['sessionId']>
+  const DSH_SESSION = 'dsh-session-reuse' as unknown as NonNullable<AdapterRequestOptions['sessionId']>
 
   function secondRoundMessages(): RequestMessage[] {
     return [
@@ -2844,7 +2845,7 @@ describe('ACP 会话复用与跨进程恢复', () => {
   it('tool-calls 与续轮 finish 即 return 仍提交游标，下个用户轮复用且不重发工具轨迹', async () => {
     const harness = createHarness()
     const request = baseOptions({ sessionId: DSH_SESSION, tools: TOOLS })
-    const untilFinish = async (options: GenerateOptions) => {
+    const untilFinish = async (options: AdapterRequestOptions) => {
       const chunks: StreamChunk[] = []
       for await (const chunk of harness.adapter.stream(options)) { chunks.push(chunk); if (chunk.type === 'finish') break }
       return chunks

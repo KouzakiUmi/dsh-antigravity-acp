@@ -1,9 +1,10 @@
 /** ACP 会话的输入前缀、已交付输出与上下文去重。DSH 始终是历史权威。 */
 import { createHash } from 'node:crypto'
-import type { ContentBlock, GenerateOptions, RequestMessage } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, RequestMessage } from '@deepseek-ai/dsh-llm'
+import type { AdapterRequestOptions, AdapterRequestOwner } from './request-options.js'
 import { messageValue, stable } from './continuation-state.js'
 
-export function reusableSessionKey(options: Pick<GenerateOptions, 'sessionId' | 'purpose'>): string | undefined {
+export function reusableSessionKey(options: AdapterRequestOwner): string | undefined {
   if (options.purpose !== undefined || !options.sessionId) return undefined
   return `${options.sessionId}::chat`
 }
@@ -95,7 +96,7 @@ export function outputMatches(fresh: readonly RequestMessage[], expected: string
 }
 
 export function routeFingerprint(
-  options: Pick<GenerateOptions, 'provider' | 'model' | 'reasoningEffort' | 'system' | 'tools'>,
+  options: Pick<AdapterRequestOptions, 'provider' | 'model' | 'reasoningEffort' | 'system' | 'tools'>,
   override?: { target?: string; effort?: string },
 ): string {
   return createHash('sha256').update(stable({

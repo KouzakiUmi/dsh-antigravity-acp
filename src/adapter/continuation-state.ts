@@ -1,4 +1,5 @@
-import type { ContentBlock, GenerateOptions, RequestMessage } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, RequestMessage } from '@deepseek-ai/dsh-llm'
+import type { AdapterRequestOptions } from './request-options.js'
 
 /** Only model-visible values participate; durable message IDs are not prompt content. */
 export function messageValue(message: RequestMessage): unknown {
@@ -15,7 +16,7 @@ export function stable(value: unknown): string {
   })
 }
 
-function configuration(options: GenerateOptions): string {
+function configuration(options: AdapterRequestOptions): string {
   return stable({
     provider: options.provider, model: options.model, effort: options.reasoningEffort?.toString(),
     system: options.system ?? '',
@@ -29,14 +30,14 @@ export class ContinuationState {
   readonly #history: string[]
   readonly #emitted: ContentBlock[] = []
 
-  constructor(options: GenerateOptions) {
+  constructor(options: AdapterRequestOptions) {
     this.#configuration = configuration(options)
     this.#history = options.messages.map((message) => stable(messageValue(message)))
   }
 
   emitted(block: ContentBlock): void { this.#emitted.push(structuredClone(block)) }
 
-  accepts(options: GenerateOptions, resultCount: number): boolean {
+  accepts(options: AdapterRequestOptions, resultCount: number): boolean {
     if (configuration(options) !== this.#configuration) return false
     const prefix = options.messages.slice(0, -resultCount)
     if (prefix.length < this.#history.length) return false

@@ -4,6 +4,12 @@
 
 记录源码与发布内容，不将本地构建、npm 发布和本机升级混为同一状态。日期采用 Asia/Hong_Kong。更早历史见 [Git 提交记录](https://github.com/KouzakiUmi/dsh-antigravity-acp/commits/main/)。
 
+## 未发布 · 2026-11-06
+
+- **契约基准对齐当前 Core**：开发依赖 `dsh-llm` / `dsh-attachment` / `dsh-subprocess` / `dsh-typert-protocol` 从 `0.2.1-alpha.4` 升到 `0.2.2-rc.1`，Cordis 从 `4.0.5-alpha.2` 升到 `4.1.0`；Cordis peer 范围补入 `^4.1.0`，使安装准入覆盖当前桌面 Core 实际加载的版本。三个 `dsh-*` peer 的既有范围本已覆盖 `0.2.2-rc.1`，未改。
+- **转发型请求的 `purpose` 放宽**：`dsh-llm` 0.2.2 起 `GenerateOptions.purpose` 由生产者包声明合并（`LlmRequestPurposeMap`）给出，本包编译单元下默认泛型退化为 `never`。新增 [`src/adapter/request-options.ts`](../src/adapter/request-options.ts)，把入站请求、回合归属判定与准备结果的 `purpose` 统一放宽为 `string`；运行时行为不变。
+- **验证**：类型检查、44 个文件 / 807 项测试与构建通过（契约基准 `0.2.2-rc.1` / Cordis `4.1.0`）。未安装到运行中的 Desktop，未做真实账户与 GUI 验收。
+
 ## 0.1.37 · 2026-11-04
 
 - **AI Credits 未开启时整块隐藏**：药丸展开详情与设置页额度面板中，「用 agy CLI 查询额度」未开启（新错误码 `cli-disabled`）时不再渲染 AI Credits 区块，也不显示占位说明文字；开关已开但 CLI 缺失、CLI 不支持或上游无数据仍显示错误信息，便于排查。删除代理模式详情与设置页共用区块底部「套餐额度属于代理账户……」的整段说明。

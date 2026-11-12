@@ -114,10 +114,11 @@ flowchart LR
 |---|---|
 | Node.js | `>=22.19` |
 | DSH Core peer 范围 | `>=0.2.0-rc.1 <0.2.1-0 \|\| >=0.2.1-0 <0.3.0-0`，适用于所声明的三个 `dsh-*` peer |
-| 开发契约基准 | `dsh-llm` / `dsh-subprocess` / `dsh-typert-protocol` / `dsh-attachment` **0.2.1-alpha.4**，Cordis **4.0.5-alpha.2** |
+| 目标运行环境（2026-11-06 取证） | DSH NEXT 桌面 **2.0.22-next**，内嵌 Core `dsh-*` **0.2.2-rc.1**、Cordis **4.1.0**、schemastery **3.19.0** |
+| 开发契约基准 | `dsh-llm` / `dsh-subprocess` / `dsh-typert-protocol` / `dsh-attachment` **0.2.2-rc.1**，Cordis **4.1.0** |
 | 上游协议 | ACP **v1**；SDK **1.4.0** 与默认 server **1.4.0** 是两个独立版本 |
-| 当前源码本地验证 | 0.1.37 当前工作副本：类型检查、44 个文件 / 804 项测试与构建通过；另有无 CLI 的真实本地 OAuth 回调闭环及既有离线 Chrome 36 项布局检查 |
-| 桌面契约核对 | 使用分发包内 `dsh-llm` / `dsh-typert-protocol` 0.2.1-rc.5、Cordis 4.0.5、Typert 注册器隔离加载构建产物，验证单次贡献注册、代理路由及卸载清理；未调用真实账户 |
+| 当前源码本地验证 | 0.1.37 当前工作副本（契约基准 `0.2.2-rc.1` / Cordis `4.1.0`）：类型检查、44 个文件 / 807 项测试与构建通过；另有无 CLI 的真实本地 OAuth 回调闭环及既有离线 Chrome 36 项布局检查 |
+| 桌面契约核对 | 历史核对使用当时分发包内 `dsh-llm` / `dsh-typert-protocol` 0.2.1-rc.5、Cordis 4.0.5 隔离加载构建产物，验证单次贡献注册、代理路由及卸载清理；2026-11-06 复核实际内嵌 Core 为 `0.2.2-rc.1` / Cordis `4.1.0`，类型与测试改以该版本为准 |
 | 尚未覆盖 | 0.1.37 安装后的 Desktop GUI、真实 Google 授权、真实上游生成与图片识别、非 Windows 实机 |
 
 宿主附件服务是可选依赖，缺少时仍可文本聊天，但不声明图片能力。安装准入、开发类型检查和真实运行兼容性分别看待。[完整声明与验证方法](docs/development.md)

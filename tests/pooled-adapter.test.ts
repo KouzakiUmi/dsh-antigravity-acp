@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { GenerateOptions, LlmModelInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
+import type { LlmModelInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
+import type { AdapterRequestOptions } from '../src/adapter/request-options.js'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { AttachmentId } from '@deepseek-ai/dsh-attachment'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
@@ -17,7 +18,7 @@ type Completion = 'finish' | 'park'
 class FakeWorker implements AcpWorker {
   busy = false
   running = false
-  calls: Array<{ options: GenerateOptions; complete(value: Completion): void }> = []
+  calls: Array<{ options: AdapterRequestOptions; complete(value: Completion): void }> = []
   catalog: LlmModelInfo[] = []
   resolved: LlmResolvedModelInfo = { provider: 'test', id: 'model', name: 'model', inputModalities: ['text'] }
   warmupGate: ReturnType<typeof deferred<void>> | undefined
@@ -50,11 +51,11 @@ class FakeWorker implements AcpWorker {
         try { await Promise.race([this.preparationGate.promise, cancelled]) }
         finally { signal?.removeEventListener('abort', abort) }
       }
-      return { model: this.resolved, stream: (options: GenerateOptions) => this.stream(options) }
+      return { model: this.resolved, stream: (options: AdapterRequestOptions) => this.stream(options) }
     }),
   }
 
-  private async *stream(options: GenerateOptions): AsyncGenerator<StreamChunk> {
+  private async *stream(options: AdapterRequestOptions): AsyncGenerator<StreamChunk> {
     const gate = deferred<Completion>()
     this.calls.push({ options, complete: gate.resolve })
     this.running = true
@@ -98,12 +99,12 @@ function setup(options: { capacity?: number; queueTimeoutMs?: number; ensureImag
   return { pool, workers }
 }
 
-function request(sessionId: string, overrides: Partial<GenerateOptions> = {}): GenerateOptions {
-  return { provider: 'test', model: 'model', sessionId: sessionId as GenerateOptions['sessionId'], messages: [], ...overrides }
+function request(sessionId: string, overrides: Partial<AdapterRequestOptions> = {}): AdapterRequestOptions {
+  return { provider: 'test', model: 'model', sessionId: sessionId as AdapterRequestOptions['sessionId'], messages: [], ...overrides }
 }
 
 async function flush() { for (let i = 0; i < 20; i++) await Promise.resolve() }
-function run(pool: PooledAcpAdapter, options: GenerateOptions) {
+function run(pool: PooledAcpAdapter, options: AdapterRequestOptions) {
   return (async () => { const chunks: StreamChunk[] = []; for await (const chunk of pool.stream(options)) chunks.push(chunk); return chunks })()
 }
 function outcome<T>(promise: Promise<T>) {
@@ -342,12 +343,12 @@ describe('PooledAcpAdapter scheduling with independent fake workers', () => {
     const b = run(pool, request('b'))
     await flush()
     workers[0]!.resolved = { ...workers[0]!.resolved, inputModalities: ['text'], reasoning: { efforts: [
-      { id: 'low' as NonNullable<GenerateOptions['reasoningEffort']>, name: 'Low' },
-      { id: 'high' as NonNullable<GenerateOptions['reasoningEffort']>, name: 'High' },
-    ], defaultEffort: 'medium' as GenerateOptions['reasoningEffort'] } }
+      { id: 'low' as NonNullable<AdapterRequestOptions['reasoningEffort']>, name: 'Low' },
+      { id: 'high' as NonNullable<AdapterRequestOptions['reasoningEffort']>, name: 'High' },
+    ], defaultEffort: 'medium' as AdapterRequestOptions['reasoningEffort'] } }
     workers[1]!.resolved = { ...workers[1]!.resolved, inputModalities: ['text', 'image'], reasoning: { efforts: [
-      { id: 'medium' as NonNullable<GenerateOptions['reasoningEffort']>, name: 'Medium' },
-    ], defaultEffort: 'medium' as GenerateOptions['reasoningEffort'] } }
+      { id: 'medium' as NonNullable<AdapterRequestOptions['reasoningEffort']>, name: 'Medium' },
+    ], defaultEffort: 'medium' as AdapterRequestOptions['reasoningEffort'] } }
     const resolved = await pool.resolveModel('test', 'model')
     expect(resolved.inputModalities).toEqual(['text'])
     expect(resolved.reasoning?.efforts.map(entry => entry.id.toString())).toEqual(['low', 'medium', 'high'])

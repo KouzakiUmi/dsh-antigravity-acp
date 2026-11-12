@@ -29,9 +29,9 @@ npm 包名为 `dsh-bundle-antigravity-host`，provider ID 为 `antigravity-acp`�
 
 | 依赖 / 协议 | 当前基准 | 核验边界 |
 |---|---|---|
-| DSH `dsh-llm` / `dsh-subprocess` / `dsh-typert-protocol` | 开发依赖 `0.2.1-alpha.4` | 本地类型、调用链与测试；不是全部 peer 范围实机认证 |
-| 可选 `dsh-attachment` | 开发依赖 `0.2.1-alpha.4` | Host 服务在场时读取图片，缺少时文本降级 |
-| Cordis | 开发依赖 `4.0.5-alpha.2` | 生命周期与注入契约 |
+| DSH `dsh-llm` / `dsh-subprocess` / `dsh-typert-protocol` | 开发依赖 `0.2.2-rc.1` | 本地类型、调用链与测试；不是全部 peer 范围实机认证 |
+| 可选 `dsh-attachment` | 开发依赖 `0.2.2-rc.1` | Host 服务在场时读取图片，缺少时文本降级 |
+| Cordis | 开发依赖 `4.1.0` | 生命周期与注入契约 |
 | ACP SDK / wire protocol | SDK `1.4.0` / wire **v1** | 两者不是同一版本；v2 / RFD 草案不能替代 v1 |
 | 默认官方 ACP server | `1.4.0` | 与 SDK 分别设置；厂商 `_meta.antigravity` 扩展不自动适用于任意上游版本 |
 | MCP SDK | `1.32.1` | loopback 工具桥与结果内容 |
@@ -39,7 +39,9 @@ npm 包名为 `dsh-bundle-antigravity-host`，provider ID 为 `antigravity-acp`�
 | undici | `8.11.2` | 本包直接依赖，HTTP / SOCKS 代理；SOCKS5 可能输出实验性 API 警告 |
 | React / test renderer | `18.3.1` | Client 使用宿主 React；renderer 是测试开发依赖，不是生产私带的 UI 运行时 |
 
-三个 `dsh-*` peer 当前均声明 `>=0.2.0-rc.1 <0.2.1-0 || >=0.2.1-0 <0.3.0-0`，Cordis peer 为 `~4.0.4 || 4.0.5-alpha.1 || 4.0.5-alpha.2`。宽范围只表达安装条件，不能推导全部版本通过运行验证。CLI、Desktop 壳与实际 Core 的版本应分别核对。
+三个 `dsh-*` peer 当前均声明 `>=0.2.0-rc.1 <0.2.1-0 || >=0.2.1-0 <0.3.0-0`，Cordis peer 为 `~4.0.4 || 4.0.5-alpha.1 || 4.0.5-alpha.2 || ^4.1.0`。宽范围只表达安装条件，不能推导全部版本通过运行验证。CLI、Desktop 壳与实际 Core 的版本应分别核对。
+
+`GenerateOptions.purpose` 自 `dsh-llm` 0.2.2 起改由各生产者包声明合并（`LlmRequestPurposeMap`）给出，默认泛型在没有生产者声明的编译单元里退化为 `never`。本包是转发型适配器，按该版本的公开约定把入站请求与准备结果的 `purpose` 放宽为 `string`（[`src/adapter/request-options.ts`](../src/adapter/request-options.ts)）：既不替生产者声明用途，也不把 `never` 当成真实契约。
 
 ## 构建与本地打包
 
@@ -60,12 +62,12 @@ npm pack
 
 ## 本次验证矩阵
 
-0.1.35 本地检查日期：**2026-11-03**；0.1.36（额度取数解耦、设置页紧凑布局与隔离修复）复检日期：**2026-11-04**（Asia/Hong_Kong）；0.1.37（AI Credits 未开启时隐藏、删除代理积分说明、保存栏面板化样式）复检日期：**2026-11-04**（Asia/Hong_Kong）。
+0.1.35 本地检查日期：**2026-11-03**；0.1.36（额度取数解耦、设置页紧凑布局与隔离修复）复检日期：**2026-11-04**（Asia/Hong_Kong）；0.1.37（AI Credits 未开启时隐藏、删除代理积分说明、保存栏面板化样式）复检日期：**2026-11-04**（Asia/Hong_Kong）；契约基准升到 Core `0.2.2-rc.1` / Cordis `4.1.0` 的适配复检日期：**2026-11-06**（Asia/Hong_Kong）。
 
 | 验证项 | 状态与范围 |
 |---|---|
 | TypeScript | `npm run typecheck` 通过 |
-| 隔离回归 | 44 个文件 / 804 项通过；本次使用系统 Node 24 运行同一 TypeScript / Vitest / 构建入口 |
+| 隔离回归 | 44 个文件 / 807 项通过；本次使用系统 Node 24 运行同一 TypeScript / Vitest / 构建入口，契约基准为 Core `0.2.2-rc.1` / Cordis `4.1.0` |
 | 构建 | `npm run build` 通过 |
 | 工具 / runtime | 假 ACP / MCP、乱序工具结果、池所有权、续轮变更、取消、写入阻塞和回收 |
 | 图片 | 附件引用校验、图片内容映射与跨 worker 能力；代理模式 inlineData 准入、12MB 预算与 offload 协商、附件缺席降级；未调用真实视觉模型 |
@@ -77,7 +79,7 @@ npm pack
 | 设置页 UX | 精简首屏、无修改时隐藏保存区、当前模式账户、紧凑模型列表、搜索/筛选/批量启停与完整详情、独立高级分组；未保存计数/撤销/只读/冲突，网络草稿与取消可用性、授权链接/阶段；手动额度、模式来源校验、实际路由家族、账户切换及旧广播、共享刷新收尾 |
 | 浏览器布局 | 已注册 Chrome + 既有 Playwright 1.63.0，离线真实 Client 静态夹具；320/390/1280 宽度、深浅主题及顶部/中部/底部共 36 项检查，保存栏可见且无横向溢出；静态布局不替代桌面实例验收 |
 | 模式切换 | 请求代理模式即注销 ACP，缺席/注册失败/卸载均不回退；Host 控制层拒绝 ACP 登录与预热，目录按模式和账户代际隔离，额度请求校验期望模式。真实 React renderer 覆盖草稿与生效状态、代理登录/退出后更新模型、失败原因与过期链接清理 |
-| 桌面注册契约 | 核对当前桌面分发包内 Core 0.2.1-rc.5 / Cordis 4.0.5 的 Typert 注册实现；使用该包实际依赖隔离导入构建产物，真实 Context 中只出现一个 package-face，代理路由生效，卸载后路由和 ready 状态清理。未连接当前运行中的 Host 或真实账户 |
+| 桌面注册契约 | 历史核对基于当时桌面分发包内 Core 0.2.1-rc.5 / Cordis 4.0.5 的 Typert 注册实现：隔离导入构建产物，真实 Context 中只出现一个 package-face，代理路由生效，卸载后路由和 ready 状态清理；未连接运行中的 Host 或真实账户。2026-11-06 复核当前安装的内嵌 Core 为 `0.2.2-rc.1` / Cordis `4.1.0`，类型与隔离回归改以该版本为准，未重做桌面隔离加载 |
 | 代理（出网） | 合成依赖、动态变更与清空、不打断旧响应、卸载释放、失败不直连、运行期地址变坏时按 Promise 拒绝、装载期非法地址不阻断插件、本地 SOCKS 测试；不是 Google 网络可达性保证 |
 | 代理环境继承 | HTTPS / ALL / HTTP 优先级、显式值覆盖及清空恢复、OAuth 与原生 TLS 接线、本地 CONNECT 首包和 NO_PROXY。无凭据 Google 探针对比直连超时与环境代理收到 401，只验证工具进程所见网络，不代表运行中 Host 的环境或账户可用性 |
 | 额度取数 | 假 fetch 覆盖超时折叠、401/403 按状态码重试一次、401 后成功、非 401/403 不重试、OAuth 元数据配对；`cliQuotaEnabled` 默认关闭时即使注入 CLI 也不 spawn，打开后才走 `/usage` 与 `/credits`，关闭后旧快照失效；代理模式默认零 `agy` 调用且套餐额度仍取代理账户，打开开关后只有 Credits 走 CLI；不触真实账户 |

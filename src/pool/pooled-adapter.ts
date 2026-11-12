@@ -1,5 +1,6 @@
 import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
-import type { GenerateOptions, LlmModelInfo, LlmResolvedModelInfo, PreparedAdapterCall, StreamChunk } from '@deepseek-ai/dsh-llm'
+import type { LlmModelInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
+import type { AdapterPreparedCall, AdapterRequestOptions, AdapterRequestOwner } from '../adapter/request-options.js'
 import type { AcpLifecycleSnapshot } from '../runtime/lifecycle.js'
 import type { AntigravityAcpAdapter } from '../adapter/antigravity-adapter.js'
 import { AGY_TURN_ERROR } from '../adapter/prompt-turn.js'
@@ -14,12 +15,12 @@ export interface AcpWorker {
 interface Slot {
   worker: AcpWorker
   leased: boolean
-  owner?: Pick<GenerateOptions, 'sessionId' | 'purpose'>
+  owner?: AdapterRequestOwner
   /** 最近一次服务过的 DSH 对话：新对话优先用别的 worker，避免抢走别人的复用会话。 */
   lastOwner?: string
 }
 interface Waiter {
-  options?: GenerateOptions
+  options?: AdapterRequestOptions
   resolve(slot: Slot): void
   reject(error: unknown): void
   cleanup(): void
@@ -83,7 +84,7 @@ export class PooledAcpAdapter extends LlmAdapter {
     this.prepared = false
   }
 
-  override async prepareCall(provider: string, model: string, signal?: AbortSignal): Promise<PreparedAdapterCall> {
+  override async prepareCall(provider: string, model: string, signal?: AbortSignal): Promise<AdapterPreparedCall> {
     if (this.closed) throw new LlmError('ACP 插件已卸载', 'AGY_LINK_CLOSED')
     if (signal?.aborted) throw new LlmError('ACP 请求已取消', AGY_TURN_ERROR.ABORTED)
     // Discover input capabilities before DSH projects attachments into a text-only request.
@@ -115,7 +116,7 @@ export class PooledAcpAdapter extends LlmAdapter {
     if (this.closed) throw new LlmError('ACP 插件已卸载', 'AGY_LINK_CLOSED')
     return { model: await this.resolveModel(provider, model, signal), stream: options => this.stream(options) }
   }
-  override async *stream(options: GenerateOptions): AsyncGenerator<StreamChunk> {
+  override async *stream(options: AdapterRequestOptions): AsyncGenerator<StreamChunk> {
     const slot = await this.acquire(options, options.signal)
     try {
       // 握手失败或取消也必须归还槽位，不能让池被一次图片准备错误耗尽。
@@ -193,7 +194,7 @@ export class PooledAcpAdapter extends LlmAdapter {
   }
 
   /** 只有普通聊天轮参与粘性；标题/压缩等一次性请求不占用会话绑定。 */
-  private affinityKey(options?: GenerateOptions): string | undefined {
+  private affinityKey(options?: AdapterRequestOptions): string | undefined {
     if (!this.sessionAffinity || !options?.sessionId || options.purpose !== undefined) return undefined
     return options.sessionId
   }
@@ -209,7 +210,7 @@ export class PooledAcpAdapter extends LlmAdapter {
     }
   }
 
-  private select(options?: GenerateOptions): Slot | undefined {
+  private select(options?: AdapterRequestOptions): Slot | undefined {
     // Preserve ownership across tool-result calls, including synchronous compaction.
     const owner = options && this.slots.find(s => s.owner
       && (s.leased || s.worker.adapter.busy)
@@ -242,7 +243,7 @@ export class PooledAcpAdapter extends LlmAdapter {
     return undefined
   }
 
-  private acquire(options: GenerateOptions | undefined, signal?: AbortSignal): Promise<Slot> {
+  private acquire(options: AdapterRequestOptions | undefined, signal?: AbortSignal): Promise<Slot> {
     if (this.closed) return Promise.reject(new LlmError('ACP 插件已卸载', 'AGY_LINK_CLOSED'))
     if (signal?.aborted) return Promise.reject(new LlmError('ACP 请求在排队前已取消', AGY_TURN_ERROR.ABORTED))
     // Tool results release parked work and must never be refused by an unrelated full queue.
@@ -296,7 +297,7 @@ export class PooledAcpAdapter extends LlmAdapter {
   }
 }
 
-function hasImageInput(options: GenerateOptions): boolean {
+function hasImageInput(options: AdapterRequestOptions): boolean {
   return options.messages.some(message => message.role === 'tool'
     ? message.content.some(block => block.type === 'image')
     : Array.isArray(message.content) && message.content.some(block => block.type === 'image'))
