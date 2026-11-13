@@ -38,9 +38,23 @@ const SIGNATURES_CLOSE = '</dsh-tool-signatures>'
 /** 历史重放说明块的哨兵（固定文本，不参与消息逆解析）。 */
 export const HISTORY_OPEN = '<dsh-conversation-history>'
 export const HISTORY_CLOSE = '</dsh-conversation-history>'
+/** 历史裁剪提示块的哨兵（固定文本，不参与消息逆解析）。 */
+export const HISTORY_TRUNCATED_OPEN = '<dsh-history-truncated>'
+export const HISTORY_TRUNCATED_CLOSE = '</dsh-history-truncated>'
+/** 当前请求头部锚点的哨兵（纯文本，不参与消息逆解析）。 */
+export const CURRENT_REQUEST_ANCHOR_OPEN = '<dsh-current-request-anchor>'
+export const CURRENT_REQUEST_ANCHOR_CLOSE = '</dsh-current-request-anchor>'
 /** 当前请求强调块的哨兵（纯文本，不参与消息逆解析）。 */
 export const CURRENT_REQUEST_OPEN = '<dsh-current-request>'
 export const CURRENT_REQUEST_CLOSE = '</dsh-current-request>'
+
+/**
+ * agy.exe 对单次 session/prompt 的 UTF-8 字节硬上限为 192,001 字节。
+ * 预留约 16 KB 安全余量给块间换行与传输开销，在组装阶段提前控制体积，
+ * 避免上游静默从尾部切掉最新指令。
+ */
+export const ACP_PROMPT_BYTE_BUDGET = 176_000
+const HEAD_ANCHOR_MAX_CHARS = 2_000
 
 /**
  * 每次 prompt 都会附带的一段工具策略说明。
@@ -96,30 +110,106 @@ export function encodeMessage(message: RequestMessage): string {
   return `${MESSAGE_OPEN_PREFIX}${message.role}${MESSAGE_OPEN_SUFFIX}${payload}${MESSAGE_CLOSE}`
 }
 
+export interface BudgetedMessages {
+  messages: readonly RequestMessage[]
+  omittedCount: number
+  omittedBytes: number
+}
+
+/** 计算一组 ACP ContentBlock 中所有文本块的 UTF-8 字节总数。 */
+export function promptContentUtf8Bytes(blocks: readonly ContentBlock[]): number {
+  let bytes = 0
+  for (const block of blocks) {
+    if (block.type === 'text') bytes += Buffer.byteLength(block.text, 'utf8')
+  }
+  return bytes
+}
+
+/** 若组装后的 prompt 仍超出 ACP 单次字节上限，显式报错而非让上游静默截断。 */
+export function assertPromptWithinBudget(blocks: readonly ContentBlock[], maxBytes = ACP_PROMPT_BYTE_BUDGET): void {
+  const bytes = promptContentUtf8Bytes(blocks)
+  if (bytes <= maxBytes) return
+  throw new LlmError(
+    `单次 ACP prompt 体积（${bytes} UTF-8 字节）超出 agy 安全上限（${maxBytes} 字节 / 硬限 192,001 字节），已阻止发送以避免静默截断；请精简当前输入、开启新对话或启用压缩`,
+    'AGY_PROMPT_TOO_LARGE',
+  )
+}
+
+/**
+ * 按字节预算从最新消息往回保留历史：优先保证固定块（system / 工具策略 /
+ * 签名 / 当前请求锚点）与最近对话完整送达，只裁掉最旧的历史轨迹。
+ */
+export function fitMessagesToPromptBudget(
+  messages: readonly RequestMessage[],
+  fixedBytes: number,
+  maxBytes = ACP_PROMPT_BYTE_BUDGET,
+): BudgetedMessages {
+  if (messages.length === 0) return { messages, omittedCount: 0, omittedBytes: 0 }
+  const encodedBytes = messages.map((message) => Buffer.byteLength(encodeMessage(message), 'utf8'))
+  const totalHistoryBytes = encodedBytes.reduce((sum, size) => sum + size, 0)
+  const budget = maxBytes - fixedBytes
+  if (totalHistoryBytes <= budget) return { messages, omittedCount: 0, omittedBytes: 0 }
+
+  // 预留裁剪提示块的字节空间。
+  const noticeReserve = 512
+  const available = Math.max(0, budget - noticeReserve)
+  let used = 0
+  let startIndex = messages.length
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const size = encodedBytes[index]!
+    if (used + size > available) break
+    used += size
+    startIndex = index
+  }
+  const omittedCount = startIndex
+  const omittedBytes = encodedBytes.slice(0, startIndex).reduce((sum, size) => sum + size, 0)
+  return {
+    messages: messages.slice(startIndex),
+    omittedCount,
+    omittedBytes,
+  }
+}
+
 /**
  * 构造一次 ACP prompt 的 content 块序列：system（若给出）在前，随后工具策略、
- * 历史重放说明、每条 DSH 消息一个信封块，最后是最新用户请求的强调块。
- * 空 system 文本不产生块（ACP 的 TextContent.text 为空串没有语义价值）。
+ * 工具签名、当前请求头部锚点、历史重放说明、预算内最近 DSH 消息信封，
+ * 最后是最新用户请求的完整强调块。
  */
 export function buildPromptContent(
   system: string | undefined,
   messages: readonly RequestMessage[],
   tools: readonly ToolSchema[] = [],
+  maxBytes = ACP_PROMPT_BYTE_BUDGET,
 ): ContentBlock[] {
-  const blocks: ContentBlock[] = []
-  if (system !== undefined && system !== '') blocks.push(textBlock(`${SYSTEM_OPEN}${system}${SYSTEM_CLOSE}`))
+  const head: ContentBlock[] = []
+  if (system !== undefined && system !== '') head.push(textBlock(`${SYSTEM_OPEN}${system}${SYSTEM_CLOSE}`))
   // 工具策略紧随 system：告诉模型原生 fs/terminal 在这里拿不到权限，请用随会话工具。
-  blocks.push(textBlock(`${POLICY_OPEN}${TOOL_POLICY_TEXT}${POLICY_CLOSE}`))
+  head.push(textBlock(`${POLICY_OPEN}${TOOL_POLICY_TEXT}${POLICY_CLOSE}`))
   // 官方只把 MCP 工具 schema 落成磁盘文件，模型常常不读就猜参数；把紧凑签名直接放进
   // prompt，让必填项与参数名在调用时就可见。
   const signatures = renderToolSignatures(tools)
-  if (signatures !== undefined) blocks.push(textBlock(`${SIGNATURES_OPEN}${signatures}${SIGNATURES_CLOSE}`))
-  // 声明历史只是背景，避免模型把上一轮未完成的工具循环当成当前任务。
-  if (messages.length > 0) blocks.push(historyNoticeBlock())
-  for (const message of messages) blocks.push(textBlock(encodeMessage(message)))
+  if (signatures !== undefined) head.push(textBlock(`${SIGNATURES_OPEN}${signatures}${SIGNATURES_CLOSE}`))
+
+  if (messages.length === 0) return head
+
+  const anchor = currentRequestAnchorBlock(messages)
+  const historyNotice = historyNoticeBlock()
+  const current = currentRequestBlock(messages)
+  const fixedBlocks = [
+    ...head,
+    ...(anchor ? [anchor] : []),
+    historyNotice,
+    ...(current ? [current] : []),
+  ]
+  const fitted = fitMessagesToPromptBudget(messages, promptContentUtf8Bytes(fixedBlocks), maxBytes)
+
+  const blocks: ContentBlock[] = [...head]
+  if (anchor) blocks.push(anchor)
+  blocks.push(historyNotice)
+  if (fitted.omittedCount > 0) blocks.push(historyTruncatedBlock(fitted.omittedCount, fitted.omittedBytes))
+  for (const message of fitted.messages) blocks.push(textBlock(encodeMessage(message)))
   // 最新用户请求放到最后：它前面可能还跟着 time-context / hindsight 等注入块，
   // 不强调时模型会把注意力停在旧任务上。
-  const current = currentRequestBlock(messages)
   if (current) blocks.push(current)
   return blocks
 }
@@ -127,6 +217,16 @@ export function buildPromptContent(
 /** 历史重放说明块；不参与消息逆解析。 */
 export function historyNoticeBlock(): ContentBlock {
   return textBlock(`${HISTORY_OPEN}${HISTORY_NOTICE_TEXT}${HISTORY_CLOSE}`)
+}
+
+/** 历史前段被预算裁剪时的提示块；不参与消息逆解析。 */
+export function historyTruncatedBlock(omittedCount: number, omittedBytes: number): ContentBlock {
+  return textBlock([
+    HISTORY_TRUNCATED_OPEN,
+    `因单次 ACP prompt 存在约 192 KB 字节上限，已自动省略最早的 ${omittedCount} 条历史消息（约 ${Math.ceil(omittedBytes / 1024)} KB），仅保留最近上下文与当前请求。`,
+    '请直接基于以下最近上下文与最新用户请求继续执行，不要回头重复已省略的旧任务。',
+    HISTORY_TRUNCATED_CLOSE,
+  ].join('\n'))
 }
 
 /**
@@ -147,13 +247,7 @@ export function latestUserRequest(messages: readonly RequestMessage[]): RequestM
   return undefined
 }
 
-/**
- * 当前请求强调块：纯文本复制最新用户消息的可见内容。
- *
- * 刻意不复制 `<dsh-message>` 信封——否则 `parsePromptTranscript` 会把同一条
- * 消息解析两次；这里只需要给模型一个明确的「现在回这条」信号。
- */
-export function currentRequestBlock(messages: readonly RequestMessage[]): ContentBlock | undefined {
+function latestUserRequestText(messages: readonly RequestMessage[]): string | undefined {
   const latest = latestUserRequest(messages)
   if (!latest) return undefined
   const parts: string[] = []
@@ -163,10 +257,38 @@ export function currentRequestBlock(messages: readonly RequestMessage[]): Conten
     else parts.push(`[本条消息附带 ${block.type} 内容，见上文对应的消息块]`)
   }
   const body = parts.join('\n').trim()
+  return body === '' ? '（本条消息没有文本内容）' : body
+}
+
+/**
+ * 头部请求锚点：在历史重放前先声明本次要回应的用户请求，防止任何极端截断
+ * 把末尾强调块切掉后，模型退化为重复历史里最早的任务。
+ */
+export function currentRequestAnchorBlock(messages: readonly RequestMessage[]): ContentBlock | undefined {
+  const body = latestUserRequestText(messages)
+  if (body === undefined) return undefined
+  const preview = body.length > HEAD_ANCHOR_MAX_CHARS ? `${body.slice(0, HEAD_ANCHOR_MAX_CHARS)}…（完整内容见末尾）` : body
+  return textBlock([
+    CURRENT_REQUEST_ANCHOR_OPEN,
+    '以下为本次需要回应的最新用户请求摘要（完整正文与强调见末尾）：',
+    preview,
+    CURRENT_REQUEST_ANCHOR_CLOSE,
+  ].join('\n'))
+}
+
+/**
+ * 当前请求强调块：纯文本复制最新用户消息的可见内容。
+ *
+ * 刻意不复制 `<dsh-message>` 信封——否则 `parsePromptTranscript` 会把同一条
+ * 消息解析两次；这里只需要给模型一个明确的「现在回这条」信号。
+ */
+export function currentRequestBlock(messages: readonly RequestMessage[]): ContentBlock | undefined {
+  const body = latestUserRequestText(messages)
+  if (body === undefined) return undefined
   return textBlock([
     CURRENT_REQUEST_OPEN,
     CURRENT_REQUEST_NOTICE_TEXT,
-    body === '' ? '（本条消息没有文本内容）' : body,
+    body,
     CURRENT_REQUEST_CLOSE,
   ].join('\n'))
 }
@@ -186,9 +308,14 @@ export function parsePromptTranscript(blocks: readonly ContentBlock[]): { system
       system = text.slice(SYSTEM_OPEN.length, text.length - SYSTEM_CLOSE.length)
       continue
     }
-    // 历史说明与当前请求强调块只为引导模型，不是消息本身：跳过它们，
+    // 历史说明、裁剪提示与当前请求锚点只为引导模型，不是消息本身：跳过它们，
     // 否则当前请求的纯文本副本会被重复计入逆解析结果。
-    if (text.startsWith(HISTORY_OPEN) || text.startsWith(CURRENT_REQUEST_OPEN)) continue
+    if (
+      text.startsWith(HISTORY_OPEN)
+      || text.startsWith(HISTORY_TRUNCATED_OPEN)
+      || text.startsWith(CURRENT_REQUEST_ANCHOR_OPEN)
+      || text.startsWith(CURRENT_REQUEST_OPEN)
+    ) continue
     entries.push(...parseMessageEnvelopes(text))
   }
   return system === undefined ? { entries } : { system, entries }

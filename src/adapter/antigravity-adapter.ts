@@ -74,6 +74,8 @@ export const AGY_ADAPTER_ERROR = {
   NO_MODEL_SELECTOR: 'AGY_NO_MODEL_SELECTOR',
   /** agent 应答选模却没有确认请求的型号，不能静默使用其他模型。 */
   MODEL_SELECTION_MISMATCH: 'AGY_MODEL_SELECTION_MISMATCH',
+  /** 单次 session/prompt 体积超出 agy 192 KB 安全预算，拒绝发送以避免静默截断。 */
+  PROMPT_TOO_LARGE: 'AGY_PROMPT_TOO_LARGE',
 } as const
 
 /** MCP 桥与回合的可调参数（由 index.ts 从插件配置注入）。 */
@@ -508,7 +510,15 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   }
 
   #imageOptions(signal?: AbortSignal) {
-    return { readImage: this.#readImage, supported: this.#imageSupported === true && (this.#canReadImages?.() ?? true), signal }
+    return {
+      readImage: this.#readImage,
+      supported: this.#imageSupported === true && (this.#canReadImages?.() ?? true),
+      signal,
+      onHistoryTruncated: (info: { omittedCount: number; omittedBytes: number; totalBytes: number }) =>
+        this.#log?.warn(
+          `antigravity-acp: 全量重放超出单次 prompt 字节预算，已自动裁剪最早的 ${info.omittedCount} 条历史消息（约 ${Math.ceil(info.omittedBytes / 1024)} KB），保留最近上下文与当前请求（最终 ${info.totalBytes} 字节）`,
+        ),
+    }
   }
 
   #inputModalities(): readonly ('text' | 'image')[] | undefined {

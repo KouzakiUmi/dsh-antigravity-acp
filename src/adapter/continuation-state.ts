@@ -23,6 +23,16 @@ function configuration(options: GenerateOptions): string {
   })
 }
 
+/** Passive context injections (e.g. time-context) may arrive mid-turn without invalidating tool continuation. */
+function isMidTurnContextInjection(message: RequestMessage): boolean {
+  if (message.role !== 'user') return false
+  const source = (message as { readonly source?: { readonly kind?: unknown; readonly form?: unknown } }).source
+  const kind = source && typeof source.kind === 'string' ? source.kind : undefined
+  if (!kind || kind === 'user' || kind === 'compact-checkpoint' || kind === 'model-selection') return false
+  const form = source && typeof source.form === 'string' ? source.form : undefined
+  return form !== 'relay'
+}
+
 /** A continuation must be the exact request plus the assistant blocks we emitted and new tool results. */
 export class ContinuationState {
   readonly #configuration: string
@@ -42,7 +52,15 @@ export class ContinuationState {
     if (prefix.length < this.#history.length) return false
     if (!this.#history.every((value, index) => value === stable(messageValue(prefix[index]!)))) return false
     const appended = prefix.slice(this.#history.length)
-    if (appended.some((message) => message.role !== 'assistant')) return false
-    return stable(appended.flatMap((message) => [...message.content])) === stable(this.#emitted)
+    const assistantBlocks: ContentBlock[] = []
+    for (const message of appended) {
+      if (message.role === 'assistant') {
+        assistantBlocks.push(...message.content)
+        continue
+      }
+      if (isMidTurnContextInjection(message)) continue
+      return false
+    }
+    return stable(assistantBlocks) === stable(this.#emitted)
   }
 }
