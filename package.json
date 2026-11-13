@@ -69,7 +69,7 @@
     "@cortexkit/antigravity-auth-core": "3.0.14",
     "@deepseek-ai/schemastery": "^3.18.4",
     "@modelcontextprotocol/sdk": "1.32.1",
-    "undici": "8.12.2",
+    "undici": "8.12.3",
     "yauzl": "^3.4.0"
   },
   "devDependencies": {
