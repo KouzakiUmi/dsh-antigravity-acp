@@ -11,15 +11,14 @@
 import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type {
   ContentBlock,
-  GenerateOptions,
   LlmModelInfo,
   LlmModelReasoningInfo,
   LlmProviderInfo,
   LlmResolvedModelInfo,
-  PreparedAdapterCall,
   RequestMessage,
   StreamChunk,
 } from '@deepseek-ai/dsh-llm'
+import type { AdapterPreparedCall, AdapterRequestOptions, AdapterRequestOwner } from './request-options.js'
 import type { AnyRequest, McpServer as AcpMcpServer, SessionConfigOption, SessionNotification, Usage } from '@agentclientprotocol/sdk'
 import type { AgentLink, AgentLinkHandlers } from '../protocol/agent-link.js'
 import { BRIDGE_MCP_SERVER_NAME, McpToolBridge } from '../bridge/mcp-bridge.js'
@@ -281,7 +280,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   /** 在首次 await 前占位，避免并发首轮同时通过 #turn 尚未建立的窗口。 */
   #streamActive = false
   #disposed = false
-  #turnOwner: Pick<GenerateOptions, 'sessionId' | 'purpose'> | undefined
+  #turnOwner: AdapterRequestOwner | undefined
   readonly #accessWaiters = new Set<() => void>()
   /**
    * 当前 ACP 回合的 park 订阅。生命周期是**回合**而不是单次 `stream` 调用：
@@ -310,7 +309,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   /** 目录缓存的惰性读取结果（只读一次）。 */
   #cacheLoad?: Promise<LlmModelInfo[]>
   /**
-   * 各 DSH 路由键（`GenerateOptions.model`）实测到的上下文容量，来自官方
+   * 各 DSH 路由键（`AdapterRequestOptions.model`）实测到的上下文容量，来自官方
    * `usage_update.size`（ACP 对 `size` 的定义即 total context window size）。
    * 有了它压缩引擎才能量化上下文，而不是每步报「no context capacity」。
    */
@@ -388,7 +387,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
 
   get streamActive(): boolean { return this.#streamActive }
   get awaitingToolResults(): boolean { return this.#turn?.awaitingToolResults === true }
-  ownsRequest(options: Pick<GenerateOptions, 'sessionId' | 'purpose'>): boolean {
+  ownsRequest(options: AdapterRequestOwner): boolean {
     return this.#turnOwner !== undefined && this.#turnOwner.sessionId === options.sessionId && this.#turnOwner.purpose === options.purpose
   }
 
@@ -719,14 +718,14 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     if (this.#readImage && (this.#canReadImages?.() ?? true) && this.#imageSupported === undefined) await this.warmup(signal, true)
   }
 
-  override async prepareCall(provider: string, model: string, signal?: AbortSignal): Promise<PreparedAdapterCall> {
+  override async prepareCall(provider: string, model: string, signal?: AbortSignal): Promise<AdapterPreparedCall> {
     // Request preparation runs before DSH projects image blocks. Discovery here only
     // handshakes; passive listModels/resolveModel remain free of connection I/O.
     await this.prepareImages(signal)
     const modelInfo = await this.resolveModel(provider, model, signal)
     return {
       model: modelInfo,
-      stream: (options: GenerateOptions) => this.stream(options),
+      stream: (options: AdapterRequestOptions) => this.stream(options),
     }
   }
 
@@ -739,7 +738,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
    * 并发防御：主对话与标题/压缩请求可以同时进入同一个 adapter；从首个 await
    * 之前串行化 stream。工具 park 保留回合所有权，辅助请求等待而不是抢占主回合。
    */
-  override async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+  override async *stream(options: AdapterRequestOptions): AsyncIterable<StreamChunk> {
     // temperature / stop 在 ACP v1 没有会话通道：不因它们拒绝整个请求（否则宿主里
     // 任何携带这两个字段的流程都会整单失败），只明确告知「值不生效」。
     const unsupported = unsupportedOptions(options)
@@ -776,7 +775,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   /* ── ACP 会话复用 ─────────────────────────────────────────────────── */
 
   /** 只把真正影响官方路由的覆盖项纳入指纹，改名和显示开关不触发无谓重建。 */
-  #sessionRouteFingerprint(options: GenerateOptions): string {
+  #sessionRouteFingerprint(options: AdapterRequestOptions): string {
     const setting = modelSettingFor(this.#modelSettingsSnapshot(), options.model)
     const override = setting.target !== undefined
       ? { target: setting.target }
@@ -790,7 +789,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
    * 跨进程恢复：重启后若磁盘上还留着该对话的 ACP 会话映射，尝试 `session/load`。
    * 只信任「路由一致 + 历史仍以已发送前缀开头」；其余情况回退重建，不猜测。
    */
-  async #resumeSession(options: GenerateOptions, key: string, entry?: SessionMapEntry): Promise<ReusedSession | undefined> {
+  async #resumeSession(options: AdapterRequestOptions, key: string, entry?: SessionMapEntry): Promise<ReusedSession | undefined> {
     if (!this.#reuseSessions || !this.#resumeSessions || !entry) return undefined
     const discard = (reason: string): undefined => {
       this.#log?.info(`antigravity-acp: 放弃恢复 ACP 会话（${reason}）`)
@@ -860,7 +859,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   }
 
   /** 找到可复用的会话；记录失效时顺手丢弃（关闭对端会话，下一轮重建）。 */
-  #findReusableSession(options: GenerateOptions, key: string): ReusedSession | undefined {
+  #findReusableSession(options: AdapterRequestOptions, key: string): ReusedSession | undefined {
     if (!this.#reuseSessions) return undefined
     const record = this.#sessions.get(key)
     if (!record) return undefined
@@ -908,7 +907,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   }
 
   /** 记录一个刚建立会话 / 刚完成全量发送的 ACP 会话。 */
-  #rememberSession(options: GenerateOptions, key: string, link: AgentLink, sessionId: string): ReusedSession {
+  #rememberSession(options: AdapterRequestOptions, key: string, link: AgentLink, sessionId: string): ReusedSession {
     const record: ReusedSession = {
       key,
       sessionId,
@@ -928,7 +927,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   }
 
   /** 在 finish 对外可见之前提交输入与实际交付输出，消费者可立即 return。 */
-  #advanceSession(record: ReusedSession, options: GenerateOptions, blocks: readonly ContentBlock[], settled: boolean): void {
+  #advanceSession(record: ReusedSession, options: AdapterRequestOptions, blocks: readonly ContentBlock[], settled: boolean): void {
     if (this.#sessions.get(record.key) !== record) return
     record.sentCount = options.messages.length
     record.sentHash = prefixHash(options.messages)
@@ -1129,7 +1128,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   }
 
   /** 同一时刻只有一个 stream 能创建/切换会话或消费回合队列。 */
-  async *#streamExclusive(options: GenerateOptions): AsyncGenerator<StreamChunk> {
+  async *#streamExclusive(options: AdapterRequestOptions): AsyncGenerator<StreamChunk> {
     const tail = trailingToolResults(options.messages)
     let turn = this.#turn
     if (turn?.awaitingToolResults) {
@@ -1160,11 +1159,11 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     for (const wake of waiters) wake()
   }
 
-  #sameTurnOwner(options: GenerateOptions): boolean {
+  #sameTurnOwner(options: AdapterRequestOptions): boolean {
     return this.#turnOwner?.sessionId === options.sessionId && this.#turnOwner?.purpose === options.purpose
   }
 
-  async #acquireStream(options: GenerateOptions): Promise<void> {
+  async #acquireStream(options: AdapterRequestOptions): Promise<void> {
     for (;;) {
       if (this.#disposed) throw new LlmError('Antigravity ACP adapter 已卸载', 'AGY_LINK_CLOSED')
       if (options.signal?.aborted) throw new LlmError('Antigravity ACP 请求在等待调度时被取消', AGY_TURN_ERROR.ABORTED)
@@ -1194,7 +1193,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   }
 
   /** 启动阶段也响应取消；迟到资源先回收，后续回合不能越过清理屏障。 */
-  async #prepareRound(options: GenerateOptions, owner?: string) {
+  async #prepareRound(options: AdapterRequestOptions, owner?: string) {
     let link: AgentLink | undefined
     const check = (): void => {
       if (this.#disposed) throw new LlmError('Antigravity ACP adapter 已卸载', 'AGY_LINK_CLOSED')
@@ -1252,7 +1251,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     }
   }
 
-  async *#runNewRound(options: GenerateOptions): AsyncGenerator<StreamChunk> {
+  async *#runNewRound(options: AdapterRequestOptions): AsyncGenerator<StreamChunk> {
     this.#clearIdleRecycle()
     await withAbort(this.#settleRecycle(), options.signal)
     if (this.#disposed) throw new LlmError('Antigravity ACP adapter 已卸载', 'AGY_LINK_CLOSED')
@@ -1446,7 +1445,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     }
   }
 
-  async *#runContinuation(turn: PromptTurn, options: GenerateOptions, tail: readonly RequestMessage[]): AsyncGenerator<StreamChunk> {
+  async *#runContinuation(turn: PromptTurn, options: AdapterRequestOptions, tail: readonly RequestMessage[]): AsyncGenerator<StreamChunk> {
     this.#bridge.publishTools(options.tools ?? [])
     if (turn.terminated) {
       // 终止的回合不会再有生产者。必须**先于 resume()** 判定：resume 会把
@@ -1778,7 +1777,7 @@ function normalizeEffort(effort?: { toString(): string }): AgyReasoningEffort | 
  * `#applyModelSelection`。`maxTokens` 同样静默忽略（宿主会话标题等流程固定
  * 携带它，硬拒绝会让这些功能永久失败）。
  */
-function unsupportedOptions(options: GenerateOptions): string[] {
+function unsupportedOptions(options: AdapterRequestOptions): string[] {
   const unsupported: string[] = []
   if (options.temperature !== undefined) unsupported.push('temperature')
   if (options.stop !== undefined) unsupported.push('stop')

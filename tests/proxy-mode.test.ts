@@ -12,7 +12,7 @@ import { readProxyImage, requiredProxyImageOffload } from '../src/proxy/image.js
 import { createProxyReplayState, compatibleProxyReplayState, PROXY_PROVIDER_ID } from '../src/proxy/replay.js'
 import { registrationPlan, modeFromFlag, createProxyModeBus } from '../src/proxy/mode-bus.js'
 import { fetchProxyQuotaSnapshot } from '../src/proxy/quota-source.js'
-import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
+import type { AdapterRequestOptions } from '../src/adapter/request-options.js'
 import { createDeveloperMessage, createSystemMessage, ReasoningEffortId, ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { Message } from '@deepseek-ai/dsh-llm'
 
@@ -144,12 +144,12 @@ describe('account store：副本与 CLI 导入', () => {
 })
 
 describe('payload：消息映射与线载荷', () => {
-  const options = (over: Partial<GenerateOptions> = {}): GenerateOptions => ({
+  const options = (over: Partial<AdapterRequestOptions> = {}): AdapterRequestOptions => ({
     provider: PROXY_PROVIDER_ID,
     model: 'gemini-3-pro',
     messages: [],
     ...over,
-  } as GenerateOptions)
+  } as AdapterRequestOptions)
 
   it('system 进 systemInstruction，tool-call 补 sentinel 签名，tool 结果配对', async () => {
     const messages = [

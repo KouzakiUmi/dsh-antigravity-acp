@@ -4,6 +4,12 @@
 
 记录源码与发布内容，不将本地构建、npm 发布和本机升级混为同一状态。日期采用 Asia/Hong_Kong。更早历史见 [Git 提交记录](https://github.com/KouzakiUmi/dsh-antigravity-acp/commits/main/)。
 
+## 未发布 · 2026-11-13
+
+- **开发契约基准对齐实机内嵌版本**：`dsh-llm` / `dsh-attachment` / `dsh-subprocess` / `dsh-typert-protocol` 从 `0.2.1-alpha.4` 升到 `0.2.2-rc.1`，Cordis 从 `4.0.5-alpha.2` 升到 `4.1.0`，类型检查自此与实机内嵌版本一致。此前安装准入（`cordis` peer `>=4.0.4 <5`）已覆盖实机，但编译基准留在更旧的 alpha，构成验证盲区。
+- **转发型请求的 `purpose` 放宽**：`dsh-llm` 0.2.2 起 `GenerateOptions.purpose` 由生产者包声明合并（`LlmRequestPurposeMap`）给出；本包不扩展该 map，默认泛型下 `purpose` 退化为 `never`——测试代码无法构造带用途的请求，而生产代码里的用途比较（回合归属、超时、会话亲和、请求重建）在类型层静默失效、失去保护。新增 [`src/adapter/request-options.ts`](../src/adapter/request-options.ts)，把入站请求、回合归属判定与准备结果的 `purpose` 统一放宽为 `string`；这是 `dsh-llm` 类型注释明确允许的转发型适配器口径，运行时行为不变。
+- **验证**：`npm run typecheck`、47 个文件 / 843 项测试、`npm run build` 通过（契约基准 `0.2.2-rc.1` / Cordis `4.1.0`，系统 Node 24）。未安装到运行中的 Desktop，未做真实账户与 GUI 验收。
+
 ## 0.1.38 · 2026-11-12
 
 - **无档位模型不再产出非法元数据**：目录里没有思考强度变体的家族 id 之前返回 `reasoning: { efforts: [] }`，宿主把空数组判为 `INVALID_MODEL_REASONING` 并让该模型完全不可用；现在改为省略 `reasoning`（不支持档位就是不声明菜单）。

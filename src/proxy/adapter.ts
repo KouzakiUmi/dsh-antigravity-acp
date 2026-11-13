@@ -24,17 +24,16 @@ import {
 } from '@deepseek-ai/dsh-llm'
 import type {
   FinishReason,
-  GenerateOptions,
   LlmImageRequestPricing,
   LlmModelInfo,
   LlmProviderInfo,
   LlmResolvedModelInfo,
-  PreparedAdapterCall,
   ReplayEnvelope,
   ResolvedRetryPolicy,
   StreamChunk,
   TokenUsage,
 } from '@deepseek-ai/dsh-llm'
+import type { AdapterPreparedCall, AdapterRequestOptions } from '../adapter/request-options.js'
 import { PROXY_PROVIDER_ID, createProxyReplayState, proxyModelFamily } from './replay.js'
 import type { ProxyReplayBlock } from './replay.js'
 import {
@@ -172,7 +171,7 @@ export class AntigravityProxyAdapter extends LlmAdapter {
     return this.resolveModelInGeneration(provider, model, this.captureGeneration())
   }
 
-  override async prepareCall(provider: string, model: string, _signal?: AbortSignal): Promise<PreparedAdapterCall> {
+  override async prepareCall(provider: string, model: string, _signal?: AbortSignal): Promise<AdapterPreparedCall> {
     const generation = this.captureGeneration()
     return {
       model: this.resolveModelInGeneration(provider, model, generation),
@@ -249,11 +248,11 @@ export class AntigravityProxyAdapter extends LlmAdapter {
       && [undefined, 'low', 'medium', 'high'].some(effort => resolveProxyWireModel(definition.id, effort) === wireModel))
   }
 
-  override async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+  override async *stream(options: AdapterRequestOptions): AsyncIterable<StreamChunk> {
     yield* this.streamInGeneration(options, this.captureGeneration())
   }
 
-  private async *streamInGeneration(options: GenerateOptions, generation: ProxyGeneration): AsyncIterable<StreamChunk> {
+  private async *streamInGeneration(options: AdapterRequestOptions, generation: ProxyGeneration): AsyncIterable<StreamChunk> {
     if (options.provider !== PROXY_PROVIDER_ID) throw new LlmError('代理模式 adapter 收到未知路由', 'NO_ADAPTER')
     const signal = options.signal
     const requested = this.definitions[options.model]
@@ -412,7 +411,7 @@ export class AntigravityProxyAdapter extends LlmAdapter {
     }
   }
 
-  private async *streamResponse(response: Response, options: GenerateOptions, hasEmitted: { value: boolean }, wireModel: string): AsyncGenerator<StreamChunk, boolean> {
+  private async *streamResponse(response: Response, options: AdapterRequestOptions, hasEmitted: { value: boolean }, wireModel: string): AsyncGenerator<StreamChunk, boolean> {
     const states: BlockState[] = []
     let current: BlockState | undefined
     let usage: TokenUsage | undefined
@@ -845,7 +844,7 @@ async function responseReportsContextWindowExceeded(response: Response, signal?:
 const SYSTEM_INSTRUCTION_ROLES = new Set(['system', 'developer'])
 
 /** 最终进入 systemInstruction 的全部文本（options.system 与 system/developer 消息）。 */
-function systemTexts(options: GenerateOptions): string[] {
+function systemTexts(options: AdapterRequestOptions): string[] {
   const texts: string[] = []
   if (typeof options.system === 'string' && options.system.length > 0) texts.push(options.system)
   for (const message of options.messages) {
@@ -858,7 +857,7 @@ function systemTexts(options: GenerateOptions): string[] {
 }
 
 /** 打散全部 system 指令文本（用户消息不动）；没有命中时原样返回 options。 */
-function cloakGenerateOptions(options: GenerateOptions): { options: GenerateOptions; hits: FingerprintHit[] } {
+function cloakGenerateOptions(options: AdapterRequestOptions): { options: AdapterRequestOptions; hits: FingerprintHit[] } {
   const hits: FingerprintHit[] = []
   const system = cloakUpstreamFingerprints(options.system)
   hits.push(...system.hits)

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
-import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
+import type { StreamChunk } from '@deepseek-ai/dsh-llm'
+import type { AdapterRequestOptions } from '../src/adapter/request-options.js'
 import { createAssistantMessage, createToolResultMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { AntigravityProxyAdapter, PROXY_PROVIDER_ID } from '../src/proxy/adapter.js'
@@ -9,7 +10,7 @@ import type { AntigravityHostConfig } from '../src/settings.js'
 import type { ProxyAttachmentReader } from '../src/proxy/image.js'
 
 const model = 'antigravity-gemini-3.8-flash'
-const options: GenerateOptions = { provider: PROXY_PROVIDER_ID, model, messages: [] }
+const options: AdapterRequestOptions = { provider: PROXY_PROVIDER_ID, model, messages: [] }
 const event = (parts: unknown[], finishReason?: string) => ({ response: { candidates: [{ content: { parts }, finishReason }] } })
 function adapter(events: unknown[]) {
   return new AntigravityProxyAdapter({

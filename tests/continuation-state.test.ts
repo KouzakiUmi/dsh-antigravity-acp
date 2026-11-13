@@ -1,17 +1,18 @@
 import { describe, expect, it } from 'vitest'
 import { createAssistantMessage, createSystemMessage, createToolResultMessage, createUserMessage, ReasoningEffortId, ToolCallId } from '@deepseek-ai/dsh-llm'
-import type { GenerateOptions, ToolCallBlock } from '@deepseek-ai/dsh-llm'
+import type { ToolCallBlock } from '@deepseek-ai/dsh-llm'
+import type { AdapterRequestOptions } from '../src/adapter/request-options.js'
 import { ContinuationState } from '../src/adapter/continuation-state.js'
 
 const call: ToolCallBlock = { type: 'tool-call', id: ToolCallId('call-1'), name: 'read', arguments: '{"path":"a"}' }
-function initial(): GenerateOptions {
+function initial(): AdapterRequestOptions {
   return {
     provider: 'antigravity-acp', model: 'gemini', system: 'obey policy',
     messages: [createUserMessage({ content: [{ type: 'text', text: 'read a' }], source: { kind: 'user' } })],
     tools: [{ name: 'read', description: 'Read', parameters: { type: 'object', properties: { path: { type: 'string' } } } }],
   }
 }
-function continuation(base: GenerateOptions): GenerateOptions {
+function continuation(base: AdapterRequestOptions): AdapterRequestOptions {
   return { ...base, messages: [
     ...base.messages,
     createAssistantMessage({ content: [call], source: { provider: base.provider, model: base.model } }),

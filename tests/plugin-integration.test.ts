@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
-import type { GenerateOptions, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
+import type { LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
+import type { AdapterRequestOptions } from '../src/adapter/request-options.js'
 import type { AntigravityAcpAdapterOptions } from '../src/adapter/antigravity-adapter.js'
 import type { SettingsControl } from '../src/quota/control.js'
 import { PooledAcpAdapter } from '../src/pool/pooled-adapter.js'
@@ -76,11 +77,11 @@ vi.mock('../src/adapter/antigravity-adapter.js', () => ({
     }
     async listModels(provider: string) { return [await this.resolveModel(provider, 'example')] }
     prepareCall = vi.fn(async (provider: string, model: string) => ({
-      model: await this.resolveModel(provider, model), stream: (options: GenerateOptions) => this.stream(options),
+      model: await this.resolveModel(provider, model), stream: (options: AdapterRequestOptions) => this.stream(options),
     }))
     discoverModels = vi.fn(async (_signal?: AbortSignal, _interactive = true) => this.listModels('antigravity-acp'))
     warmup = vi.fn(async () => {})
-    async *stream(_options: GenerateOptions): AsyncGenerator<StreamChunk> {
+    async *stream(_options: AdapterRequestOptions): AsyncGenerator<StreamChunk> {
       this.busy = true
       this.options.lifecycle?.spawned()
       await new Promise<void>((resolve) => { this.finish = resolve })
@@ -152,8 +153,8 @@ function harness(initialAttachment?: AttachmentStub) {
 }
 
 async function flush() { for (let i = 0; i < 30; i++) await Promise.resolve() }
-function request(id: string): GenerateOptions {
-  return { provider: 'antigravity-acp', model: 'example', messages: [], sessionId: id as GenerateOptions['sessionId'] }
+function request(id: string): AdapterRequestOptions {
+  return { provider: 'antigravity-acp', model: 'example', messages: [], sessionId: id as AdapterRequestOptions['sessionId'] }
 }
 
 beforeEach(() => {

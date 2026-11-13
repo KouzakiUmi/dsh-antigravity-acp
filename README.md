@@ -114,9 +114,9 @@ flowchart LR
 |---|---|
 | Node.js | `>=22.19` |
 | DSH Core peer 范围 | `>=0.2.0-rc.1 <0.2.1-0 \|\| >=0.2.1-0 <0.3.0-0`，适用于所声明的三个 `dsh-*` peer |
-| 开发契约基准 | `dsh-llm` / `dsh-subprocess` / `dsh-typert-protocol` / `dsh-attachment` **0.2.1-alpha.4**，Cordis **4.0.5-alpha.2** |
+| 开发契约基准 | `dsh-llm` / `dsh-subprocess` / `dsh-typert-protocol` / `dsh-attachment` **0.2.2-rc.1**，Cordis **4.1.0**（与实机内嵌版本一致，类型检查在该基准下运行） |
 | 上游协议 | ACP **v1**；SDK **1.4.0** 与默认 server **1.4.0** 是两个独立版本 |
-| 当前源码本地验证 | 0.1.38 当前工作副本：类型检查、47 个文件 / 843 项测试与构建通过；另有无 CLI 的真实本地 OAuth 回调闭环及既有离线 Chrome 36 项布局检查 |
+| 当前源码本地验证 | 0.1.38 + 未发布基准对齐（契约基准 `0.2.2-rc.1` / Cordis `4.1.0`）：类型检查、47 个文件 / 843 项测试与构建通过；另有无 CLI 的真实本地 OAuth 回调闭环及既有离线 Chrome 36 项布局检查 |
 | 实机运行时核对 | 2026-11-12 对 `/opt/dsh` 的 **dsh 0.2.2-rc.1 / cordis 4.1.0** 逐个核对运行时导出：`LlmAdapter` 方法集、`registerAdapter().replace([])`、`LlmError`、品牌类型构造函数、`settings.describe/mutate`（含非 volatile 拒绝文案）、`attachments` 服务名与 `readImage`/`requestImageDimensions`、Typert 远程注册形状、客户端 `__ModuleLoader__.load` / `$mount` / `settings.section` 槽位均在；未在 0.2.2-rc.1 上跑真实生成 |
 | 桌面契约核对 | 使用分发包内 `dsh-llm` / `dsh-typert-protocol` 0.2.1-rc.5、Cordis 4.0.5、Typert 注册器隔离加载构建产物，验证单次贡献注册、代理路由及卸载清理；未调用真实账户 |
 | 尚未覆盖 | 0.1.38 安装后的 Desktop GUI、真实 Google 授权、真实上游生成与图片识别、非 Windows 实机 |
