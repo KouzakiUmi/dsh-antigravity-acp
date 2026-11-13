@@ -3,13 +3,25 @@ import type { ContentBlock as DshContentBlock, ImageBlock, RequestMessage, ToolS
 import type { ImageAttachmentRef, StoredImageAttachment } from '@deepseek-ai/dsh-attachment'
 import type { ContentBlock } from '@agentclientprotocol/sdk'
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js'
-import { buildPromptContent, currentRequestBlock, encodeMessage, historyNoticeBlock } from './prompt-transcript.js'
+import {
+  assertPromptWithinBudget,
+  buildPromptContent,
+  currentRequestAnchorBlock,
+  currentRequestBlock,
+  encodeMessage,
+  fitMessagesToPromptBudget,
+  historyNoticeBlock,
+  historyTruncatedBlock,
+  promptContentUtf8Bytes,
+} from './prompt-transcript.js'
 
 export type ImageReader = (ref: ImageAttachmentRef, signal?: AbortSignal) => Promise<StoredImageAttachment>
 export interface ImageContentOptions {
   readImage?: ImageReader
   supported: boolean
   signal?: AbortSignal
+  maxPromptBytes?: number
+  onHistoryTruncated?: (info: { omittedCount: number; omittedBytes: number; totalBytes: number }) => void
 }
 
 function aborted(signal?: AbortSignal): void {
@@ -47,13 +59,36 @@ async function imageContent(block: ImageBlock, options: ImageContentOptions): Pr
 export async function buildPromptWithImages(
   system: string | undefined, messages: readonly RequestMessage[], tools: readonly ToolSchema[], options: ImageContentOptions,
 ): Promise<ContentBlock[]> {
-  const content = buildPromptContent(system, [], tools)
-  // 历史说明块：与无图片路径保持同样的「历史只是背景」声明。
-  if (messages.length > 0) content.push(historyNoticeBlock())
-  await appendMessageContent(content, messages, options)
-  // 最新用户请求放到最后强调；图片字节仍跟随各自消息的信封块。
+  const head = buildPromptContent(system, [], tools)
+  if (messages.length === 0) {
+    assertPromptWithinBudget(head, options.maxPromptBytes)
+    return head
+  }
+  const anchor = currentRequestAnchorBlock(messages)
+  const historyNotice = historyNoticeBlock()
   const current = currentRequestBlock(messages)
+  const fixedBytes = promptContentUtf8Bytes([
+    ...head,
+    ...(anchor ? [anchor] : []),
+    historyNotice,
+    ...(current ? [current] : []),
+  ])
+  const fitted = fitMessagesToPromptBudget(messages, fixedBytes, options.maxPromptBytes)
+  const content: ContentBlock[] = [...head]
+  if (anchor) content.push(anchor)
+  content.push(historyNotice)
+  if (fitted.omittedCount > 0) content.push(historyTruncatedBlock(fitted.omittedCount, fitted.omittedBytes))
+  await appendMessageContent(content, fitted.messages, options)
+  // 最新用户请求放到最后强调；图片字节仍跟随各自消息的信封块。
   if (current) content.push(current)
+  assertPromptWithinBudget(content, options.maxPromptBytes)
+  if (fitted.omittedCount > 0) {
+    options.onHistoryTruncated?.({
+      omittedCount: fitted.omittedCount,
+      omittedBytes: fitted.omittedBytes,
+      totalBytes: promptContentUtf8Bytes(content),
+    })
+  }
   return content
 }
 
@@ -68,6 +103,7 @@ export async function buildPromptDeltaWithImages(
 ): Promise<ContentBlock[]> {
   const content: ContentBlock[] = []
   await appendMessageContent(content, messages, options)
+  assertPromptWithinBudget(content, options.maxPromptBytes)
   return content
 }
 

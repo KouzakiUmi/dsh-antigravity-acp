@@ -48,4 +48,41 @@ describe('continuation request integrity', () => {
     next.messages[2] = createToolResultMessage({ callId: call.id, content: [{ type: 'text', text: 'rewritten' }], isError: false })
     expect(state.accepts(next, 1)).toBe(false)
   })
+  it('accepts mid-turn passive context injections (e.g. time-context) without breaking continuation', () => {
+    const base = initial()
+    const state = new ContinuationState(base)
+    state.emitted(call)
+    const injected = { role: 'user', content: [{ type: 'text', text: 'Current time: 10:11' }], source: { kind: 'time-context', form: 'snapshot', sections: [] } } as unknown as GenerateOptions['messages'][number]
+    const next: GenerateOptions = {
+      ...base,
+      messages: [
+        ...base.messages,
+        createAssistantMessage({ content: [call], source: { provider: base.provider, model: base.model } }),
+        injected,
+        createToolResultMessage({ callId: call.id, content: [{ type: 'text', text: 'result' }], isError: false }),
+      ],
+    }
+    expect(state.accepts(next, 1)).toBe(true)
+  })
+  it('rejects mid-turn real user messages or relay messages', () => {
+    const base = initial()
+    const state = new ContinuationState(base)
+    state.emitted(call)
+    const relay = { role: 'user', content: [{ type: 'text', text: 'from peer' }], source: { kind: 'relay', form: 'relay' } } as unknown as GenerateOptions['messages'][number]
+    for (const extra of [
+      createUserMessage({ content: [{ type: 'text', text: 'new prompt' }], source: { kind: 'user' } }),
+      relay,
+    ]) {
+      const next: GenerateOptions = {
+        ...base,
+        messages: [
+          ...base.messages,
+          createAssistantMessage({ content: [call], source: { provider: base.provider, model: base.model } }),
+          extra,
+          createToolResultMessage({ callId: call.id, content: [{ type: 'text', text: 'result' }], isError: false }),
+        ],
+      }
+      expect(state.accepts(next, 1)).toBe(false)
+    }
+  })
 })

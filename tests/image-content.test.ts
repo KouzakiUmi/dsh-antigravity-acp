@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ImageBlock } from '@deepseek-ai/dsh-llm'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
-import { buildPromptWithImages, buildToolResultContent } from '../src/adapter/image-content.js'
+import { buildPromptDeltaWithImages, buildPromptWithImages, buildToolResultContent } from '../src/adapter/image-content.js'
 
 const data = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+cCioAAAAASUVORK5CYII=', 'base64')
 const ref = { attachmentId: 'sha256:test', mediaType: 'image/png', bytes: data.length, width: 1, height: 1 } as ImageAttachmentRef
@@ -41,5 +41,26 @@ describe('host-owned native image transport', () => {
     const result = buildToolResultContent([block], { supported: true, readImage: async () => new Promise(() => {}), signal: controller.signal })
     controller.abort()
     await expect(result).rejects.toMatchObject({ code: 'AGY_ABORTED' })
+  })
+  it('trims oldest messages within byte budget and skips reading omitted old images', async () => {
+    const readImage = vi.fn(async () => ({ ref, data }))
+    const onHistoryTruncated = vi.fn()
+    const oldWithImage = createUserMessage({ content: [{ type: 'text', text: 'old '.repeat(600) }, block], source: { kind: 'user' } })
+    const latest = createUserMessage({ content: [{ type: 'text', text: '继续执行最新任务' }], source: { kind: 'user' } })
+    const result = await buildPromptWithImages(undefined, [oldWithImage, latest], [], {
+      readImage,
+      supported: true,
+      maxPromptBytes: 4_000,
+      onHistoryTruncated,
+    })
+    expect(readImage).not.toHaveBeenCalled()
+    expect(onHistoryTruncated).toHaveBeenCalledWith(expect.objectContaining({ omittedCount: 1 }))
+    expect(result.at(-1)).toMatchObject({ type: 'text', text: expect.stringContaining('继续执行最新任务') })
+  })
+  it('rejects oversized delta prompts with AGY_PROMPT_TOO_LARGE', async () => {
+    const huge = createUserMessage({ content: [{ type: 'text', text: 'x'.repeat(5_000) }], source: { kind: 'user' } })
+    await expect(buildPromptDeltaWithImages([huge], { supported: false, maxPromptBytes: 1_000 })).rejects.toMatchObject({
+      code: 'AGY_PROMPT_TOO_LARGE',
+    })
   })
 })
