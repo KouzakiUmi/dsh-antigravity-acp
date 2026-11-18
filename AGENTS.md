@@ -53,6 +53,7 @@ npm 包名 `dsh-bundle-antigravity-host`、provider ID `antigravity-acp` / `anti
 - 代理模式接受图片输入（宿主附件服务在场时，单图 4MP / 1MB、整请求 12MB 内联预算，超预算协商 offload）；附件服务缺席时仅声明文本能力，图片请求报 `UNSUPPORTED_MODALITY`。端点白名单含 Cloud Code Assist 生成、目录、项目、额度方法与 Google token 端点；代理账户凭据不进日志与客户端响应。
 - 版本与测试范围见 [README 兼容性矩阵](README.md#兼容性与验证范围)；宽 peer 范围是安装条件，不是全部 Core / 平台实机兼容证明。
 - 自定义 LLM 错误统一经 [`llmError`](src/runtime/llm-error.ts) 构造：新宿主走 `fromFailure`，没有工厂方法的旧宿主走原构造函数；两条路径均保留自定义码和 provider 失败事实。
+- [`transport.ts`](src/proxy/transport.ts) 按响应类型管理字节预算：成功生成流在传输与 SSE 解码层单独计数，普通响应使用独立预算；提高生成总量不提高单帧、目录或额度上限。
 
 ## 维护约定
 

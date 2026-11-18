@@ -5,7 +5,7 @@ import { Duplex } from 'node:stream'
 import * as tls from 'node:tls'
 import { gzipSync } from 'node:zlib'
 import { describe, expect, it, vi } from 'vitest'
-import { createProxyTransport, iterateProxySse, readProxyText } from '../src/proxy/transport.js'
+import { createProxyTransport, iterateProxySse, PROXY_RESPONSE_BYTES, PROXY_STREAM_RESPONSE_BYTES, readProxyText } from '../src/proxy/transport.js'
 import { resolveHttpsProxy } from '../src/runtime/proxy-env.js'
 
 vi.mock('node:tls', async original => {
@@ -125,8 +125,50 @@ describe('代理模式完整 HTTP 响应', () => {
       peer.push(Buffer.from('HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\na00000\r\n'))
       peer.push(Buffer.alloc(9 * 1024 * 1024))
     })
+    const response = await createProxyTransport().request({ url: url.replace('streamGenerateContent?alt=sse', 'fetchAvailableModels'), body: '{}' })
+    await expect(iterateProxySse(response, { idleTimeoutMs: 1000 }).next()).rejects.toMatchObject({ code: 'response-too-large', message: expect.stringContaining('8 MiB') })
+  })
+
+  it('成功生成的多帧流能超过旧 8 MiB 总量且正常完成', async () => {
+    const frame = Buffer.from(`data: ${JSON.stringify({ text: 'x'.repeat(128 * 1024) })}\n\n`)
+    const count = Math.floor(PROXY_RESPONSE_BYTES / frame.length) + 2
+    const end = Buffer.from('data: [DONE]\n\n')
+    syntheticPeer(peer => {
+      peer.push(Buffer.from(`HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: ${frame.length * count + end.length}\r\n\r\n`))
+      for (let i = 0; i < count; i++) peer.push(frame)
+      peer.push(end)
+      peer.push(null)
+    })
     const response = await createProxyTransport().request({ url, body: '{}' })
-    await expect(readProxyText(response, { idleTimeoutMs: 1000 })).rejects.toMatchObject({ code: 'response-too-large' })
+    let frames = 0
+    let endSeen = false
+    for await (const event of iterateProxySse(response, { idleTimeoutMs: 1000 })) {
+      if (event.data === '[DONE]') endSeen = true
+      else frames++
+    }
+    expect(frames).toBe(count)
+    expect(endSeen).toBe(true)
+  })
+
+  it('生成响应仍有 64 MiB 解压后总量上限', async () => {
+    const frame = Buffer.from(`data: ${'x'.repeat(256 * 1024)}\n\n`)
+    const allowed = Math.floor(PROXY_STREAM_RESPONSE_BYTES / frame.length)
+    let sent = 0
+    const response = new Response(new ReadableStream({ pull(controller) {
+      if (sent < allowed + 1) { sent++; controller.enqueue(frame) }
+      else controller.close()
+    } }))
+    const consume = async () => { for await (const event of iterateProxySse(response)) expect(event.data.length).toBe(256 * 1024) }
+    await expect(consume()).rejects.toMatchObject({ code: 'response-too-large', message: expect.stringContaining('64 MiB') })
+  })
+
+  it('非成功生成响应仍在传输层受 8 MiB 限制', async () => {
+    syntheticPeer(peer => {
+      peer.push(Buffer.from('HTTP/1.1 503 Unavailable\r\nContent-Encoding: gzip\r\n\r\n'))
+      peer.push(Buffer.alloc(PROXY_RESPONSE_BYTES + 1))
+    })
+    const response = await createProxyTransport().request({ url, body: '{}' })
+    await expect(readProxyText(response)).rejects.toMatchObject({ code: 'response-too-large', message: expect.stringContaining('8 MiB') })
   })
 
   it('Content-Length 截断与 chunked 截断都报告 offline', async () => {

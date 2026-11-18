@@ -54,7 +54,7 @@ import { ProxyTransportError } from './transport.js'
 import { redactSensitiveText } from '../runtime/redact.js'
 import { cloakUpstreamFingerprints, describeFingerprintHits, scanUpstreamFingerprints } from './prompt-guard.js'
 import type { FingerprintHit } from './prompt-guard.js'
-import { PROXY_RESPONSE_HEADER_TIMEOUT_MS, PROXY_IDLE_TIMEOUT_MS, PROXY_TOTAL_TIMEOUT_MS, PROXY_RESPONSE_BYTES, PROXY_FRAME_BYTES } from './transport.js'
+import { PROXY_RESPONSE_HEADER_TIMEOUT_MS, PROXY_IDLE_TIMEOUT_MS, PROXY_TOTAL_TIMEOUT_MS, PROXY_RESPONSE_BYTES, PROXY_STREAM_RESPONSE_BYTES, PROXY_FRAME_BYTES } from './transport.js'
 import type { ProxyCredential } from './account-store.js'
 import type { AntigravityHostConfig } from '../settings.js'
 import { modelDisplayName, modelSettingFor, modelVisible, normalizeModelSettings, resolveModelTarget } from '../adapter/model-settings.js'
@@ -450,7 +450,7 @@ export class AntigravityProxyAdapter extends LlmAdapter {
       ...(options.signal === undefined ? {} : { signal: options.signal }),
       idleTimeoutMs: PROXY_IDLE_TIMEOUT_MS,
       totalTimeoutMs: PROXY_TOTAL_TIMEOUT_MS,
-      maxBytes: PROXY_RESPONSE_BYTES,
+      maxBytes: PROXY_STREAM_RESPONSE_BYTES,
       maxFrameBytes: PROXY_FRAME_BYTES,
     })) {
       if (sse.data.trim() === '[DONE]') { sawDone = true; break }

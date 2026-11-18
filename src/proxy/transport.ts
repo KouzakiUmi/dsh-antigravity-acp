@@ -26,6 +26,7 @@ export const PROXY_RESPONSE_HEADER_TIMEOUT_MS = 180_000
 export const PROXY_IDLE_TIMEOUT_MS = 240_000
 export const PROXY_TOTAL_TIMEOUT_MS = 600_000
 export const PROXY_RESPONSE_BYTES = 8 * 1024 * 1024
+export const PROXY_STREAM_RESPONSE_BYTES = 64 * 1024 * 1024
 export const PROXY_REQUEST_BYTES = 16 * 1024 * 1024
 export const PROXY_FRAME_BYTES = 2 * 1024 * 1024
 const MAX_RESPONSE_HEAD_BYTES = 64 * 1024
@@ -106,7 +107,9 @@ export function createProxyTransport(options: ProxyTransportOptions = {}): Proxy
         accepted = true
         const { head, leftover } = await waitForHead(socket, timeout, accepted, input.signal)
         const parsed = parseResponseHead(head)
-        const body = buildResponseBody(socket, leftover, parsed, input.signal)
+        const wireLimit = parsed.status >= 200 && parsed.status < 300 && url.pathname === '/v1internal:streamGenerateContent'
+          ? PROXY_STREAM_RESPONSE_BYTES : PROXY_RESPONSE_BYTES
+        const body = buildResponseBody(socket, leftover, parsed, input.signal, wireLimit)
         return new Response(body, { status: parsed.status, statusText: parsed.statusText, headers: parsed.headers })
       } catch (error) {
         socket.destroy()
@@ -142,7 +145,7 @@ export async function readProxyBytes(response: Response, options: BoundedReadOpt
   const maxBytes = boundedBytes(options.maxBytes, PROXY_RESPONSE_BYTES, PROXY_RESPONSE_BYTES)
   if (response.body === null) {
     const data = new Uint8Array(await response.arrayBuffer().catch(() => { throw new ProxyTransportError('offline', '代理模式响应体不可读') }))
-    if (data.byteLength > maxBytes) throw new ProxyTransportError('response-too-large', '代理模式响应超出字节上限')
+    if (data.byteLength > maxBytes) throw responseTooLarge(maxBytes)
     return data
   }
   const reader = response.body.getReader()
@@ -156,7 +159,7 @@ export async function readProxyBytes(response: Response, options: BoundedReadOpt
       total += chunk.value.byteLength
       if (total > maxBytes) {
         await cancelReader(reader)
-        throw new ProxyTransportError('response-too-large', '代理模式响应超出字节上限')
+        throw responseTooLarge(maxBytes)
       }
       chunks.push(chunk.value)
     }
@@ -186,7 +189,7 @@ export interface ProxySseEvent { readonly data: string; readonly event?: string 
 
 /** 解析 SSE（兼容无 SSE 帧的纯 JSON 响应）；帧与总量有界。 */
 export async function* iterateProxySse(response: Response, options: BoundedReadOptions = {}): AsyncGenerator<ProxySseEvent> {
-  const maxBytes = boundedBytes(options.maxBytes, PROXY_RESPONSE_BYTES, PROXY_RESPONSE_BYTES)
+  const maxBytes = boundedBytes(options.maxBytes, PROXY_STREAM_RESPONSE_BYTES, PROXY_STREAM_RESPONSE_BYTES)
   const maxFrameBytes = boundedBytes(options.maxFrameBytes, PROXY_FRAME_BYTES, PROXY_FRAME_BYTES)
   if (response.body === null) {
     const text = await readProxyText(response, options)
@@ -219,7 +222,7 @@ export async function* iterateProxySse(response: Response, options: BoundedReadO
       const chunk = await readChunk(reader, options, startedAt)
       if (chunk.done) break
       bytes += chunk.value.byteLength
-      if (bytes > maxBytes) throw new ProxyTransportError('response-too-large', '代理模式响应超出字节上限')
+      if (bytes > maxBytes) throw responseTooLarge(maxBytes)
       let decoded: string
       try { decoded = decoder.decode(chunk.value, { stream: true }) } catch { throw new ProxyTransportError('invalid-response', '代理模式响应不是合法 UTF-8') }
       if (!sawSseFrame) plainText += decoded
@@ -445,14 +448,15 @@ function parseResponseHead(value: string): ParsedResponseHead {
   return { status, statusText: match[2] ?? '', headers, chunked, gzip, ...(contentLength === undefined ? {} : { contentLength }) }
 }
 
-function buildResponseBody(socket: Duplex, leftover: Buffer, head: ParsedResponseHead, signal: AbortSignal | undefined): ReadableStream<Uint8Array> {
+function buildResponseBody(socket: Duplex, leftover: Buffer, head: ParsedResponseHead, signal: AbortSignal | undefined, wireLimit: number): ReadableStream<Uint8Array> {
   const source = new PassThrough()
-  let current: Readable = pipeStage(source, new ResponseByteLimit())
+  let current: Readable = pipeStage(source, new ResponseByteLimit(wireLimit))
   if (head.chunked) current = pipeStage(current, new ChunkedDecoder())
   else if (head.contentLength !== undefined) current = pipeStage(current, new ContentLengthDecoder(head.contentLength))
   if (head.gzip) {
     current = pipeStage(current, createGunzip())
     current = pipeStage(current, new PassThrough(), (error) => {
+      if (error instanceof ProxyTransportError) return error
       const zlibCode = (error as { code?: string }).code
       return zlibCode === 'Z_BUF_ERROR'
         ? new ProxyTransportError('offline', '上游 gzip 响应提前结束')
@@ -499,12 +503,19 @@ function pipeStage(source: Readable, target: Transform, mapError: (error: Error)
 
 class ResponseByteLimit extends Transform {
   private total = 0
+  constructor(private readonly limit: number) { super() }
   override _transform(chunk: Buffer, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
     this.total += chunk.byteLength
-    if (this.total > PROXY_RESPONSE_BYTES) { callback(new ProxyTransportError('response-too-large', '代理模式响应超出字节上限')); return }
+    if (this.total > this.limit) { callback(responseTooLarge(this.limit)); return }
     this.push(chunk)
     callback()
   }
+}
+
+function responseTooLarge(limit: number): ProxyTransportError {
+  const mib = 1024 * 1024
+  const size = limit % mib === 0 ? `${limit / mib} MiB` : `${limit} 字节`
+  return new ProxyTransportError('response-too-large', `代理模式响应超出字节上限（${size}）`)
 }
 
 class ContentLengthDecoder extends Transform {
