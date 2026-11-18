@@ -10,7 +10,7 @@
  * 单账户语义：429 不做多账户轮转，直接报 `RATE_LIMIT` 让宿主重试策略处理；
  * 401/403 在未出块前换发一次凭据重试一次。
  */
-import { getAgyNativeModel, getPublicModelDefinitions, resolveModelWithTier } from '@cortexkit/antigravity-auth-core'
+import { getAgyNativeModel, getPublicModelDefinitions } from '@cortexkit/antigravity-auth-core'
 import { createHash, randomUUID } from 'node:crypto'
 import type { ImageAttachmentRef, ImageRequestTarget } from '@deepseek-ai/dsh-attachment'
 import {
@@ -59,6 +59,9 @@ import type { ProxyCredential } from './account-store.js'
 import type { AntigravityHostConfig } from '../settings.js'
 import { modelDisplayName, modelSettingFor, modelVisible, normalizeModelSettings, resolveModelTarget } from '../adapter/model-settings.js'
 import type { ModelSetting } from '../adapter/model-settings.js'
+import { llmError } from '../runtime/llm-error.js'
+import { parseLiveProxyCatalog, PROXY_MODEL_EFFORTS } from './model-catalog.js'
+import type { LiveProxyCatalog } from './model-catalog.js'
 
 export { PROXY_PROVIDER_ID }
 
@@ -88,9 +91,15 @@ export interface ProxyAdapterOptions {
   log?: { info(message: string): void; warn(message: string, error?: unknown): void }
 }
 
+interface CatalogSnapshot {
+  readonly key: string
+  readonly models: LiveProxyCatalog
+}
+
 interface ProxyGeneration {
   readonly settings: ReadonlyMap<string, ModelSetting>
   readonly attachments: ProxyAttachmentReader | undefined
+  readonly catalog?: CatalogSnapshot
 }
 
 interface BlockState {
@@ -108,10 +117,8 @@ export class AntigravityProxyAdapter extends LlmAdapter {
   private readonly definitions = getPublicModelDefinitions()
   private catalogKey: string | undefined
   private catalogRevision = 0
-  private catalogLastGoodKey: string | undefined
-  private catalogLastGoodIds: ReadonlySet<string> | undefined
+  private catalogLastGood: CatalogSnapshot | undefined
   private catalogExpiresAt = 0
-  private catalogModelIds = new Set<string>()
   private catalogFailureCode: string | undefined
 
   constructor(private readonly options: ProxyAdapterOptions & { transport: ProxyTransport }) {
@@ -136,35 +143,32 @@ export class AntigravityProxyAdapter extends LlmAdapter {
   invalidateModelCatalog(): void {
     this.catalogRevision += 1
     this.catalogKey = undefined
-    this.catalogLastGoodKey = undefined
-    this.catalogLastGoodIds = undefined
+    this.catalogLastGood = undefined
     this.catalogExpiresAt = 0
-    this.catalogModelIds = new Set<string>()
     this.catalogFailureCode = undefined
   }
 
   override async listModels(provider: string, signal?: AbortSignal): Promise<readonly LlmModelInfo[]> {
     this.providerInfo(provider)
     const generation = this.captureGeneration()
-    let models: readonly LlmModelInfo[]
+    let catalog: CatalogSnapshot
     let lookupKey: string | undefined
     try {
-      const available = await this.readLiveModelIds(signal, false, this.catalogRevision, key => { lookupKey = key })
-      models = this.pinnedTextModelInfos(generation).filter(model => available.has(model.id))
+      catalog = await this.readLiveCatalog(signal, false, this.catalogRevision, key => { lookupKey = key })
     } catch (error) {
       if (error instanceof LlmError && (error.code === 'AUTH' || error.code === 'CANCELLED')) throw error
-      if (lookupKey === undefined || this.catalogLastGoodIds === undefined || this.catalogLastGoodKey !== lookupKey) throw error
+      if (this.catalogLastGood === undefined || this.catalogLastGood.key !== lookupKey) throw error
       this.options.log?.warn('antigravity-proxy: 模型目录刷新失败，保留该账户已观测目录', error)
-      models = this.pinnedTextModelInfos(generation).filter(model => this.catalogLastGoodIds!.has(model.id))
+      catalog = this.catalogLastGood
     }
-    return models.filter(model => modelVisible(generation.settings, model.id))
+    return this.pinnedTextModelInfos(generation, catalog).filter(model => modelVisible(generation.settings, model.id))
   }
 
   async discoverModels(force = false, signal?: AbortSignal): Promise<readonly LlmModelInfo[]> {
     const generation = this.captureGeneration()
     if (force) { this.catalogRevision += 1; this.catalogExpiresAt = 0; this.catalogFailureCode = undefined }
-    const available = await this.readLiveModelIds(signal)
-    return this.pinnedTextModelInfos(generation).filter(model => available.has(model.id))
+    const catalog = await this.readLiveCatalog(signal)
+    return this.pinnedTextModelInfos(generation, catalog)
   }
 
   override async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
@@ -185,51 +189,71 @@ export class AntigravityProxyAdapter extends LlmAdapter {
   }
 
   private captureGeneration(): ProxyGeneration {
-    return { settings: normalizeModelSettings(this.options.readSettings?.().modelOverrides), attachments: this.options.attachments?.() }
+    const catalog = this.catalogLastGood
+    return {
+      settings: normalizeModelSettings(this.options.readSettings?.().modelOverrides), attachments: this.options.attachments?.(),
+      ...(catalog !== undefined && catalog.key === this.catalogKey ? { catalog } : {}),
+    }
   }
 
   private async readCredential(signal?: AbortSignal, forceRefresh = false): Promise<ProxyCredential | undefined> {
-    if (signal?.aborted) throw new LlmError('代理模式请求已取消', 'CANCELLED')
+    if (signal?.aborted) throw llmError('代理模式请求已取消', 'CANCELLED')
     let onAbort: (() => void) | undefined
     try {
       const operation = this.options.credential.credential(signal, forceRefresh ? { forceRefresh: true } : undefined)
       const credential = signal === undefined ? await operation : await Promise.race([operation, new Promise<never>((_, reject) => {
-        onAbort = () => reject(new LlmError('代理模式请求已取消', 'CANCELLED'))
+        onAbort = () => reject(llmError('代理模式请求已取消', 'CANCELLED'))
         if (signal.aborted) onAbort()
         else signal.addEventListener('abort', onAbort, { once: true })
       })])
-      if (signal?.aborted) throw new LlmError('代理模式请求已取消', 'CANCELLED')
+      if (signal?.aborted) throw llmError('代理模式请求已取消', 'CANCELLED')
       return credential
     } catch (error) {
-      if (signal?.aborted) throw new LlmError('代理模式请求已取消', 'CANCELLED')
+      if (signal?.aborted) throw llmError('代理模式请求已取消', 'CANCELLED')
       throw toLlmError(error)
     } finally { if (onAbort !== undefined) signal?.removeEventListener('abort', onAbort) }
   }
 
   private wireModel(model: string, effort: string | undefined, generation: ProxyGeneration): string {
     const normalized = normalizeReasoningEffort(effort)
+    const observed = generation.catalog?.models.get(model)
     const wire = resolveModelTarget({
       settings: generation.settings,
       model,
       ...(normalized === undefined ? {} : { effort: normalized }),
-      route: tier => resolveProxyWireModel(model, tier),
+      route: tier => {
+        if (generation.catalog === undefined) return resolveProxyWireModel(model, tier)
+        if (observed === undefined) throw new LlmError('当前账户的模型目录未提供此模型', 'MODEL_UNSUPPORTED')
+        if (tier !== undefined && observed.efforts.includes(tier)) return resolveProxyWireModel(model, tier)
+        if (normalized !== undefined && modelReasoningEfforts(model) !== undefined) {
+          throw new LlmError('当前账户的模型目录未提供所选思考档位', 'UNSUPPORTED_REASONING_EFFORT')
+        }
+        return observed.defaultWire
+      },
     })
-    if (wire.length === 0 || wire.length > 256 || containsControl(wire)) throw new LlmError('代理模式模型映射无效', 'INVALID_MODEL')
-    if (Object.values(this.definitions).some(definition => definition.modalities.output.includes('image') && resolveProxyWireModel(definition.id) === wire)) throw new LlmError('代理模式文本路由不接受图片生成模型映射', 'INVALID_MODEL')
+    if (wire.length === 0 || wire.length > 256 || containsControl(wire)) throw llmError('代理模式模型映射无效', 'INVALID_MODEL')
+    if (Object.values(this.definitions).some(definition => definition.modalities.output.includes('image') && resolveProxyWireModel(definition.id) === wire)) throw llmError('代理模式文本路由不接受图片生成模型映射', 'INVALID_MODEL')
     return wire
   }
 
   private resolveModelInGeneration(provider: string, model: string, generation: ProxyGeneration): LlmResolvedModelInfo {
     this.providerInfo(provider)
-    if (typeof model !== 'string' || model.trim().length === 0 || model.length > 256) throw new LlmError('代理模式模型 id 无效', 'INVALID_MODEL')
+    if (typeof model !== 'string' || model.trim().length === 0 || model.length > 256) throw llmError('代理模式模型 id 无效', 'INVALID_MODEL')
     const definition = this.definitions[model]
-    if (definition === undefined || definition.modalities.output.includes('image')) throw new LlmError('该模型不在代理模式审计文本快照内', 'INVALID_MODEL')
+    if (definition === undefined || definition.modalities.output.includes('image')) throw llmError('该模型不在代理模式审计文本快照内', 'INVALID_MODEL')
     const setting = modelSettingFor(generation.settings, model)
     const wireModel = this.wireModel(model, undefined, generation)
     const native = getAgyNativeModel(wireModel)
-    const routedDefinition = this.definitionForWireModel(wireModel)
-    const reasoning = routedDefinition === undefined ? undefined : modelReasoningEfforts(setting.target === undefined ? model : wireModel)
-    if (reasoning !== undefined && setting.effort !== undefined && setting.target === undefined) reasoning.defaultEffort = ReasoningEffortId(setting.effort)
+    const routedDefinition = setting.target === undefined ? definition : this.definitionForWireModel(wireModel)
+    const reasoning = setting.target === undefined ? modelReasoningEfforts(model) : undefined
+    if (reasoning !== undefined) {
+      const observed = generation.catalog?.models.get(model)
+      if (observed !== undefined) {
+        reasoning.efforts = reasoning.efforts.filter(({ id }) => observed.efforts.some(effort => effort === id))
+        const selected = observed.efforts.find(effort => resolveProxyWireModel(model, effort) === wireModel)
+        if (selected !== undefined) reasoning.defaultEffort = ReasoningEffortId(selected)
+      } else if (setting.effort !== undefined) reasoning.defaultEffort = ReasoningEffortId(setting.effort)
+    }
     return {
       provider: PROXY_PROVIDER_ID,
       id: definition.id,
@@ -239,13 +263,13 @@ export class AntigravityProxyAdapter extends LlmAdapter {
         context: { contextWindow: native?.maxTokens ?? routedDefinition.limit.context },
         defaultMaxTokens: native?.maxOutputTokens ?? routedDefinition.limit.output,
       }),
-      ...(reasoning === undefined ? {} : { reasoning }),
+      ...(reasoning === undefined || reasoning.efforts.length === 0 ? {} : { reasoning }),
     }
   }
 
   private definitionForWireModel(wireModel: string): ReturnType<typeof getPublicModelDefinitions>[string] | undefined {
     return Object.values(this.definitions).find(definition => !definition.modalities.output.includes('image')
-      && [undefined, 'low', 'medium', 'high'].some(effort => resolveProxyWireModel(definition.id, effort) === wireModel))
+      && [undefined, ...PROXY_MODEL_EFFORTS].some(effort => resolveProxyWireModel(definition.id, effort) === wireModel))
   }
 
   override async *stream(options: AdapterRequestOptions): AsyncIterable<StreamChunk> {
@@ -257,11 +281,12 @@ export class AntigravityProxyAdapter extends LlmAdapter {
     const signal = options.signal
     const requested = this.definitions[options.model]
     if (requested === undefined || requested.modalities.output.includes('image')) {
-      throw new LlmError('该模型不在代理模式审计文本快照内', 'INVALID_MODEL')
+      throw llmError('该模型不在代理模式审计文本快照内', 'INVALID_MODEL')
     }
     if (signal?.aborted) { yield finishChunk('aborted', 'CANCELLED'); return }
     const wireModel = this.wireModel(options.model, options.reasoningEffort, generation)
-    const attachments = this.definitionForWireModel(wireModel)?.modalities.input.includes('image') ? generation.attachments : undefined
+    const routedDefinition = modelSettingFor(generation.settings, options.model).target === undefined ? requested : this.definitionForWireModel(wireModel)
+    const attachments = routedDefinition?.modalities.input.includes('image') ? generation.attachments : undefined
     const hasEmitted = { value: false }
     let refreshed = false
     let refreshNext = false
@@ -281,6 +306,9 @@ export class AntigravityProxyAdapter extends LlmAdapter {
       const credential = await this.readCredential(signal, refreshNext)
       refreshNext = false
       if (credential === undefined) throw new LlmError('代理模式需要登录：请在设置页连接代理账户', 'AUTH')
+      if (generation.catalog !== undefined && credentialCatalogKey(credential) !== generation.catalog.key) {
+        throw llmError('代理模式账户已切换，请重新选择模型', 'CANCELLED')
+      }
       // 上游会把「请求文本里的已知客户端指纹」伪装成 429（magpie 生态的实测结论）。
       // 诊断读的是**实际发出去的**文本，并且与打散状态一致（不会一边说已打散、
       // 一边说"未改写"）。
@@ -298,11 +326,11 @@ export class AntigravityProxyAdapter extends LlmAdapter {
       try {
         payload = await buildProxyGeneratePayload(effective, credential, this.sessions, Date.now(), attachments, signal, wireModel)
       } catch (error) {
-        if (signal?.aborted) throw new LlmError('代理模式请求已取消', 'CANCELLED')
+        if (signal?.aborted) throw llmError('代理模式请求已取消', 'CANCELLED')
         // 图片准入与校验失败在 image.ts / payload.ts 里已经一律是 LlmError，这里
         // 直接透传；非 LlmError 是构包期间的其它异常，不能伪装成附件问题。
         if (error instanceof LlmError) throw error
-        throw new LlmError(
+        throw llmError(
           `代理模式请求构造失败：${redactSensitiveText(error instanceof Error ? error.message : String(error))}`,
           'AGY_PAYLOAD_BUILD',
           { cause: error },
@@ -326,7 +354,7 @@ export class AntigravityProxyAdapter extends LlmAdapter {
         requestType: payload.requestType,
       })
       if (new TextEncoder().encode(serialized).byteLength > 16 * 1024 * 1024) {
-        throw new LlmError('代理模式请求超出传输字节上限', 'REQUEST_LIMIT')
+        throw llmError('代理模式请求超出传输字节上限', 'REQUEST_LIMIT')
       }
       let response: Response
       try {
@@ -502,24 +530,22 @@ export class AntigravityProxyAdapter extends LlmAdapter {
     return reason !== 'error'
   }
 
-  private pinnedTextModelInfos(generation: ProxyGeneration): readonly LlmModelInfo[] {
-    return Object.values(this.definitions)
-      .filter((definition) => !definition.modalities.output.includes('image'))
-      .map((definition) => {
-        const resolved = this.resolveModelInGeneration(PROXY_PROVIDER_ID, definition.id, generation)
-        return { provider: resolved.provider, id: resolved.id, name: resolved.name, inputModalities: resolved.inputModalities }
-      })
+  private pinnedTextModelInfos(generation: ProxyGeneration, catalog: CatalogSnapshot): readonly LlmModelInfo[] {
+    return Array.from(catalog.models.keys(), id => {
+      const resolved = this.resolveModelInGeneration(PROXY_PROVIDER_ID, id, { ...generation, catalog })
+      return { provider: resolved.provider, id: resolved.id, name: resolved.name, inputModalities: resolved.inputModalities }
+    })
   }
 
-  private async readLiveModelIds(signal?: AbortSignal, force = false, revision = this.catalogRevision, onCredentialKey?: (key: string) => void): Promise<ReadonlySet<string>> {
+  private async readLiveCatalog(signal?: AbortSignal, force = false, revision = this.catalogRevision, onCredentialKey?: (key: string) => void): Promise<CatalogSnapshot> {
     const credential = await this.readCredential(signal, force)
     this.assertCatalogCurrent(revision, signal)
     if (credential === undefined) throw new LlmError('代理模式需要登录后才能读取模型目录', 'AUTH')
-    const key = createHash('sha256').update(JSON.stringify([credential.email ?? credential.refreshToken ?? credential.accessToken, credential.projectId])).digest('hex')
+    const key = credentialCatalogKey(credential)
     onCredentialKey?.(key)
     if (!force && this.catalogKey === key && Date.now() < this.catalogExpiresAt) {
-      if (this.catalogFailureCode !== undefined) throw new LlmError('代理模式模型目录仍不可用', this.catalogFailureCode)
-      return this.catalogModelIds
+      if (this.catalogFailureCode !== undefined) throw llmError('代理模式模型目录仍不可用', this.catalogFailureCode)
+      if (this.catalogLastGood?.key === key) return this.catalogLastGood
     }
     const body = credential.projectId ? { project: credential.projectId } : {}
     let response: Response
@@ -557,7 +583,7 @@ export class AntigravityProxyAdapter extends LlmAdapter {
       await cancelResponse(response)
       if (statusError.code === 'authentication' && !force && !signal?.aborted) {
         this.catalogExpiresAt = 0
-        return this.readLiveModelIds(signal, true, revision, onCredentialKey)
+        return this.readLiveCatalog(signal, true, revision, onCredentialKey)
       }
       const failure = toLlmError(statusError)
       this.rememberCatalogFailure(key, failure, revision)
@@ -576,33 +602,30 @@ export class AntigravityProxyAdapter extends LlmAdapter {
       this.rememberCatalogFailure(key, failure, revision)
       throw failure
     }
-    let ids: Set<string>
+    let models: LiveProxyCatalog
     try {
-      ids = parseLiveModelIds(value, this.definitions)
+      models = parseLiveProxyCatalog(value, this.definitions)
     } catch (error) {
-      const failure = error instanceof LlmError ? error : new LlmError('代理模式模型目录不符合预期结构', 'PROTOCOL_DRIFT')
+      const failure = error instanceof LlmError ? error : llmError('代理模式模型目录不符合预期结构', 'PROTOCOL_DRIFT')
       this.rememberCatalogFailure(key, failure, revision)
       throw failure
     }
     this.assertCatalogCurrent(revision, signal)
     this.catalogKey = key
-    this.catalogModelIds = ids
-    this.catalogLastGoodKey = key
-    this.catalogLastGoodIds = ids
+    const catalog = this.catalogLastGood = { key, models }
     this.catalogFailureCode = undefined
     this.catalogExpiresAt = Date.now() + MODEL_CATALOG_TTL_MS
-    return ids
+    return catalog
   }
 
   private assertCatalogCurrent(revision: number, signal?: AbortSignal): void {
-    if (revision !== this.catalogRevision || signal?.aborted) throw new LlmError('代理模式模型目录请求已失效或取消', 'CANCELLED')
+    if (revision !== this.catalogRevision || signal?.aborted) throw llmError('代理模式模型目录请求已失效或取消', 'CANCELLED')
   }
 
   private rememberCatalogFailure(key: string, failure: LlmError, revision: number): void {
     this.assertCatalogCurrent(revision)
     if (failure.code === 'AUTH' || failure.code === 'CANCELLED') return
     this.catalogKey = key
-    this.catalogModelIds = new Set<string>()
     this.catalogFailureCode = failure.code
     this.catalogExpiresAt = Date.now() + MODEL_CATALOG_TTL_MS
   }
@@ -639,61 +662,8 @@ function modelReasoningEfforts(modelId: string): { efforts: readonly { id: Retur
   return undefined
 }
 
-function parseLiveModelIds(value: unknown, definitions: ReturnType<typeof getPublicModelDefinitions>): Set<string> {
-  const root = isRecord(value) && isRecord(value.response) ? value.response : value
-  if (!isRecord(root) || !isRecord(root.models)) throw new LlmError('代理模式模型目录不符合预期结构', 'PROTOCOL_DRIFT')
-  const entries = Object.entries(root.models)
-  if (entries.length > 512) throw new LlmError('代理模式模型目录超出模型数量上限', 'PROTOCOL_DRIFT')
-  const live = new Set<string>()
-  for (const [id, rawEntry] of entries) {
-    if (!safeModelId(id) || !isRecord(rawEntry)) throw new LlmError('代理模式模型目录不符合预期结构', 'PROTOCOL_DRIFT')
-    const cleanId = cleanModelId(id)
-    live.add(cleanId)
-    live.add(id)
-    for (const alias of familyAliases(cleanId)) live.add(alias)
-    const modelName = rawEntry.modelName
-    if (modelName !== undefined) {
-      if (typeof modelName !== 'string' || !safeModelId(modelName)) throw new LlmError('代理模式模型目录不符合预期结构', 'PROTOCOL_DRIFT')
-      const cleanName = cleanModelId(modelName)
-      live.add(cleanName)
-      for (const alias of familyAliases(cleanName)) live.add(alias)
-    }
-    if (rawEntry.displayName !== undefined && (typeof rawEntry.displayName !== 'string' || rawEntry.displayName.length > 512)) {
-      throw new LlmError('代理模式模型目录不符合预期结构', 'PROTOCOL_DRIFT')
-    }
-  }
-  const available = new Set<string>()
-  for (const definition of Object.values(definitions)) {
-    const resolved = resolveModelWithTier(definition.id).actualModel
-    const cleanResolved = cleanModelId(resolved)
-    if (live.has(cleanResolved) || live.has(resolved) || live.has(definition.id)
-      || (definition.id === 'antigravity-gemini-3.5-flash' && (live.has('gemini-3-flash') || live.has('gemini-3.5-flash')))) {
-      available.add(definition.id)
-    }
-  }
-  return available
-}
-
-function familyAliases(cleanId: string): string[] {
-  const aliases: string[] = []
-  if (cleanId === 'gemini-3-flash' || cleanId.startsWith('gemini-3-flash') || cleanId.startsWith('gemini-3.5-flash')) {
-    aliases.push('gemini-3.5-flash', 'gemini-3-flash-agent', 'gemini-3.5-flash-low', 'gemini-3.5-flash-extra-low')
-  }
-  if (cleanId === 'gemini-3.8-flash-tiered' || cleanId.startsWith('gemini-3.8-flash')) {
-    aliases.push('gemini-3.8-flash', 'gemini-3.8-flash-medium', 'gemini-3.8-flash-low', 'gemini-3.8-flash-high')
-  }
-  if (cleanId.startsWith('gemini-4-argon')) aliases.push('gemini-4-argon', 'gemini-4-argon-low', 'gemini-4-argon-medium', 'gemini-4-argon-high')
-  if (cleanId.startsWith('claude-sonnet-5-5')) aliases.push('claude-sonnet-5-5', 'claude-sonnet-5-5-low', 'claude-sonnet-5-5-medium', 'claude-sonnet-5-5-high')
-  if (cleanId.startsWith('claude-opus-5-5')) aliases.push('claude-opus-5-5', 'claude-opus-5-5-low', 'claude-opus-5-5-medium', 'claude-opus-5-5-high')
-  return aliases
-}
-
-function cleanModelId(value: string): string {
-  return value.replace(/^(?:publishers\/[^/]+\/)?models\//, '')
-}
-
-function safeModelId(value: unknown): value is string {
-  return typeof value === 'string' && value.length > 0 && value.length <= 256 && !containsControl(value)
+function credentialCatalogKey(credential: ProxyCredential): string {
+  return createHash('sha256').update(JSON.stringify([credential.email ?? credential.refreshToken ?? credential.accessToken, credential.projectId])).digest('hex')
 }
 
 function containsControl(value: string): boolean {
@@ -735,12 +705,12 @@ function sameBlock(state: BlockState, part: ProxyProviderPart): boolean {
 }
 
 function assembleFunctionName(current: string | undefined, fragment: string): string {
-  if (fragment.length === 0 || fragment.length > 256 || containsControl(fragment)) throw new LlmError('代理模式工具调用名无效', 'PROTOCOL_DRIFT')
+  if (fragment.length === 0 || fragment.length > 256 || containsControl(fragment)) throw llmError('代理模式工具调用名无效', 'PROTOCOL_DRIFT')
   if (current === undefined || current.length === 0) return fragment
   if (fragment === current) return current
   if (fragment.startsWith(current)) return fragment
   const combined = `${current}${fragment}`
-  if (combined.length > 256) throw new LlmError('代理模式工具调用名超出上限', 'PROTOCOL_DRIFT')
+  if (combined.length > 256) throw llmError('代理模式工具调用名超出上限', 'PROTOCOL_DRIFT')
   return combined
 }
 
@@ -751,10 +721,10 @@ function endBlock(state: BlockState): StreamChunk {
     const parsed: unknown = JSON.parse(state.text || '{}')
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error('not an object')
   } catch {
-    throw new LlmError('代理模式工具调用参数不是完整 JSON', 'PROTOCOL_DRIFT')
+    throw llmError('代理模式工具调用参数不是完整 JSON', 'PROTOCOL_DRIFT')
   }
   if (state.name === undefined || !/^[A-Za-z_][A-Za-z0-9_.:-]{0,255}$/u.test(state.name)) {
-    throw new LlmError('代理模式工具调用名缺失或无效', 'PROTOCOL_DRIFT')
+    throw llmError('代理模式工具调用名缺失或无效', 'PROTOCOL_DRIFT')
   }
   return { type: 'block-end', index: state.index, block: { type: 'tool-call', id: state.id, name: state.name, arguments: state.text || '{}' } }
 }
@@ -807,10 +777,10 @@ function isRetryableNetworkError(error: unknown): boolean {
 }
 
 async function waitBackoff(attempt: number, signal?: AbortSignal): Promise<void> {
-  if (signal?.aborted) throw new LlmError('代理模式请求已取消', 'CANCELLED')
+  if (signal?.aborted) throw llmError('代理模式请求已取消', 'CANCELLED')
   const ms = Math.min(1000 * 2 ** (attempt - 1), 4000)
   await new Promise<void>((resolve, reject) => {
-    const onAbort = (): void => { clearTimeout(timer); reject(new LlmError('代理模式请求已取消', 'CANCELLED')) }
+    const onAbort = (): void => { clearTimeout(timer); reject(llmError('代理模式请求已取消', 'CANCELLED')) }
     const timer = setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve() }, ms)
     signal?.addEventListener('abort', onAbort, { once: true })
   })
@@ -835,7 +805,7 @@ async function responseReportsContextWindowExceeded(response: Response, signal?:
     }
     return false
   } catch (error) {
-    if (signal?.aborted || error instanceof ProxyTransportError && error.code === 'cancelled') throw new LlmError('代理模式请求已取消', 'CANCELLED')
+    if (signal?.aborted || error instanceof ProxyTransportError && error.code === 'cancelled') throw llmError('代理模式请求已取消', 'CANCELLED')
     return false
   }
 }
@@ -892,7 +862,7 @@ export function isAccountSuspended(body: string): boolean {
 /** 命中「服务因违反条款被停用」时给出专门错误；否则 undefined。 */
 function suspendedErrorFor(body: string, status?: number): LlmError | undefined {
   if (!isAccountSuspended(body)) return undefined
-  return new LlmError(
+  return llmError(
     '代理模式账户已被上游停用：Antigravity 报告该账号违反了服务条款（violation of Terms of Service）。' +
       '换发登录态或重试都无法恢复，请在 Google 账号侧申诉后再连接；期间可切回 ACP 模式',
     'AGY_ACCOUNT_SUSPENDED',
@@ -920,7 +890,7 @@ function toLlmError(error: unknown): LlmError {
                   : transport.code === 'proxy-unsupported' ? 'AGY_INVALID_PROXY'
                     : transport.code === 'protocol-drift' || transport.code === 'invalid-response' ? 'PROTOCOL_DRIFT'
                       : 'TRANSPORT'
-    return new LlmError(transport.message, code, ...(transport.status === undefined ? [] : [{ status: transport.status }]))
+    return llmError(transport.message, code, ...(transport.status === undefined ? [] : [{ status: transport.status }]))
   }
   return new LlmError(error instanceof Error ? error.message : String(error), 'TRANSPORT', { cause: error })
 }

@@ -20,7 +20,8 @@
  */
 import type { ContentBlock, TextContent } from '@agentclientprotocol/sdk'
 import type { RequestMessage, ToolSchema } from '@deepseek-ai/dsh-llm'
-import { LlmError } from '@deepseek-ai/dsh-llm'
+import { llmError } from '../runtime/llm-error.js'
+import type { LlmError } from '@deepseek-ai/dsh-llm'
 import { renderToolSignatures } from './tool-args.js'
 
 /** 消息信封的起始标签前缀（后跟 `role="…"` 与 `>`）。 */
@@ -235,7 +236,7 @@ export function renderToolResultText(blocks: readonly { type: string; [key: stri
       parts.push(block.text)
       continue
     }
-    throw new LlmError('非文本工具结果必须使用原生内容通道，不能序列化为 JSON 文本', 'AGY_UNSUPPORTED_CONTENT')
+    throw llmError('非文本工具结果必须使用原生内容通道，不能序列化为 JSON 文本', 'AGY_UNSUPPORTED_CONTENT')
   }
   return parts.join('\n')
 }

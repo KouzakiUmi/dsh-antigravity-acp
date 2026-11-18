@@ -18,7 +18,7 @@
 
 ---
 
-> **0.1.38 · 修复档位元数据、模式回切与设置卡片**：没有思考档位变体的模型不再返回空 `reasoning.efforts`（宿主会判为非法元数据并使模型不可用）；代理组件缺席时关闭 `proxyMode` 会真正恢复 ACP 路由；设置卡片不再渲染宿主拒绝写入的普通配置（并发 / 二进制 / 超时），改为指引到普通配置编辑器；会话选模短路、一次性请求占死 worker、工具结果与错误原因等逻辑一并修复；代理模式按 magpie 直连实现的实测口径修复工具 schema（本地 `$ref` 展开、对象兄弟 union、`items`/`properties` 优先于推断类型、空枚举值）并新增上游身份指纹诊断与可选打散、账号被停用识别，ACP 侧加了 64 MiB 单帧上限。类型检查、**47 个文件 / 843 项测试**与构建通过。[查看更新与限制](docs/changelog.md#0138--2026-11-12)
+> **0.1.39 · DSH 兼容性与代理可靠性**：对齐 Core 0.2.2-rc.3 并保留旧版自定义错误码；代理目录过滤禁用模型和档位，工具联合分支保留主 Schema 字段，项目探测临时失败时复用已保存的项目查询额度。[查看更新记录](docs/changelog.md#0139--2026-11-19)
 
 > **0.1.36 · 紧凑设置与账户隔离**：设置页改为连接 / 模型 / 额度 / 高级分页，无修改时隐藏保存横幅；模型使用紧凑列表，支持搜索、筛选、批量启停与完整详情。修复 ACP 复用会话沿用旧映射、代理目录跨账户残留、刷新失败误换 CLI 账户及额度来源错配。类型检查、**44 个文件 / 804 项测试**与构建通过。[查看更新与限制](docs/changelog.md#0136--2026-11-04)
 
@@ -113,15 +113,15 @@ flowchart LR
 | 项目 | 当前声明 / 证据 |
 |---|---|
 | Node.js | `>=22.19` |
-| DSH Core peer 范围 | `>=0.2.0-rc.1 <0.2.1-0 \|\| >=0.2.1-0 <0.3.0-0`，适用于所声明的三个 `dsh-*` peer |
-| 开发契约基准 | `dsh-llm` / `dsh-subprocess` / `dsh-typert-protocol` / `dsh-attachment` **0.2.2-rc.1**，Cordis **4.1.0**（与实机内嵌版本一致，类型检查在该基准下运行） |
+| DSH Core peer 范围 | `>=0.2.0-rc.1 <0.2.1-0 \|\| >=0.2.1-0 <0.3.0-0 \|\| >=0.2.2-0 <0.3.0-0`，适用于所声明的三个 `dsh-*` peer；npm 与 DSH 分别检查准入 |
+| 开发契约基准 | `dsh-llm` / `dsh-subprocess` / `dsh-typert-protocol` / `dsh-attachment` **0.2.2-rc.3**，Cordis **4.1.0**（与实机内嵌版本一致，类型检查在该基准下运行） |
 | 上游协议 | ACP **v1**；SDK **1.4.0** 与默认 server **1.4.0** 是两个独立版本 |
-| 当前源码本地验证 | 0.1.38 + 未发布基准对齐（契约基准 `0.2.2-rc.1` / Cordis `4.1.0`）：类型检查、47 个文件 / 843 项测试与构建通过；另有无 CLI 的真实本地 OAuth 回调闭环及既有离线 Chrome 36 项布局检查 |
-| 实机运行时核对 | 2026-11-12 对 `/opt/dsh` 的 **dsh 0.2.2-rc.1 / cordis 4.1.0** 逐个核对运行时导出：`LlmAdapter` 方法集、`registerAdapter().replace([])`、`LlmError`、品牌类型构造函数、`settings.describe/mutate`（含非 volatile 拒绝文案）、`attachments` 服务名与 `readImage`/`requestImageDimensions`、Typert 远程注册形状、客户端 `__ModuleLoader__.load` / `$mount` / `settings.section` 槽位均在；未在 0.2.2-rc.1 上跑真实生成 |
-| 桌面契约核对 | 使用分发包内 `dsh-llm` / `dsh-typert-protocol` 0.2.1-rc.5、Cordis 4.0.5、Typert 注册器隔离加载构建产物，验证单次贡献注册、代理路由及卸载清理；未调用真实账户 |
-| 尚未覆盖 | 0.1.38 安装后的 Desktop GUI、真实 Google 授权、真实上游生成与图片识别、非 Windows 实机 |
+| 当前源码本地验证 | 0.1.39（契约基准 `0.2.2-rc.3` / Cordis `4.1.0`）：类型检查、48 个文件 / 849 项测试与构建通过；另有无 CLI 的真实本地 OAuth 回调闭环及既有离线 Chrome 36 项布局检查 |
+| 实机运行时核对 | 2026-11-16 复核实机分发包（`app.asar`）内嵌 **dsh-llm / dsh-subprocess / dsh-typert-protocol / dsh-attachment 0.2.2-rc.3，cordis 4.1.0**；此前 2026-11-12 在 0.2.2-rc.1 逐项核对的导出（`LlmAdapter` 方法集、`registerAdapter().replace([])`、`LlmError`、品牌类型构造函数、`settings.describe/mutate`、`attachments` 服务名、Typert 远程注册形状、客户端 `__ModuleLoader__.load` / `$mount` / `settings.section`）在 rc.3 类型层复核通过——`LlmError` constructor 自 rc.3 起只接受 `BuiltinLlmFailureCode`，本包自定义码改经 `LlmError.fromFailure` 原样抛出；未在 0.2.2-rc.3 上跑真实生成 |
+| 桌面契约核对 | DSH NEXT **2.0.23-next**（Core **0.2.2-rc.3**，Cordis **4.1.0**）：使用分发包的真实组件在独立进程验证 peer 范围、ACP / 代理路由互斥切换、Typert 贡献注册与卸载清理、自定义错误码及其状态和原因。未加载桌面 Profile |
+| 尚未覆盖 | 0.1.39 安装后的 Desktop GUI、真实 Google 授权、真实上游生成与图片识别、非 Windows 实机 |
 
-宿主附件服务是可选依赖，缺少时仍可文本聊天，但不声明图片能力。安装准入、开发类型检查和真实运行兼容性分别看待。[完整声明与验证方法](docs/development.md)
+宿主附件服务是可选依赖，缺少时仍可文本聊天。npm 对照已解析的依赖版本检查 peer；本包未声明 `engines.dsh`，DSH 对照自身 Core 版本检查 `dsh-*` peer，并让预发布版本参与范围匹配。路由、服务与客户端装载另行验证。[完整声明与验证方法](docs/development.md)
 
 ## 文档导航
 

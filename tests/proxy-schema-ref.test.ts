@@ -97,6 +97,14 @@ describe('代理模式工具 schema 的本地 $ref', () => {
 })
 
 describe('对象节点带兄弟 union', () => {
+  it('主 Schema 的字段优先，同时补充只在分支定义的字段', () => {
+    const schema = declarations({
+      type: 'object', properties: { count: { type: 'integer' }, forbidden: false },
+      oneOf: [{ properties: { count: { type: 'string' }, forbidden: { type: 'string' }, label: { type: 'string' } } }],
+    })
+    expect(propertiesOf(schema)).toEqual({ count: { type: 'integer' }, label: { type: 'string' } })
+  })
+
   it('保留 object 与 properties，丢弃只表达字段互斥的 oneOf', () => {
     // magpie issue #4046 的复现形态：oneOf 的两个分支都只有 required/not。
     const parameters = declarations({

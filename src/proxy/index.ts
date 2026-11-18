@@ -11,7 +11,8 @@
  * 模式默认关闭：`proxyMode` 为 false 时不注册路由；设置页仍可提前登录代理账户。
  */
 import type { Context } from '@deepseek-ai/cordis'
-import { LlmError } from '@deepseek-ai/dsh-llm'
+import type { LlmError } from '@deepseek-ai/dsh-llm'
+import { llmError } from '../runtime/llm-error.js'
 import type {} from '@deepseek-ai/dsh-llm'
 import { AntigravityProxyAdapter, PROXY_PROVIDER_ID } from './adapter.js'
 import { createProxyTransport } from './transport.js'
@@ -61,7 +62,7 @@ function mountProxyRouter(
         return resolveHttpsProxy({ url: settings.url, bypass: settings.bypass })
       } catch (error) {
         if (error instanceof ProxyConfigError) {
-          throw new LlmError(`代理配置无效，代理模式无法出网：${error.message}`, 'AGY_INVALID_PROXY')
+          throw llmError(`代理配置无效，代理模式无法出网：${error.message}`, 'AGY_INVALID_PROXY')
         }
         throw error
       }

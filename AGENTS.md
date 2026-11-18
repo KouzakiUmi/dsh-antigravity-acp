@@ -29,7 +29,7 @@ npm 包名 `dsh-bundle-antigravity-host`、provider ID `antigravity-acp` / `anti
 
 ## 关键设计取舍
 
-- **模型目录只观测，不自造**：ACP 模式目录来自会话 `configOptions` 与官方 CLI 只读清单；代理模式目录为 `@cortexkit/antigravity-auth-core` 审计快照 ∩ `fetchAvailableModels` 实况。用户设置（`modelOverrides`）只作用于已存在的条目。
+- **模型目录只观测，不自造**：ACP 模式目录来自会话 `configOptions` 与官方 CLI 只读清单；代理模式由 [`model-catalog.ts`](src/proxy/model-catalog.ts) 将审计快照与当前账户的可用模型取交集，排除上游停用项，仅声明确证档位。用户设置（`modelOverrides`）只作用于已存在的条目。
 - **停用 ≠ 删除**：停用只是不列入选择器，已知模型的显示名、上下文容量与路由仍保留，重新启用不会退回裸 ID。
 - **映射优先于家族路由**：`target` 原样写入 `session/set_config_option`，由官方 agent 判定是否接受；未登记 ID 不被静默改写。没有映射时才走「显式选择 → 该模型默认档位 → 官方默认档位」。
 - **默认档位必须存在**：配置的档位若未被官方声明，退回官方默认档位，不指向不存在的选项。
@@ -41,7 +41,7 @@ npm 包名 `dsh-bundle-antigravity-host`、provider ID `antigravity-acp` / `anti
 - **连接成功包含只读项目检测**：CLI 导入先校验或刷新 access token，再通过 `loadCodeAssist` 解析已有 Cloud Code Assist 项目；缺项目时给出可读错误，流程与参考插件的只读探测一致。失效登录态可进入 OAuth；状态快照只返回脱敏阶段与账户代际，授权链接仅在显式登录结果中返回。
 - **代理模式统一出网**：OAuth 与原生 TLS 请求都使用 `resolveHttpsProxy`，显式 `proxyUrl` 优先，留空继承 Host 的 HTTPS / ALL / HTTP 代理环境；小写变量优先。`proxyBypass` 优先于环境排除列表，命中目标才直连。原生 TLS 不读取全局 fetch dispatcher，不能把宿主 fetch 已走代理当作其出网证据。
 - **登录阶段与取消一致**：连接状态区分准备、等待浏览器、完成登录；阶段变化不增加账户代际或重复刷新目录。取消覆盖 OAuth 之前的换发和项目检测，以及回调后的换码与提交；失败原因按授权、项目检测和本地保存分别反馈，重试不受旧回调或监听关闭阻塞。
-- **设置页额度手动读取**：打开设置页只注册共享读取器，不自动取额度；手动拉取与药丸共享同一读取器。模式或账户代际变化时清空旧结果，旧请求不得覆盖新界面；同一次取数的广播不能使刷新按钮永久处于忙碌状态。
+- **设置页额度手动读取**：打开设置页只注册共享读取器，不自动取额度；手动拉取与药丸共享同一读取器。代理模式额度优先使用当前凭据的已保存项目；项目探测临时不可用时继续读取额度，401/403 仍按原流程换发。模式或账户代际变化时清空旧结果，旧请求不得覆盖新界面；同一次取数的广播不能使刷新按钮永久处于忙碌状态。
 - **伪装口径复用审计实现**：agy 线头、chunked 分帧、OAuth 常量与请求变换取自 `@cortexkit/antigravity-auth-core@3.0.14`（与 dsh-tool-antigravity 0.5.2 同版本）；本包只写有界传输与适配器胶水。与参考实现的差异显式记录：不携带 DSH 归属第二头、单账户不轮转 429、SOCKS 在代理模式报错。
 
 ## 实现边界
@@ -52,6 +52,7 @@ npm 包名 `dsh-bundle-antigravity-host`、provider ID `antigravity-acp` / `anti
 - 上下文容量只在实测到 `usage_update.size` 后才声明，不填猜测值。
 - 代理模式接受图片输入（宿主附件服务在场时，单图 4MP / 1MB、整请求 12MB 内联预算，超预算协商 offload）；附件服务缺席时仅声明文本能力，图片请求报 `UNSUPPORTED_MODALITY`。端点白名单含 Cloud Code Assist 生成、目录、项目、额度方法与 Google token 端点；代理账户凭据不进日志与客户端响应。
 - 版本与测试范围见 [README 兼容性矩阵](README.md#兼容性与验证范围)；宽 peer 范围是安装条件，不是全部 Core / 平台实机兼容证明。
+- 自定义 LLM 错误统一经 [`llmError`](src/runtime/llm-error.ts) 构造：新宿主走 `fromFailure`，没有工厂方法的旧宿主走原构造函数；两条路径均保留自定义码和 provider 失败事实。
 
 ## 维护约定
 

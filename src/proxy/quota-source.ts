@@ -9,12 +9,14 @@
  * 运行官方 CLI 只读命令，与本模块无关，本模块也不 spawn 任何官方进程。
  */
 import { LlmError } from '@deepseek-ai/dsh-llm'
+import { llmError } from '../runtime/llm-error.js'
 import { buildAntigravityLoadCodeAssistMetadata } from '@cortexkit/antigravity-auth-core'
 import { withProxyAccountDeadline } from './oauth.js'
 import { parseQuotaSummary } from '../runtime/quota.js'
 import type { QuotaGroup, QuotaSnapshot } from '../runtime/quota.js'
 import { redactSensitiveText } from '../runtime/redact.js'
 import type { ProxyCredentialSource } from './adapter.js'
+import type { ProxyCredential } from './account-store.js'
 import { proxyStatusError, readProxyText } from './transport.js'
 import type { ProxyTransport } from './transport.js'
 
@@ -37,12 +39,12 @@ export async function fetchProxyQuotaSnapshot(deps: ProxyQuotaDeps, signal?: Abo
       return failure(stamp(), 'token-missing', '代理模式未登录，无法读取套餐额度；请在设置页连接代理账户')
     }
     try {
-      return await readWith(credential.accessToken, stamp, deps, signal)
+      return await readWith(credential, stamp, deps, signal)
     } catch (error) {
       const status = error instanceof LlmError ? error.failure?.status : undefined
       if (status === 401 || status === 403) {
         const refreshed = await deps.credential.credential(signal, { forceRefresh: true })
-        if (refreshed) return await readWith(refreshed.accessToken, stamp, deps, signal)
+        if (refreshed) return await readWith(refreshed, stamp, deps, signal)
       }
       throw error
     }
@@ -54,10 +56,22 @@ export async function fetchProxyQuotaSnapshot(deps: ProxyQuotaDeps, signal?: Abo
   }
 }
 
-async function readWith(accessToken: string, stamp: () => string, deps: ProxyQuotaDeps, signal?: AbortSignal): Promise<QuotaSnapshot> {
-  const projectPayload = await post(LOAD_ENDPOINT, { metadata: buildAntigravityLoadCodeAssistMetadata() }, accessToken, deps, signal)
-  const projectId = managedProjectId(projectPayload.cloudaicompanionProject)
-  if (!projectId) throw new LlmError('loadCodeAssist 未返回项目 id', 'PROTOCOL_DRIFT')
+async function readWith(credential: ProxyCredential, stamp: () => string, deps: ProxyQuotaDeps, signal?: AbortSignal): Promise<QuotaSnapshot> {
+  const { accessToken } = credential
+  const savedProject = managedProjectId(credential.projectId)
+  let projectPayload: Record<string, unknown> = {}
+  try {
+    projectPayload = await post(LOAD_ENDPOINT, { metadata: buildAntigravityLoadCodeAssistMetadata() }, accessToken, deps, signal)
+  } catch (error) {
+    signal?.throwIfAborted()
+    const status = error instanceof LlmError ? error.failure?.status : undefined
+    // Authentication still follows the shared one-refresh rule. Project discovery
+    // otherwise only enriches the snapshot when the account already has a project.
+    if (savedProject === undefined || status === 401 || status === 403) throw error
+    deps.log?.info('antigravity-proxy: 项目探测暂不可用，使用当前账户已保存的项目读取额度')
+  }
+  const projectId = savedProject ?? managedProjectId(projectPayload.cloudaicompanionProject)
+  if (!projectId) throw llmError('loadCodeAssist 未返回项目 id', 'PROTOCOL_DRIFT')
   const tiers = [projectPayload.paidTier, projectPayload.currentTier]
   const plan = tiers
     .map((tier) => (isRecord(tier) && typeof tier.name === 'string' ? tier.name : undefined))
@@ -82,7 +96,7 @@ async function post(url: string, payload: Record<string, unknown>, accessToken: 
   const statusError = proxyStatusError(response.status)
   if (statusError !== undefined) {
     try { await response.body?.cancel() } catch { /* best effort */ }
-    throw new LlmError(`代理账户服务请求失败（HTTP ${response.status}）`, response.status === 401 || response.status === 403 ? 'AUTH' : 'UPSTREAM', { status: response.status })
+    throw llmError(`代理账户服务请求失败（HTTP ${response.status}）`, response.status === 401 || response.status === 403 ? 'AUTH' : 'UPSTREAM', { status: response.status })
   }
   const text = await readProxyText(response, { ...(signal === undefined ? {} : { signal }), maxBytes: 512 * 1024,
     idleTimeoutMs: 15_000, totalTimeoutMs: 30_000 })
@@ -90,7 +104,7 @@ async function post(url: string, payload: Record<string, unknown>, accessToken: 
     const value: unknown = JSON.parse(text)
     return isRecord(value) ? value : {}
   } catch {
-    throw new LlmError('代理账户服务响应不是合法 JSON', 'PROTOCOL_DRIFT')
+    throw llmError('代理账户服务响应不是合法 JSON', 'PROTOCOL_DRIFT')
   }
 }
 
@@ -101,7 +115,7 @@ export async function resolveProxyProject(accessToken: string, transport: ProxyT
     const payload = await post(LOAD_ENDPOINT, { metadata: buildAntigravityLoadCodeAssistMetadata() }, accessToken, deps, signal)
     const projectId = managedProjectId(payload.cloudaicompanionProject)
     if (projectId) return projectId
-    throw new LlmError('上游未返回可用项目；请先确认该账户可使用官方 Antigravity，再重新连接', 'AGY_PROXY_PROJECT')
+    throw llmError('上游未返回可用项目；请先确认该账户可使用官方 Antigravity，再重新连接', 'AGY_PROXY_PROJECT')
   }, signal, 30_000)
 }
 

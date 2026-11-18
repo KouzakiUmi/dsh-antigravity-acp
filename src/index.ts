@@ -10,7 +10,8 @@
 import { createReadStream, existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
-import { LlmError } from '@deepseek-ai/dsh-llm'
+import type { LlmError } from '@deepseek-ai/dsh-llm'
+import { llmError } from './runtime/llm-error.js'
 import type {} from '@deepseek-ai/dsh-llm'
 import type { ClientCapabilities } from '@agentclientprotocol/sdk'
 import type { SubprocessHandle, SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
@@ -147,7 +148,7 @@ export async function recycleAcpRuntime(active: ActiveAcpRuntime, link: AgentLin
   handle?.terminate()
   await link.close()
   if (handle && !await handle.waitForExit(AbortSignal.timeout(10_000))) {
-    throw new LlmError('Antigravity ACP 受管进程未能在回收期限内退出，拒绝开启新回合', AGY_LINK_ERROR.LINK_CLOSED)
+    throw llmError('Antigravity ACP 受管进程未能在回收期限内退出，拒绝开启新回合', AGY_LINK_ERROR.LINK_CLOSED)
   }
   if (active.link === link && active.directory) {
     await releaseRuntimeDirectory(active.directory).catch(() => undefined)
@@ -204,7 +205,7 @@ export async function ensureAcpRuntime(
   deps: AcpRuntimeDeps = {},
 ): Promise<AgentLink> {
   if (active.disposed) {
-    throw new LlmError('Antigravity ACP 插件已卸载，无法启动 ACP 链路', AGY_LINK_ERROR.LINK_CLOSED)
+    throw llmError('Antigravity ACP 插件已卸载，无法启动 ACP 链路', AGY_LINK_ERROR.LINK_CLOSED)
   }
   if (active.inflight) return active.inflight
   if (active.link) {
@@ -245,7 +246,7 @@ async function startAcpRuntime(
   if (active.handle) {
     active.handle.terminate()
     if (!await active.handle.waitForExit(AbortSignal.timeout(10_000)).catch(() => false)) {
-      throw new LlmError('前一个 ACP 进程尚未确认退出，无法安全启动新连接', AGY_LINK_ERROR.LINK_CLOSED)
+      throw llmError('前一个 ACP 进程尚未确认退出，无法安全启动新连接', AGY_LINK_ERROR.LINK_CLOSED)
     }
     active.handle = undefined
     if (active.directory) {
@@ -262,7 +263,7 @@ async function startAcpRuntime(
       return resolveProxy({ url: config.proxyUrl, bypass: config.proxyBypass })
     } catch (error) {
       if (!(error instanceof ProxyConfigError)) throw error
-      throw new LlmError(`代理配置无效，无法启动 ACP：${error.message}`, 'AGY_INVALID_PROXY')
+      throw llmError(`代理配置无效，无法启动 ACP：${error.message}`, 'AGY_INVALID_PROXY')
     }
   })()
   const startupSignal = AbortSignal.any([active.abort.signal, ...(deps.signal ? [deps.signal] : [])])
@@ -288,12 +289,12 @@ async function startAcpRuntime(
     const probeLowIntegrity =
       deps.probeLowIntegrity ?? ((path: string, sp: SubprocessRuntime) => isLowIntegrityTarget(path, (target) => runIcacls(sp, target)))
     if (await probeLowIntegrity(resolution.executablePath, subprocess)) {
-      throw new LlmError(describeLowIntegrity(resolution.executablePath), AGY_BINARY_ERROR.LOW_INTEGRITY)
+      throw llmError(describeLowIntegrity(resolution.executablePath), AGY_BINARY_ERROR.LOW_INTEGRITY)
     }
     // 下载可能耗时数分钟，期间插件可能被卸载：这时不再 spawn，避免出现一个
     // dispose 之后才出生、无人终止的进程。
     if (active.disposed) {
-      throw new LlmError('Antigravity ACP 插件已卸载，取消启动 ACP 链路', AGY_LINK_ERROR.LINK_CLOSED)
+      throw llmError('Antigravity ACP 插件已卸载，取消启动 ACP 链路', AGY_LINK_ERROR.LINK_CLOSED)
     }
     startupSignal.throwIfAborted()
     // 登录态在 spawn 前备好：优先导入本机官方 CLI 的已登录凭据（用户要求不弹浏览器
@@ -305,7 +306,7 @@ async function startAcpRuntime(
       ?? (() => ensureAcpCredentials({ acpVersion: config.acpVersion, cliPath: config.agyCliPath, fetchImpl: pluginFetch })))()
     startupSignal.throwIfAborted()
     if (!credentials.ready && deps.allowInteractiveAuth === false) {
-      throw new LlmError('未找到可用的 ACP 登录态，请先使用“连接 / 登录 ACP”，然后再预热', 'AGY_AUTH_REQUIRED')
+      throw llmError('未找到可用的 ACP 登录态，请先使用“连接 / 登录 ACP”，然后再预热', 'AGY_AUTH_REQUIRED')
     }
     const proxy = downloadProxy
     active.lifecycle?.startupPhase('spawn')
@@ -315,7 +316,7 @@ async function startAcpRuntime(
     try {
       startupSignal.throwIfAborted()
       if (await probeLowIntegrity(directory.path, subprocess)) {
-        throw new LlmError(describeLowIntegrity(directory.path), AGY_BINARY_ERROR.LOW_INTEGRITY)
+        throw llmError(describeLowIntegrity(directory.path), AGY_BINARY_ERROR.LOW_INTEGRITY)
       }
       startupSignal.throwIfAborted()
       handle = launchAcpAgent(subprocess, {
@@ -448,7 +449,7 @@ function toLaunchError(error: unknown, stderr: string, credentialsNote?: string)
   const waitingForLogin = describeAuthWait(stderr) !== undefined
   const detail = waitingForLogin ? describeAuthWait(stderr) : stderr || undefined
   const parts = [detail, credentialsNote].filter((part): part is string => Boolean(part))
-  return new LlmError(
+  return llmError(
     parts.length > 0 ? `${message}（诊断：${parts.join('；')}）` : message,
     code,
     { cause: error },
@@ -602,7 +603,7 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
       sessionStore: config.resumeSessions ? sessionStore : undefined,
       canReadImages: () => attachmentStore !== undefined,
       readImage: (ref, signal) => {
-        if (!attachmentStore) throw new LlmError('宿主附件服务不可用，无法读取图片', 'AGY_IMAGE_UNAVAILABLE')
+        if (!attachmentStore) throw llmError('宿主附件服务不可用，无法读取图片', 'AGY_IMAGE_UNAVAILABLE')
         return attachmentStore.readImage(ref, signal)
       },
       onMetadataChanged: (snapshot) => {
@@ -667,7 +668,7 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
     models: async (force) => {
       if (modeBus.current()) {
         const catalog = ctx.get('antigravityProxyCatalog') as ProxyModelCatalog | undefined
-        if (!catalog) throw new LlmError('代理模型目录尚未就绪，请启用代理路由组件后重试', 'AGY_PROXY_UNAVAILABLE')
+        if (!catalog) throw llmError('代理模型目录尚未就绪，请启用代理路由组件后重试', 'AGY_PROXY_UNAVAILABLE')
         return catalog.models(force)
       }
       if (force) {

@@ -110,6 +110,8 @@ ACP fs / terminal 与未知原生权限请求始终拒绝并记录，但不因�
 
 ### ACP 认证
 
+插件在 ACP 模式使用本机官方 ACP 的当前登录态；设置页没有保存多个 Google 账号或按会话选账号的入口。
+
 优先复用本机已有 ACP 凭据。需要导入时，只读 `~/.gemini/antigravity-cli/antigravity-oauth-token`，换发后写入官方 ACP 使用的 `~/.gemini/antigravity-acp/acp_token.json`，并在 `settings.json` 缺少认证方式时合并 `auth.type = oauth-personal`。保留既有设置与用户指定的其它认证方式，不覆盖无法解析的设置文件。
 
 这意味着插件**可能读写本机认证材料**，不是“完全不碰凭据”。CLI 源文件不由插件改写；有可用登录态时跳过浏览器授权。没有可用登录态且本次允许交互时才退回官方 OAuth。预热与非交互目录刷新不会暗中弹登录页。CLI 登录不会由 ACP 登录反向补齐。
@@ -120,7 +122,7 @@ ACP fs / terminal 与未知原生权限请求始终拒绝并记录，但不因�
 
 在设置页「运行模式」勾选并保存 `proxyMode`，启用插件页第二组件 `antigravity-proxy-router`，连接代理账户，随后在会话模型选择器中选择 `antigravity-proxy` 的模型。保存代理模式即撤下 ACP 并停用其连接、预热、目录发现与二进制预读；组件缺席、卸载或注册失败也不会回退 ACP，设置页会说明代理不可用原因。未保存的草稿不改变当前运行模式。
 
-- 登录态副本：缓存目录 `proxy-account.json`（原子写、尽力 `0600`），保存 access / refresh / 过期 / 项目 / 邮箱 / 来源；官方 CLI 登录态文件保持只读，换发结果只写副本。
+- 登录态副本：缓存目录 `proxy-account.json`（原子写、尽力 `0600`）只保存一份代理账户的 access / refresh / 过期 / 项目 / 邮箱 / 来源。完成新的 OAuth 登录会替换副本；官方 CLI 登录态文件保持只读，换发结果只写副本。
 - 导入优先：连接代理账户时先只读导入 `~/.gemini/antigravity-cli/antigravity-oauth-token`；无可用登录态才启动 PKCE + loopback（`localhost:51121/oauth-callback`，只绑 127.0.0.1，5 分钟 TTL，state 不匹配不消耗在途 flow）。
 - 无需安装 agy CLI：没有登录文件时直接点击「连接代理账户 → 打开 Google 授权页」，在运行 DSH 的同一台电脑上授权。插件自行处理回调、换码、已有项目检测和保存；账户需已有 Antigravity 使用权限。额度查询默认也不调用 agy。只有设置页打开「用 agy CLI 查询额度」后才会 spawn `agy`；缺少 CLI 不影响代理登录、目录、套餐额度与聊天。
 - 成功条件：过期 access 先刷新，被拒绝的登录态允许重新授权。连接还会通过 `loadCodeAssist` 只读检测已有项目；缺失时提供可读错误，检测完成后才显示已连接。请点击返回的 Google 授权链接完成登录；失败或过期后可以重连，轮询状态不回传授权链接。
@@ -130,7 +132,7 @@ ACP fs / terminal 与未知原生权限请求始终拒绝并记录，但不因�
 - 与参考实现（dsh-tool-antigravity）的差异：不携带 DSH 归属第二头（归属 User-Agent 与 agy 伪装互斥，代理模式是用户显式开启的功能）；SOCKS 代理在代理模式明确报错而非静默直连；单账户，429 不轮转。
 - 图片输入：宿主附件服务在场时经 `readImageRequest` 有界投影（单图 4MP / 1MB）转 `inlineData`；整请求 12MB 内联预算，超预算报 `IMAGE_OFFLOAD_REQUIRED` 并按最旧优先协商 offload；已 offload 的图片投影为占位文本。附件服务缺席时报 `UNSUPPORTED_MODALITY`。输出含图片的型号（图像生成类）不在代理路由内；上游对文本模型返回媒体输出按协议漂移拒绝。
 - 工具调用：同一响应中的多个完整 `functionCall` 分别交给 DSH，即使上游省略调用 ID 也保持独立；同一 ID 的字符串参数分片继续组装为一条调用。工具响应即使附带 `STOP` 也进入工具续轮。文本与思考块的后到签名随历史回放保留，模型映射或档位改变后不误用旧签名；未收到完成标记就断开会报告传输错误。
-- 目录刷新：设置页按实际生效模式和代理账户代际读取目录，登录完成和退出自动刷新；退出或换账户后不会复用前一账户目录。代理模式的手动刷新重取上游目录；失败仅保留同账户已观测目录。已有代理账户刷新失败不会静默切换到 CLI 的另一账户。模型隐藏、改名、默认思考档位、映射均用于实际代理调用，隐藏条目仍可重新启用。
+- 目录刷新：设置页按实际生效模式和代理账户代际读取目录，登录完成和退出自动刷新；退出或换账户后不会复用前一账户目录。手动刷新重取上游目录；失败仅保留同账户已观测目录。上游标记停用的模型与档位会被排除，只有家族 ID 时不推断档位。已有代理账户刷新失败不会静默切换到 CLI 的另一账户；用户手动隐藏的条目仍可重新启用。
 - 服务挂载：本包的额度与代理账户使用一次 Host Typert contribution 和一次客户端 `$mount`，合并两个命名空间；重复注册相同包身份会被宿主拒绝。
 - 连接卡在准备授权或目录刷新时，检查「高级设置 → 出网代理」。0.1.33 起，留空会继承 Host 的 HTTPS / ALL / HTTP 代理环境，OAuth 和原生 TLS 请求使用相同解析规则；仅有其它插件配置的全局 fetch 代理时，可在此显式填写 HTTP(S) 代理地址。连接失败不退回直连，排除列表只在命中目标时绕过代理。
 
@@ -150,7 +152,7 @@ ACP / 代理模式切换时，药丸清空旧模式的额度并立即重新读�
 |---|---|---|
 | 套餐额度（默认） | ACP 模式走 Cloud Code Assist HTTP；代理模式走代理账户 | 不 spawn `agy`。HTTP 产品授权不匹配可能返回 403 |
 | 套餐额度（打开 CLI 取数） | `agy -p /usage --output-format json` 的 `command.data.groups[].buckets[]` | 两种模式都走 CLI；未找到 agy 时 ACP 回落 HTTP |
-| 套餐额度（代理模式，默认） | 代理账户的 `loadCodeAssist` + `retrieveUserQuotaSummary`（agy 线传输，不启动 agy 程序） | 未登录代理账户时报 `token-missing`；401/403 换发一次重试 |
+| 套餐额度（代理模式，默认） | 当前账户的 `retrieveUserQuotaSummary`；`loadCodeAssist` 提供项目及订阅档位信息 | 项目探测失败时可使用该账户已保存的项目，401/403 仍换发一次；未登录时报 `token-missing` |
 | AI Credits | 仅当 `cliQuotaEnabled` 为真时：`agy -p /credits --output-format json` 的 `command.data.remaining_credits`，可选 `plan_name` | 默认不查询（`cli-disabled`，界面隐藏区块）；开关开启但 CLI 缺失等故障以 `cli-unavailable` 等错误码显示，不从套餐额度推算 |
 | 模型目录 | 会话观测与 `agy models` | 手动强制刷新无 CLI 时尝试非交互 ACP 发现；代理模式为审计快照 ∩ `fetchAvailableModels` |
 

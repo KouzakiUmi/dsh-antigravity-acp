@@ -79,14 +79,14 @@ ACP 官方 agent 在同一会话内会保留上下文（2026-10-23 真机验证�
 
 - **登录态**：代理账户独立于 ACP 登录。连接时优先只读导入 `~/.gemini/antigravity-cli/antigravity-oauth-token`，过期则先换发；失效登录态不会被报告为连接成功。没有可用登录态时返回 PKCE 授权链接，请点击完成浏览器登录（回调 `http://localhost:51121/oauth-callback`，只绑 127.0.0.1）。连接还会只读检测上游已有项目，未返回项目时显示具体原因，检测完成后才显示已连接。副本落在缓存目录 `proxy-account.json`（原子写、尽力 0600），官方文件保持只读。
 - **无需安装 CLI**：点击「连接代理账户 → 打开 Google 授权页」，在运行 DSH 的同一台电脑上授权。插件自行处理回调、换码、项目检测及保存；账户需已有 Antigravity 使用权限。页面分别显示准备、等待授权和完成阶段，以及对应失败原因。
-- **取消与退出**：收到浏览器回调后的 token 交换仍可取消。退出会使在途刷新失效，并等待已有保存结束后清除副本；本次插件生命周期内，自动取数保持退出状态，点击「连接代理账户」可重新连接。
+- **账户与退出**：代理模式一次只保存一个 Google 账号，重新 OAuth 登录会替换当前副本。收到浏览器回调后的 token 交换仍可取消。退出会使在途刷新失效，并等待已有保存结束后清除副本；本次插件生命周期内，自动取数保持退出状态，点击「连接代理账户」可重新连接。
 - **出网代理**：OAuth、项目检测、模型目录、额度与生成使用同一解析规则：非空 `proxyUrl` 优先；留空依次读取 Host 的 `https_proxy` / `HTTPS_PROXY`、`all_proxy` / `ALL_PROXY`、`http_proxy` / `HTTP_PROXY`，都缺失才直连。`proxyBypass` 未配置时继承 `no_proxy` / `NO_PROXY`，始终合并 loopback；命中目标时直连。原生 TLS 不使用宿主全局 fetch dispatcher，因此仅启用其它插件的 fetch 代理不代表它已使用同一出口。
 - **线形态**：请求头按 agy CLI 口径固定（`antigravity/cli/<version> (aidev_client; …)` User-Agent、`:streamGenerateContent` 走 chunked、其余 Content-Length），端点白名单包含生成、目录、只读项目检测、额度与 Google token 方法；调用方不能注入任意头或目的地。出网代理沿用 `proxyUrl` / `proxyBypass`，代理模式支持 HTTP(S) CONNECT，SOCKS 会明确报错。
-- **模型目录**：core 审计快照 ∩ `fetchAvailableModels` 实况（30 秒 TTL）。登录完成或退出后自动更新目录；手动刷新绕过缓存。失败只可保留同账户已成功观测的目录，无成功记录时显示错误。隐藏、改名、默认思考档位和 `target` 映射均用于实际代理调用；隐藏项保留在设置页以便重新启用，映射优先于思考档位。切回 ACP 后恢复原来的 CLI / ACP 来源。
-- **额度**：默认不调用 `agy`。代理模式套餐额度走代理账户的 `loadCodeAssist` + `retrieveUserQuotaSummary`；ACP 模式走内置 Cloud Code Assist 直连。只有打开 `cliQuotaEnabled` 后，套餐额度与 AI Credits 才运行官方 CLI 只读命令。模式切换、退出、重新连接和开关翻转均失效旧快照，在途旧结果不覆盖新状态。打开 CLI 取数后，AI Credits 属于官方 CLI 账户，可能与代理账户不同。
+- **模型目录**：core 审计快照 ∩ `fetchAvailableModels` 当前账户可用项（30 秒 TTL）。上游停用项不显示；只列出已观测的思考档位。已保存的默认档位失效时用当前目录的可用默认项；手动 `target` 映射优先，不提供档位菜单。登录完成或退出后自动更新目录；手动刷新绕过缓存，失败只保留同账户已确认目录。用户手动隐藏的项仍保留在设置页。切回 ACP 后恢复 CLI / ACP 来源。
+- **额度**：默认不调用 `agy`。代理模式优先用已保存的项目请求 `retrieveUserQuotaSummary`；`loadCodeAssist` 临时不可用时仍可查询该项目的额度，但该次不显示订阅档位。ACP 模式走内置 Cloud Code Assist 直连。只有打开 `cliQuotaEnabled` 后，套餐额度与 AI Credits 才运行官方 CLI 只读命令。模式切换、退出、重新连接和开关翻转均失效旧快照，在途旧结果不覆盖新状态。打开 CLI 取数后，AI Credits 属于官方 CLI 账户，可能与代理账户不同。
 - **边界**：代理模式不 spawn 官方进程、没有 MCP 工具桥（工具仍由 DSH 自身执行面提供，与 ACP 模式相同）；429 不做多账户轮转，直接报 `RATE_LIMIT`；401/403 在未出块前换发一次重试一次——但 **403 且上游写明 `violation of Terms of Service` / `disabled in this account`** 时不再换发，直接报 `AGY_ACCOUNT_SUSPENDED` 并说明需要申诉（换发救不回被停用的账号）。
 - **提示词指纹**：Antigravity 会把「请求文本里出现已知客户端身份」的请求恒定伪装成 `429 Resource has been exhausted`（magpie 在真实账号上逐条试过：计费行、Claude Code / Agent SDK 身份句、Codex 的 GPT-5 身份句），与剩余额度无关。代理模式对 system 做只读诊断，并在 429 文案里点明可能原因；只有打开 `cloakSensitiveWords` 才按同一实测口径在命中词段插入零宽空格（零宽混淆属于绕过上游识别，默认关闭）。
-- **工具 schema 净化**：DSH 的工具参数会被裁成上游要的子集——本地 `$ref`（JSON Pointer 与 `$defs` / `definitions` 名字）展开，对象节点的兄弟 `oneOf` / `anyOf` 丢弃，节点**有 `items` 就是 array、有 `properties` 就是 object**（优先于显式 type 与由 enum / const 推断的类型），空数组补 `items`，空串与纯空白不算有效枚举值。这些形态会让上游 400，或让模型根本看不到参数结构。
+- **工具 schema 净化**：本地 `$ref` 展开；对象的 `oneOf` / `anyOf` 分支可补充字段，但不能覆盖主 Schema 的字段定义。节点有 `items` 优先识别为数组，有 `properties` 则识别为对象；数组补齐 `items`，字符串枚举忽略空串与纯空白。
 
 设置页字段通过宿主的即时配置引用保存：模型显示开关、显示名与映射随保存更新选择器，会话与进程偏好在下一轮聊天、预热或目录发现时读取，不打断正在输出或等待工具的回合。自动预热开关在下次启用插件时读取。代理和 CLI 路径用于后续请求及新启动的官方进程；已有 ACP 进程保留原启动环境，切换其出口仍需重新加载插件。
 

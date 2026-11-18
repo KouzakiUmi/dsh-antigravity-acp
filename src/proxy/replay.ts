@@ -297,7 +297,8 @@ function sanitizeSchema(value: unknown, depth = 0, scope?: SchemaScope, isRoot =
   if (enumValues !== undefined && enumValues.length > 0) output.enum = enumValues
   if (type === 'object') {
     const properties: Record<string, unknown> = {}
-    const declared: Record<string, unknown> = { ...(isRecord(source.properties) ? source.properties : {}), ...(unionProperties ?? {}) }
+    const declared: Record<string, unknown> = isRecord(source.properties) ? { ...source.properties } : {}
+    for (const [key, item] of Object.entries(unionProperties ?? {})) if (!Object.hasOwn(declared, key)) declared[key] = item
     for (const [key, item] of Object.entries(declared).slice(0, 128)) {
       if (hasControl(key) || key.length === 0) continue
       const cleaned = sanitizeSchema(item, depth + 1, scope)

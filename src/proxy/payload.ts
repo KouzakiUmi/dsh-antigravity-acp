@@ -26,7 +26,8 @@ import {
   orderAgyRequestPayloadInPlace,
   resolveModelWithTier,
 } from '@cortexkit/antigravity-auth-core'
-import { LlmError } from '@deepseek-ai/dsh-llm'
+import type { LlmError } from '@deepseek-ai/dsh-llm'
+import { llmError } from '../runtime/llm-error.js'
 import type { ContentBlock, RequestMessage, TokenUsage } from '@deepseek-ai/dsh-llm'
 import type { AdapterRequestOptions } from '../adapter/request-options.js'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
@@ -272,7 +273,7 @@ interface ToolCallBinding { readonly id: string; readonly name: string }
 interface ToolCallState { last: ToolCallBinding; pending: ToolCallBinding[] }
 
 function rememberToolName(toolNames: Map<string, ToolCallState>, callId: unknown, name: string): string {
-  if (typeof name !== 'string' || name.length === 0 || name.length > 256 || containsControl(name)) throw new LlmError('代理模式工具调用名无效', 'INVALID_ARGS')
+  if (typeof name !== 'string' || name.length === 0 || name.length > 256 || containsControl(name)) throw llmError('代理模式工具调用名无效', 'INVALID_ARGS')
   const id = requireToolCallId(callId)
   const state = toolNames.get(id)
   const assigned = state === undefined ? id : state.last.name === name ? state.last.id : `${id}#${name}`
@@ -283,7 +284,7 @@ function rememberToolName(toolNames: Map<string, ToolCallState>, callId: unknown
 
 function consumeToolBinding(toolNames: Map<string, ToolCallState>, callId: unknown): ToolCallBinding {
   const state = toolNames.get(requireToolCallId(callId))
-  if (state === undefined) throw new LlmError('代理模式工具结果没有匹配的调用：会话历史已被裁剪或回退，请新建会话后重试', 'INVALID_ARGS')
+  if (state === undefined) throw llmError('代理模式工具结果没有匹配的调用：会话历史已被裁剪或回退，请新建会话后重试', 'INVALID_ARGS')
   const next = state.pending.shift()
   return next ?? state.last
 }
@@ -293,7 +294,7 @@ function expirePendingToolCalls(toolNames: Map<string, ToolCallState>): void {
 }
 
 function requireToolCallId(value: unknown): string {
-  if (typeof value !== 'string' || value.length === 0 || value.length > 512 || containsControl(value)) throw new LlmError('代理模式工具调用 id 无效', 'INVALID_ARGS')
+  if (typeof value !== 'string' || value.length === 0 || value.length > 512 || containsControl(value)) throw llmError('代理模式工具调用 id 无效', 'INVALID_ARGS')
   return value
 }
 
@@ -352,7 +353,7 @@ async function mapMessage(
       })
     } else if (block.type === 'image') {
       if (attachments === undefined) {
-        throw new LlmError('代理模式图片输入需要宿主附件服务；当前宿主未提供，请移除图片或改用文本', 'UNSUPPORTED_MODALITY')
+        throw llmError('代理模式图片输入需要宿主附件服务；当前宿主未提供，请移除图片或改用文本', 'UNSUPPORTED_MODALITY')
       }
       const ref = block.attachment as ImageAttachmentRef
       const read = await readProxyImage(attachments, ref, signal)
@@ -383,16 +384,16 @@ function parseJsonObject(value: string): Record<string, unknown> {
   } catch {
     // 历史工具调用不能被静默改写：报错而不是发送损坏参数。
   }
-  throw new LlmError('代理模式历史工具调用参数不是合法 JSON', 'PROTOCOL_DRIFT')
+  throw llmError('代理模式历史工具调用参数不是合法 JSON', 'PROTOCOL_DRIFT')
 }
 
 function boundedInteger(value: number, min: number, max: number, label: string): number {
-  if (!Number.isFinite(value) || value < min || value > max) throw new LlmError(`${label} 超出代理模式允许范围`, 'INVALID_ARGS')
+  if (!Number.isFinite(value) || value < min || value > max) throw llmError(`${label} 超出代理模式允许范围`, 'INVALID_ARGS')
   return Math.floor(value)
 }
 
 function boundedNumber(value: number, min: number, max: number, label: string): number {
-  if (!Number.isFinite(value) || value < min || value > max) throw new LlmError(`${label} 超出代理模式允许范围`, 'INVALID_ARGS')
+  if (!Number.isFinite(value) || value < min || value > max) throw llmError(`${label} 超出代理模式允许范围`, 'INVALID_ARGS')
   return value
 }
 
@@ -437,9 +438,9 @@ export function parseProxyProviderEvent(data: string): ProxyProviderEvent {
   const normalized = data.trim().replace(/^\)\]\}'(?:\r?\n)?/u, '')
   let value: unknown
   try { value = JSON.parse(normalized) as unknown } catch {
-    throw new LlmError('代理模式响应包含非法 JSON', 'PROTOCOL_DRIFT')
+    throw llmError('代理模式响应包含非法 JSON', 'PROTOCOL_DRIFT')
   }
-  if (!isRecord(value)) throw new LlmError('代理模式响应事件不是对象', 'PROTOCOL_DRIFT')
+  if (!isRecord(value)) throw llmError('代理模式响应事件不是对象', 'PROTOCOL_DRIFT')
   if (isRecord(value.error)) return { parts: [], error: errorDetails(value.error) }
   const root = isRecord(value.response) ? value.response : value
   if (isRecord(root.error)) return { parts: [], error: errorDetails(root.error) }
@@ -471,7 +472,7 @@ function findParts(value: Record<string, unknown>): unknown[] {
       if (!isRecord(candidate)) continue
       const content = isRecord(candidate.content) ? candidate.content : candidate
       if (Array.isArray(content.parts)) {
-        if (output.length + content.parts.length > MAX_PROVIDER_PARTS) throw new LlmError('代理模式响应 part 过多', 'PROTOCOL_DRIFT')
+        if (output.length + content.parts.length > MAX_PROVIDER_PARTS) throw llmError('代理模式响应 part 过多', 'PROTOCOL_DRIFT')
         output.push(...content.parts)
       }
     }
@@ -484,12 +485,12 @@ function findParts(value: Record<string, unknown>): unknown[] {
 }
 
 function boundedParts(value: unknown[]): unknown[] {
-  if (value.length > MAX_PROVIDER_PARTS) throw new LlmError('代理模式响应 part 过多', 'PROTOCOL_DRIFT')
+  if (value.length > MAX_PROVIDER_PARTS) throw llmError('代理模式响应 part 过多', 'PROTOCOL_DRIFT')
   return value
 }
 
 function parsePart(value: unknown): ProxyProviderPart | undefined {
-  if (!isRecord(value)) throw new LlmError('代理模式响应 part 格式错误', 'PROTOCOL_DRIFT')
+  if (!isRecord(value)) throw llmError('代理模式响应 part 格式错误', 'PROTOCOL_DRIFT')
   const functionCall = isRecord(value.functionCall) ? value.functionCall : isRecord(value.function_call) ? value.function_call : undefined
   if (functionCall !== undefined) {
     const name = stringValue(functionCall.name)
@@ -515,9 +516,9 @@ function parsePart(value: unknown): ProxyProviderPart | undefined {
     }
   }
   if (value.inlineData !== undefined || value.inline_data !== undefined) {
-    throw new LlmError('代理模式收到了媒体输出（本路由只请求文本模型）', 'PROTOCOL_DRIFT')
+    throw llmError('代理模式收到了媒体输出（本路由只请求文本模型）', 'PROTOCOL_DRIFT')
   }
-  throw new LlmError('代理模式响应包含未知 part 类型', 'PROTOCOL_DRIFT')
+  throw llmError('代理模式响应包含未知 part 类型', 'PROTOCOL_DRIFT')
 }
 
 function errorDetails(value: Record<string, unknown>): NonNullable<ProxyProviderEvent['error']> {

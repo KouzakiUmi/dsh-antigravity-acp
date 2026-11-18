@@ -8,7 +8,8 @@
  * 不一致时完整重建。工具结果在同一个 ACP prompt 内经 MCP 回填。
  * 可选磁盘映射只保存 ID、计数与指纹，不存消息正文。
  */
-import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { LlmAdapter, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { llmError } from '../runtime/llm-error.js'
 import type {
   ContentBlock,
   LlmModelInfo,
@@ -448,8 +449,8 @@ export class AntigravityAcpAdapter extends LlmAdapter {
 
   /** Explicit discovery is allowed to authenticate, but never sends a model prompt. */
   async discoverModels(signal?: AbortSignal, interactive = true): Promise<readonly LlmModelInfo[]> {
-    if (this.busy) throw new LlmError('ACP 正在处理对话，请在空闲时连接并读取模型目录', AGY_ADAPTER_ERROR.BUSY)
-    if (this.#disposed) throw new LlmError('Antigravity ACP adapter 已卸载', 'AGY_LINK_CLOSED')
+    if (this.busy) throw llmError('ACP 正在处理对话，请在空闲时连接并读取模型目录', AGY_ADAPTER_ERROR.BUSY)
+    if (this.#disposed) throw llmError('Antigravity ACP adapter 已卸载', 'AGY_LINK_CLOSED')
     this.#refreshSettings()
     this.#streamActive = true
     this.#clearIdleRecycle()
@@ -466,7 +467,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       }, { signal })
       discoverySession = session.sessionId
       throwIfAborted(signal)
-      if (!findModelSelector(session.configOptions)) throw new LlmError('ACP 会话未提供模型目录', AGY_ADAPTER_ERROR.NO_MODEL_SELECTOR)
+      if (!findModelSelector(session.configOptions)) throw llmError('ACP 会话未提供模型目录', AGY_ADAPTER_ERROR.NO_MODEL_SELECTOR)
       this.observeSessionConfigOptions(session.configOptions)
       return await this.listModels(AGY_PROVIDER_ID)
     } catch (error) {
@@ -482,8 +483,8 @@ export class AntigravityAcpAdapter extends LlmAdapter {
 
   /** 预热复用聊天的同一组 handlers 和运行时；不建临时会话、不消耗模型请求。 */
   async warmup(signal?: AbortSignal, interactive = false): Promise<void> {
-    if (this.#disposed) throw new LlmError('Antigravity ACP adapter 已卸载', 'AGY_LINK_CLOSED')
-    if (this.busy) throw new LlmError('ACP 正在处理对话，无需再次预热', AGY_ADAPTER_ERROR.BUSY)
+    if (this.#disposed) throw llmError('Antigravity ACP adapter 已卸载', 'AGY_LINK_CLOSED')
+    if (this.busy) throw llmError('ACP 正在处理对话，无需再次预热', AGY_ADAPTER_ERROR.BUSY)
     this.#refreshSettings()
     this.#streamActive = true
     this.#clearIdleRecycle()
@@ -1145,7 +1146,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       turn = undefined
     }
     if (turn && !this.#isTurnClosed(turn)) {
-      throw new LlmError(
+      throw llmError(
         'Antigravity ACP 同一时刻只允许一路活跃 stream：当前回合仍在进行中，本请求既不是其续轮，也无法安全抢占',
         AGY_ADAPTER_ERROR.BUSY,
       )
@@ -1165,8 +1166,8 @@ export class AntigravityAcpAdapter extends LlmAdapter {
 
   async #acquireStream(options: AdapterRequestOptions): Promise<void> {
     for (;;) {
-      if (this.#disposed) throw new LlmError('Antigravity ACP adapter 已卸载', 'AGY_LINK_CLOSED')
-      if (options.signal?.aborted) throw new LlmError('Antigravity ACP 请求在等待调度时被取消', AGY_TURN_ERROR.ABORTED)
+      if (this.#disposed) throw llmError('Antigravity ACP adapter 已卸载', 'AGY_LINK_CLOSED')
+      if (options.signal?.aborted) throw llmError('Antigravity ACP 请求在等待调度时被取消', AGY_TURN_ERROR.ABORTED)
       // 压缩由主循环在下一步之前同步等待，不能排在它自己尚未回喂的工具回合后面；
       // 同会话压缩沿用下方的 abandon + 完整历史重建兜底，标题等后台请求则必须等待。
       const inlineCompaction = options.purpose === 'compaction' && this.#turnOwner?.sessionId === options.sessionId
@@ -1183,7 +1184,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         const wake = (): void => { cleanup(); resolve() }
         const onAbort = (): void => {
           cleanup()
-          reject(new LlmError('Antigravity ACP 请求在等待调度时被取消', AGY_TURN_ERROR.ABORTED))
+          reject(llmError('Antigravity ACP 请求在等待调度时被取消', AGY_TURN_ERROR.ABORTED))
         }
         this.#accessWaiters.add(wake)
         options.signal?.addEventListener('abort', onAbort, { once: true })
@@ -1196,7 +1197,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   async #prepareRound(options: AdapterRequestOptions, owner?: string) {
     let link: AgentLink | undefined
     const check = (): void => {
-      if (this.#disposed) throw new LlmError('Antigravity ACP adapter 已卸载', 'AGY_LINK_CLOSED')
+      if (this.#disposed) throw llmError('Antigravity ACP adapter 已卸载', 'AGY_LINK_CLOSED')
       throwIfAborted(options.signal)
     }
     const setup = (async () => {
@@ -1254,7 +1255,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   async *#runNewRound(options: AdapterRequestOptions): AsyncGenerator<StreamChunk> {
     this.#clearIdleRecycle()
     await withAbort(this.#settleRecycle(), options.signal)
-    if (this.#disposed) throw new LlmError('Antigravity ACP adapter 已卸载', 'AGY_LINK_CLOSED')
+    if (this.#disposed) throw llmError('Antigravity ACP adapter 已卸载', 'AGY_LINK_CLOSED')
     this.#turnOwner = {
       ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
       ...(options.purpose === undefined ? {} : { purpose: options.purpose }),
@@ -1405,7 +1406,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     }
     if (this.#disposed) {
       turn.abort('adapter 已卸载')
-      throw new LlmError('Antigravity ACP adapter 已卸载', 'AGY_LINK_CLOSED')
+      throw llmError('Antigravity ACP adapter 已卸载', 'AGY_LINK_CLOSED')
     }
     turn.startPrompt(content, options.signal)
     try {
@@ -1462,7 +1463,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     // 同回合重复调用是幂等的，不会叠加监听器。
     this.#subscribeTurn(turn)
     const results: BridgeToolResult[] = await Promise.all(tail.map(async (message) => {
-      if (message.role !== 'tool') throw new LlmError('续轮内部错误：非 tool 角色进入工具回喂', AGY_ADAPTER_ERROR.BUSY)
+      if (message.role !== 'tool') throw llmError('续轮内部错误：非 tool 角色进入工具回喂', AGY_ADAPTER_ERROR.BUSY)
       return {
         callId: message.toolCallId,
         text: '',
@@ -1691,7 +1692,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     })
     const selector = this.#modelSelector
     if (!selector) {
-      throw new LlmError(
+      throw llmError(
         'Antigravity ACP 会话未声明任何 model 类配置选项（select + category/name 匹配 model），无法为该 provider 选择模型',
         AGY_ADAPTER_ERROR.NO_MODEL_SELECTOR,
       )
@@ -1727,7 +1728,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
 }
 
 function throwIfAborted(signal?: AbortSignal): void {
-  if (signal?.aborted) throw new LlmError('Antigravity ACP 请求已取消', AGY_TURN_ERROR.ABORTED)
+  if (signal?.aborted) throw llmError('Antigravity ACP 请求已取消', AGY_TURN_ERROR.ABORTED)
 }
 
 /** 不丢失原 promise 的拒绝处理；取消只停止等待，资源所有者负责清理。 */
@@ -1736,7 +1737,7 @@ function withAbort<T>(pending: Promise<T>, signal?: AbortSignal): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const onAbort = (): void => {
       signal.removeEventListener('abort', onAbort)
-      reject(new LlmError('Antigravity ACP 请求已取消', AGY_TURN_ERROR.ABORTED))
+      reject(llmError('Antigravity ACP 请求已取消', AGY_TURN_ERROR.ABORTED))
     }
     signal.addEventListener('abort', onAbort, { once: true })
     pending.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort))

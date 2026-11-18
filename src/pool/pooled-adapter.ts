@@ -1,4 +1,6 @@
-import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
+import { LlmAdapter } from '@deepseek-ai/dsh-llm'
+import type { LlmError } from '@deepseek-ai/dsh-llm'
+import { llmError } from '../runtime/llm-error.js'
 import type { LlmModelInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { AdapterPreparedCall, AdapterRequestOptions, AdapterRequestOwner } from '../adapter/request-options.js'
 import type { AcpLifecycleSnapshot } from '../runtime/lifecycle.js'
@@ -62,7 +64,7 @@ export class PooledAcpAdapter extends LlmAdapter {
   override async resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
     const models = await Promise.all(this.slots.map(s => s.worker.adapter.resolveModel(provider, model, signal)))
     const first = models[0]
-    if (!first) throw new LlmError('ACP 没有可用的模型元数据', 'AGY_MODEL_UNAVAILABLE')
+    if (!first) throw llmError('ACP 没有可用的模型元数据', 'AGY_MODEL_UNAVAILABLE')
     const known = models.find(m => m.name !== m.id)
     const reasoning = mergeReasoning(models)
     const modalities = models.every(m => m.inputModalities !== undefined)
@@ -85,12 +87,12 @@ export class PooledAcpAdapter extends LlmAdapter {
   }
 
   override async prepareCall(provider: string, model: string, signal?: AbortSignal): Promise<AdapterPreparedCall> {
-    if (this.closed) throw new LlmError('ACP 插件已卸载', 'AGY_LINK_CLOSED')
-    if (signal?.aborted) throw new LlmError('ACP 请求已取消', AGY_TURN_ERROR.ABORTED)
+    if (this.closed) throw llmError('ACP 插件已卸载', 'AGY_LINK_CLOSED')
+    if (signal?.aborted) throw llmError('ACP 请求已取消', AGY_TURN_ERROR.ABORTED)
     // Discover input capabilities before DSH projects attachments into a text-only request.
     while (!this.prepared) {
-      if (this.closed) throw new LlmError('ACP 插件已卸载', 'AGY_LINK_CLOSED')
-      if (signal?.aborted) throw new LlmError('ACP 请求已取消', AGY_TURN_ERROR.ABORTED)
+      if (this.closed) throw llmError('ACP 插件已卸载', 'AGY_LINK_CLOSED')
+      if (signal?.aborted) throw llmError('ACP 请求已取消', AGY_TURN_ERROR.ABORTED)
       if (!this.preparation) {
         const controller = new AbortController()
         const generation = this.preparationGeneration
@@ -113,7 +115,7 @@ export class PooledAcpAdapter extends LlmAdapter {
         if (!this.preparationWaiters && !this.prepared) this.preparationAbort?.abort()
       }
     }
-    if (this.closed) throw new LlmError('ACP 插件已卸载', 'AGY_LINK_CLOSED')
+    if (this.closed) throw llmError('ACP 插件已卸载', 'AGY_LINK_CLOSED')
     return { model: await this.resolveModel(provider, model, signal), stream: options => this.stream(options) }
   }
   override async *stream(options: AdapterRequestOptions): AsyncGenerator<StreamChunk> {
@@ -180,7 +182,7 @@ export class PooledAcpAdapter extends LlmAdapter {
     this.poll = undefined
     for (const waiter of this.waiters.splice(0)) {
       waiter.cleanup()
-      waiter.reject(new LlmError('ACP 插件已卸载', 'AGY_LINK_CLOSED'))
+      waiter.reject(llmError('ACP 插件已卸载', 'AGY_LINK_CLOSED'))
     }
     const results = await Promise.allSettled(this.slots.map(s => s.worker.dispose()))
     const failed = results.find((r): r is PromiseRejectedResult => r.status === 'rejected')
@@ -244,14 +246,14 @@ export class PooledAcpAdapter extends LlmAdapter {
   }
 
   private acquire(options: AdapterRequestOptions | undefined, signal?: AbortSignal): Promise<Slot> {
-    if (this.closed) return Promise.reject(new LlmError('ACP 插件已卸载', 'AGY_LINK_CLOSED'))
-    if (signal?.aborted) return Promise.reject(new LlmError('ACP 请求在排队前已取消', AGY_TURN_ERROR.ABORTED))
+    if (this.closed) return Promise.reject(llmError('ACP 插件已卸载', 'AGY_LINK_CLOSED'))
+    if (signal?.aborted) return Promise.reject(llmError('ACP 请求在排队前已取消', AGY_TURN_ERROR.ABORTED))
     // Tool results release parked work and must never be refused by an unrelated full queue.
     const owner = options && this.slots.find(s => !s.leased && s.worker.adapter.busy && s.owner
       && s.owner.sessionId === options.sessionId
       && (s.owner.purpose === options.purpose || options.purpose === 'compaction'))
     if (owner) { owner.leased = true; return Promise.resolve(owner) }
-    if (this.waiters.length >= 64) return Promise.reject(new LlmError('ACP 等待队列已满，请稍后重试', 'AGY_QUEUE_FULL'))
+    if (this.waiters.length >= 64) return Promise.reject(llmError('ACP 等待队列已满，请稍后重试', 'AGY_QUEUE_FULL'))
     return new Promise((resolve, reject) => {
       const remove = (error: LlmError): void => {
         const index = this.waiters.indexOf(waiter)
@@ -261,8 +263,8 @@ export class PooledAcpAdapter extends LlmAdapter {
         reject(error)
         this.dispatch()
       }
-      const abort = (): void => remove(new LlmError('ACP 请求在等待连接时已取消', AGY_TURN_ERROR.ABORTED))
-      const timer = setTimeout(() => remove(new LlmError('ACP 连接繁忙，等待超时；请完成其他对话的工具审批或稍后重试', 'AGY_QUEUE_TIMEOUT')), this.queueTimeoutMs)
+      const abort = (): void => remove(llmError('ACP 请求在等待连接时已取消', AGY_TURN_ERROR.ABORTED))
+      const timer = setTimeout(() => remove(llmError('ACP 连接繁忙，等待超时；请完成其他对话的工具审批或稍后重试', 'AGY_QUEUE_TIMEOUT')), this.queueTimeoutMs)
       const waiter: Waiter = { options, resolve, reject, cleanup: () => { clearTimeout(timer); signal?.removeEventListener('abort', abort) } }
       signal?.addEventListener('abort', abort, { once: true })
       this.waiters.push(waiter)
@@ -317,7 +319,7 @@ function mergeReasoning(models: readonly LlmResolvedModelInfo[]): LlmResolvedMod
 function waitWithSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return promise
   return new Promise((resolve, reject) => {
-    const abort = (): void => { cleanup(); reject(new LlmError('ACP 请求已取消', AGY_TURN_ERROR.ABORTED)) }
+    const abort = (): void => { cleanup(); reject(llmError('ACP 请求已取消', AGY_TURN_ERROR.ABORTED)) }
     const cleanup = (): void => signal.removeEventListener('abort', abort)
     signal.addEventListener('abort', abort, { once: true })
     promise.then(value => { cleanup(); resolve(value) }, error => { cleanup(); reject(error) })

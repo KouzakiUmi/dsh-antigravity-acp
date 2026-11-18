@@ -189,6 +189,43 @@ describe('代理凭据取消', () => {
 })
 
 describe('代理模型设置与调用准备', () => {
+  it('目录排除停用模型与档位，准备与派发只使用观测到的档位', async () => {
+    const request = vi.fn(async ({ url }: { url: string }) => url.includes('fetchAvailableModels')
+      ? Response.json({ models: {
+        'publishers/google/models/gemini-3.8-flash-high': { disabled: true },
+        'gemini-3.8-flash-medium': {},
+        'claude-opus-5-5-low': { disabled: true, modelName: 'claude-opus-5-5-high' },
+      } }) : new Response(`data: ${JSON.stringify(event([{ text: 'ok' }], 'STOP'))}\n\n`))
+    const instance = new AntigravityProxyAdapter({
+      readSettings: () => ({ modelOverrides: { [model]: { effort: 'high' } } }),
+      credential: { credential: async () => ({ accessToken: 'fixture', source: 'login', updatedAt: 'x' }) },
+      transport: { request },
+    })
+    expect((await instance.listModels(PROXY_PROVIDER_ID)).map(row => row.id)).toEqual([model])
+    await expect(instance.resolveModel(PROXY_PROVIDER_ID, 'antigravity-claude-opus-5-5')).rejects.toMatchObject({ code: 'MODEL_UNSUPPORTED' })
+    const prepared = await instance.prepareCall(PROXY_PROVIDER_ID, model)
+    expect(prepared.model.reasoning).toEqual({ efforts: [{ id: 'medium', name: 'Medium' }], defaultEffort: 'medium' })
+    await expect(collect(prepared.stream({ ...options, reasoningEffort: ReasoningEffortId('high') }))).rejects.toMatchObject({ code: 'UNSUPPORTED_REASONING_EFFORT' })
+    expect(request).toHaveBeenCalledOnce()
+    await collect(prepared.stream(options))
+    expect(request).toHaveBeenLastCalledWith(expect.objectContaining({ body: expect.stringContaining('"model":"gemini-3.8-flash-medium"') }))
+  })
+
+  it('只观测到家族 ID 时不虚构档位，也不把本账户快照用于另一个账户', async () => {
+    let email = 'first@example.invalid'
+    const request = vi.fn(async () => Response.json({ models: { 'gemini-3.8-flash-tiered': {} } }))
+    const instance = new AntigravityProxyAdapter({
+      credential: { credential: async () => ({ accessToken: 'fixture', email, source: 'login', updatedAt: 'x' }) },
+      transport: { request },
+    })
+    expect(await instance.discoverModels()).toHaveLength(1)
+    const prepared = await instance.prepareCall(PROXY_PROVIDER_ID, model)
+    expect(prepared.model.reasoning).toBeUndefined()
+    email = 'other@example.invalid'
+    await expect(collect(prepared.stream(options))).rejects.toMatchObject({ code: 'CANCELLED' })
+    expect(request).toHaveBeenCalledOnce()
+  })
+
   it('目录失败只保留同账户已观测结果，不回退未观测的审计快照', async () => {
     let account = 'a'
     const request = vi.fn(async () => new Response('unavailable', { status: 503 }))
@@ -229,7 +266,9 @@ describe('代理模型设置与调用准备', () => {
       credential: { credential: async () => ({ accessToken: 'synthetic', source: 'login', updatedAt: 'x' }) },
       transport: { request: vi.fn() },
     })
-    expect(await instance.resolveModel(PROXY_PROVIDER_ID, model)).toMatchObject({ context: { contextWindow: 1000000 }, defaultMaxTokens: 128000, inputModalities: ['text', 'image'] })
+    const mapped = await instance.resolveModel(PROXY_PROVIDER_ID, model)
+    expect(mapped).toMatchObject({ context: { contextWindow: 1000000 }, defaultMaxTokens: 128000, inputModalities: ['text', 'image'] })
+    expect(mapped.reasoning).toBeUndefined()
     target = 'unknown-text-target'
     const unknown = await instance.resolveModel(PROXY_PROVIDER_ID, model)
     expect(unknown.inputModalities).toEqual(['text'])
@@ -250,7 +289,7 @@ describe('代理模型设置与调用准备', () => {
       readSettings: () => settings,
       credential: { credential: async () => ({ accessToken: 'synthetic', source: 'login', updatedAt: 'x' }) },
       transport: { request: async input => {
-        if (input.url.includes('fetchAvailableModels')) return new Response('{"models":{"gemini-3.8-flash-medium":{}}}')
+        if (input.url.includes('fetchAvailableModels')) return Response.json({ models: { 'gemini-3.8-flash-low': {}, 'gemini-3.8-flash-medium': {}, 'gemini-3.8-flash-high': {} } })
         bodies.push(JSON.parse(String(input.body)))
         return new Response(`data: ${JSON.stringify(event([{ text: 'ok' }], 'STOP'))}\n\n`)
       } },

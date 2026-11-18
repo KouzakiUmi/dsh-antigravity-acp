@@ -1,6 +1,6 @@
 {
   "name": "dsh-bundle-antigravity-host",
-  "version": "0.1.38",
+  "version": "0.1.39",
   "description": "DeepSeek Harness host bundle that talks to the official Antigravity ACP server over stdio (Agent Client Protocol v1).",
   "displayName": "Antigravity ACP",
   "keywords": [
@@ -60,9 +60,9 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=4.0.4 <5",
-    "@deepseek-ai/dsh-llm": ">=0.2.0-rc.1 <0.2.1-0 || >=0.2.1-0 <0.3.0-0",
-    "@deepseek-ai/dsh-subprocess": ">=0.2.0-rc.1 <0.2.1-0 || >=0.2.1-0 <0.3.0-0",
-    "@deepseek-ai/dsh-typert-protocol": ">=0.2.0-rc.1 <0.2.1-0 || >=0.2.1-0 <0.3.0-0"
+    "@deepseek-ai/dsh-llm": ">=0.2.0-rc.1 <0.2.1-0 || >=0.2.1-0 <0.3.0-0 || >=0.2.2-0 <0.3.0-0",
+    "@deepseek-ai/dsh-subprocess": ">=0.2.0-rc.1 <0.2.1-0 || >=0.2.1-0 <0.3.0-0 || >=0.2.2-0 <0.3.0-0",
+    "@deepseek-ai/dsh-typert-protocol": ">=0.2.0-rc.1 <0.2.1-0 || >=0.2.1-0 <0.3.0-0 || >=0.2.2-0 <0.3.0-0"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "1.4.0",
@@ -74,10 +74,11 @@
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.1.0",
-    "@deepseek-ai/dsh-attachment": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-llm": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-subprocess": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-typert-protocol": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-attachment": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-brand": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-llm": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-subprocess": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-typert-protocol": "0.2.2-rc.3",
     "@types/node": "^22.19.0",
     "@types/react-test-renderer": "18.3.1",
     "@types/yauzl": "^2.10.3",

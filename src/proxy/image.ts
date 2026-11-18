@@ -11,7 +11,9 @@
 import { Buffer } from 'node:buffer'
 import { requestImageDimensions } from '@deepseek-ai/dsh-attachment'
 import type { AttachmentStore, ImageAttachmentRef, ImageRequestTarget } from '@deepseek-ai/dsh-attachment'
-import { LlmError, offloadedImageText, projectOffloadedImages, requiredImageOffload } from '@deepseek-ai/dsh-llm'
+import { offloadedImageText, projectOffloadedImages, requiredImageOffload } from '@deepseek-ai/dsh-llm'
+import type { LlmError } from '@deepseek-ai/dsh-llm'
+import { llmError } from '../runtime/llm-error.js'
 import type { RequestMessage } from '@deepseek-ai/dsh-llm'
 
 export const PROXY_REQUEST_IMAGE_MAX_PIXELS = 4 * 1024 * 1024
@@ -44,13 +46,13 @@ export async function readProxyImage(
   ref: ImageAttachmentRef,
   signal: AbortSignal | undefined,
 ): Promise<ProxyImageRead> {
-  if (signal?.aborted) throw new LlmError('代理模式请求已取消', 'CANCELLED')
+  if (signal?.aborted) throw llmError('代理模式请求已取消', 'CANCELLED')
   if (typeof attachments.readImageRequest === 'function') {
     const stored = await withImageAbort(attachments.readImageRequest(ref, proxyImageRequestTarget(ref), signal), signal)
     validateImageBytes(stored.data, stored.mediaType)
     return { mediaType: stored.mediaType, encoded: Buffer.from(stored.data).toString('base64'), bytes: stored.data.byteLength }
   }
-  if (ref.width * ref.height > PROXY_REQUEST_IMAGE_MAX_PIXELS) throw new LlmError('宿主附件服务未提供请求图片缩放，图片超出像素上限', 'UNSUPPORTED_MODALITY')
+  if (ref.width * ref.height > PROXY_REQUEST_IMAGE_MAX_PIXELS) throw llmError('宿主附件服务未提供请求图片缩放，图片超出像素上限', 'UNSUPPORTED_MODALITY')
   const stored = await withImageAbort(attachments.readImage(ref as never, signal), signal)
   validateImageBytes(stored.data, stored.ref.mediaType)
   return { mediaType: stored.ref.mediaType, encoded: Buffer.from(stored.data).toString('base64'), bytes: stored.data.byteLength }
@@ -58,7 +60,7 @@ export async function readProxyImage(
 
 function validateImageBytes(data: Uint8Array, mediaType: string): void {
   if (data.byteLength === 0 || data.byteLength > PROXY_REQUEST_IMAGE_MAX_BYTES || !['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(mediaType)) {
-    throw new LlmError('代理模式请求图片超出字节上限或媒体类型不受支持', 'UNSUPPORTED_MODALITY')
+    throw llmError('代理模式请求图片超出字节上限或媒体类型不受支持', 'UNSUPPORTED_MODALITY')
   }
 }
 
@@ -67,7 +69,7 @@ async function withImageAbort<T>(operation: Promise<T>, signal?: AbortSignal): P
   let onAbort: (() => void) | undefined
   try {
     return await Promise.race([operation, new Promise<never>((_, reject) => {
-      onAbort = () => reject(new LlmError('代理模式请求已取消', 'CANCELLED'))
+      onAbort = () => reject(llmError('代理模式请求已取消', 'CANCELLED'))
       if (signal.aborted) onAbort()
       else signal.addEventListener('abort', onAbort, { once: true })
     })])

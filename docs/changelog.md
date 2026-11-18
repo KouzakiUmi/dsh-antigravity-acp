@@ -4,11 +4,21 @@
 
 记录源码与发布内容，不将本地构建、npm 发布和本机升级混为同一状态。日期采用 Asia/Hong_Kong。更早历史见 [Git 提交记录](https://github.com/KouzakiUmi/dsh-antigravity-acp/commits/main/)。
 
-## 未发布 · 2026-11-13
+## 0.1.39 · 2026-11-19
 
-- **开发契约基准对齐实机内嵌版本**：`dsh-llm` / `dsh-attachment` / `dsh-subprocess` / `dsh-typert-protocol` 从 `0.2.1-alpha.4` 升到 `0.2.2-rc.1`，Cordis 从 `4.0.5-alpha.2` 升到 `4.1.0`，类型检查自此与实机内嵌版本一致。此前安装准入（`cordis` peer `>=4.0.4 <5`）已覆盖实机，但编译基准留在更旧的 alpha，构成验证盲区。
+- 保留 `LlmError.fromFailure` 适配，同时回退到旧宿主的构造函数，避免没有工厂方法时用 `TypeError` 覆盖原始错误。错误码、HTTP 状态、重试时间和错误原因仍沿原路径上报。
+- 新增桌面兼容性检查，使用 DSH NEXT 2.0.23-next 分发包内 Core 0.2.2-rc.3 的真实组件验证路由互斥、Typert 注册与清理，不加载桌面 Profile。
+- **代理模型与档位**：不再展示上游标记停用的条目或从家族名推断所有档位；使用账户目录确认的档位。失效的默认档位回退到已观测项，显式选择不可用档位时在发送前报错；手动 `target` 仍优先。
+- **代理 Schema 和额度**：联合分支只补充主定义中没有的字段；项目探测临时不可用时，使用当前账户已保存的项目读取额度汇总，认证失败仍换发一次。
+
+### DSH Core 0.2.2 适配
+
+- **peer 范围补 `0.2.2` prerelease 界标**：三个 `dsh-*` peer 改为 `>=0.2.0-rc.1 <0.2.1-0 || >=0.2.1-0 <0.3.0-0 || >=0.2.2-0 <0.3.0-0`。修正 0.1.38 里「既有范围本已覆盖 `0.2.2-rc.1`」的错误判断：semver 的 `-0` 界标只放行同一版本组的 prerelease，不外推到更高 patch，实测旧范围拒绝 `0.2.2-rc.1` / `0.2.2-rc.3`（宿主已装 0.2.2-rc.3 时 `npm install` 直接 ERESOLVE）；整体放宽为 `>=0.2.0-0 <0.3.0-0` 同样拒绝 `0.2.2-rc.3`，必须单列 `>=0.2.2-0` 段。该范围只约束 npm 安装准入，DSH loader 装载另有宿主条件。
+- **开发契约基准对齐 rc.3**：`dsh-llm` / `dsh-attachment` / `dsh-subprocess` / `dsh-typert-protocol` 开发依赖升到 `0.2.2-rc.3`，与实机分发包（app.asar）内嵌版本一致；`dsh-brand` 随 `dsh-attachment` 的 peer 需求一并显式列为开发依赖。Cordis 保持 `4.1.0`。
+- **自定义错误码改走 `LlmError.fromFailure`**：rc.3 起 `LlmError` constructor 只接受 `BuiltinLlmFailureCode`（50 个内置码 + `HTTP_${number}`），`AGY_*`、`PROTOCOL_DRIFT`、`CANCELLED` 等 100 处自定义码调用改经新增的 [`src/runtime/llm-error.ts`](../src/runtime/llm-error.ts) `llmError()` 薄封装转发到 `fromFailure`——这是官方为「凭外部码重新抛出」预留的通道，运行时码字符串全部保持不变，用户与日志的排查口径不受影响。内置码（`TRANSPORT`、`AUTH`、`NO_ADAPTER`、`RATE_LIMIT`、`IMAGE_OFFLOAD_REQUIRED` 等）仍走 constructor。读取侧已有 `error.failure.status` 用法不受影响，`.code` / `.message` 由 `HarnessError` / `Error` 基类继续提供。
+- **验证**：`npm run typecheck`、`npm test`（47 个文件 / 843 项，并发全量下 2 项 CLI 相关测试偶发 5s 超时、单独重跑通过）、`npm run build`、`npm run check` 通过；模拟宿主已装 `dsh-llm@0.2.2-rc.3` 后 `npm install` 本包打包产物不再 ERESOLVE。未安装到运行中的 Desktop，未做真实账户与 GUI 验收。
+
 - **转发型请求的 `purpose` 放宽**：`dsh-llm` 0.2.2 起 `GenerateOptions.purpose` 由生产者包声明合并（`LlmRequestPurposeMap`）给出；本包不扩展该 map，默认泛型下 `purpose` 退化为 `never`——测试代码无法构造带用途的请求，而生产代码里的用途比较（回合归属、超时、会话亲和、请求重建）在类型层静默失效、失去保护。新增 [`src/adapter/request-options.ts`](../src/adapter/request-options.ts)，把入站请求、回合归属判定与准备结果的 `purpose` 统一放宽为 `string`；这是 `dsh-llm` 类型注释明确允许的转发型适配器口径，运行时行为不变。
-- **验证**：`npm run typecheck`、47 个文件 / 843 项测试、`npm run build` 通过（契约基准 `0.2.2-rc.1` / Cordis `4.1.0`，系统 Node 24）。未安装到运行中的 Desktop，未做真实账户与 GUI 验收。
 
 ## 0.1.38 · 2026-11-12
 

@@ -300,6 +300,18 @@ describe('mode bus：互斥计划', () => {
 })
 
 describe('quota source：代理账户取数', () => {
+  it('项目探测遇到 503 时复用已保存项目，仍读取额度汇总', async () => {
+    const credential = vi.fn(async () => ({ accessToken: 'fixture', projectId: 'saved-project', source: 'login' as const, updatedAt: 'x' }))
+    const request = vi.fn(async ({ url }: { url: string }) => url.endsWith(':loadCodeAssist')
+      ? new Response('{}', { status: 503 })
+      : Response.json({ groups: [{ displayName: 'Gemini', buckets: [{ remainingFraction: 0.5 }] }] }))
+    const result = await fetchProxyQuotaSnapshot({ credential: { credential }, transport: { request } })
+    expect(result).toMatchObject({ status: 'ok', groups: [{ buckets: [{ remainingPct: 50 }] }] })
+    expect(credential).toHaveBeenCalledOnce()
+    expect(request).toHaveBeenCalledTimes(2)
+    expect(request).toHaveBeenLastCalledWith(expect.objectContaining({ url: expect.stringMatching(/:retrieveUserQuotaSummary$/u), body: '{"project":"saved-project"}' }))
+  })
+
   it('loadCodeAssist + retrieveUserQuotaSummary 折成快照；401 换发一次重试', async () => {
     const calls: string[] = []
     const staleTokens = new Set(['stale'])

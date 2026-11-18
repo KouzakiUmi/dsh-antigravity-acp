@@ -2,6 +2,7 @@
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { LlmError } from '@deepseek-ai/dsh-llm'
+import { llmError } from '../runtime/llm-error.js'
 import { ProxyAccountStore, importCliCredential, isProxyCredentialUsable } from './account-store.js'
 import type { ProxyCredential } from './account-store.js'
 import { createProxyOAuthFlow, ProxyOAuthError, refreshProxyAccessToken } from './oauth.js'
@@ -385,5 +386,5 @@ function oauthFailureMessage(oauth: ProxyOAuthStatus): string {
 export function toProxyAccountError(error: unknown): LlmError {
   if (error instanceof LlmError) return error
   const message = redactSensitiveText(error instanceof Error ? error.message : String(error))
-  return new LlmError(`代理模式账户操作失败：${message}`, 'AGY_PROXY_ACCOUNT')
+  return llmError(`代理模式账户操作失败：${message}`, 'AGY_PROXY_ACCOUNT')
 }
