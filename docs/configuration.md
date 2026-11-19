@@ -85,6 +85,7 @@ ACP 官方 agent 在同一会话内会保留上下文（2026-10-23 真机验证�
 - **模型目录**：`fetchAvailableModels` 当前账户可用项（30 秒 TTL）与插件支持的模型取交集；支持列表包含 core 审计快照、Gemini 4 Hydrogen 和 Gemini 4 Neon。上游停用项不显示；只列出已观测档位。Hydrogen 和 Neon 的 `xhigh` 可在对话选择器选用；可用时默认用 `medium`。已保存的默认档位失效时用当前目录的可用默认项；手动 `target` 映射优先，不提供档位菜单。登录、退出和手动刷新更新目录；失败只保留同账户已确认目录。用户手动隐藏的项仍保留在设置页。切回 ACP 后恢复 CLI / ACP 来源。
 - **图片输入**：按当前账户目录的 `supportsImages` 字段判断，并需要宿主附件服务。同一家族只要有可用看图档位，就保留图片到请求派发；实际档位不支持时会提示切换。图片输出未接入代理模式。
 - **响应限制**：代理生成流原始响应与解压后内容各限 64 MiB，单个 SSE 帧限 2 MiB。模型目录沿用插件已有的 8 MiB 普通响应预算，并最多解析 512 个条目。这些预算不随模型输出配置变化。
+- **Claude 工具续聊**：中断工具批次后发新消息时，保留已有结果并标明其余结果未知。若尚未进入下一条消息且当前批次缺结果，会提示检查工具执行状态。
 - **额度**：默认不调用 `agy`。代理模式优先用已保存的项目请求 `retrieveUserQuotaSummary`；`loadCodeAssist` 临时不可用时仍可查询该项目的额度，但该次不显示订阅档位。ACP 模式走内置 Cloud Code Assist 直连。只有打开 `cliQuotaEnabled` 后，套餐额度与 AI Credits 才运行官方 CLI 只读命令。模式切换、退出、重新连接和开关翻转均失效旧快照，在途旧结果不覆盖新状态。打开 CLI 取数后，AI Credits 属于官方 CLI 账户，可能与代理账户不同。
 - **边界**：代理模式不 spawn 官方进程、没有 MCP 工具桥（工具仍由 DSH 自身执行面提供，与 ACP 模式相同）；429 不做多账户轮转，直接报 `RATE_LIMIT`；401/403 在未出块前换发一次重试一次——但 **403 且上游写明 `violation of Terms of Service` / `disabled in this account`** 时不再换发，直接报 `AGY_ACCOUNT_SUSPENDED` 并说明需要申诉（换发救不回被停用的账号）。
 - **提示词指纹**：Antigravity 会把「请求文本里出现已知客户端身份」的请求恒定伪装成 `429 Resource has been exhausted`（magpie 在真实账号上逐条试过：计费行、Claude Code / Agent SDK 身份句、Codex 的 GPT-5 身份句），与剩余额度无关。代理模式对 system 做只读诊断，并在 429 文案里点明可能原因；只有打开 `cloakSensitiveWords` 才按同一实测口径在命中词段插入零宽空格（零宽混淆属于绕过上游识别，默认关闭）。

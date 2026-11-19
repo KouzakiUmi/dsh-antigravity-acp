@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { AdapterRequestOptions } from '../src/adapter/request-options.js'
-import Llm, { createAssistantMessage, createToolResultMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import Llm, { createAssistantMessage, createToolResultMessage, ReasoningEffortId, ToolCallId } from '@deepseek-ai/dsh-llm'
 import { Context } from '@deepseek-ai/cordis'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { AntigravityProxyAdapter, PROXY_PROVIDER_ID } from '../src/proxy/adapter.js'
@@ -158,6 +158,37 @@ describe('代理模式流式工具与签名', () => {
     })
     expect((await collect(instance.stream(options))).at(-1)).toMatchObject({ type: 'finish', reason: { kind: 'stop' } })
     expect(cancel).toHaveBeenCalled()
+  })
+
+  it.each([0, 1])('Claude 中断的历史工具批次保留 %i 个已知结果，其他标记无结果', async (resultCount) => {
+    const claudeModel = 'antigravity-claude-sonnet-5-5'
+    const assistant = createAssistantMessage({ content: [
+      { type: 'tool-call', id: ToolCallId('call-a'), name: 'lookup_a', arguments: '{}' },
+      { type: 'tool-call', id: ToolCallId('call-b'), name: 'lookup_b', arguments: '{}' },
+    ], source: { provider: PROXY_PROVIDER_ID, model: claudeModel } })
+    const result = createToolResultMessage({ callId: ToolCallId('call-a'), isError: false, content: [{ type: 'text', text: 'known result' }] })
+    const historicalMessages: AdapterRequestOptions['messages'] = [assistant, ...(resultCount ? [result] : [])]
+    const claude = { ...options, model: claudeModel, messages: historicalMessages }
+    await expect(buildProxyGeneratePayload(claude, {}, createProxySessionStore(), 1))
+      .rejects.toMatchObject({ code: 'INVALID_ARGS', message: expect.stringContaining('工具批次结果不完整') })
+    const messages: AdapterRequestOptions['messages'] = [...historicalMessages, { role: 'user', content: [{ type: 'text', text: 'next' }] }]
+    const wire = await buildProxyGeneratePayload({ ...claude, messages }, {}, createProxySessionStore(), 1)
+    expect(wire.request.contents).toMatchObject([
+      { role: 'model', parts: [{ functionCall: { id: 'call-a' } }, { functionCall: { id: 'call-b' } }] },
+      { role: 'user', parts: [
+        { functionResponse: { id: 'call-a', name: 'lookup_a', response: resultCount
+          ? { content: 'known result' } : { error: expect.stringContaining('may have executed') } } },
+        { functionResponse: { id: 'call-b', name: 'lookup_b', response: { error: expect.stringContaining('may have executed') } } },
+      ] },
+      { role: 'user', parts: [{ text: 'next' }] },
+    ])
+  })
+
+  it('HTTP 拒绝显示状态但不转发原始响应正文', async () => {
+    const request = vi.fn(async () => Response.json({ error: { message: 'private synthetic upstream data' } }, { status: 400 }))
+    const instance = new AntigravityProxyAdapter({ credential: { credential: async () => ({ accessToken: 'synthetic', source: 'login', updatedAt: 'x' }) }, transport: { request } })
+    await expect(collect(instance.stream(options))).rejects.toMatchObject({ code: 'PROTOCOL_DRIFT', message: '上游返回了意外状态（HTTP 400）' })
+    expect(request).toHaveBeenCalledTimes(1)
   })
 
   it('HTTP 400 的 SSE 上下文错误进入压缩分类', async () => {

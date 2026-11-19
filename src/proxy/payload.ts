@@ -257,9 +257,22 @@ function groupClaudeFunctionResponses(contents: readonly Record<string, unknown>
   if (proxyModelFamily(model) !== 'claude') return contents
   const grouped: Record<string, unknown>[] = []
   let pending: Record<string, unknown>[] = []
-  const flush = (): void => {
-    if (pending.length === 0) return
-    grouped.push({ role: 'user', parts: pending })
+  const calls = new Map<string, string>()
+  const flush = (historical: boolean): void => {
+    for (const part of pending) {
+      const response = part.functionResponse
+      if (isRecord(response) && typeof response.id === 'string') calls.delete(response.id)
+    }
+    if (calls.size > 0 && !historical) {
+      throw llmError('当前 Claude 工具批次结果不完整，未向上游发送；请检查工具的执行状态', 'INVALID_ARGS')
+    }
+    // Claude requires one result per historical call in the immediately following
+    // user turn. An interrupted batch may have side effects even without a result.
+    for (const [id, name] of calls) pending.push({ functionResponse: { id, name, response: {
+      error: 'No result is available in the conversation history. The tool may have executed; verify its state before repeating it.',
+    } } })
+    if (pending.length > 0) grouped.push({ role: 'user', parts: pending })
+    calls.clear()
     pending = []
   }
   for (const content of contents) {
@@ -270,10 +283,16 @@ function groupClaudeFunctionResponses(contents: readonly Record<string, unknown>
       pending.push(...responseParts)
       continue
     }
-    flush()
+    flush(true)
     grouped.push(content)
+    if (content.role === 'model') {
+      for (const part of rawParts) {
+        const call = isRecord(part) ? part.functionCall : undefined
+        if (isRecord(call) && typeof call.id === 'string' && typeof call.name === 'string') calls.set(call.id, call.name)
+      }
+    }
   }
-  flush()
+  flush(false)
   return grouped
 }
 

@@ -4,6 +4,10 @@
 
 记录源码与发布内容，不将本地构建、npm 发布和本机升级混为同一状态。日期采用 Asia/Hong_Kong。更早历史见 [Git 提交记录](https://github.com/KouzakiUmi/dsh-antigravity-acp/commits/main/)。
 
+## 0.1.44 · 2026-11-20
+
+- 修复 Claude 代理模式续聊时，历史并行工具批次缺少结果引起的 HTTP 400。保留已有结果，对缺失项标出执行状态未知；当前批次未收齐时就地提示。意外 HTTP 响应的提示包含状态码。
+
 ## 0.1.43 · 2026-11-19
 
 - 代理模式为 Gemini 4 Hydrogen / Neon 请求上游思考摘要，保留所选线模型的档位和默认预算。

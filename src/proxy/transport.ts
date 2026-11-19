@@ -129,7 +129,7 @@ export function proxyStatusError(status: number): ProxyTransportError | undefine
   if (status === 403) return new ProxyTransportError('forbidden', '上游拒绝了该账户', { status })
   if (status === 429) return new ProxyTransportError('rate-limited', '上游限流', { status })
   if (status >= 500) return new ProxyTransportError('upstream', '上游不可用', { status })
-  return new ProxyTransportError('protocol-drift', '上游返回了意外状态', { status })
+  return new ProxyTransportError('protocol-drift', `上游返回了意外状态（HTTP ${status}）`, { status })
 }
 
 export interface BoundedReadOptions {

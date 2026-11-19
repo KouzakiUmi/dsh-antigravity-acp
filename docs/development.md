@@ -81,6 +81,7 @@ ELECTRON_RUN_AS_NODE=1 "$DSH_NODE_EXECUTABLE" scripts/check-desktop-compat.cjs
 | 代理思考摘要 | 同一 Hydrogen `medium` 线模型的真实对照：两次 HTTP 200；原请求收到正文和签名但无摘要，仅添加 `includeThoughts: true` 后收到 1,135 字符摘要。Neon `medium` 经 DSH NEXT 2.0.24-next 所带 Core `0.2.2-rc.5`，真实生成输出 2,177 字符摘要及 reasoning 块，正常结束 |
 | 额度快照 | 用桌面包内 Cordis 拉取真实 Google 额度，获得 3 个分组；新开隔离 Host，在上游不可调用的条件下重读同一快照，分组与时间戳一致。自动回归覆盖独立定时、手动合并、读取不等待刷新、换账户隔离与过期标记 |
 | 工具 / runtime | 假 ACP / MCP、乱序工具结果、池所有权、续轮变更、取消、写入阻塞和回收 |
+| Claude 历史工具批次 | 桌面 Core `0.2.2-rc.5` + 真实 Sonnet 5.5 `medium`：并行两个工具只回填一个后续发消息，已安装 0.1.42 上游 HTTP 400 / `PROTOCOL_DRIFT`；候选用同一历史正常完成（HTTP 200），两个结果都缺失时也正常完成；当前批次未收齐时在本地返回 `INVALID_ARGS`，不派发 |
 | 图片 | 附件引用校验、图片内容映射与跨 worker 能力；代理模式 inlineData 准入、12MB 预算与 offload 协商、附件缺席降级；未调用真实视觉模型 |
 | 设置交互 | React 18 renderer 覆盖全部即时字段（普通配置只在指引块列出字段名，`proxyBypass` 不提供控制项）与逐模型 `modelOverrides` 的编辑、搜索、启停筛选、保存回读、草稿、冲突、只读与 namespace 恢复；连接 / 模型 / 额度 / 高级分页后非活动页只隐藏不卸载，全部字段仍在同一份草稿里；不替代真实宿主设置服务或 GUI 验收 |
 | 代理模式 | 线头顺序与 chunked 字节、端点白名单、SOCKS 拒绝、OAuth 回调 state/主机校验与不消耗在途 flow、副本原子写与 CLI 导入（含仅 refresh 形态）、payload 映射与 sentinel 签名、replay 归属校验、模式总线通知幂等、路由注册/注销互斥、代理额度 401 换发一次重试；全部合成依赖，不触真实网络与账户 |
