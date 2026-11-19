@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs'
+import { buildClientSource } from '../scripts/client-bundle.mjs'
 import { runInNewContext } from 'node:vm'
 import React from 'react'
 import { act, create, type ReactTestInstance, type ReactTestRenderer } from 'react-test-renderer'
@@ -33,7 +33,7 @@ function loadCard(quotaRead?: () => Promise<unknown>) {
   const injections = new Map<string, () => Record<string, unknown>>()
   const intervals = new Map<number, { callback: () => void; delay: number }>()
   let timerId = 0
-  runInNewContext(readFileSync(new URL('../src/client.js', import.meta.url), 'utf8'), {
+  runInNewContext(buildClientSource(), {
     window: { __ModuleLoader__: { load: (value: typeof registration) => { registration = value } }, innerHeight: 800, addEventListener: () => {}, removeEventListener: () => {} },
     document: { documentElement: { clientWidth: 1200 }, addEventListener: () => {}, removeEventListener: () => {} },
     setInterval: (callback: () => void, delay: number) => { intervals.set(++timerId, { callback, delay }); return timerId },
@@ -443,10 +443,7 @@ describe('settings card with real React state and effects', () => {
     })
     const { renderer } = await mount(service.remote, controlWith())
     // modelOverrides 由逐模型行渲染，不是普通输入框。
-    // 代理专属开关（proxyOnly）在 ACP 模式不渲染：卡片只显示当前模式所需的控制项。
-    const proxyOnly = ['cloakSensitiveWords']
-    const renderable = fields.filter(key => !proxyOnly.includes(key))
-    for (const key of proxyOnly) expect(renderer.root.findAllByProps({ name: key })).toHaveLength(0)
+    const renderable = fields
     const inputs = [...renderer.root.findAllByType('input'), ...renderer.root.findAllByType('textarea')]
       .filter(input => fields.includes(input.props.name))
     expect(inputs).toHaveLength(renderable.length)

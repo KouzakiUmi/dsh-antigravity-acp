@@ -52,8 +52,6 @@ import { iterateProxySse, proxyStatusError, readProxyText } from './transport.js
 import type { ProxyTransport } from './transport.js'
 import { ProxyTransportError } from './transport.js'
 import { redactSensitiveText } from '../runtime/redact.js'
-import { cloakUpstreamFingerprints, describeFingerprintHits, scanUpstreamFingerprints } from './prompt-guard.js'
-import type { FingerprintHit } from './prompt-guard.js'
 import { PROXY_RESPONSE_HEADER_TIMEOUT_MS, PROXY_IDLE_TIMEOUT_MS, PROXY_TOTAL_TIMEOUT_MS, PROXY_RESPONSE_BYTES, PROXY_STREAM_RESPONSE_BYTES, PROXY_FRAME_BYTES } from './transport.js'
 import type { ProxyCredential } from './account-store.js'
 import type { AntigravityHostConfig } from '../settings.js'
@@ -86,7 +84,7 @@ export interface ProxyAdapterOptions {
   responseHeaderTimeoutMs?: number
   /** 宿主附件服务的惰性读取面；缺席时图片输入报 UNSUPPORTED_MODALITY，文本能力不受影响。 */
   attachments?: () => ProxyAttachmentReader | undefined
-  readSettings?: () => Pick<AntigravityHostConfig, 'modelOverrides' | 'cloakSensitiveWords'>
+  readSettings?: () => Pick<AntigravityHostConfig, 'modelOverrides'>
   log?: { info(message: string): void; warn(message: string, error?: unknown): void }
 }
 
@@ -358,17 +356,6 @@ export class AntigravityProxyAdapter extends LlmAdapter {
     let refreshed = false
     let refreshNext = false
     let networkRetries = 0
-    let fingerprintChecked = false
-    let fingerprintNote: string | undefined
-    // 打散只在开关打开时做一次（幂等：插入零宽后原文不再匹配同一短语），并覆盖
-    // 最终进入 systemInstruction 的**全部**文本——options.system 之外，messages 里
-    // role 为 system / developer 的文本也会被并进同一条 system 指令。
-    let effective = options
-    if (this.options.readSettings?.().cloakSensitiveWords === true) {
-      const cloaked = cloakGenerateOptions(options)
-      if (cloaked.hits.length > 0) effective = cloaked.options
-    }
-    const cloaked = effective !== options
     for (;;) {
       const credential = await this.readCredential(signal, refreshNext)
       refreshNext = false
@@ -376,22 +363,9 @@ export class AntigravityProxyAdapter extends LlmAdapter {
       if (generation.catalog !== undefined && credentialCatalogKey(credential) !== generation.catalog.key) {
         throw llmError('代理模式账户已切换，请重新选择模型', 'CANCELLED')
       }
-      // 上游会把「请求文本里的已知客户端指纹」伪装成 429（magpie 生态的实测结论）。
-      // 诊断读的是**实际发出去的**文本，并且与打散状态一致（不会一边说已打散、
-      // 一边说"未改写"）。
-      if (!fingerprintChecked) {
-        fingerprintChecked = true
-        const hits = systemTexts(effective).flatMap((text) => scanUpstreamFingerprints(text))
-        if (hits.length > 0) {
-          fingerprintNote = describeFingerprintHits(hits)
-          this.options.log?.warn(cloaked
-            ? `antigravity-proxy: 已按 cloakSensitiveWords 打散 system 指令里的上游身份指纹 ${fingerprintNote}`
-            : `antigravity-proxy: system 指令命中上游已知指纹 ${fingerprintNote}；若出现恒定 429（换账号无效），这可能是原因，而不一定是额度耗尽。打开 cloakSensitiveWords 可在发送前打散`)
-        }
-      }
       let payload: Awaited<ReturnType<typeof buildProxyGeneratePayload>>
       try {
-        payload = await buildProxyGeneratePayload(effective, credential, this.sessions, Date.now(), attachments, signal, wireModel)
+        payload = await buildProxyGeneratePayload(options, credential, this.sessions, Date.now(), attachments, signal, wireModel)
       } catch (error) {
         if (signal?.aborted) throw llmError('代理模式请求已取消', 'CANCELLED')
         // 图片准入与校验失败在 image.ts / payload.ts 里已经一律是 LlmError，这里
@@ -455,8 +429,7 @@ export class AntigravityProxyAdapter extends LlmAdapter {
           }
         }
         if (statusError.code === 'rate-limited' && !hasEmitted.value) {
-          // 只有上游原话确实说配额/容量耗尽，才谈得上「可能是提示词指纹而不是额度」；
-          // 别的 429 就是限流本身（magpie #1425 的口径），否则会把用户引去改无关指令。
+          // 只有上游原话说配额/容量耗尽才报额度耗尽；别的 429 就是限流本身。
           const body = await readProxyText(response, { signal }).catch(() => '')
           await cancelResponse(response)
           const lowered = body.toLowerCase()
@@ -465,10 +438,7 @@ export class AntigravityProxyAdapter extends LlmAdapter {
           throw new LlmError(
             !exhausted
               ? `代理模式请求被上游拒绝（429）${detail.length > 0 ? `：${detail}` : ''}；可稍后重试或切换回 ACP 模式`
-              : fingerprintNote === undefined
-                ? '代理模式账户被上游限流（429 Resource has been exhausted，配额或容量已耗尽）；稍后重试或切换回 ACP 模式'
-                : `代理模式请求被上游拒绝（429 Resource has been exhausted）：本轮 system 指令命中客户端身份指纹 ${fingerprintNote}。` +
-                  '若换账号、等额度都无效，原因通常是被拒绝的提示词指纹而不是额度耗尽；可改写这些指令后重试，或切换回 ACP 模式',
+              : '代理模式账户被上游限流（429 Resource has been exhausted，配额或容量已耗尽）；稍后重试或切换回 ACP 模式',
             'RATE_LIMIT',
             { status: response.status },
           )
@@ -895,45 +865,6 @@ async function responseReportsContextWindowExceeded(response: Response, signal?:
 }
 
 /** 会进入 systemInstruction 的消息角色：payload 把它们与 options.system 并成一条指令。 */
-const SYSTEM_INSTRUCTION_ROLES = new Set(['system', 'developer'])
-
-/** 最终进入 systemInstruction 的全部文本（options.system 与 system/developer 消息）。 */
-function systemTexts(options: AdapterRequestOptions): string[] {
-  const texts: string[] = []
-  if (typeof options.system === 'string' && options.system.length > 0) texts.push(options.system)
-  for (const message of options.messages) {
-    if (!SYSTEM_INSTRUCTION_ROLES.has(message.role)) continue
-    for (const block of message.content) {
-      if (block.type === 'text' && typeof block.text === 'string' && block.text.length > 0) texts.push(block.text)
-    }
-  }
-  return texts
-}
-
-/** 打散全部 system 指令文本（用户消息不动）；没有命中时原样返回 options。 */
-function cloakGenerateOptions(options: AdapterRequestOptions): { options: AdapterRequestOptions; hits: FingerprintHit[] } {
-  const hits: FingerprintHit[] = []
-  const system = cloakUpstreamFingerprints(options.system)
-  hits.push(...system.hits)
-  let changed = system.hits.length > 0
-  const messages = options.messages.map((message) => {
-    if (!SYSTEM_INSTRUCTION_ROLES.has(message.role)) return message
-    let touched = false
-    const content = message.content.map((block) => {
-      if (block.type !== 'text' || typeof block.text !== 'string') return block
-      const cloaked = cloakUpstreamFingerprints(block.text)
-      if (cloaked.hits.length === 0) return block
-      hits.push(...cloaked.hits)
-      touched = true
-      return { ...block, text: cloaked.text }
-    })
-    if (!touched) return message
-    changed = true
-    return { ...message, content }
-  })
-  return changed ? { options: { ...options, system: system.text, messages }, hits } : { options, hits }
-}
-
 /** 上游对「账号被停用」的回答（magpie 记录的 Google 原话）：
  * 403 `This service has been disabled in this account for violation of Terms of
  * Service. Please submit an appeal …`。导出以便单测。

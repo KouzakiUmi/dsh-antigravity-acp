@@ -1,7 +1,8 @@
 /** 离线预览夹具共享模块：从真实 client 组件生成模拟数据的静态 HTML；无登录/联网/宿主访问。 */
-import { readFileSync, mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, writeFileSync } from 'node:fs'
+import { buildClientSource } from './client-bundle.mjs'
 import { runInNewContext } from 'node:vm'
-const source = readFileSync(new URL("../src/client.js", import.meta.url), 'utf8')
+const source = buildClientSource()
 const quota = { status: 'ok', updatedAt: '2026-10-22T03:00:00+08:00', plan: '示例套餐', groups: [
   { name: 'Gemini Models', buckets: [{ window: '5h', remainingPct: 86, resetTime: new Date(Date.now() + 2 * 3600_000).toISOString() }, { window: 'weekly', remainingPct: 72 }] },
   { name: 'Claude and GPT models', buckets: [{ window: '5h', remainingPct: 42 }, { window: 'weekly', remainingPct: 24 }] },

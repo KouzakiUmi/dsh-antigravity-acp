@@ -4,6 +4,11 @@
 
 记录源码与发布内容，不将本地构建、npm 发布和本机升级混为同一状态。日期采用 Asia/Hong_Kong。更早历史见 [Git 提交记录](https://github.com/KouzakiUmi/dsh-antigravity-acp/commits/main/)。
 
+## 0.1.46 · 未发布
+
+- **客户端 i18n**：设置卡片、额度药丸与 Host 回传的固定状态文本支持简体中文 / English。语言取自 `navigator.language`（缺失时看 `<html lang>`），非中文环境显示英文，判定不到时保持中文；字典缺项回落中文，Host 动态拼接的文本原样显示。字典与内核拆在 `src/client-i18n/`，构建时内联为单个 `dist/client.js`。宿主配置编辑器中的字段说明（`Config` schema）仍是中文。
+- **移除 `cloakSensitiveWords`**：该开关与「上游指纹只读诊断」原为 Claude Code / Codex 场景设计，本插件只服务 DSH，已整体删除（`prompt-guard`、设置项、设置页开关与 429 文案里的指纹提示）。已保存的 `cloakSensitiveWords` 配置会被忽略。429 文案只区分「额度或容量耗尽」与普通限流。
+
 ## 0.1.45 · 2026-11-20
 
 - **修复 ACP 长回合续轮被打断与 192KB prompt 截断**（#6，by @ScottLi023）：`ContinuationState` 放行回合内被动上下文注入（如 `time-context`），避免丢弃当前会话；为单次 ACP `session/prompt` 增加 `176,000` UTF-8 字节预算与头尾请求锚点，超限时优先裁剪最旧历史，单条/固定块超限显式报错 `AGY_PROMPT_TOO_LARGE`。

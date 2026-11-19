@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs'
+import { buildClientSource } from '../scripts/client-bundle.mjs'
 import { runInNewContext } from 'node:vm'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -60,7 +60,7 @@ function loadRegistrations(options: QuotaStubOptions = {}): Map<string, SlotRegi
   let registration: {
     factory: (require: (id: string) => unknown) => { apply: (ctx: Record<string, unknown>) => void }
   } | undefined
-  runInNewContext(readFileSync(new URL('../src/client.js', import.meta.url), 'utf8'), {
+  runInNewContext(buildClientSource(), {
     window: { __ModuleLoader__: { load: (value: unknown) => { registration = value as typeof registration } }, innerHeight: 844,
       addEventListener: (type: string, fn: (event: { key?: string; target?: unknown }) => void) => options.listeners?.set(type, fn),
       removeEventListener: (type: string) => options.listeners?.delete(type),
@@ -318,7 +318,7 @@ describe('browser client module', () => {
       return { createElement() {} }
     }
 
-    runInNewContext(readFileSync(new URL('../src/client.js', import.meta.url), 'utf8'), {
+    runInNewContext(buildClientSource(), {
       window: {
         __ModuleLoader__: {
           load(value: NonNullable<typeof registration>) {

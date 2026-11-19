@@ -10,7 +10,6 @@
 |---|---|---|
 | `maxConcurrentSessions` | `2` | 最大独立 worker 数，整数 1–4，按需启动。不是单个官方进程的多 session 开关，也不增加账户额度。 |
 | `queueTimeoutMs` | `120000` | 等待 worker 的上限（毫秒），最小 1000；队列最多 64 项，排队可取消。 |
-| `cloakSensitiveWords` | `false` | 代理模式是否打散 system 里已知会被上游拒绝的身份文本（Claude Code / Codex 的身份句、`x-anthropic-billing-header` 计费行等）：命中区间内的 ASCII 词段首两个字符后插入零宽空格。作用面是整条 system 指令（`system` 设置与 `role: system/developer` 的消息），不动用户消息。属于绕过上游识别，默认关闭。 |
 | `agyCliPath` | 未设置 | 官方 `agy` CLI 路径，优先于 `AGY_CLI_BIN`、PATH 与平台默认位置；刷新时重新探测。 |
 | `autoWarmup` | `true` | 加载插件时预热已有登录态与连接，不发送聊天 prompt，不主动弹浏览器授权；无登录态时预热报错，需手动「连接 / 登录 ACP」。设为 `false` 时改为只预读已缓存的官方 exe 到系统文件缓存。常驻一个官方进程约 170MB 内存。 |
 | `binaryPath` | 未设置 | 本地官方 ACP server 入口，优先级最高；指定但不存在会报错，不静默换来源。 |
@@ -88,7 +87,6 @@ ACP 官方 agent 在同一会话内会保留上下文（2026-10-23 真机验证�
 - **Claude 工具续聊**：中断工具批次后发新消息时，保留已有结果并标明其余结果未知。若尚未进入下一条消息且当前批次缺结果，会提示检查工具执行状态。
 - **额度**：默认不调用 `agy`。代理模式优先用已保存的项目请求 `retrieveUserQuotaSummary`；`loadCodeAssist` 临时不可用时仍可查询该项目的额度，但该次不显示订阅档位。ACP 模式走内置 Cloud Code Assist 直连。只有打开 `cliQuotaEnabled` 后，套餐额度与 AI Credits 才运行官方 CLI 只读命令。模式切换、退出、重新连接和开关翻转均失效旧快照，在途旧结果不覆盖新状态。打开 CLI 取数后，AI Credits 属于官方 CLI 账户，可能与代理账户不同。
 - **边界**：代理模式不 spawn 官方进程、没有 MCP 工具桥（工具仍由 DSH 自身执行面提供，与 ACP 模式相同）；429 不做多账户轮转，直接报 `RATE_LIMIT`；401/403 在未出块前换发一次重试一次——但 **403 且上游写明 `violation of Terms of Service` / `disabled in this account`** 时不再换发，直接报 `AGY_ACCOUNT_SUSPENDED` 并说明需要申诉（换发救不回被停用的账号）。
-- **提示词指纹**：Antigravity 会把「请求文本里出现已知客户端身份」的请求恒定伪装成 `429 Resource has been exhausted`（magpie 在真实账号上逐条试过：计费行、Claude Code / Agent SDK 身份句、Codex 的 GPT-5 身份句），与剩余额度无关。代理模式对 system 做只读诊断，并在 429 文案里点明可能原因；只有打开 `cloakSensitiveWords` 才按同一实测口径在命中词段插入零宽空格（零宽混淆属于绕过上游识别，默认关闭）。
 - **工具 schema 净化**：本地 `$ref` 展开；对象的 `oneOf` / `anyOf` 分支可补充字段，但不能覆盖主 Schema 的字段定义。节点有 `items` 优先识别为数组，有 `properties` 则识别为对象；数组补齐 `items`，字符串枚举忽略空串与纯空白。
 
 设置页字段通过宿主的即时配置引用保存：模型显示开关、显示名与映射随保存更新选择器，会话与进程偏好在下一轮聊天、预热或目录发现时读取，不打断正在输出或等待工具的回合。自动预热开关在下次启用插件时读取。代理和 CLI 路径用于后续请求及新启动的官方进程；已有 ACP 进程保留原启动环境，切换其出口仍需重新加载插件。

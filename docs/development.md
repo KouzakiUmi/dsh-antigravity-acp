@@ -16,7 +16,8 @@
 | [`src/runtime/`](https://github.com/KouzakiUmi/dsh-antigravity-acp/tree/main/src/runtime/) | 官方程序、运行目录、登录材料、代理、CLI 与模型缓存 |
 | [`src/quota/`](https://github.com/KouzakiUmi/dsh-antigravity-acp/tree/main/src/quota/) | 套餐 / Credits 快照、连接控制与 Typert remote |
 | [`src/proxy/`](https://github.com/KouzakiUmi/dsh-antigravity-acp/tree/main/src/proxy/) | 代理模式（默认关闭）：OAuth 登录态、agy 线传输、`antigravity-proxy` 路由与模式总线 |
-| [`src/client.js`](https://github.com/KouzakiUmi/dsh-antigravity-acp/blob/main/src/client.js) | 惰性 CommonJS 客户端、设置卡片与额度药丸；无 Node 原生导入 |
+| [`src/client.js`](https://github.com/KouzakiUmi/dsh-antigravity-acp/blob/main/src/client.js) | 惰性 CommonJS 客户端、设置卡片与额度药丸；无 Node 原生导入。构建时由 [`scripts/client-bundle.mjs`](https://github.com/KouzakiUmi/dsh-antigravity-acp/blob/main/scripts/client-bundle.mjs) 把 `@include` 的 [`src/client-i18n/`](https://github.com/KouzakiUmi/dsh-antigravity-acp/tree/main/src/client-i18n) 片段内联成单文件 |
+| [`src/client-i18n/`](https://github.com/KouzakiUmi/dsh-antigravity-acp/tree/main/src/client-i18n) | 客户端界面 i18n：`core.js`（`t()` / `msg()` 与语言判定）、`en-ui.js`（界面英文字典）、`en-host.js`（Host 固定状态文本的英文字典）；键是中文原文，缺译回落中文。新增文案必须同步字典，`tests/client-i18n.test.ts` 会拦截缺项与占位符不一致 |
 | [`src/settings.ts`](https://github.com/KouzakiUmi/dsh-antigravity-acp/blob/main/src/settings.ts) | 完整 Config 与默认值 |
 | [`cordis.patch.yml`](../cordis.patch.yml) | 仅插入本插件，不抢占默认模型 |
 | [`tests/`](https://github.com/KouzakiUmi/dsh-antigravity-acp/tree/main/tests/) | 假 ACP / MCP、隔离 runtime、真实 React renderer 与回归测试 |
@@ -86,7 +87,7 @@ ELECTRON_RUN_AS_NODE=1 "$DSH_NODE_EXECUTABLE" scripts/check-desktop-compat.cjs
 | 设置交互 | React 18 renderer 覆盖全部即时字段（普通配置只在指引块列出字段名，`proxyBypass` 不提供控制项）与逐模型 `modelOverrides` 的编辑、搜索、启停筛选、保存回读、草稿、冲突、只读与 namespace 恢复；连接 / 模型 / 额度 / 高级分页后非活动页只隐藏不卸载，全部字段仍在同一份草稿里；不替代真实宿主设置服务或 GUI 验收 |
 | 代理模式 | 线头顺序与 chunked 字节、端点白名单、SOCKS 拒绝、OAuth 回调 state/主机校验与不消耗在途 flow、副本原子写与 CLI 导入（含仅 refresh 形态）、payload 映射与 sentinel 签名、replay 归属校验、模式总线通知幂等、路由注册/注销互斥、代理额度 401 换发一次重试；全部合成依赖，不触真实网络与账户 |
 | 代理功能回归 | Google SSE 错误字段、401/403 首块前换发、工具 STOP 续轮与真实宿主消息回填、16KB 签名与映射归属、缺完成标志及 HTTP 截断、chunk 增量解码；目录排除停用项、仅发布已观测档位、调用准备的目录与设置快照、跨账户派发拒绝、附件能力及请求尺寸 |
-| 代理 schema 与指纹 | 工具参数本地 `$ref` 展开、联合分支补字段但保留主 Schema、`items`/`properties` 优先于显式与推断类型、空数组补 `items`、忽略空白枚举值；上游指纹只读诊断、零宽打散算法与 magpie 实测用例逐字符对齐（默认关闭）、403「violation of Terms of Service」识别为账号停用。全部为合成请求，不触真实上游 |
+| 代理 schema | 工具参数本地 `$ref` 展开、联合分支补字段但保留主 Schema、`items`/`properties` 优先于显式与推断类型、空数组补 `items`、忽略空白枚举值；403「violation of Terms of Service」识别为账号停用。全部为合成请求，不触真实上游 |
 | 代理账户 | 过期 CLI 导入刷新、失效凭据转 OAuth、只读项目检测与缺失错误、取消抢占、真实存储加载/清除竞态、删除失败、授权终态与 URL 最小返回；已有账户刷新失败不导入其他 CLI 账户，直接重登增加代际；账户代际隔离目录、额度及在途结果；项目探测 503 时用已保存项目读取额度 |
 | 无 CLI 授权闭环 | 不存在的 CLI 文件 → 实际 OAuth/PKCE → 生产监听器随机测试端口的真实 HTTP 回调 → 模拟 Google 换码/项目 → 真实临时 store → 真实适配器目录 → 重建读取；拒绝/缺码/过期/端口冲突/项目及保存失败/取消后可重试 |
 | 设置页 UX | 精简首屏、无修改时隐藏保存区、当前模式账户、紧凑模型列表、搜索/筛选/批量启停与完整详情、独立高级分组；未保存计数/撤销/只读/冲突，网络草稿与取消可用性、授权链接/阶段；手动额度、模式来源校验、实际路由家族、账户切换及旧广播、共享刷新收尾 |
