@@ -146,6 +146,25 @@ describe('代理模式流式工具与签名', () => {
     expect(chunks.at(-1)).toMatchObject({ type: 'finish', reason: { kind: 'error', failure: { code: 'RATE_LIMIT', status: 429 } } })
   })
 
+  it('HTTP 429 区分配额耗尽与普通限流文案，并脱敏上游原话', async () => {
+    const respond = (body: string) => new AntigravityProxyAdapter({
+      credential: { credential: async () => ({ accessToken: 'synthetic', source: 'login', updatedAt: 'x' }) },
+      transport: { request: async () => new Response(body, { status: 429 }) },
+    })
+    await expect(collect(respond('Resource has been exhausted for this project').stream(options))).rejects.toMatchObject({
+      code: 'RATE_LIMIT', failure: { status: 429 }, message: expect.stringContaining('配额或容量已耗尽'),
+    })
+    await expect(collect(respond('You have exhausted your capacity for today').stream(options))).rejects.toMatchObject({
+      code: 'RATE_LIMIT', message: expect.stringContaining('配额或容量已耗尽'),
+    })
+    const ordinary = await collect(respond('Slow down: too many requests. Bearer abcdefgh12345678').stream(options)).catch((error: unknown) => error)
+    expect(ordinary).toMatchObject({ code: 'RATE_LIMIT', failure: { status: 429 } })
+    expect((ordinary as Error).message).toContain('代理模式请求被上游拒绝（429）')
+    expect((ordinary as Error).message).toContain('Slow down')
+    expect((ordinary as Error).message).not.toContain('配额或容量已耗尽')
+    expect((ordinary as Error).message).not.toContain('abcdefgh12345678')
+  })
+
   it('文本已到但缺少完成标记时不伪装成功；DONE 可终止保持打开的 SSE', async () => {
     await expect(collect(adapter([event([{ text: 'partial' }])]).stream(options))).rejects.toMatchObject({ code: 'TRANSPORT' })
     const cancel = vi.fn()

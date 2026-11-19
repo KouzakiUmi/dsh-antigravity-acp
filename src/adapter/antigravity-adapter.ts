@@ -866,6 +866,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       usesTools: tools.length > 0,
     }
     this.#sessions.set(key, record)
+    this.#evictSessions()
     this.#log?.info(`antigravity-acp: 已恢复 ACP 会话 session=${entry.sessionId} 已发送消息=${entry.sentCount}`)
     return record
   }
@@ -930,12 +931,17 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       usesTools: (options.tools?.length ?? 0) > 0,
     }
     this.#sessions.set(key, record)
+    this.#evictSessions()
+    return record
+  }
+
+  /** 会话表容量淘汰：恢复与新建共用同一 64 项上限，超出时淘汰最早的一条。 */
+  #evictSessions(): void {
     while (this.#sessions.size > 64) {
       const oldest = this.#sessions.values().next().value
       if (!oldest) break
       this.#dropSession(oldest, '内存会话 LRU 淘汰')
     }
-    return record
   }
 
   /** 在 finish 对外可见之前提交输入与实际交付输出，消费者可立即 return。 */

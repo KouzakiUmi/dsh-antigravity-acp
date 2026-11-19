@@ -2548,6 +2548,29 @@ describe('ACP 会话复用与跨进程恢复', () => {
     expect(visibleText(await resumed)).toBe('恢复后回答')
   })
 
+  it('会话表超过 64 项时 LRU 淘汰最早会话', async () => {
+    const map: Record<string, SessionMapEntry> = {}
+    const shared = {
+      loadSessionMap: async () => ({ ...map }),
+      saveSessionMap: (entries: Record<string, SessionMapEntry>) => {
+        for (const key of Object.keys(map)) delete map[key]
+        Object.assign(map, entries)
+      },
+    }
+    const info = vi.fn()
+    const harness = createHarness({ resumeSessions: true, ...shared, log: { info, warn: vi.fn() } })
+    const sid = (value: string) => value as unknown as NonNullable<AdapterRequestOptions['sessionId']>
+    for (let index = 0; index < 65; index += 1) {
+      const round = collect(harness.adapter.stream(baseOptions({ sessionId: sid(`conv-${index}`) })))
+      await waitForRequest(harness.agent, 'session/prompt', index + 1)
+      await replyWithText(harness, '第一轮回答', index)
+      await round
+    }
+    expect(info.mock.calls.some(([line]) => String(line).includes('内存会话 LRU 淘汰'))).toBe(true)
+    await vi.waitFor(() => expect(Object.keys(map)).toHaveLength(64))
+    expect(Object.keys(map)).not.toContain('conv-0::chat')
+  }, 30_000)
+
   it('usage 按协议原样上报，不做累计换算（官方 1.4.0 实测不返回）', async () => {
     const harness = createHarness()
     const first = collect(harness.adapter.stream(baseOptions({ sessionId: DSH_SESSION })))

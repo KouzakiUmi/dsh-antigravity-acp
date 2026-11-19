@@ -53,7 +53,7 @@ npm pack --dry-run
 npm pack
 ```
 
-`check` 顺序执行 `typecheck`、`test`、`build`：构建由 TypeScript 输出 `dist/`，再通过 [`scripts/copy-client.mjs`](https://github.com/KouzakiUmi/dsh-antigravity-acp/blob/main/scripts/copy-client.mjs) 复制客户端文件。`dist/` 不提交到 Git，但发布包必须包含它。
+`check` 顺序执行 `typecheck`、`test`、`build`：构建由 TypeScript 输出 `dist/`，再通过 [`scripts/copy-client.mjs`](https://github.com/KouzakiUmi/dsh-antigravity-acp/blob/main/scripts/copy-client.mjs) 内联客户端 i18n 片段并输出 `dist/client.js`。`dist/` 不提交到 Git，但发布包必须包含它。
 
 **本包没有自动构建的 prepare / prepack / install hook**，所以裸 `npm pack` 或 `npm publish` 不会替你构建。打包前必须先运行构建 / 完整检查。发布清单包含 `dist/`、patch、README、`docs/`、LICENSE；源码、测试、预览与本地审查记录不属于安装包。
 
@@ -67,12 +67,12 @@ ELECTRON_RUN_AS_NODE=1 "$DSH_NODE_EXECUTABLE" scripts/check-desktop-compat.cjs
 
 ## 本次验证矩阵
 
-0.1.35 本地检查日期：**2026-11-03**；0.1.36（额度取数解耦、设置页紧凑布局与隔离修复）复检日期：**2026-11-04**（Asia/Hong_Kong）；0.1.37（AI Credits 未开启时隐藏、删除代理积分说明、保存栏面板化样式）复检日期：**2026-11-04**（Asia/Hong_Kong）；0.1.38（无档位模型的元数据、模式总线回切、设置卡片只编辑即时字段、会话选模按会话判定、一次性请求不再占死 worker、账户刷新与资源回收修复）复检日期：**2026-11-12**（Asia/Hong_Kong）；开发契约基准升到 Core `0.2.2-rc.1` / Cordis `4.1.0` 与转发型请求 `purpose` 放宽的适配复检日期：**2026-11-13**（Asia/Hong_Kong）；peer 范围补 `0.2.2` prerelease 界标、契约基准升到 `0.2.2-rc.3` 与 `LlmError` 自定义码改走 `fromFailure` 的适配复检日期：**2026-11-16**（Asia/Hong_Kong）。
+0.1.35 本地检查日期：**2026-11-03**；0.1.36（额度取数解耦、设置页紧凑布局与隔离修复）复检日期：**2026-11-04**（Asia/Hong_Kong）；0.1.37（AI Credits 未开启时隐藏、删除代理积分说明、保存栏面板化样式）复检日期：**2026-11-04**（Asia/Hong_Kong）；0.1.38（无档位模型的元数据、模式总线回切、设置卡片只编辑即时字段、会话选模按会话判定、一次性请求不再占死 worker、账户刷新与资源回收修复）复检日期：**2026-11-12**（Asia/Hong_Kong）；开发契约基准升到 Core `0.2.2-rc.1` / Cordis `4.1.0` 与转发型请求 `purpose` 放宽的适配复检日期：**2026-11-13**（Asia/Hong_Kong）；peer 范围补 `0.2.2` prerelease 界标、契约基准升到 `0.2.2-rc.3` 与 `LlmError` 自定义码改走 `fromFailure` 的适配复检日期：**2026-11-16**（Asia/Hong_Kong）；0.1.46（客户端 i18n、`cloakSensitiveWords` 移除、Host 字典补齐与会话容量修复）复检日期：**2026-11-20**（Asia/Hong_Kong）。
 
 | 验证项 | 状态与范围 |
 |---|---|
 | TypeScript | `npm run typecheck` 通过 |
-| 隔离回归 | 2026-11-19 使用系统 Node 24：48 个文件 / 849 项通过（契约基准 Core `0.2.2-rc.3` / Cordis `4.1.0`），包含旧宿主错误回退、目录停用项与档位、Schema 字段优先和已保存项目额度回退 |
+| 隔离回归 | 2026-11-20 使用系统 Node 24：48 个文件 / 864 项通过（契约基准 Core `0.2.2-rc.3` / Cordis `4.1.0`），包含旧宿主错误回退、目录停用项与档位、Schema 字段优先、已保存项目额度回退、会话表 LRU 容量与 429 限流文案 |
 | 构建 | `npm run build` 通过 |
 | 代理响应预算 | 合成 HTTP 与 SSE 测试覆盖：多帧生成超过旧 8 MiB 后仍能完成；解码后超过 64 MiB 正确失败；非生成和非成功生成响应仍受 8 MiB 传输预算约束 |
 | 代理目录预算 | 2026-11-19，同一账户真实 `fetchAvailableModels` 回包为 HTTP 200、解码后 303,104 字节、38 条；同一回包交给已安装 0.1.40 复现 `REQUEST_LIMIT`（262,144 字节），候选代码成功解析并返回 6 个可选模型。未保存原始回包、未发起生成请求。合成回归另外覆盖普通响应预算与同账户缓存回退 |
@@ -85,6 +85,7 @@ ELECTRON_RUN_AS_NODE=1 "$DSH_NODE_EXECUTABLE" scripts/check-desktop-compat.cjs
 | Claude 历史工具批次 | 桌面 Core `0.2.2-rc.5` + 真实 Sonnet 5.5 `medium`：并行两个工具只回填一个后续发消息，已安装 0.1.42 上游 HTTP 400 / `PROTOCOL_DRIFT`；候选用同一历史正常完成（HTTP 200），两个结果都缺失时也正常完成；当前批次未收齐时在本地返回 `INVALID_ARGS`，不派发 |
 | 图片 | 附件引用校验、图片内容映射与跨 worker 能力；代理模式 inlineData 准入、12MB 预算与 offload 协商、附件缺席降级；未调用真实视觉模型 |
 | 设置交互 | React 18 renderer 覆盖全部即时字段（普通配置只在指引块列出字段名，`proxyBypass` 不提供控制项）与逐模型 `modelOverrides` 的编辑、搜索、启停筛选、保存回读、草稿、冲突、只读与 namespace 恢复；连接 / 模型 / 额度 / 高级分页后非活动页只隐藏不卸载，全部字段仍在同一份草稿里；不替代真实宿主设置服务或 GUI 验收 |
+| 客户端 i18n | 字典完整性、占位符一致性与 `t()` 行为测试；en 环境实际渲染设置卡与药丸（ACP / 代理 / 正常 / 错误 / 展开）无中文残留，zh 基线正常；Host 固定文本字典覆盖经源码比对 |
 | 代理模式 | 线头顺序与 chunked 字节、端点白名单、SOCKS 拒绝、OAuth 回调 state/主机校验与不消耗在途 flow、副本原子写与 CLI 导入（含仅 refresh 形态）、payload 映射与 sentinel 签名、replay 归属校验、模式总线通知幂等、路由注册/注销互斥、代理额度 401 换发一次重试；全部合成依赖，不触真实网络与账户 |
 | 代理功能回归 | Google SSE 错误字段、401/403 首块前换发、工具 STOP 续轮与真实宿主消息回填、16KB 签名与映射归属、缺完成标志及 HTTP 截断、chunk 增量解码；目录排除停用项、仅发布已观测档位、调用准备的目录与设置快照、跨账户派发拒绝、附件能力及请求尺寸 |
 | 代理 schema | 工具参数本地 `$ref` 展开、联合分支补字段但保留主 Schema、`items`/`properties` 优先于显式与推断类型、空数组补 `items`、忽略空白枚举值；403「violation of Terms of Service」识别为账号停用。全部为合成请求，不触真实上游 |
@@ -93,7 +94,7 @@ ELECTRON_RUN_AS_NODE=1 "$DSH_NODE_EXECUTABLE" scripts/check-desktop-compat.cjs
 | 设置页 UX | 精简首屏、无修改时隐藏保存区、当前模式账户、紧凑模型列表、搜索/筛选/批量启停与完整详情、独立高级分组；未保存计数/撤销/只读/冲突，网络草稿与取消可用性、授权链接/阶段；手动额度、模式来源校验、实际路由家族、账户切换及旧广播、共享刷新收尾 |
 | 浏览器布局 | 已注册 Chrome + 既有 Playwright 1.63.0，离线真实 Client 静态夹具；320/390/1280 宽度、深浅主题及顶部/中部/底部共 36 项检查，保存栏可见且无横向溢出；静态布局不替代桌面实例验收 |
 | 模式切换 | 请求代理模式即注销 ACP，缺席/注册失败/卸载均不回退；Host 控制层拒绝 ACP 登录与预热，目录按模式和账户代际隔离，额度请求校验期望模式。真实 React renderer 覆盖草稿与生效状态、代理登录/退出后更新模型、失败原因与过期链接清理 |
-| 桌面注册契约 | 2026-11-19 使用 DSH NEXT 2.0.23-next / Core 0.2.2-rc.3 / Cordis 4.1.0 的实际组件隔离验证：npm 与 DSH 的 peer 判定、ACP 与代理模式双向切换、唯一 Typert Host 贡献、卸载清理、自定义错误码和 provider 失败事实。旧版无工厂分支由 Vitest 模拟覆盖；没有启动完整 Loader 或连接现有 Host |
+| 桌面注册契约 | 2026-11-20 使用 DSH NEXT 2.0.24-next / Core 0.2.2-rc.5 / Cordis 4.1.0 的实际组件隔离验证：npm 与 DSH 的 peer 判定、ACP 与代理模式双向切换、唯一 Typert Host 贡献、卸载清理、自定义错误码和 provider 失败事实。旧版无工厂分支由 Vitest 模拟覆盖；没有启动完整 Loader 或连接现有 Host |
 | 代理（出网） | 合成依赖、动态变更与清空、不打断旧响应、卸载释放、失败不直连、运行期地址变坏时按 Promise 拒绝、装载期非法地址不阻断插件、本地 SOCKS 测试；不是 Google 网络可达性保证 |
 | 代理环境继承 | HTTPS / ALL / HTTP 优先级、显式值覆盖及清空恢复、OAuth 与原生 TLS 接线、本地 CONNECT 首包和 NO_PROXY。无凭据 Google 探针对比直连超时与环境代理收到 401，只验证工具进程所见网络，不代表运行中 Host 的环境或账户可用性 |
 | 额度取数 | 假 fetch 覆盖超时折叠、401/403 按状态码重试一次、401 后成功、非 401/403 不重试、OAuth 元数据配对；`cliQuotaEnabled` 默认关闭时即使注入 CLI 也不 spawn，打开后才走 `/usage` 与 `/credits`，关闭后旧快照失效；代理模式默认零 `agy` 调用且套餐额度仍取代理账户，打开开关后只有 Credits 走 CLI；不触真实账户 |
