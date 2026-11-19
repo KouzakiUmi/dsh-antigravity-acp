@@ -152,10 +152,12 @@ export function completeProxyExecution(sessions: AgyRequestSessionStore, options
 // ---------------------------------------------------------------- internals
 
 function applyFamilyTransforms(request: Record<string, unknown>, wireModel: string, reasoningEffort?: string): void {
-  // These directories expose separate wire IDs per tier. Let the selected ID own
-  // its thinking defaults; the pinned core does not define their thinking config.
+  // The wire ID selects the tier; request summaries without overriding its budget.
   if (/^gemini-4-(?:hydrogen|neon)-(?:low|medium|high|xhigh)$/u.test(wireModel)) {
     applyGeminiTransforms(request, { model: wireModel })
+    const config = isRecord(request.generationConfig) ? request.generationConfig : {}
+    config.thinkingConfig = { includeThoughts: true }
+    request.generationConfig = config
     return
   }
   const resolved = resolveModelWithTier(wireModel)
@@ -562,17 +564,24 @@ export function reportsContextWindowExceeded(value: Record<string, unknown>, dep
 
 function parseUsage(value: unknown): TokenUsage | undefined {
   if (!isRecord(value)) return undefined
-  const input = numberValue(value.promptTokenCount ?? value.inputTokenCount)
-  const output = numberValue(value.candidatesTokenCount ?? value.outputTokenCount)
-  const reasoning = numberValue(value.thoughtsTokenCount ?? value.reasoningTokenCount)
-  const cached = numberValue(value.cachedContentTokenCount ?? value.cacheReadTokens)
+  const input = count(value.promptTokenCount ?? value.inputTokenCount)
+  const output = count(value.candidatesTokenCount ?? value.outputTokenCount)
+  const reasoning = count(value.thoughtsTokenCount ?? value.reasoningTokenCount)
+  const cached = count(value.cachedContentTokenCount ?? value.cacheReadTokens)
+  const total = count(value.totalTokenCount ?? value.totalTokens)
   if (input === undefined && output === undefined && reasoning === undefined && cached === undefined) return undefined
+  const knownTotal = Math.max(input ?? 0, cached ?? 0) + (output ?? 0) + (reasoning ?? 0)
   return {
     inputTokens: Math.max(0, (input ?? 0) - (cached ?? 0)),
     outputTokens: output ?? 0,
     ...(cached === undefined ? {} : { cacheReadTokens: cached }),
     ...(reasoning === undefined ? {} : { reasoningTokens: reasoning }),
+    ...(total === undefined || total < knownTotal ? {} : { totalTokens: total }),
   }
+}
+
+function count(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined
 }
 
 function findFinish(value: Record<string, unknown>): string | undefined {

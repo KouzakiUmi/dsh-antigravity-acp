@@ -14,6 +14,12 @@
  */
 import type { ModelOverride } from '../settings.js'
 
+/** Read-only capacity shown in model settings; never submitted as an override. */
+export interface ModelCapacity {
+  contextWindow?: number
+  maxOutputTokens?: number
+}
+
 /** 与 runtime/agy-cli.ts 的档位顺序一致（弱 → 强）。 */
 export type ModelEffort = 'low' | 'medium' | 'high'
 const EFFORTS: readonly ModelEffort[] = ['low', 'medium', 'high']

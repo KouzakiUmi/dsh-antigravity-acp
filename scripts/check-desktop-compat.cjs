@@ -50,6 +50,8 @@ async function main() {
   // Applying the Host prunes its stale cache and runtime directories; use fresh roots.
   process.env.DSH_HOME = path.join(scratch.path, 'profile')
   process.env.AGY_ACP_HOME = path.join(scratch.path, 'install')
+  // Background quota refresh must not discover the user's official CLI login.
+  process.env.USERPROFILE = process.env.HOME = path.join(scratch.path, 'home')
   const ctx = new Context()
   const typertFiber = ctx.plugin(Typert)
   const llmFiber = ctx.plugin(Llm)

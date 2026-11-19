@@ -4,6 +4,13 @@
 
 记录源码与发布内容，不将本地构建、npm 发布和本机升级混为同一状态。日期采用 Asia/Hong_Kong。更早历史见 [Git 提交记录](https://github.com/KouzakiUmi/dsh-antigravity-acp/commits/main/)。
 
+## 0.1.43 · 2026-11-19
+
+- 代理模式为 Gemini 4 Hydrogen / Neon 请求上游思考摘要，保留所选线模型的档位和默认预算。
+- 额度由宿主独立刷新并保存本地快照；设置页和对话药丸打开时只读快照，手动「拉取额度」单独请求上游。
+- 代理模式按账户目录读取图片能力；混合档位的家族保留图片到派发阶段，再由实际档位校验。Gemini 4 Hydrogen 和 Gemini 4 Neon 复用宿主附件服务。
+- 代理模式保留 Google 报告的完整 token 用量，并将目录容量交给 DSH。模型详情只读显示已知的上下文窗口和输出上限；ACP 容量仍从 `usage_update.size` 获取。
+
 ## 0.1.42 · 2026-11-19
 
 - 代理模式接入 Gemini 4 Hydrogen 和 Gemini 4 Neon；只列出当前账户目录中未停用的型号与档位，按观测到的 ID 派发。新增两组模型先提供文本输入。

@@ -26,12 +26,14 @@ import { fetchProxyQuotaSnapshot } from '../proxy/quota-source.js'
 import type { ProxyCredentialSource } from '../proxy/adapter.js'
 import type { ProxyTransport } from '../proxy/transport.js'
 import { AGY_PROXY_ACCOUNT_INVOCATIONS } from '../proxy/account-remote.js'
+import { cliQuotaIdentity, markQuotaAge, quotaIdentity, QuotaSnapshotStore } from './snapshot-store.js'
+import type { QuotaMode } from './snapshot-store.js'
 
 export const PACKAGE_NAME = 'dsh-bundle-antigravity-host'
 /** Typert service / wire namespace。 */
 export const AGY_QUOTA_SERVICE = 'agyQuota'
 
-/** `read` 的请求体：`force` 绕过缓存；`source` 防止旧模型误领新模式的额度。 */
+/** 额度 read/refresh 共用的请求体；force 仅供 models 使用。 */
 export interface AgYQuotaRequest {
   force?: boolean
   source?: 'acp' | 'proxy'
@@ -89,17 +91,17 @@ function parseModels(value: unknown): unknown {
 
 /** 本包贡献的 invocation 描述符（直连一元调用）。 */
 export const AGY_QUOTA_INVOCATIONS: readonly InvocationDescriptor[] = [
-  {
-    id: `${PACKAGE_NAME}#${AGY_QUOTA_SERVICE}/read`,
+  ...(['read', 'refresh'] as const).map((method): InvocationDescriptor => ({
+    id: `${PACKAGE_NAME}#${AGY_QUOTA_SERVICE}/${method}`,
     service: AGY_QUOTA_SERVICE,
     namespace: AGY_QUOTA_SERVICE,
-    method: 'read',
+    method,
     invocation: { kind: 'direct' },
     parameters: [
       { name: 'request', wire: 'request', source: 'json', acceptsUndefined: true, codec: requestCodec },
     ],
     result: resultCodec,
-  },
+  })),
   ...(['account', 'models'] as const).map((method): InvocationDescriptor => ({
     id: `${PACKAGE_NAME}#${AGY_QUOTA_SERVICE}/${method}`,
     service: AGY_QUOTA_SERVICE, namespace: AGY_QUOTA_SERVICE, method,
@@ -185,6 +187,11 @@ export interface AgYQuotaServiceOptions {
   modelTarget?: (model: string) => string | undefined
   /** 代理模式额度取数面（凭据 + agy 线传输）；缺省时代理模式回落 ACP 口径。 */
   proxyQuota?: { credential: ProxyCredentialSource & { revision?(): number }; transport: ProxyTransport }
+  /** Stable, read-only proxy account fingerprint; never obtains or refreshes access. */
+  proxyIdentity?: () => Promise<string | undefined>
+  snapshotDirectory?: string
+  background?: boolean
+  onScopeChange?: (tick: () => void) => () => void
   /** 宿主日志（index.ts 接 `ctx.logger`）；用于记录每次取数的来源与结果。 */
   log?: { info(message: string): void; warn(message: string, error?: unknown): void }
 }
@@ -197,8 +204,10 @@ export interface AgYQuotaServiceOptions {
  * object whose class did not declare it”。
  */
 export class AgYQuotaService extends TypertRemoteService {
-  private readonly _cache: { value?: QuotaSnapshot; at?: number } = {}
-  private readonly _creditsCache: { value?: CreditsSnapshot; at?: number } = {}
+  private readonly _snapshots: QuotaSnapshotStore
+  private readonly _persistent: boolean
+  private readonly _proxyIdentity: AgYQuotaServiceOptions['proxyIdentity']
+  private readonly _lifetime = new AbortController()
   private readonly _deps: QuotaDeps
   private readonly _cli: { run: CliRun; cliPath: string } | undefined
   private readonly _resolveCli: AgYQuotaServiceOptions['resolveCli']
@@ -208,21 +217,14 @@ export class AgYQuotaService extends TypertRemoteService {
   private readonly _proxyQuota: AgYQuotaServiceOptions['proxyQuota']
   private readonly _log: AgYQuotaServiceOptions['log']
   private readonly _control: SettingsControl | undefined
-  /** 在途取数：并发调用（多会话药丸 / 定时器 + 手动刷新）共享同一次取数，而不是各起一个进程。 */
-  private _inflight: Promise<QuotaSnapshot> | undefined
-  private _inflightMode: string | undefined
-  /** 在途取数是否真的绕过了缓存（而非「命中缓存」的即时返回）；force 的合并判定依据。 */
-  private _inflightBypassed = false
-  /** _read 在首个 await 前同步写入，供 read() 判断在途请求是否真正全量刷新。 */
-  private _readCacheStatus = { quota: true, credits: true }
-  /** 上次实际执行的 force 是否要求两路绕过缓存（在调用 _read 前失效）。 */
-  private _forcedRead = false
-  /** 额度缓存所属的生成模式：跨模式的旧额度不展示（账户不同）。 */
-  private _cacheMode: string | undefined
+  private _inflight?: { key: string; result: Promise<boolean> }
 
   constructor(ctx: Context, options: AgYQuotaServiceOptions = {}) {
     super(ctx, AGY_QUOTA_SERVICE)
     this._deps = options.deps ?? {}
+    this._snapshots = new QuotaSnapshotStore(options.snapshotDirectory)
+    this._persistent = options.snapshotDirectory !== undefined
+    this._proxyIdentity = options.proxyIdentity
     this._cli = options.cli
     this._resolveCli = options.resolveCli
     this._cliQuotaEnabled = options.cliQuotaEnabled
@@ -231,6 +233,18 @@ export class AgYQuotaService extends TypertRemoteService {
     this._proxyQuota = options.proxyQuota
     this._log = options.log
     this._control = options.control
+    if (options.background) {
+      ctx.effect(() => {
+        const tick = () => { void this.refresh().catch(error => this._log?.warn('antigravity-acp: 额度刷新失败：' + redactSensitiveText(String(error)))) }
+        let start: ReturnType<typeof setTimeout> | undefined
+        const schedule = () => { clearTimeout(start); start = setTimeout(tick, 0); start.unref() }
+        const off = options.onScopeChange?.(schedule)
+        schedule()
+        const interval = setInterval(tick, QUOTA_CACHE_MS)
+        interval.unref()
+        return () => { off?.(); clearTimeout(start); clearInterval(interval); this._lifetime.abort() }
+      }, 'antigravity: background quota refresh')
+    }
   }
 
   account(request?: { action: 'status' | 'login' | 'warmup' | 'cancel' }): AccountSnapshot {
@@ -243,162 +257,109 @@ export class AgYQuotaService extends TypertRemoteService {
     return this._control.models(parseRequest(request)?.force === true)
   }
 
-  /** 客户端药丸的取数入口；并发调用合并为同一次取数。 */
+  /** Pure snapshot read: no provider requests, CLI calls, or OAuth refresh. */
   async read(request?: AgYQuotaRequest): Promise<QuotaSnapshot> {
-    // 会话可刻意保留旧 provider 的已选模型；此时不能把全局新模式的额度
-    // 按旧 provider 广播给药丸。显式来源不匹配就失败，而不是错误归因。
-    if (request?.source !== undefined && request.source !== this.currentMode()) {
-      throw new Error('模型所属模式与当前生成模式不一致，请在会话中重新选择模型')
+    const scope = await this.snapshotScope(request)
+    const snapshot = await this._snapshots.read(scope.mode, scope.key, scope.persistent)
+    if (scope.epoch !== this.epoch()) return this.read(request)
+    const value = snapshot === undefined ? this.emptySnapshot() : markQuotaAge(snapshot, (this._deps.now ?? Date.now)())
+    if (!scope.cliOn && value.credits === undefined) value.credits = this.creditsUnavailable(false, value.updatedAt)
+    return request?.model ? { ...value, requestedModel: request.model, routeModel: this._modelTarget?.(request.model) || request.model } : value
+  }
+
+  /** Sole upstream entry point; host timer and explicit refresh share in-flight work. */
+  async refresh(request?: AgYQuotaRequest): Promise<QuotaSnapshot> {
+    return this.refreshCurrent(request, true)
+  }
+
+  private async refreshCurrent(request: AgYQuotaRequest | undefined, retry: boolean): Promise<QuotaSnapshot> {
+    const scope = await this.snapshotScope(request)
+    const flightKey = scope.epoch + ':' + scope.key
+    if (this._inflight?.key === flightKey) {
+      const committed = await this._inflight.result
+      if (!committed && retry && !this._lifetime.signal.aborted) return this.refreshCurrent(request, false)
+      return this.read(request)
     }
-    const force = request?.force === true
-    while (this._inflight) {
-      const existing = this._inflight
-      const mode = this.currentAccountKey()
-      // force 只并入「确实在取新数」的在途读取（结果即新数据）；在途读取若只是
-      // 命中缓存的即时返回，必须等它结束后另行取数，否则刷新会拿到旧缓存。
-      if (mode === this._inflightMode && (!force || this._inflightBypassed)) {
-        const result = await existing
-        if (mode === this.currentAccountKey()) return this.withModelRoute(result, request)
-      } else await existing.catch(() => undefined)
+    if (this._inflight) {
+      await this._inflight.result
+      return this.refreshCurrent(request, retry)
     }
-    if (force) {
-      // 必须在调用 _read 前失效：旧的部分读取即使刚完成，也不能把新 force
-      // 误变成命中缓存。保留 value 供失败时 stale 展示。
-      delete this._cache.at
-      delete this._creditsCache.at
-    }
-    this._forcedRead = force
-    const mode = this.currentAccountKey()
-    const run = this._read(request)
-    this._inflight = run
-    this._inflightMode = mode
-    // 只有「两路都取新数据」的在途读取才能吸收后续强制刷新。若其中一路命中
-    // 缓存，让 force 等本轮结束后再单独补刷，避免把手动刷新静默降级成旧值。
-    this._inflightBypassed = !this._readCacheStatus.quota && !this._readCacheStatus.credits
-    let result: QuotaSnapshot
+    if (this._lifetime.signal.aborted) return this.read(request)
+    const result = this.pull(scope)
+    this._inflight = { key: flightKey, result }
+    let committed: boolean
+    try { committed = await result }
+    finally { if (this._inflight?.result === result) this._inflight = undefined }
+    if (!committed && retry && !this._lifetime.signal.aborted) return this.refreshCurrent(request, false)
+    return this.read(request)
+  }
+
+  private currentMode(): QuotaMode { return this._mode?.() ?? 'acp' }
+
+  private epoch(): string {
+    const mode = this.currentMode()
+    return JSON.stringify([mode, mode === 'proxy' ? this._proxyQuota?.credential.revision?.() ?? 0 : 0, this._cliQuotaEnabled?.() === true])
+  }
+
+  private async snapshotScope(request?: AgYQuotaRequest): Promise<{ mode: QuotaMode; epoch: string; key: string; persistent: boolean; cliOn: boolean }> {
+    const mode = this.currentMode()
+    if (request?.source !== undefined && request.source !== mode) throw new Error('模型所属模式与当前生成模式不一致，请在会话中重新选择模型')
+    const cliOn = this._cliQuotaEnabled?.() === true
+    const epoch = this.epoch()
+    const [cli, proxy] = await Promise.all([
+      this._persistent && (mode === 'acp' || cliOn) ? cliQuotaIdentity(this._deps) : undefined,
+      mode === 'proxy' ? this._proxyIdentity?.() : undefined,
+    ])
+    if (epoch !== this.epoch()) return this.snapshotScope(request)
+    const persistent = mode === 'acp' ? cli !== undefined : proxy !== undefined && (!cliOn || cli !== undefined)
+    const key = quotaIdentity(mode, cliOn ? 'cli-on' : 'cli-off', cli ?? '', proxy ?? '', persistent ? '' : epoch)
+    return { mode, epoch, key, persistent, cliOn }
+  }
+
+  private emptySnapshot(): QuotaSnapshot {
+    return { status: 'error', updatedAt: new Date((this._deps.now ?? Date.now)()).toISOString(), groups: [],
+      error: { code: 'not-fetched', message: '暂无额度快照，可手动拉取' } }
+  }
+
+  private creditsUnavailable(cliOn: boolean, updatedAt: string): CreditsSnapshot {
+    return { status: 'unavailable', updatedAt, error: { code: cliOn ? 'cli-unavailable' : 'cli-disabled',
+      message: cliOn ? '未找到官方 agy CLI，无法查询 AI Credits' : '未开启 agy CLI 取数，不查询 AI Credits' } }
+  }
+
+  private async pull(scope: Awaited<ReturnType<AgYQuotaService['snapshotScope']>>): Promise<boolean> {
+    const previous = await this._snapshots.read(scope.mode, scope.key, scope.persistent)
+    if (scope.epoch !== this.epoch() || this._lifetime.signal.aborted) return false
+    const [fresh, freshCredits] = await this.collect(scope)
+    // The account may have changed outside DSH (official CLI), or in this host.
+    const latest = await this.snapshotScope()
+    if (this._lifetime.signal.aborted || scope.epoch !== latest.epoch || scope.key !== latest.key) return false
+    const credits = freshCredits.status === 'error' && previous?.credits?.status === 'ok'
+      ? { ...previous.credits, stale: true, staleReason: freshCredits.error?.message ?? '余额刷新失败' } : freshCredits
+    const snapshot = fresh.status === 'error' && previous?.status === 'ok'
+      ? { ...previous, stale: true, staleReason: fresh.error?.message ?? '刷新失败' } : fresh
+    try { await this._snapshots.put(scope.mode, scope.key, { ...snapshot, credits }, scope.persistent) }
+    catch { this._log?.warn('antigravity-acp: 额度快照写入失败；本次额度仍可在当前宿主读取') }
+    return true
+  }
+
+  private async collect({ mode, cliOn }: { mode: QuotaMode; cliOn: boolean }): Promise<[QuotaSnapshot, CreditsSnapshot]> {
+    const updatedAt = new Date((this._deps.now ?? Date.now)()).toISOString()
     try {
-      result = await run
-    } finally {
-      if (this._inflight === run) this._inflight = undefined
-    }
-    return mode === this.currentAccountKey() ? this.withModelRoute(result, request) : this.read(request)
-  }
-
-  private withModelRoute(result: QuotaSnapshot, request?: AgYQuotaRequest): QuotaSnapshot {
-    if (!request?.model) return result
-    return { ...result, requestedModel: request.model, routeModel: this._modelTarget?.(request.model) || request.model }
-  }
-
-  private currentMode(): 'acp' | 'proxy' {
-    return this._mode?.() === 'proxy' && this._proxyQuota !== undefined ? 'proxy' : 'acp'
-  }
-
-  /** 用户是否显式允许调用本机 agy CLI 取数；默认不允许。 */
-  private cliQuotaOn(): boolean {
-    return this._cliQuotaEnabled?.() === true
-  }
-
-  /**
-   * 缓存身份纳入 CLI 开关：开关翻转后套餐额度与 Credits 都属于另一条取数
-   * 口径（代理模式还意味着是否会 spawn agy），旧快照必须立即失效重取。
-   */
-  private currentAccountKey(): string {
-    const cliOn = this.cliQuotaOn()
-    return this.currentMode() === 'proxy'
-      ? `proxy:${this._proxyQuota?.credential.revision?.() ?? 0}:${cliOn ? 1 : 0}`
-      : `acp:${cliOn ? 1 : 0}`
-  }
-
-  private async _read(request?: AgYQuotaRequest): Promise<QuotaSnapshot> {
-    const accountKey = this.currentAccountKey()
-    // 这条日志让「药丸到底有没有把请求发到 Host」可证：浏览器侧完全无法写宿主日志。
-    // 只有显式开启 CLI 取数时才解析并可能 spawn 官方 agy；默认零 agy 调用。
-    const cliOn = this.cliQuotaOn()
-    const cli = cliOn ? (this._resolveCli?.() ?? this._cli) : undefined
-    const proxyMode = this.currentMode() === 'proxy'
-    const source = proxyMode
-      ? 'proxy-account（代理模式）'
-      : cli ? `cli=${redactSensitiveText(cli.cliPath)}`
-        : cliOn ? 'http（已开启 CLI 取数但未找到 agy CLI）'
-          : 'http（未开启 agy CLI 取数）'
-    this._log?.info(`antigravity-acp: 额度取数请求（force=${request?.force === true}，来源 ${source}）`)
-    try {
-      const now = Date.now()
-      // 模式切换后账户不同：旧模式的额度缓存不跨模式展示，直接失效。
-      const mode = accountKey
-      if (this._cacheMode !== undefined && this._cacheMode !== mode) {
-        delete this._cache.value
-        delete this._cache.at
-        delete this._creditsCache.at
-      }
-      this._cacheMode = mode
-      // 双路 CLI 的完成时间可能不同：本轮时间戳必须一致，且不能早于请求开始。
-      // 否则后到结果的时间戳会被另一路覆盖，使缓存提前过期或 force 后立即重读。
-      const fetchedAt = Math.max(now, this._cache.at ?? 0, this._creditsCache.at ?? 0)
-      const cached = this._cache.value
-      const previousCredits = this._creditsCache.value
-      const quotaCached = !this._forcedRead && Boolean(cached && this._cache.at !== undefined && now - this._cache.at < QUOTA_CACHE_MS && cached.status === 'ok' && cached.stale !== true)
-      const creditsCached = !this._forcedRead && Boolean(previousCredits && this._creditsCache.at !== undefined && now - this._creditsCache.at < QUOTA_CACHE_MS && previousCredits.status !== 'error' && !previousCredits.stale)
-      this._readCacheStatus = { quota: quotaCached, credits: creditsCached }
-      if (quotaCached && creditsCached) {
-        this._log?.info('antigravity-acp: 套餐额度与余额命中独立缓存')
-        return { ...cached!, credits: previousCredits }
-      }
-      // 上一次成功数据必须在取数**前**捕获：HTTP 回退实现（fetchQuotaSnapshot）
-      // 会把失败快照写进同一个缓存对象，取完再读就只剩失败结果了。
-      const previous = this._cache.value
-      // 两个只读命令并发且各有超时，不把 45s + 45s 串成超过客户端 60s 的请求。
-      const [fresh, freshCredits] = await Promise.all([
-        quotaCached ? Promise.resolve(cached!) : proxyMode
-          ? fetchProxyQuotaSnapshot({ credential: this._proxyQuota!.credential, transport: this._proxyQuota!.transport, log: this._log })
-          : cli
-            ? fetchAgyUsage(cli.run, cli.cliPath)
-            : fetchQuotaSnapshot(this._cache, this._deps),
-        creditsCached ? Promise.resolve(previousCredits!) : cli
-          ? fetchAgyCredits(cli.run, cli.cliPath)
-          // 开关关闭是「用户主动不看」（客户端隐藏区块）；开关开着但找不到 agy 是
-          // 可排查故障（cli-unavailable），客户端必须显示，不能静默吞掉。
-          : Promise.resolve<CreditsSnapshot>({ status: 'unavailable', updatedAt: new Date().toISOString(), error: {
-            code: cliOn ? 'cli-unavailable' : 'cli-disabled',
-            message: cliOn
-              ? '未找到官方 agy CLI，无法查询 AI Credits'
-              : '未开启 agy CLI 取数，不查询 AI Credits。在设置页「额度」打开「用 agy CLI 查询额度」并保存后才会调用本机 agy。',
-          } }),
+      const cli = cliOn ? (this._resolveCli?.() ?? this._cli) : undefined
+      const proxy = this._proxyQuota
+      this._log?.info('antigravity-acp: 正在刷新额度快照')
+      return await Promise.all([
+        mode === 'proxy'
+          ? proxy === undefined ? Promise.resolve<QuotaSnapshot>({ status: 'error', updatedAt, groups: [], error: { code: 'request-failed', message: '代理额度服务未就绪' } })
+            : fetchProxyQuotaSnapshot({ credential: proxy.credential, transport: proxy.transport, log: this._log }, this._lifetime.signal)
+          : cli ? fetchAgyUsage(cli.run, cli.cliPath) : fetchQuotaSnapshot({}, this._deps),
+        cli ? fetchAgyCredits(cli.run, cli.cliPath) : Promise.resolve(this.creditsUnavailable(cliOn, updatedAt)),
       ])
-      // 账户/模式变化后的结果交由 read 重取，不能写入新账户缓存或充当 stale。
-      if (accountKey !== this.currentAccountKey()) return fresh
-      const credits: CreditsSnapshot = freshCredits.status === 'error' && previousCredits?.status === 'ok'
-        ? { ...previousCredits, stale: true, staleReason: freshCredits.error?.message ?? '余额刷新失败' }
-        : freshCredits
-      this._creditsCache.value = credits
-      if (credits.stale || credits.status === 'error') delete this._creditsCache.at
-      else if (!creditsCached) this._creditsCache.at = fetchedAt
-      // 刷新失败但手里有上一次成功的数据：继续展示它并标记 stale，而不是让药丸
-      // 因为一次网络抖动就从「剩余 62%」变成「额度读取失败」。CLI 与 HTTP 回退
-      // 共用同一条 stale 保留语义。
-      const snapshot: QuotaSnapshot = fresh.status === 'error' && previous?.status === 'ok'
-        ? { ...previous, stale: true, staleReason: fresh.error?.message ?? '刷新失败' }
-        : fresh
-      this._cache.value = snapshot
-      // stale 不算新鲜：不刷新时间戳，也不被缓存命中分支当作可复用结果，下次调用立刻重试。
-      if (snapshot.stale === true) delete this._cache.at
-      else if (!quotaCached) this._cache.at = fetchedAt
-      this._log?.info(
-        `antigravity-acp: 额度取数结果 status=${snapshot.status} 组数=${snapshot.groups.length}` +
-          (snapshot.error ? ` 错误=${snapshot.error.code}:${snapshot.error.message.slice(0, 160)}` : ''),
-      )
-      return { ...snapshot, credits }
     } catch (error) {
-      // 取数实现自身已折叠错误；这里兜住意外异常，绝不让原始错误穿到客户端。
-      // 脱敏与快照内其它错误一致：token / URL userinfo 等不能进 UI 或宿主日志。
       const message = redactSensitiveText(error instanceof Error ? error.message : String(error))
-      this._log?.warn?.(`antigravity-acp: 额度取数抛异常：${message}`)
-      return {
-        status: 'error',
-        updatedAt: new Date().toISOString(),
-        groups: [],
-        error: { code: error instanceof QuotaError ? error.code : 'request-failed', message },
-      }
+      this._log?.warn('antigravity-acp: 额度刷新失败：' + message)
+      return [{ status: 'error', updatedAt, groups: [], error: { code: error instanceof QuotaError ? error.code : 'request-failed', message } },
+        { status: 'error', updatedAt, error: { code: 'request-failed', message } }]
     }
   }
 }

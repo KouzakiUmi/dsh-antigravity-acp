@@ -58,7 +58,7 @@ import { PROXY_RESPONSE_HEADER_TIMEOUT_MS, PROXY_IDLE_TIMEOUT_MS, PROXY_TOTAL_TI
 import type { ProxyCredential } from './account-store.js'
 import type { AntigravityHostConfig } from '../settings.js'
 import { modelDisplayName, modelSettingFor, modelVisible, normalizeModelSettings, resolveModelTarget } from '../adapter/model-settings.js'
-import type { ModelSetting } from '../adapter/model-settings.js'
+import type { ModelCapacity, ModelSetting } from '../adapter/model-settings.js'
 import { llmError } from '../runtime/llm-error.js'
 import { isLiveGeminiFamily, parseLiveProxyCatalog, PROXY_MODEL_EFFORTS } from './model-catalog.js'
 import type { LiveProxyCatalog, LiveProxyModel } from './model-catalog.js'
@@ -77,7 +77,7 @@ export interface ProxyCredentialSource {
 
 /** 设置页读取当前代理路由的目录，手动刷新绕过目录缓存。 */
 export interface ProxyModelCatalog {
-  models(force: boolean): Promise<readonly LlmModelInfo[]>
+  models(force: boolean): Promise<readonly (LlmModelInfo & ModelCapacity)[]>
 }
 
 export interface ProxyAdapterOptions {
@@ -92,7 +92,7 @@ export interface ProxyAdapterOptions {
 
 interface CatalogSnapshot {
   readonly key: string
-  readonly models: LiveProxyCatalog
+  readonly data: LiveProxyCatalog
 }
 
 interface ProxyGeneration {
@@ -163,7 +163,7 @@ export class AntigravityProxyAdapter extends LlmAdapter {
     return this.pinnedTextModelInfos(generation, catalog).filter(model => modelVisible(generation.settings, model.id))
   }
 
-  async discoverModels(force = false, signal?: AbortSignal): Promise<readonly LlmModelInfo[]> {
+  async discoverModels(force = false, signal?: AbortSignal): Promise<readonly (LlmModelInfo & ModelCapacity)[]> {
     const generation = this.captureGeneration()
     if (force) { this.catalogRevision += 1; this.catalogExpiresAt = 0; this.catalogFailureCode = undefined }
     const catalog = await this.readLiveCatalog(signal)
@@ -223,7 +223,7 @@ export class AntigravityProxyAdapter extends LlmAdapter {
 
   private wireModel(model: string, effort: string | undefined, generation: ProxyGeneration): string {
     const normalized = normalizeReasoningEffort(effort)
-    const observed = generation.catalog?.models.get(model)
+    const observed = generation.catalog?.data.models.get(model)
     const wire = isLiveGeminiFamily(model) ? selectLiveGeminiWire(observed, modelSettingFor(generation.settings, model), effort) : resolveModelTarget({
       settings: generation.settings,
       model,
@@ -255,20 +255,22 @@ export class AntigravityProxyAdapter extends LlmAdapter {
     const routedDefinition = setting.target === undefined ? definition : this.definitionForWireModel(wireModel)
     const reasoning = setting.target === undefined ? modelReasoningEfforts(model) : undefined
     if (reasoning !== undefined) {
-      const observed = generation.catalog?.models.get(model)
+      const observed = generation.catalog?.data.models.get(model)
       if (observed !== undefined) {
         reasoning.efforts = reasoning.efforts.filter(({ id }) => observed.efforts.some(effort => effort === id))
         const selected = observed.efforts.find(effort => resolveProxyWireModel(model, effort) === wireModel)
         if (selected !== undefined) reasoning.defaultEffort = ReasoningEffortId(selected)
       } else if (setting.effort !== undefined) reasoning.defaultEffort = ReasoningEffortId(setting.effort)
     }
+    const candidates = this.possibleWires(model, wireModel, generation)
+    const contextWindow = this.liveLimits(candidates, generation).contextWindow ?? native?.maxTokens ?? routedDefinition?.limit.context
     return {
       provider: PROXY_PROVIDER_ID,
       id: definition.id,
       name: modelDisplayName(generation.settings, model, cleanModelDisplayName(definition.name)),
-      inputModalities: (routedDefinition?.modalities.input ?? ['text']).filter((item): item is 'text' | 'image' => item === 'text' || (item === 'image' && generation.attachments !== undefined)),
+      inputModalities: this.inputModalities(candidates, generation, routedDefinition?.modalities.input.includes('image') === true),
+      ...(contextWindow === undefined ? {} : { context: { contextWindow } }),
       ...(routedDefinition === undefined ? {} : {
-        context: { contextWindow: native?.maxTokens ?? routedDefinition.limit.context },
         defaultMaxTokens: native?.maxOutputTokens ?? routedDefinition.limit.output,
       }),
       ...(reasoning === undefined || reasoning.efforts.length === 0 ? {} : { reasoning }),
@@ -277,16 +279,48 @@ export class AntigravityProxyAdapter extends LlmAdapter {
 
   private resolveLiveGemini(model: string, generation: ProxyGeneration): LlmResolvedModelInfo {
     const wire = this.wireModel(model, undefined, generation)
-    const family = generation.catalog!.models.get(model)!.liveGemini!
+    const observed = generation.catalog!.data.models.get(model)!
+    const family = observed.liveGemini!
     const target = modelSettingFor(generation.settings, model).target
     const selected = Array.from(family.variants).find(([, id]) => id === wire)?.[0]
+    const candidates = this.possibleWires(model, wire, generation)
+    const { contextWindow } = this.liveLimits(candidates, generation)
     return {
-      provider: PROXY_PROVIDER_ID, id: model, name: modelDisplayName(generation.settings, model, family.name), inputModalities: ['text'],
+      provider: PROXY_PROVIDER_ID, id: model, name: modelDisplayName(generation.settings, model, family.name),
+      inputModalities: this.inputModalities(candidates, generation),
+      ...(contextWindow === undefined ? {} : { context: { contextWindow } }),
       ...(target === undefined && selected !== undefined ? { reasoning: {
         efforts: Array.from(family.variants.keys(), effort => ({ id: ReasoningEffortId(effort), name: effort === 'xhigh' ? 'Extra High' : effort[0]!.toUpperCase() + effort.slice(1) })),
         defaultEffort: ReasoningEffortId(selected),
       } } : {}),
     }
+  }
+
+  private possibleWires(model: string, wire: string, generation: ProxyGeneration): readonly string[] {
+    const row = generation.catalog?.data.models.get(model)
+    if (modelSettingFor(generation.settings, model).target !== undefined || row === undefined) return [wire]
+    const alternates = row.liveGemini === undefined ? row.efforts.map(effort => resolveProxyWireModel(model, effort)) : [...row.liveGemini.variants.values()]
+    return [...new Set([wire, ...alternates])]
+  }
+
+  private liveLimits(wires: readonly string[], generation: ProxyGeneration): { contextWindow?: number; maxOutputTokens?: number } {
+    const bounded = (key: 'contextWindow' | 'maxOutputTokens') => {
+      const values = wires.map(wire => generation.catalog?.data.wire.get(wire)?.[key])
+      const known = values.filter(value => value !== undefined)
+      return known.length === wires.length && known.length > 0 ? Math.min(...known) : undefined
+    }
+    return { contextWindow: bounded('contextWindow'), maxOutputTokens: bounded('maxOutputTokens') }
+  }
+
+  private acceptsImage(wire: string, generation: ProxyGeneration, fallback = false): boolean {
+    return generation.catalog?.data.wire.get(wire)?.supportsImages
+      ?? this.definitionForWireModel(wire)?.modalities.input.includes('image') ?? fallback
+  }
+
+  private inputModalities(wires: readonly string[], generation: ProxyGeneration, fallback = false): readonly ('text' | 'image')[] {
+    // Core projects images before the adapter sees the selected effort. Preserve
+    // them at route level if any tier supports them, then validate the exact wire.
+    return generation.attachments !== undefined && wires.some(wire => this.acceptsImage(wire, generation, fallback)) ? ['text', 'image'] : ['text']
   }
 
   private definitionForWireModel(wireModel: string): ReturnType<typeof getPublicModelDefinitions>[string] | undefined {
@@ -315,7 +349,11 @@ export class AntigravityProxyAdapter extends LlmAdapter {
     if (signal?.aborted) { yield finishChunk('aborted', 'CANCELLED'); return }
     const wireModel = this.wireModel(options.model, options.reasoningEffort, generation)
     const routedDefinition = modelSettingFor(generation.settings, options.model).target === undefined ? requested : this.definitionForWireModel(wireModel)
-    const attachments = routedDefinition?.modalities.input.includes('image') ? generation.attachments : undefined
+    const acceptsImage = this.acceptsImage(wireModel, generation, routedDefinition?.modalities.input.includes('image') === true)
+    if (!acceptsImage && options.messages.some(message => message.content.some(block => block.type === 'image' && !block.offloaded))) {
+      throw llmError('所选代理模型或档位不支持图片输入，请切换到支持图片的档位或移除图片', 'UNSUPPORTED_MODALITY')
+    }
+    const attachments = acceptsImage ? generation.attachments : undefined
     const hasEmitted = { value: false }
     let refreshed = false
     let refreshNext = false
@@ -559,10 +597,14 @@ export class AntigravityProxyAdapter extends LlmAdapter {
     return reason !== 'error'
   }
 
-  private pinnedTextModelInfos(generation: ProxyGeneration, catalog: CatalogSnapshot): readonly LlmModelInfo[] {
-    return Array.from(catalog.models.keys(), id => {
-      const resolved = this.resolveModelInGeneration(PROXY_PROVIDER_ID, id, { ...generation, catalog })
-      return { provider: resolved.provider, id: resolved.id, name: resolved.name, inputModalities: resolved.inputModalities }
+  private pinnedTextModelInfos(generation: ProxyGeneration, catalog: CatalogSnapshot): readonly (LlmModelInfo & ModelCapacity)[] {
+    const bound = { ...generation, catalog }
+    return Array.from(catalog.data.models.keys(), id => {
+      const resolved = this.resolveModelInGeneration(PROXY_PROVIDER_ID, id, bound)
+      const wire = this.wireModel(id, undefined, bound)
+      const { maxOutputTokens } = this.liveLimits(this.possibleWires(id, wire, bound), bound)
+      return { provider: resolved.provider, id: resolved.id, name: resolved.name, inputModalities: resolved.inputModalities,
+        contextWindow: resolved.context?.contextWindow, maxOutputTokens }
     })
   }
 
@@ -633,9 +675,9 @@ export class AntigravityProxyAdapter extends LlmAdapter {
       this.rememberCatalogFailure(key, failure, revision)
       throw failure
     }
-    let models: LiveProxyCatalog
+    let data: LiveProxyCatalog
     try {
-      models = parseLiveProxyCatalog(value, this.definitions)
+      data = parseLiveProxyCatalog(value, this.definitions)
     } catch (error) {
       const failure = error instanceof LlmError ? error : llmError('代理模式模型目录不符合预期结构', 'PROTOCOL_DRIFT')
       this.rememberCatalogFailure(key, failure, revision)
@@ -643,7 +685,7 @@ export class AntigravityProxyAdapter extends LlmAdapter {
     }
     this.assertCatalogCurrent(revision, signal)
     this.catalogKey = key
-    const catalog = this.catalogLastGood = { key, models }
+    const catalog = this.catalogLastGood = { key, data }
     this.catalogFailureCode = undefined
     this.catalogExpiresAt = Date.now() + MODEL_CATALOG_TTL_MS
     return catalog

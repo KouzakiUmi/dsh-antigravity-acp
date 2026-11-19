@@ -2,6 +2,7 @@
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { LlmError } from '@deepseek-ai/dsh-llm'
+import { createHash } from 'node:crypto'
 import { llmError } from '../runtime/llm-error.js'
 import { ProxyAccountStore, importCliCredential, isProxyCredentialUsable } from './account-store.js'
 import type { ProxyCredential } from './account-store.js'
@@ -274,6 +275,15 @@ export class ProxyAccountService implements ProxyCredentialSource {
   }
 
   email(): string | undefined { return this.signedOut ? undefined : this.store.peek()?.email }
+  async quotaIdentity(): Promise<string | undefined> {
+    const generation = this.generation
+    if (this.signedOut) return undefined
+    const account = this.store.peek() ?? await this.store.load()
+    if (!account || this.signedOut || generation !== this.generation) return undefined
+    const stable = account.email ?? account.refreshToken ?? account.accessToken
+    return stable && account.projectId
+      ? createHash('sha256').update(JSON.stringify([stable, account.projectId])).digest('hex') : undefined
+  }
   revision(): number { return this.accountRevision }
   subscribe(listener: () => void): () => void {
     this.listeners.add(listener)

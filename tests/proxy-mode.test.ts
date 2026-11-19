@@ -238,8 +238,10 @@ describe('payload：消息映射与线载荷', () => {
   })
 
   it('缓存命中从总 prompt 计数扣除，避免宿主重复统计', () => {
-    const parsed = parseProxyProviderEvent('{"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":80,"candidatesTokenCount":4}}')
-    expect(parsed.usage).toMatchObject({ inputTokens: 20, cacheReadTokens: 80, outputTokens: 4 })
+    const metadata = { promptTokenCount: 100, cachedContentTokenCount: 80, candidatesTokenCount: 4, thoughtsTokenCount: 3, totalTokenCount: 107 }
+    const parsed = parseProxyProviderEvent(JSON.stringify({ usageMetadata: metadata }))
+    expect(parsed.usage).toEqual({ inputTokens: 20, cacheReadTokens: 80, outputTokens: 4, reasoningTokens: 3, totalTokens: 107 })
+    expect(parseProxyProviderEvent(JSON.stringify({ usageMetadata: { ...metadata, totalTokenCount: 20 } })).usage?.totalTokens).toBeUndefined()
   })
 
   it('图片读取后校验 1MB 上限，旧附件面不发送超过 4MP 的原图', async () => {

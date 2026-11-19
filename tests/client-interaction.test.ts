@@ -51,7 +51,7 @@ function loadCard(quotaRead?: () => Promise<unknown>) {
   const ctx = {
     slots,
     remote: { $mount: () => () => {} },
-    get: (name: string) => name === 'remote.agyQuota' ? { read: quotaRead } : undefined,
+    get: (name: string) => name === 'remote.agyQuota' ? { read: quotaRead, refresh: quotaRead } : undefined,
     effect: (callback: () => unknown) => callback(),
     inject: (_names: string[], callback: (scope: unknown) => void) => callback(ctx),
   }
@@ -283,15 +283,16 @@ describe('settings card with real React state and effects', () => {
     expect(button(renderer, '取消登录').props.disabled).toBe(false)
   })
 
-  it('设置页额度只在点击时拉取，可见模式、失败缓存及再次刷新', async () => {
+  it('设置页自动读快照，只在点击时请求刷新', async () => {
     const service = transport(document({ proxyMode: true }))
-    const readQuota = vi.fn(async () => ({ status: 'ok', groups: [{ name: 'Gemini', buckets: [{ window: '5h', remainingPct: 73 }] }] }) as unknown)
+    const readQuota = vi.fn(async (_force: boolean, _source?: string, _model?: string) => ({ status: 'ok', groups: [{ name: 'Gemini', buckets: [{ window: '5h', remainingPct: 73 }] }] }) as unknown)
     const { renderer, intervals } = await mount(service.remote, undefined, undefined, readQuota)
-    expect(readQuota).not.toHaveBeenCalled()
+    expect(readQuota).toHaveBeenCalledWith(false, 'antigravity-proxy', undefined)
+    expect(renderedText(renderer)).toContain('73')
     await act(async () => { for (const timer of intervals.values()) timer.callback() })
-    expect(readQuota).not.toHaveBeenCalled()
+    expect(readQuota.mock.calls.every(([force]) => force === false)).toBe(true)
     await act(async () => { await button(renderer, '拉取额度').props.onClick() })
-    expect(readQuota).toHaveBeenCalledWith(true, 'antigravity-proxy')
+    expect(readQuota).toHaveBeenCalledWith(true, 'antigravity-proxy', undefined)
     expect(renderedText(renderer)).toContain('73')
     readQuota.mockRejectedValueOnce(new Error('额度网络超时'))
     await act(async () => { await button(renderer, '拉取额度').props.onClick() })
@@ -303,14 +304,14 @@ describe('settings card with real React state and effects', () => {
   it('设置页切换额度来源时清空旧结果，不接纳旧模式的迟到请求', async () => {
     const service = transport(document({ proxyMode: true }))
     const pending = deferred<unknown>()
-    const readQuota = vi.fn(() => pending.promise)
+    const readQuota = vi.fn((force: boolean) => force ? pending.promise : Promise.resolve({ status: 'error', groups: [], error: { code: 'not-fetched' } }))
     const { renderer } = await mount(service.remote, undefined, undefined, readQuota)
     let request: Promise<void> | undefined
     await act(async () => { request = button(renderer, '拉取额度').props.onClick() })
     await act(async () => { service.change(document({ proxyMode: false }, 2)) })
     await act(async () => { pending.resolve({ status: 'ok', groups: [{ name: 'former-account', buckets: [{ remainingPct: 99 }] }] }); await request })
     expect(renderedText(renderer)).not.toContain('former-account')
-    expect(renderedText(renderer)).toContain('尚未查询')
+    expect(renderedText(renderer)).toContain('暂无额度快照')
     expect(button(renderer, '拉取额度').props.disabled).toBe(false)
   })
   it('模式草稿不冒充已生效模式，代理模式保存后显示对应连接控件', async () => {
@@ -492,6 +493,19 @@ describe('settings card with real React state and effects', () => {
     })
     await act(async () => { await button(renderer, '保存').props.onClick() })
     expect(service.mutate).toHaveBeenCalledWith('llm-antigravity-acp', [{ op: 'set', path: ['modelOverrides'], value: {} }], 1)
+  })
+
+  it('设置页显示已观测的上下文和输出上限，不把容量当成草稿字段', async () => {
+    const service = transport(document())
+    const models = catalog()
+    const control = controlWith({ ...models, models: models.models.map((row, i) => i === 0
+      ? { ...row, contextWindow: 1048576, maxOutputTokens: 262144 } : row) })
+    const { renderer } = await mount(service.remote, control)
+    const text = renderedText(renderer)
+    expect(text).toContain(`上下文窗口 ${(1048576).toLocaleString()} tokens`)
+    expect(text).toContain(`输出上限 ${(262144).toLocaleString()} tokens`)
+    expect(text).toContain('上下文窗口：尚未观测')
+    expect(service.mutate).not.toHaveBeenCalled()
   })
 
   it('全部模型被隐藏时提示 provider 会从选择器消失，重新启用后提示消失', async () => {

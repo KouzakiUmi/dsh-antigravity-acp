@@ -741,6 +741,15 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
     mode: () => (modeBus.current() ? 'proxy' : 'acp'),
     modelTarget: (model) => config.modelOverrides?.[model]?.target?.trim() || model,
     proxyQuota: { credential: proxyAccount, transport: proxyQuotaTransport },
+    proxyIdentity: () => proxyAccount.quotaIdentity(),
+    snapshotDirectory: cacheDir,
+    background: true,
+    onScopeChange: (tick) => {
+      const offMode = modeBus.subscribe(tick)
+      const offAccount = proxyAccount.subscribe(() => { if (modeBus.current()) tick() })
+      const offSettings = ctx.on('loader/volatile-update', paths => { if (paths.some(([key]) => key === 'cliQuotaEnabled' || key === 'agyCliPath' || key === 'proxyUrl')) tick() })
+      return () => { offMode(); offAccount(); offSettings() }
+    },
     // 取数打点：浏览器侧无法写宿主日志，这条是「药丸有没有真的发请求、结果如何」的唯一现场。
     log: {
       info: (message: string) => ctx.logger?.info?.(message),

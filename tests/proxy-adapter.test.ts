@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { AdapterRequestOptions } from '../src/adapter/request-options.js'
-import { createAssistantMessage, createToolResultMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import Llm, { createAssistantMessage, createToolResultMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { Context } from '@deepseek-ai/cordis'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { AntigravityProxyAdapter, PROXY_PROVIDER_ID } from '../src/proxy/adapter.js'
 import { ProxyTransportError } from '../src/proxy/transport.js'
@@ -189,6 +190,43 @@ describe('代理凭据取消', () => {
 })
 
 describe('代理模型设置与调用准备', () => {
+  it('经 DSH Core 保留混合档位家族的图片，再按实际路由校验', async () => {
+    const image = { attachmentId: 'test-image', mediaType: 'image/png', width: 1, height: 1, bytes: 3 } as ImageAttachmentRef
+    const reader: ProxyAttachmentReader = { readImage: vi.fn(), readImageRequest: vi.fn(async () => ({ data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' })) }
+    let attachments: ProxyAttachmentReader | undefined = reader
+    const request = vi.fn(async ({ url }: { url: string; body: string | Uint8Array }) => url.includes('fetchAvailableModels')
+      ? Response.json({ models: {
+        'gemini-4-hydrogen-medium': { supportsImages: true }, 'gemini-4-hydrogen-xhigh': { supportsImages: true },
+        'gemini-4-neon-medium': { supportsImages: true, maxTokens: 1048576, maxOutputTokens: 262144 },
+        'gemini-4-neon-xhigh': { supportsImages: false, maxTokens: 524288, maxOutputTokens: 131072 },
+      } }) : new Response(`data: ${JSON.stringify(event([{ text: 'ok' }], 'STOP'))}\n\n`))
+    const instance = new AntigravityProxyAdapter({ attachments: () => attachments,
+      credential: { credential: async () => ({ accessToken: 'fixture', source: 'login', updatedAt: 'x' }) }, transport: { request } })
+    const hydrogen = 'antigravity-gemini-4-hydrogen', neon = 'antigravity-gemini-4-neon'
+    const messages: AdapterRequestOptions['messages'] = [{ role: 'user', content: [{ type: 'image', attachment: image }] }]
+    expect(await instance.discoverModels()).toEqual([
+      expect.objectContaining({ id: hydrogen, inputModalities: ['text', 'image'] }),
+      expect.objectContaining({ id: neon, inputModalities: ['text', 'image'], contextWindow: 524288, maxOutputTokens: 131072 }),
+    ])
+    const ctx = new Context()
+    const fiber = ctx.plugin(Llm)
+    try {
+      await fiber.inertia
+      ctx.llm.registerAdapter([PROXY_PROVIDER_ID], instance)
+      const ready = await ctx.llm.prepareCall({ provider: PROXY_PROVIDER_ID, model: neon, reasoningEffort: ReasoningEffortId('medium') })
+      expect(ready).toMatchObject({ context: { contextWindow: 524288 }, inputModalities: ['text', 'image'] })
+      expect(ready.config.maxTokens).toBeUndefined() // output maximum is not a request default
+      await collect(ready.stream({ ...ready.config, messages }))
+      expect(String(request.mock.lastCall?.[0].body)).toContain('"inlineData":{"mimeType":"image/png","data":"AQID"}')
+      const rejected = await collect(ctx.llm.stream({ provider: PROXY_PROVIDER_ID, model: neon, messages, reasoningEffort: ReasoningEffortId('xhigh') }))
+      expect(rejected.at(-1)).toMatchObject({ type: 'finish', reason: { kind: 'error', failure: { code: 'UNSUPPORTED_MODALITY', message: expect.stringContaining('档位不支持图片') } } })
+    } finally { await fiber.dispose() }
+    attachments = undefined
+    expect((await instance.resolveModel(PROXY_PROVIDER_ID, hydrogen)).inputModalities).toEqual(['text'])
+    expect(reader.readImageRequest).toHaveBeenCalledTimes(1)
+    expect(request).toHaveBeenCalledTimes(2)
+  })
+
   it('设置目录公布已观测的 Hydrogen 和 Neon，派发精确档位 ID', async () => {
     const request = vi.fn(async ({ url }: { url: string; body: string | Uint8Array }) => url.includes('fetchAvailableModels')
       ? Response.json({ models: {
@@ -211,7 +249,7 @@ describe('代理模型设置与调用准备', () => {
     await collect(prepared.stream({ ...options, model: hydrogen, reasoningEffort: ReasoningEffortId('xhigh') }))
     const wire = JSON.parse(String(request.mock.lastCall?.[0].body))
     expect(wire.model).toBe('gemini-4-hydrogen-xhigh')
-    expect(wire.request.generationConfig?.thinkingConfig).toBeUndefined()
+    expect(wire.request.generationConfig?.thinkingConfig).toEqual({ includeThoughts: true })
     expect(request).toHaveBeenCalledTimes(2)
   })
 

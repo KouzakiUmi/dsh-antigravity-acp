@@ -106,7 +106,7 @@ window.__ModuleLoader__.load({
     }
     /** 目录条目 + 已配置但当前目录没有的 ID，都要能在此编辑。 */
     function modelRows(models, overrides) {
-      const rows = models.map((model) => ({ id: model.id, name: model.name, inputModalities: model.inputModalities, inCatalog: true }))
+      const rows = models.map(({ id, name, inputModalities, contextWindow, maxOutputTokens }) => ({ id, name, inputModalities, contextWindow, maxOutputTokens, inCatalog: true }))
       const known = new Set(rows.map((row) => row.id))
       for (const id of Object.keys(canonicalOverrides(overrides))) {
         if (!known.has(id)) rows.push({ id, name: id, inCatalog: false })
@@ -268,7 +268,11 @@ window.__ModuleLoader__.load({
           h('div', { style: { display: 'grid', gap: '10px', marginTop: '10px', padding: '10px', borderRadius: '8px', background: 'rgba(128,128,128,.04)' } },
             h('div', { style: { display: 'grid', gap: '3px' } },
               h('span', { style: labelStyle }, '模型 ID'),
-              h('code', { style: { fontSize: '10px', overflowWrap: 'anywhere', opacity: .75 } }, row.id)),
+            h('code', { style: { fontSize: '10px', overflowWrap: 'anywhere', opacity: .75 } }, row.id),
+            row.inCatalog ? h('span', { style: labelStyle }, Number.isSafeInteger(row.contextWindow)
+              ? '上下文窗口 ' + row.contextWindow.toLocaleString() + ' tokens（上游容量）'
+              : '上下文窗口：尚未观测') : null,
+            Number.isSafeInteger(row.maxOutputTokens) ? h('span', { style: labelStyle }, '输出上限 ' + row.maxOutputTokens.toLocaleString() + ' tokens') : null),
             h('div', { style: { display: 'grid', gap: '10px', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))' } },
               h('div', { style: { display: 'grid', gap: '4px', minWidth: 0 } },
                 h('label', { htmlFor: inputId + '-name', style: labelStyle }, '显示名'),
@@ -828,18 +832,20 @@ window.__ModuleLoader__.load({
         style: { display: 'block', width: compact ? '34px' : '100%', height: compact ? compactHeight + 'px' : '4px', borderRadius: '99px', overflow: 'hidden', background: TRACK },
       }, h('span', { style: { display: 'block', height: '100%', width: unknown ? '100%' : pct + '%', opacity: unknown ? .35 : 1, borderRadius: '99px', background: tone(bucket, stale) } }))
     }
-    function useQuota(readQuota, enabled = true, source, model) {
+    function useQuota(readQuota, enabled = true, source, model, accountRevision) {
       const [data, setData] = React.useState(null)
       const [refreshing, setRefreshing] = React.useState(false)
       const version = React.useRef(0)
       const currentSource = React.useRef(source)
       const currentModel = React.useRef(model)
+      const manual = React.useRef(false)
       currentModel.current = model
       const update = React.useCallback((value) => setData(value), [])
       const load = React.useCallback((force = false) => {
-        if (!enabled || !readQuota) return Promise.resolve()
+        if (!enabled || !readQuota || manual.current) return Promise.resolve()
         const current = ++version.current
-        setRefreshing(true)
+        manual.current = force
+        if (force) setRefreshing(true)
         return Promise.resolve().then(() => readQuota(force, source, model)).then(unwrap).then((value) => {
           if (current === version.current) update(value)
         }).catch((error) => {
@@ -849,26 +855,29 @@ window.__ModuleLoader__.load({
               ? { ...previous, stale: true, staleReason: message }
               : { status: 'error', groups: [], error: { message } })
           }
-        }).finally(() => { if (current === version.current) setRefreshing(false) })
+        }).finally(() => { if (current === version.current) { manual.current = false; setRefreshing(false) } })
       }, [readQuota, enabled, update, source, model])
       React.useEffect(() => {
         currentSource.current = source
+        manual.current = false
         setData(null)
+        setRefreshing(false)
         if (!enabled || !readQuota) { setData(null); return undefined }
         void load(false)
         const off = readQuota.subscribe?.((value, origin) => {
           if (origin !== undefined && origin !== source) return
           if (value?.requestedModel !== undefined && value.requestedModel !== currentModel.current) return
           if (value === null) {
-            ++version.current; update(null); setRefreshing(false)
-            void load(true)
+            ++version.current; manual.current = false; update(null); setRefreshing(false)
+            void load(false)
             return
           }
+          if (manual.current) return
           ++version.current; update(value); setRefreshing(false)
         })
-        const timer = setInterval(() => { if (typeof document === 'undefined' || document.visibilityState !== 'hidden') void load(false) }, 300_000)
+        const timer = setInterval(() => { if (typeof document === 'undefined' || document.visibilityState !== 'hidden') void load(false) }, 15_000)
         return () => { ++version.current; clearInterval(timer); off?.() }
-      }, [load, enabled, readQuota, update, source, model])
+      }, [load, enabled, readQuota, update, source, model, accountRevision])
       return { data: currentSource.current === source ? data : null, refreshing, load }
     }
     function CreditsDetails({ credits, pending }) {
@@ -888,49 +897,11 @@ window.__ModuleLoader__.load({
         credits?.error?.message ? h('p', { role: credits.status === 'error' ? 'alert' : 'status', style: { margin: '4px 0 0', fontSize: '10px', overflowWrap: 'anywhere' } }, credits.error.message) : null)
     }
     function SettingsQuotaPanel({ readQuota, source, accountRevision, cliQuotaOn, cliQuotaDirty }) {
-      const [data, setData] = React.useState(null)
-      const [refreshing, setRefreshing] = React.useState(false)
-      const version = React.useRef(0)
-      const requested = React.useRef(false)
-      const pending = React.useRef(false)
-      React.useEffect(() => {
-        ++version.current
-        requested.current = false
-        pending.current = false
-        setData(null)
-        setRefreshing(false)
-        const off = readQuota?.subscribe?.((value, origin) => {
-          if (origin !== source) return
-          if (value === null) {
-            ++version.current; requested.current = false; pending.current = false
-            setData(null); setRefreshing(false)
-          } else if (requested.current) setData(value)
-        })
-        return () => { ++version.current; off?.() }
-      }, [readQuota, source, accountRevision])
-      const load = async () => {
-        if (!readQuota || pending.current) return
-        pending.current = true
-        requested.current = true
-        const current = ++version.current
-        setRefreshing(true)
-        try {
-          const value = unwrap(await readQuota(true, source))
-          if (current === version.current) setData(value)
-        } catch (error) {
-          if (current === version.current) {
-            const message = error instanceof Error ? error.message : String(error)
-            setData(previous => previous?.status === 'ok' ? { ...previous, stale: true, staleReason: message }
-              : { status: 'error', groups: [], error: { message } })
-          }
-        } finally {
-          if (current === version.current) { pending.current = false; setRefreshing(false) }
-        }
-      }
+      const { data, refreshing, load } = useQuota(readQuota, true, source, undefined, accountRevision)
       return h('section', { style: PANEL, 'aria-label': '套餐额度查询' },
         h(SectionHeading, { title: '套餐额度', description: (source === PROXY_PROVIDER ? '代理账户' : 'ACP 账户') + (cliQuotaDirty ? ' · CLI 开关未保存' : cliQuotaOn ? ' · CLI 补充取数' : ''),
-          action: h('button', { type: 'button', style: ACTION, disabled: !readQuota || refreshing, 'aria-busy': refreshing || undefined, onClick: load }, refreshing ? '正在拉取…' : '拉取额度') }),
-        data ? QuotaDetails({ data, refreshing, source }) : h('p', { role: 'status', style: { margin: 0, fontSize: '12px', lineHeight: 1.5, opacity: .65 } }, refreshing ? '正在读取…' : '尚未查询'))
+          action: h('button', { type: 'button', style: ACTION, disabled: !readQuota || refreshing, 'aria-busy': refreshing || undefined, onClick: () => load(true) }, refreshing ? '正在拉取…' : '拉取额度') }),
+        data && (data.error?.code !== 'not-fetched' || data.credits?.status === 'ok') ? QuotaDetails({ data, refreshing, source }) : h('p', { role: 'status', style: { margin: 0, fontSize: '12px', lineHeight: 1.5, opacity: .65 } }, refreshing ? '正在拉取…' : '暂无额度快照'))
     }
     function QuotaDetails({ data, refreshing, load, model, source, onClose }) {
       return h('div', { style: { display: 'grid', gap: 0 } },
@@ -939,7 +910,7 @@ window.__ModuleLoader__.load({
           data?.plan ? h('span', { style: { fontSize: '11px', padding: '2px 8px', background: TRACK, borderRadius: '99px' } }, data.plan) : null,
           onClose ? h('button', { type: 'button', 'aria-label': '关闭额度详情', onClick: onClose, style: { ...ACTION, padding: '2px 7px', minHeight: '26px', borderColor: 'transparent' } }, '×') : null),
         data?.stale ? h('p', { role: 'status', style: { margin: '8px 0', padding: '6px 8px', borderRadius: '7px', background: 'rgba(217,155,40,.10)', color: '#d99b28', fontSize: '11px' } }, '缓存数据 · ' + (data.staleReason ?? '刷新失败')) : null,
-        data?.status === 'error' ? h('p', { role: 'alert', style: { margin: '8px 0', color: '#ef4444', fontSize: '11px', overflowWrap: 'anywhere' } }, data.error?.message ?? data.error?.text ?? '额度读取失败') : null,
+         data?.status === 'error' ? h('p', { role: data.error?.code === 'not-fetched' ? 'status' : 'alert', style: { margin: '8px 0', color: data.error?.code === 'not-fetched' ? '#8b909a' : '#ef4444', fontSize: '11px', overflowWrap: 'anywhere' } }, data.error?.message ?? data.error?.text ?? '额度读取失败') : null,
         ...quotaGroups(data).map((group) => h('section', { key: group.key, style: { padding: '9px 0', borderBottom: '1px solid rgba(128,128,128,.14)' }, 'aria-label': group.name + '额度' },
           h('div', { style: { display: 'flex', alignItems: 'center', gap: '7px', marginBottom: '7px' } },
             h('strong', { style: { fontSize: '12px' } }, group.name),
@@ -955,12 +926,13 @@ window.__ModuleLoader__.load({
           })) : h('span', { style: { opacity: .55, fontSize: '11px' } }, data ? '未提供额度数据' : '正在读取…'))),
         CreditsDetails({ credits: data?.credits, pending: !data }),
         h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', paddingTop: '8px' } },
-          h('small', { style: { flex: 1, opacity: .5, minWidth: 0, fontSize: '10px' } }, data?.updatedAt ? '更新于 ' + new Date(data.updatedAt).toLocaleString() : '尚无成功快照'),
+           h('small', { style: { flex: 1, opacity: .5, minWidth: 0, fontSize: '10px' } }, data?.status === 'ok' && data.updatedAt ? '更新于 ' + new Date(data.updatedAt).toLocaleString() : '尚无成功快照'),
           load ? h('button', { type: 'button', disabled: refreshing, onClick: () => load(true), style: { ...ACTION, minHeight: '27px', padding: '3px 9px', fontSize: '11px' } }, refreshing ? '刷新中…' : '刷新额度') : null))
     }
     /** 紧凑余量条与单词状态的交互参考 dsh-subusage；取数仍由本插件负责。 */
     function quotaPillStatus(data, buckets) {
       if (!data) return { short: '', icon: '…', color: '#8b909a' }
+      if (data.error?.code === 'not-fetched') return { short: '暂无', icon: '?', color: '#8b909a' }
       if (data.status === 'error') return { short: '失败', icon: '!', color: '#e5534b', tint: true }
       if (data.stale) return { short: '缓存', icon: '!', color: '#d99b28', tint: true }
       const usable = buckets.filter(bucket => !bucket.disabled && percentage(bucket) !== undefined)
@@ -1040,7 +1012,7 @@ window.__ModuleLoader__.load({
       const miniBuckets = buckets.slice(0, 5)
       const miniHeight = miniBuckets.length <= 1 ? 6 : miniBuckets.length === 2 ? 5 : miniBuckets.length === 3 ? 4 : miniBuckets.length === 4 ? 3 : 2
       const modeTag = isProxy ? '代理' : 'ACP'
-      const label = quota.data?.status === 'error' ? '额度读取失败' : !quota.data ? '正在读取额度' : !group ? '额度未匹配，请选择具体模型' : !buckets.length ? '额度未知' : buckets.map((b) => windowName(b) + ' ' + (b.disabled ? '已停用' : percentage(b) === undefined ? '额度未知' : Math.round(percentage(b)) + '% 剩余')).join(' · ')
+      const label = quota.data?.error?.code === 'not-fetched' ? '暂无额度快照' : quota.data?.status === 'error' ? '额度读取失败' : !quota.data ? '正在读取额度' : !group ? '额度未匹配，请选择具体模型' : !buckets.length ? '额度未知' : buckets.map((b) => windowName(b) + ' ' + (b.disabled ? '已停用' : percentage(b) === undefined ? '额度未知' : Math.round(percentage(b)) + '% 剩余')).join(' · ')
       const title = modeTag + ' · ' + String(model ?? '未选择模型') + ' · ' + label + (quota.data?.stale ? ' · 缓存数据' : '')
       return h('span', { ref: root, className: 'antigravity-usage-pill', 'data-expanded': String(expanded), style: { position: 'relative', display: 'inline-flex', alignItems: 'center' } },
         h('button', { ref: button, type: 'button', title, 'aria-label': title, 'aria-expanded': expanded, 'aria-haspopup': 'dialog', onClick: () => setExpanded((value) => !value),
@@ -1078,17 +1050,15 @@ window.__ModuleLoader__.load({
           // inject」，而这正是本药丸的处境（贡献型 remote 由 $mount 挂载、不进 inject）。
           // 参考实现 dsh-subusage 同样是 `ctx.get("remote.subUsage")`。
           const service = scope.get('remote.agyQuota')
-          if (service && typeof service.read === 'function') {
-            // Host 侧会起官方 agy CLI 取数（其启动含登录刷新）。万一它挂在网络上，
-            // 也要让药丸显示「读取失败 + 原因」，而不是一直停在「额度…」。
+          const method = force ? 'refresh' : 'read'
+          if (service && typeof service[method] === 'function') {
             return await withTimeout(
-              service.read({
-                ...(force ? { force: true } : {}),
+              service[method]({
                 ...(source === PROVIDER ? { source: 'acp' } : source === PROXY_PROVIDER ? { source: 'proxy' } : {}),
                 ...(model ? { model } : {}),
               }),
-              60_000,
-              '额度读取超时（Host 侧 agy CLI 60 秒内没有返回）',
+              force ? 60_000 : 5_000,
+              force ? '额度拉取超时' : '额度快照读取超时',
             )
           }
           if (Date.now() >= deadline) {
@@ -1216,11 +1186,11 @@ window.__ModuleLoader__.load({
     const AGY_QUOTA_REMOTE = {
       package: AGY_QUOTA_PACKAGE,
       descriptors: [
-        {
-          id: `${AGY_QUOTA_PACKAGE}#${AGY_QUOTA_SERVICE}/read`,
+        ...['read', 'refresh'].map((method) => ({
+          id: `${AGY_QUOTA_PACKAGE}#${AGY_QUOTA_SERVICE}/${method}`,
           service: AGY_QUOTA_SERVICE,
           namespace: AGY_QUOTA_SERVICE,
-          method: 'read',
+          method,
           invocation: { kind: 'direct' },
           parameters: [
             {
@@ -1232,7 +1202,7 @@ window.__ModuleLoader__.load({
             },
           ],
           result: strictCodec(`${AGY_QUOTA_PACKAGE}#AgYQuotaResult`, parseQuotaResult),
-        },
+        })),
         ...['account', 'models'].map((method) => ({
           id: `${AGY_QUOTA_PACKAGE}#${AGY_QUOTA_SERVICE}/${method}`, service: AGY_QUOTA_SERVICE, namespace: AGY_QUOTA_SERVICE, method,
           invocation: { kind: 'direct' },

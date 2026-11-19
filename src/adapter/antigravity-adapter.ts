@@ -559,6 +559,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         name: model.name,
         ...(model.description === undefined ? {} : { description: model.description }),
         ...(this.#inputModalities() === undefined ? {} : { inputModalities: this.#inputModalities() }),
+        ...(this.#contextWindows.has(model.id) ? { contextWindow: this.#contextWindows.get(model.id) } : {}),
       })),
     ]
   }

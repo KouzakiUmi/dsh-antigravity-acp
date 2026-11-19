@@ -50,6 +50,7 @@ export type QuotaErrorCode =
   | 'refresh-failed'
   | 'request-failed'
   | 'bad-response'
+  | 'not-fetched'
 
 /** 一个额度窗口（如「5 小时」「每周」）。 */
 export interface QuotaBucket {

@@ -181,7 +181,7 @@ describe('额度失败保留旧值', () => {
     command: { name: 'usage', data: { groups: [{ name: 'Gemini', buckets: [{ name: '5h', window: '5h', remaining_fraction: 0.62 }] }] } },
   })
 
-  it('先成功后失败：返回上次数据并标记 stale，且下次调用立刻重试而不是被缓存挡住', async () => {
+  it('先成功后失败：读取保留陈旧快照，独立刷新可立刻恢复', async () => {
     let call = 0
     const run: CliRun = async (request) => {
       if (request.argv.includes('/credits')) return { exitCode: 0, stdout: CREDITS, stderr: '' }
@@ -193,13 +193,15 @@ describe('额度失败保留旧值', () => {
     const ctx = new Context()
     ctx.plugin(AgYQuotaService, { cli: { run, cliPath: '/fake/agy' }, cliQuotaEnabled: () => true })
     await new Promise((resolve) => setTimeout(resolve, 0))
-    const service = (ctx as unknown as Record<string, { read(r?: { force?: boolean }): Promise<{ status: string; stale?: boolean; staleReason?: string; groups: unknown[] }> }>)[AGY_QUOTA_SERVICE]!
-    expect((await service.read({ force: true })).stale).toBeUndefined()
-    const failed = await service.read({ force: true })
+    const service = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
+    expect((await service.refresh()).stale).toBeUndefined()
+    const failed = await service.refresh()
     expect(failed).toMatchObject({ status: 'ok', stale: true })
     expect(failed.staleReason).toMatch(/network down|退出码/)
     expect(failed.groups).toHaveLength(1)
-    const recovered = await service.read()
+    expect((await service.read()).stale).toBe(true)
+    expect(call).toBe(2)
+    const recovered = await service.refresh()
     expect(call).toBe(3)
     expect(recovered.stale).toBeUndefined()
   })
@@ -233,19 +235,19 @@ describe('额度失败保留旧值', () => {
     const ctx = new Context()
     ctx.plugin(AgYQuotaService, { deps })
     await new Promise((resolve) => setTimeout(resolve, 0))
-    const service = (ctx as unknown as Record<string, { read(r?: { force?: boolean }): Promise<{ status: string; stale?: boolean; staleReason?: string; groups: unknown[] }> }>)[AGY_QUOTA_SERVICE]!
-    const first = await service.read({ force: true })
+    const service = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
+    const first = await service.refresh()
     expect(first).toMatchObject({ status: 'ok' })
     expect(first.groups).toHaveLength(1)
     healthy = false
-    const failed = await service.read({ force: true })
+    const failed = await service.refresh()
     // 与 CLI 主路径同一条 stale 保留语义：显示旧数据 + stale 标记，而不是整页报错。
     expect(failed).toMatchObject({ status: 'ok', stale: true })
     expect(failed.staleReason).toMatch(/HTTP 500|失败/)
     expect(failed.groups).toHaveLength(1)
   })
 
-  it('force 刷新不并入「命中缓存」的在途读取：同一 tick 的刷新必须真正重新取数', async () => {
+  it('同一 tick 的快照读取不拦截真正的上游刷新', async () => {
     let call = 0
     const run: CliRun = async (request) => {
       if (request.argv.includes('/credits')) return { exitCode: 0, stdout: CREDITS, stderr: '' }
@@ -255,12 +257,12 @@ describe('额度失败保留旧值', () => {
     const ctx = new Context()
     ctx.plugin(AgYQuotaService, { cli: { run, cliPath: '/fake/agy' }, cliQuotaEnabled: () => true })
     await new Promise((resolve) => setTimeout(resolve, 0))
-    const service = (ctx as unknown as Record<string, { read(r?: { force?: boolean }): Promise<{ status: string; groups: unknown[] }> }>)[AGY_QUOTA_SERVICE]!
-    await service.read()
+    const service = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
+    await service.refresh()
     const before = call
-    // 同一同步段内：非 force 读取命中缓存（在途、即时返回），force 紧随其后到达。
+    // 快照与上游分别走 read / refresh，两者可同时执行。
     const cached = service.read()
-    const forced = service.read({ force: true })
+    const forced = service.refresh()
     const [a, b] = await Promise.all([cached, forced])
     expect(a.groups).toHaveLength(1)
     expect(b.groups).toHaveLength(1)

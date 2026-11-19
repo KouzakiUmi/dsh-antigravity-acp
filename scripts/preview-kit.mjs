@@ -60,7 +60,8 @@ const settings = render('antigravity-acp', {
 }, { remote: {}, control() {}, readQuota() {} })
 const proxySettings = render('antigravity-acp', {
   0: { state: 'idle', message: '代理模式已就绪（模拟）', generationMode: { requested: 'proxy', active: 'proxy', proxyRouterReady: true } },
-  1: models.map(model => ({ ...model, id: 'antigravity-' + model.id })),
+  1: [...models.map(model => ({ ...model, id: 'antigravity-' + model.id })),
+    { id: 'antigravity-gemini-4-neon', name: 'Gemini 4 Neon', inputModalities: ['text', 'image'], contextWindow: 1048576, maxOutputTokens: 262144 }],
   4: { revision: 1 }, 5: true, 6: { proxyMode: true, proxyUrl: '', agyCliPath: '', cliQuotaEnabled: false, modelOverrides: {} },
   8: false, 9: true, 13: true,
   14: 'connection',

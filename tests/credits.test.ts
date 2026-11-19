@@ -73,50 +73,50 @@ describe('官方 AI Credits 契约', () => {
 })
 
 describe('套餐额度与余额独立状态/缓存', () => {
-  it('余额失败保留上次值和时间，下一次只重试余额，不重取正常额度', async () => {
+  it('余额失败保留上次值和时间，读取不会重试', async () => {
     let quotaCalls = 0, creditCalls = 0, failing = false
     const api = await service(async ({ argv }) => {
       if (argv.includes('/usage')) { quotaCalls++; return usage() }
       creditCalls++
       return failing ? { exitCode: 1, stdout: '', stderr: 'network down' } : success(envelope(42))
     })
-    const first = await api.read()
+    const first = await api.refresh()
     failing = true
-    const second = await api.read({ force: true })
+    const second = await api.refresh()
     expect(second.stale).not.toBe(true)
     expect(second.credits).toMatchObject({ status: 'ok', remainingCredits: 42, stale: true, updatedAt: first.credits!.updatedAt })
     expect(second.credits!.staleReason).toContain('network down')
     failing = false
-    expect((await api.read()).credits?.stale).toBeUndefined()
-    expect([quotaCalls, creditCalls]).toEqual([2, 3])
-    await api.read()
-    expect([quotaCalls, creditCalls]).toEqual([2, 3])
+    expect((await api.read()).credits?.stale).toBe(true)
+    expect([quotaCalls, creditCalls]).toEqual([2, 2])
+    expect((await api.refresh()).credits?.stale).toBeUndefined()
+    expect([quotaCalls, creditCalls]).toEqual([3, 3])
   })
 
-  it('额度失败不掩盖有效零余额；重试额度复用余额缓存', async () => {
+  it('额度失败不掩盖有效零余额；读取不重试', async () => {
     let quotaCalls = 0, creditCalls = 0
     const api = await service(async ({ argv }) => {
       if (argv.includes('/credits')) { creditCalls++; return success(envelope(0)) }
       quotaCalls++
       return { exitCode: 1, stdout: '', stderr: 'usage unavailable' }
     })
+    expect(await api.refresh()).toMatchObject({ status: 'error', credits: { status: 'ok', remainingCredits: 0 } })
     expect(await api.read()).toMatchObject({ status: 'error', credits: { status: 'ok', remainingCredits: 0 } })
-    await api.read()
-    expect([quotaCalls, creditCalls]).toEqual([2, 1])
+    expect([quotaCalls, creditCalls]).toEqual([1, 1])
   })
 
   it('明确不再提供余额时撤下旧余额，不把其它账户信息标为新值', async () => {
     let missing = false
     const api = await service(async ({ argv }) => argv.includes('/usage') ? usage() : missing
       ? { exitCode: 1, stdout: '', stderr: 'no credits info found' } : success(envelope(42)))
-    await api.read()
+    await api.refresh()
     missing = true
-    const result = await api.read({ force: true })
+    const result = await api.refresh()
     expect(result.credits?.status).toBe('unavailable')
     expect(result.credits?.remainingCredits).toBeUndefined()
   })
 
-  it('force 不并入只有余额在刷新的请求，仍重取两路', async () => {
+  it('读取可在下一次刷新期间返回上一次快照', async () => {
     let quotaCalls = 0, creditCalls = 0
     let release!: () => void
     const gate = new Promise<void>((resolve) => { release = resolve })
@@ -127,19 +127,18 @@ describe('套餐额度与余额独立状态/缓存', () => {
       if (n === 3) await gate
       return success(envelope(42))
     })
-    await api.read()
-    await api.read({ force: true })
-    const partial = api.read()
-    const forced = api.read({ force: true })
-    expect([quotaCalls, creditCalls]).toEqual([2, 3])
+    await api.refresh()
+    await api.refresh()
+    const pulling = api.refresh()
+    expect((await api.read()).credits?.remainingCredits).toBe(42)
     release()
-    await Promise.all([partial, forced])
-    expect([quotaCalls, creditCalls]).toEqual([3, 4])
+    await pulling
+    expect([quotaCalls, creditCalls]).toEqual([3, 3])
   })
 
   it('CLI 缺失时余额明确 unavailable，不从 HTTP 配额推算', async () => {
     // 夹具未传 cliQuotaEnabled，开关默认关闭，产出 cli-disabled（客户端隐藏）。
-    const result = await (await service()).read()
+    const result = await (await service()).refresh()
     expect(result.credits).toMatchObject({ status: 'unavailable', error: { code: 'cli-disabled' } })
     expect(result.credits?.remainingCredits).toBeUndefined()
   })
@@ -150,7 +149,7 @@ describe('套餐额度与余额独立状态/缓存', () => {
     ctx.plugin(AgYQuotaService, { cliQuotaEnabled: () => true })
     await new Promise((resolve) => setTimeout(resolve, 0))
     const api = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
-    const result = await api.read()
+    const result = await api.refresh()
     expect(result.credits).toMatchObject({ status: 'unavailable', error: { code: 'cli-unavailable' } })
     expect(result.credits?.error?.message).toContain('未找到官方 agy CLI')
   })

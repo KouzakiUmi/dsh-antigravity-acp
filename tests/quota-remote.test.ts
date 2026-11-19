@@ -5,6 +5,9 @@
  * 这里必须经真实 Cordis Context 调用，直接 `new` 实例复现不出来。
  */
 import { Context } from '@deepseek-ai/cordis'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import type { CliRun } from '../src/runtime/agy-cli.js'
 import { AgYQuotaService, AGY_QUOTA_SERVICE, AGY_QUOTA_INVOCATIONS, registerAgYQuotaRemote } from '../src/quota/quota-remote.js'
@@ -26,6 +29,54 @@ const USAGE_JSON = {
 }
 
 describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
+  it('重开宿主离线读取磁盘快照；换账号后不再显示旧额度', async () => {
+    const path = mkdtempSync(join(tmpdir(), 'dsh-quota-test-'))
+    using directory = { path, [Symbol.dispose]: () => rmSync(path, { recursive: true, force: true }) }
+    let account = 'account-a'
+    const credential = vi.fn(async () => ({ accessToken: 'unsaved-test-token', projectId: 'synthetic-project', source: 'login' as const, updatedAt: 'x' }))
+    const request = vi.fn(async ({ url }: { url: string }) => new Response(JSON.stringify(url.includes('loadCodeAssist') ? {} : {
+      groups: [{ displayName: 'Gemini', buckets: [{ remainingFraction: 0.7 }] }],
+    })))
+    async function openHost() {
+      const host = new Context()
+      const fiber = await host.plugin(AgYQuotaService, { mode: () => 'proxy', snapshotDirectory: directory.path,
+        proxyIdentity: async () => account, proxyQuota: { credential: { credential }, transport: { request } } })
+      return { service: host.get(AGY_QUOTA_SERVICE) as AgYQuotaService, close: async () => { await fiber.dispose(); await host.fiber.dispose() } }
+    }
+    const first = await openHost()
+    try {
+      expect((await first.service.read({ force: true })).error?.code).toBe('not-fetched')
+      expect(credential).not.toHaveBeenCalled()
+      expect((await first.service.refresh()).groups[0]?.buckets[0]?.remainingPct).toBe(70)
+    } finally { await first.close() }
+    const stored = readFileSync(join(directory.path, 'quota-proxy.json'), 'utf8')
+    expect(stored).not.toMatch(/unsaved-test-token|account-a|synthetic-project/)
+    const second = await openHost()
+    try {
+      expect((await second.service.read()).groups[0]?.buckets[0]?.remainingPct).toBe(70)
+      account = 'account-b'
+      expect((await second.service.read()).error?.code).toBe('not-fetched')
+      expect(credential).toHaveBeenCalledTimes(1)
+      expect(request).toHaveBeenCalledTimes(2)
+    } finally { await second.close() }
+  })
+
+  it('不打开界面也由宿主定时拉取，卸载后停止', async () => {
+    vi.useFakeTimers()
+    const ctx = new Context()
+    const credential = vi.fn(async () => undefined)
+    const fiber = ctx.plugin(AgYQuotaService, { mode: () => 'proxy', background: true,
+      proxyQuota: { credential: { credential }, transport: { request: vi.fn() } } })
+    try {
+      await vi.advanceTimersByTimeAsync(10)
+      expect(credential).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(300_000)
+      expect(credential).toHaveBeenCalledTimes(2)
+      await fiber.dispose()
+      await vi.advanceTimersByTimeAsync(300_000)
+      expect(credential).toHaveBeenCalledTimes(2)
+    } finally { await ctx.fiber.dispose(); vi.useRealTimers() }
+  })
   it('同一 package-face 只注册一次，同时贡献额度与代理账户两个命名空间', () => {
     const register = vi.fn((_contribution: unknown) => () => {})
     const scope = { get: () => ({ register }), effect: (callback: () => unknown) => callback() }
@@ -55,7 +106,7 @@ describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
       credential: { credential, revision: () => revision }, transport: { request } } })
     try {
       const service = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
-      expect((await service.read()).status).toBe('ok')
+      expect((await service.refresh()).status).toBe('ok')
       expect(summaries).toBe(2)
       expect((await service.read()).status).toBe('ok')
       expect(summaries).toBe(2)
@@ -73,13 +124,14 @@ describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
       proxyQuota: { credential: { credential, revision: () => revision }, transport: { request } } })
     try {
       const service = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
-      expect((await service.read()).groups[0]?.name).toBe('account-1')
+      expect((await service.refresh()).groups[0]?.name).toBe('account-1')
       signedIn = false; revision++
-      const signedOut = await service.read()
+      expect((await service.read()).groups).toEqual([])
+      const signedOut = await service.refresh()
       expect(signedOut).toMatchObject({ status: 'error', groups: [], error: { code: 'token-missing' } })
       expect(signedOut.stale).not.toBe(true)
       signedIn = true; revision++
-      expect((await service.read()).groups[0]?.name).toBe('account-3')
+      expect((await service.refresh()).groups[0]?.name).toBe('account-3')
     } finally { await fiber.dispose(); await ctx.fiber.dispose() }
   })
 
@@ -101,10 +153,10 @@ describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
       credential: { credential: async () => ({ accessToken: 'synthetic', source: 'login', updatedAt: 'x' }), revision: () => revision }, transport: { request } } })
     try {
       const service = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
-      const old = service.read()
+      const old = service.refresh()
       await started
       revision++
-      const current = service.read()
+      const current = service.refresh()
       release()
       for (const result of await Promise.all([old, current])) expect(result.groups[0]?.name).toBe('account-2')
       expect((await service.read()).groups[0]?.name).toBe('account-2')
@@ -121,9 +173,9 @@ describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
     })
     try {
       const service = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
-      expect((await service.read()).groups).toHaveLength(1)
+      expect((await service.refresh()).groups).toHaveLength(1)
       mode = 'proxy'
-      expect(await service.read()).toMatchObject({ status: 'error', groups: [], error: { code: 'token-missing' } })
+      expect(await service.refresh()).toMatchObject({ status: 'error', groups: [], error: { code: 'token-missing' } })
     } finally { await fiber.dispose(); await ctx.fiber.dispose() }
   })
 
@@ -143,9 +195,9 @@ describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
     })
     try {
       const service = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
-      const old = service.read()
+      const old = service.refresh()
       mode = 'proxy'
-      const current = service.read()
+      const current = service.refresh()
       release()
       for (const result of await Promise.all([old, current])) {
         expect(result).toMatchObject({ status: 'error', groups: [], error: { code: 'token-missing' } })
@@ -205,7 +257,7 @@ describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
     await control.dispose()
   })
 
-  it('ctx.agyQuota.read() 不因私有字段品牌检查失败，且走 CLI 取数', async () => {
+  it('ctx.agyQuota.refresh() 经真实 Cordis 调用并走 CLI 取数', async () => {
     const calls: string[][] = []
     const run: CliRun = async (request) => {
       calls.push([...request.argv])
@@ -219,18 +271,18 @@ describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
     })
     await new Promise((resolve) => setTimeout(resolve, 0))
 
-    const service = (ctx as unknown as Record<string, { read(r?: { force?: boolean }): Promise<{ status: string; error?: { message: string } }> }>)[AGY_QUOTA_SERVICE]!
+    const service = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
     expect(service).toBeDefined()
-    const snapshot = await service.read({ force: true })
+    const snapshot = await service.refresh()
 
     expect(snapshot.error?.message ?? '').not.toMatch(/private member/)
     expect(snapshot.status).toBe('ok')
     expect(calls).toHaveLength(2)
     expect(calls[0]).toEqual(['/fake/agy', '-p', '/usage', '--output-format', 'json'])
     expect(calls[1]).toEqual(['/fake/agy', '-p', '/credits', '--output-format', 'json'])
-    expect(logs.join('\n')).toContain('cli=/fake/agy')
+    expect(logs).toContain('antigravity-acp: 正在刷新额度快照')
   })
-  it('同一轮双路刷新不会把后完成的缓存时间戳回退', async () => {
+  it('过期读取只标记陈旧，不触发上游刷新', async () => {
     vi.useFakeTimers()
     try {
       vi.setSystemTime(new Date('2026-10-25T00:00:00Z'))
@@ -245,11 +297,10 @@ describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
       ctx.plugin(AgYQuotaService, { cli: { run, cliPath: '/fake/agy' }, cliQuotaEnabled: () => true })
       await vi.advanceTimersByTimeAsync(0)
       const service = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
-      await service.read()
+      await service.refresh()
       expect(runs).toBe(2)
-      vi.setSystemTime(startedAt + 290_000)
-      await service.read()
-      // 两路缓存都只有 5 分钟寿命；usage 的时间戳不能比本轮开始还早。
+      vi.setSystemTime(startedAt + 320_000)
+      expect((await service.read()).stale).toBe(true)
       expect(runs).toBe(2)
 
     } finally { vi.useRealTimers() }
@@ -265,14 +316,14 @@ describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
     ctx.plugin(AgYQuotaService, { cli: { run, cliPath: '/fake/agy' }, cliQuotaEnabled: () => true })
     await new Promise((resolve) => setTimeout(resolve, 0))
     const service = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
-    await service.read({ force: true })
+    await service.refresh()
     expect(runs).toBe(2)
     await service.read()
     expect(runs).toBe(2)
 
   })
 
-  it('并发 read 合并为一次 CLI 取数，而不是各起一个进程', async () => {
+  it('并发 refresh 合并取数，read 不等待在途刷新', async () => {
     let runs = 0
     let release: (() => void) | undefined
     const gate = new Promise<void>((resolve) => { release = resolve })
@@ -284,14 +335,14 @@ describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
     const ctx = new Context()
     ctx.plugin(AgYQuotaService, { cli: { run, cliPath: '/fake/agy' }, cliQuotaEnabled: () => true })
     await new Promise((resolve) => setTimeout(resolve, 0))
-    const service = (ctx as unknown as Record<string, { read(r?: { force?: boolean }): Promise<{ status: string }> }>)[AGY_QUOTA_SERVICE]!
-    const first = service.read({ force: true })
-    const second = service.read({ force: true })
-    const third = service.read()
+    const service = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
+    const first = service.refresh()
+    const second = service.refresh()
+    expect((await service.read()).error?.code).toBe('not-fetched')
     release?.()
-    const results = await Promise.all([first, second, third])
+    const results = await Promise.all([first, second])
     expect(runs).toBe(2) // 并发读取合并：/usage 与 /credits 各一次。
-    expect(results.map((item) => item.status)).toEqual(['ok', 'ok', 'ok'])
+    expect(results.map((item) => item.status)).toEqual(['ok', 'ok'])
   })
 
   it('默认不调用 agy：有 CLI 但开关关闭时走内置直连，Credits 为 unavailable', async () => {
@@ -304,7 +355,7 @@ describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
     })
     await new Promise((resolve) => setTimeout(resolve, 0))
     const service = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
-    const snapshot = await service.read()
+    const snapshot = await service.refresh()
     expect(run).not.toHaveBeenCalled()
     expect(snapshot.credits).toMatchObject({ status: 'unavailable', error: { code: 'cli-disabled' } })
     expect(snapshot.credits?.error?.message).toContain('未开启 agy CLI 取数')
@@ -324,13 +375,13 @@ describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
     await new Promise((resolve) => setTimeout(resolve, 0))
     const service = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
     // 默认关闭：本机有没有 agy 都不影响，套餐额度来自代理账户，一次都不 spawn。
-    const off = await service.read()
+    const off = await service.refresh()
     expect(off.groups[0]?.name).toBe('proxy-account')
     expect(off.credits).toMatchObject({ status: 'unavailable', error: { code: 'cli-disabled' } })
     expect(run).not.toHaveBeenCalled()
     // 打开开关：只有 AI Credits 走 CLI；套餐额度仍由代理账户提供，不被 CLI 账户顶替。
     enabled = true
-    const on = await service.read()
+    const on = await service.refresh()
     expect(on.groups[0]?.name).toBe('proxy-account')
     expect(on.credits).toMatchObject({ status: 'ok', remainingCredits: 200 })
     expect(run.mock.calls.map(([call]) => call.argv)).toEqual([expect.arrayContaining(['/credits'])])
@@ -343,15 +394,15 @@ describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
     ctx.plugin(AgYQuotaService, { cli: { run, cliPath: '/fake/agy' }, cliQuotaEnabled: () => enabled })
     await new Promise((resolve) => setTimeout(resolve, 0))
     const service = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
-    expect((await service.read()).credits?.status).toBe('unavailable')
+    expect((await service.refresh()).credits?.status).toBe('unavailable')
     expect(run).not.toHaveBeenCalled()
     enabled = true
-    const fresh = await service.read()
+    const fresh = await service.refresh()
     expect(fresh.status).toBe('ok')
     expect(fresh.credits).toMatchObject({ status: 'ok', remainingCredits: 200 })
     expect(run).toHaveBeenCalledTimes(2)
     enabled = false
-    const closed = await service.read()
+    const closed = await service.refresh()
     expect(closed.credits?.status).toBe('unavailable')
     expect(run).toHaveBeenCalledTimes(2)
   })

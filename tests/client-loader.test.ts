@@ -115,7 +115,8 @@ function loadRegistrations(options: QuotaStubOptions = {}): Map<string, SlotRegi
     useRef: <T,>(initial: T) => {
       const index = refIndex++
       const stateIndex = options.refStateBindings?.[index]
-      return { get current() { return stateIndex === undefined ? options.refOverrides?.[index] ?? initial : latestStateValues[stateIndex] } }
+      let value: unknown = options.refOverrides?.[index] ?? initial
+      return { get current() { return stateIndex === undefined ? value : latestStateValues[stateIndex] }, set current(next: unknown) { value = next } }
     },
   }
 
@@ -144,7 +145,7 @@ function loadRegistrations(options: QuotaStubOptions = {}): Map<string, SlotRegi
     },
     get: (name: string) =>
       name === 'remote.agyQuota' && (options.quotaRead || options.models)
-        ? { read: options.quotaRead, models: options.models } : undefined,
+        ? { read: options.quotaRead, refresh: options.quotaRead, models: options.models } : undefined,
     // 忠实模拟 cordis 的 ReflectService：读取**未 inject** 的 `remote.<ns>` 属性会抛
     // 「cannot get property "remote.<ns>" without inject」。贡献型 remote 不进 inject，
     // 因此组件只能走 `ctx.get('remote.<ns>')`；这条替身行为让写错的一行在测试里就暴露。
@@ -244,7 +245,7 @@ describe('browser client module', () => {
     expect(control).toHaveBeenCalledWith('account', { action: 'login' })
     expect(control).toHaveBeenCalledWith('account', { action: 'warmup' })
     expect(control).toHaveBeenCalledWith('models', { force: true })
-    expect(readQuota).not.toHaveBeenCalled()
+    expect(readQuota).toHaveBeenCalledExactlyOnceWith(false, 'antigravity-acp', undefined)
     expect(texts(tree).join(' ')).not.toContain('AI Credits 余额')
   })
 
@@ -253,7 +254,7 @@ describe('browser client module', () => {
     const text = texts(tree).join(' ')
     for (const label of ['连接', '模型', '额度', '高级', '会话偏好', '网络与 CLI', '连接诊断']) expect(text).toContain(label)
     expect(text).toContain('拉取额度')
-    expect(text).toContain('尚未查询')
+    expect(text).toContain('暂无额度快照')
     // 默认模型由 DSH 自己的模型选择器负责，设置页不再重复维护。
     expect(text).not.toContain('默认模型')
     expect(text).not.toContain('套餐额度管理')
@@ -538,8 +539,8 @@ describe('额度药丸（conversation.input.right）', () => {
   })
 
   it('窄屏靠左的药丸展开时把弹层夹在视口内', () => {
-    const pill = loadRegistrations({ stateOverrides: { 2: true }, refStateBindings: { 3: 3 }, refOverrides: {
-      4: { getBoundingClientRect: () => ({ right: 75, top: 760, bottom: 786 }) },
+    const pill = loadRegistrations({ stateOverrides: { 2: true }, refStateBindings: { 4: 3 }, refOverrides: {
+      5: { getBoundingClientRect: () => ({ right: 75, top: 760, bottom: 786 }) },
     } }).get('antigravity-quota')!.component
     pill({ store: modelStore('antigravity-acp') })
     expect(lastStateCalls).toContainEqual(expect.objectContaining({ position: 'fixed', left: 12, width: 340, bottom: 92 }))
@@ -740,6 +741,7 @@ describe('额度药丸：remote 客户端挂载', () => {
     const call = lastMountCalls[0]!
     expect(call.descriptors?.map(item => item.id)).toEqual([
       'dsh-bundle-antigravity-host#agyQuota/read',
+      'dsh-bundle-antigravity-host#agyQuota/refresh',
       'dsh-bundle-antigravity-host#agyQuota/account',
       'dsh-bundle-antigravity-host#agyQuota/models',
       'dsh-bundle-antigravity-host#agyProxyAccount/account',

@@ -1,6 +1,7 @@
 /** 设置页控制面：不自动登录，不向客户端返回凭据或授权 URL。 */
 import { redactSensitiveText } from '../runtime/redact.js'
 import type { AcpLifecycleSnapshot } from '../runtime/lifecycle.js'
+import type { ModelCapacity } from '../adapter/model-settings.js'
 
 export interface AccountSnapshot {
   state: 'idle' | 'connecting' | 'cancelling' | 'connected' | 'cancelled' | 'error'
@@ -11,9 +12,10 @@ export interface AccountSnapshot {
 }
 export interface ModelSnapshot {
   status: 'ok' | 'error'
-  models: Array<{ id: string; name: string; inputModalities?: readonly string[] }>
+  models: ModelRow[]
   message?: string
 }
+type ModelRow = { id: string; name: string; inputModalities?: readonly string[] } & ModelCapacity
 export interface ControlOptions {
   connect(signal: AbortSignal): Promise<void>
   warmup?(signal: AbortSignal): Promise<void>
@@ -22,7 +24,7 @@ export interface ControlOptions {
   generationMode?(): AccountSnapshot['generationMode']
   /** 代理模式下从 Host 控制层拒绝 ACP 登录与预热，避免旧客户端触发官方进程。 */
   acpEnabled?(): boolean
-  models(force: boolean): Promise<readonly { id: string; name: string; inputModalities?: readonly string[] }[]>
+  models(force: boolean): Promise<readonly ModelRow[]>
 }
 
 export class SettingsControl {
@@ -76,7 +78,11 @@ export class SettingsControl {
     try {
       const models = await this.options.models(force)
       if (source !== this.options.modelSource?.()) return this.models(force)
-      this.rows = models.map(({ id, name, inputModalities }) => ({ id, name, ...(inputModalities ? { inputModalities } : {}) }))
+      this.rows = models.map(({ id, name, inputModalities, contextWindow, maxOutputTokens }) => ({ id, name,
+        ...(inputModalities ? { inputModalities } : {}),
+        ...(contextWindow === undefined ? {} : { contextWindow }),
+        ...(maxOutputTokens === undefined ? {} : { maxOutputTokens }),
+      }))
       return { status: 'ok', models: this.rows }
     } catch (error) {
       if (source !== this.options.modelSource?.()) return this.models(force)
