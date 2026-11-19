@@ -19,6 +19,7 @@ import {
   QuotaError,
 } from '../src/runtime/quota.js'
 import type { QuotaDeps, QuotaSnapshot } from '../src/runtime/quota.js'
+import { ANTIGRAVITY_CLIENT_ID, ANTIGRAVITY_CLIENT_SECRET } from '@cortexkit/antigravity-auth-core'
 
 const CLIENT_ID = ['1234567890', '-abcdef.apps.googleusercontent.com'].join('')
 const CLIENT_SECRET = ['GOCSPX-', 'AbCdEfGhIjKlMnOpQrStUvWxYz01'].join('')
@@ -158,6 +159,44 @@ describe('OAuth client 元数据提取', () => {
     // 把本该配给 CLIENT_ID 的那份误判成「在 id 之前」。
     const text = `${otherId} ${shared} ... ${CLIENT_ID} ${shared} ... tail`
     expect(parseOAuthClientFromBinary(text)).toEqual({ clientId: CLIENT_ID, clientSecret: shared })
+  })
+
+  it('分发物含已审计的 Antigravity client 时优先选它（位置配对会选错组）', () => {
+    const decoyId = ['9876543210', '-zzzzzz.apps.googleusercontent.com'].join('')
+    const decoySecret = ['GOCSPX-', 'ZzYyXxWwVvUuTtSsRrQqPpOoNn01'].join('')
+    // 实测 agy 1.5.9 Linux 分发物里同时有三组 client，Antigravity 那份不是最后一条；
+    // 位置配对照样返回一对「看起来合法」的参数，换发却被 OAuth 端点拒绝。
+    const text = `${ANTIGRAVITY_CLIENT_ID} ${ANTIGRAVITY_CLIENT_SECRET} ... ${decoyId} ${decoySecret} ... tail`
+    expect(parseOAuthClientFromBinary(text)).toEqual({
+      clientId: ANTIGRAVITY_CLIENT_ID,
+      clientSecret: ANTIGRAVITY_CLIENT_SECRET,
+    })
+    // 只命中一半时仍按原规则配对，不把两半拼成一对编造出来的 client。
+    expect(parseOAuthClientFromBinary(`${ANTIGRAVITY_CLIENT_ID} ${decoySecret}`)).toEqual({
+      clientId: ANTIGRAVITY_CLIENT_ID,
+      clientSecret: decoySecret,
+    })
+  })
+})
+
+describe('Code Assist 请求的线身份', () => {
+  it('loadCodeAssist 带上 agy 的 User-Agent 与 Accept-Encoding，授权仍以显式 Bearer 为准', async () => {
+    const sent: Array<Record<string, string>> = []
+    const fetchImpl: typeof fetch = async (_input, init) => {
+      sent.push({ ...((init?.headers ?? {}) as Record<string, string>) })
+      return json({ cloudaicompanionProject: 'project-test' })
+    }
+    const project = await loadCodeAssist(ACCESS_TOKEN, { fetchImpl })
+    expect(project.projectId).toBe('project-test')
+    const headers = at(sent, 0)
+    // 少这一条时上游回 200 但没有 cloudaicompanionProject，只在 ineligibleTiers 里给
+    // UNSUPPORTED_CLIENT；因此这是「额度能不能读到」的必要条件，不是装饰。
+    expect(headers['User-Agent']).toMatch(/^antigravity\/cli\//)
+    expect(headers['User-Agent']).toContain('aidev_client')
+    expect(headers['Accept-Encoding']).toBeTruthy()
+    expect(headers.Authorization).toBe(`Bearer ${ACCESS_TOKEN}`)
+    expect(headers['Content-Type']).toBe('application/json')
+    expect(headers.Accept).toBe('application/json')
   })
 })
 

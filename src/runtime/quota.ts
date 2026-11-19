@@ -19,6 +19,11 @@
 import { readFile, readdir } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import {
+  ANTIGRAVITY_CLIENT_ID,
+  ANTIGRAVITY_CLIENT_SECRET,
+  buildAntigravityHarnessBootstrapHeaders,
+} from '@cortexkit/antigravity-auth-core'
 import { redactSensitiveText } from './redact.js'
 import { resolveInstallRoot, versionCachePaths, DEFAULT_ACP_SERVER_VERSION } from './binary.js'
 import { agyCliCandidates } from './agy-cli.js'
@@ -225,9 +230,17 @@ export function isTokenUsable(state: QuotaTokenState, nowMs: number, marginMs = 
 
 /** 从官方二进制文本里提取 client 元数据（正则即时编译匹配，不留模块级全局状态）；取不到返回 undefined（不猜值）。 */
 export function parseOAuthClientFromBinary(text: string): OAuthClientMeta | undefined {
-  const ids = text.match(/\d+-[a-z0-9]+\.apps\.googleusercontent\.com/g) ?? []
-  const secrets = text.match(/GOCSPX-[A-Za-z0-9_-]{28}/g) ?? []
+  const ids: string[] = text.match(/\d+-[a-z0-9]+\.apps\.googleusercontent\.com/g) ?? []
+  const secrets: string[] = text.match(/GOCSPX-[A-Za-z0-9_-]{28}/g) ?? []
   if (ids.length === 0 || secrets.length === 0) return undefined
+  // 官方分发物里可能同时打包多组 client（实测 agy 1.5.9 Linux 有三组：Gemini CLI、
+  // antigravity 及其它内部客户端）。位置配对在真实二进制上不稳定：选中的那一对
+  // 会让 OAuth 端点回 `invalid_client` / `unauthorized_client`，表现为「换发 401」。
+  // 已审计实现里那份 Antigravity client 才是本链路真正在用的，两半都在就优先它；
+  // 不在时保持原来的位置配对，绝不编造。
+  if (ids.includes(ANTIGRAVITY_CLIENT_ID) && secrets.includes(ANTIGRAVITY_CLIENT_SECRET)) {
+    return { clientId: ANTIGRAVITY_CLIENT_ID, clientSecret: ANTIGRAVITY_CLIENT_SECRET }
+  }
   // 与官方 CLI 同源的最后一条 client id 最可能是当前在用的。
   const clientId = ids[ids.length - 1] as string
   // 多份元数据同时存在时必须按「相邻出现」配对，不能固定取第一条 secret：
@@ -515,15 +528,21 @@ async function postCodeAssist(
 ): Promise<Record<string, unknown>> {
   const fetchImpl = deps.fetchImpl ?? globalThis.fetch
   const base = (deps.baseUrl ?? CODE_ASSIST_BASE_URL).replace(/\/+$/, '')
+  // Cloud Code Assist 按调用方的线身份判定客户端：只发 `metadata.ideType` 时上游回
+  // HTTP 200 但没有 `cloudaicompanionProject`，并在 ineligibleTiers 里给出
+  // `UNSUPPORTED_CLIENT`（实测 2026-11-17）。复用代理模式已经在用的 agy 线头
+  // （User-Agent + Accept-Encoding）后同一账户正常返回项目与套餐。
+  const headers: Record<string, string> = {
+    ...buildAntigravityHarnessBootstrapHeaders(accessToken),
+    Authorization: `Bearer ${accessToken}`,
+    'Content-Type': 'application/json',
+    Accept: 'application/json',
+  }
   let response: Response
   try {
     response = await fetchImpl(`${base}:${method}`, {
       method: 'POST',
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
+      headers,
       body: JSON.stringify(payload),
       signal: timeoutSignal(deps),
     })
