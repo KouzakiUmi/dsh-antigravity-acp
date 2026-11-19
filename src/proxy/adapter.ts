@@ -68,7 +68,6 @@ export { PROXY_PROVIDER_ID }
 const STREAM_ENDPOINT = 'https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse'
 const MODELS_ENDPOINT = 'https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels'
 const MODEL_CATALOG_TTL_MS = 30_000
-const MAX_MODEL_CATALOG_BYTES = 256 * 1024
 const MAX_NETWORK_RETRIES = 3
 
 export interface ProxyCredentialSource {
@@ -595,10 +594,12 @@ export class AntigravityProxyAdapter extends LlmAdapter {
         ...(signal === undefined ? {} : { signal }),
         idleTimeoutMs: PROXY_IDLE_TIMEOUT_MS,
         totalTimeoutMs: PROXY_TOTAL_TIMEOUT_MS,
-        maxBytes: Math.min(PROXY_RESPONSE_BYTES, MAX_MODEL_CATALOG_BYTES),
+        maxBytes: PROXY_RESPONSE_BYTES,
       })) as unknown
     } catch (error) {
-      const failure = toLlmError(error)
+      const failure = error instanceof ProxyTransportError && error.code === 'response-too-large'
+        ? llmError(`读取代理模式模型目录失败：${error.message}`, 'REQUEST_LIMIT', { cause: error })
+        : toLlmError(error)
       this.rememberCatalogFailure(key, failure, revision)
       throw failure
     }

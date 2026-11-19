@@ -189,6 +189,24 @@ describe('代理凭据取消', () => {
 })
 
 describe('代理模型设置与调用准备', () => {
+  it('目录不再单独限 256 KiB，超过普通响应预算时报告目录错误', async () => {
+    let metadataBytes = 300 * 1024
+    const request = vi.fn(async () => Response.json({ models: {
+      'gemini-3.8-flash-medium': { upstreamMetadata: 'x'.repeat(metadataBytes) },
+    } }))
+    const instance = new AntigravityProxyAdapter({
+      credential: { credential: async () => ({ accessToken: 'fixture', source: 'login', updatedAt: 'x' }) },
+      transport: { request },
+    })
+    expect((await instance.discoverModels()).map(row => row.id)).toEqual([model])
+    metadataBytes = 8 * 1024 * 1024
+    await expect(instance.discoverModels(true)).rejects.toMatchObject({
+      code: 'REQUEST_LIMIT', message: '读取代理模式模型目录失败：代理模式响应超出字节上限（8 MiB）',
+    })
+    expect((await instance.listModels(PROXY_PROVIDER_ID)).map(row => row.id)).toEqual([model])
+    expect(request).toHaveBeenCalledTimes(2)
+  })
+
   it('目录排除停用模型与档位，准备与派发只使用观测到的档位', async () => {
     const request = vi.fn(async ({ url }: { url: string }) => url.includes('fetchAvailableModels')
       ? Response.json({ models: {
