@@ -33,7 +33,7 @@ import {
   routeTieredModelId,
   tierForModelId,
 } from '../runtime/agy-cli.js'
-import type { AgyReasoningEffort } from '../runtime/agy-cli.js'
+import type { AgyModelTier, AgyReasoningEffort } from '../runtime/agy-cli.js'
 import { findModelSelector, toModelCatalog } from './model-catalog.js'
 import type { ModelSelector } from './model-catalog.js'
 import { applyModelSettings, modelDisplayName, modelSettingFor, normalizeModelSettings, resolveModelTarget } from './model-settings.js'
@@ -268,7 +268,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   /** 官方 CLI 清单的在途读取；完成即释放，底层负责缓存和后台刷新。 */
   #cliCatalog?: Promise<readonly { id: string; name: string }[]>
   /** 家族 → 支持的思考强度档位（由目录折叠得到）。 */
-  #familyTiers = new Map<string, ReadonlySet<AgyReasoningEffort>>()
+  #familyTiers = new Map<string, ReadonlySet<AgyModelTier>>()
   /** 防止异步 CLI 读取后的旧折叠结果覆盖较新的会话目录。 */
   #catalogFoldGeneration = 0
   /**
@@ -580,7 +580,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
    */
   async #foldCatalog(provider: string): Promise<{
     models: Array<{ id: string; name: string; description?: string }>
-    tiers: Map<string, ReadonlySet<AgyReasoningEffort>>
+    tiers: Map<string, ReadonlySet<AgyModelTier>>
   }> {
     const generation = ++this.#catalogFoldGeneration
     // 未观测到真实目录时用磁盘缓存兜住选择器空窗。
