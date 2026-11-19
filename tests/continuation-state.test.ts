@@ -53,8 +53,8 @@ describe('continuation request integrity', () => {
     const base = initial()
     const state = new ContinuationState(base)
     state.emitted(call)
-    const injected = { role: 'user', content: [{ type: 'text', text: 'Current time: 10:11' }], source: { kind: 'time-context', form: 'snapshot', sections: [] } } as unknown as GenerateOptions['messages'][number]
-    const next: GenerateOptions = {
+    const injected = { role: 'user', content: [{ type: 'text', text: 'Current time: 10:11' }], source: { kind: 'time-context', form: 'snapshot', sections: [] } } as unknown as AdapterRequestOptions['messages'][number]
+    const next: AdapterRequestOptions = {
       ...base,
       messages: [
         ...base.messages,
@@ -69,12 +69,12 @@ describe('continuation request integrity', () => {
     const base = initial()
     const state = new ContinuationState(base)
     state.emitted(call)
-    const relay = { role: 'user', content: [{ type: 'text', text: 'from peer' }], source: { kind: 'relay', form: 'relay' } } as unknown as GenerateOptions['messages'][number]
+    const relay = { role: 'user', content: [{ type: 'text', text: 'from peer' }], source: { kind: 'relay', form: 'relay' } } as unknown as AdapterRequestOptions['messages'][number]
     for (const extra of [
       createUserMessage({ content: [{ type: 'text', text: 'new prompt' }], source: { kind: 'user' } }),
       relay,
     ]) {
-      const next: GenerateOptions = {
+      const next: AdapterRequestOptions = {
         ...base,
         messages: [
           ...base.messages,

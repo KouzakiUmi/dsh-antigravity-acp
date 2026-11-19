@@ -4,6 +4,13 @@
 
 记录源码与发布内容，不将本地构建、npm 发布和本机升级混为同一状态。日期采用 Asia/Hong_Kong。更早历史见 [Git 提交记录](https://github.com/KouzakiUmi/dsh-antigravity-acp/commits/main/)。
 
+## 0.1.45 · 2026-11-20
+
+- **修复 ACP 长回合续轮被打断与 192KB prompt 截断**（#6，by @ScottLi023）：`ContinuationState` 放行回合内被动上下文注入（如 `time-context`），避免丢弃当前会话；为单次 ACP `session/prompt` 增加 `176,000` UTF-8 字节预算与头尾请求锚点，超限时优先裁剪最旧历史，单条/固定块超限显式报错 `AGY_PROMPT_TOO_LARGE`。
+- **修正 ACP 额度 OAuth client 选择与 Code Assist 线身份**（#7，by @AlaIchhe）：`parseOAuthClientFromBinary` 优先选用分发物中同时出现的已审计 Antigravity client；`postCodeAssist` 补齐 `buildAntigravityHarnessBootstrapHeaders()` 线头，解决换发 401 与 `loadCodeAssist` 缺 `cloudaicompanionProject`。
+- **放行未声明 `mcpCapabilities` 的官方 `agy acp`**（#8，by @AlaIchhe）：`newSession` 仅在服务端明确声明 `http: false` / `sse: false` 时拒绝，不再把未声明等同于不支持。
+- **识别 `xhigh` 档位但不暴露**（#11，by @AlaIchhe）：`tierForModelId` / `stripTierLabel` 识别 `-xhigh` 并折叠进所属家族，同时保持 `AGY_REASONING_EFFORTS` 为 `low` / `medium` / `high`，避免被拆成独立家族或触发宿主校验失败。
+
 ## 0.1.44 · 2026-11-20
 
 - 修复 Claude 代理模式续聊时，历史并行工具批次缺少结果引起的 HTTP 400。保留已有结果，对缺失项标出执行状态未知；当前批次未收齐时就地提示。意外 HTTP 响应的提示包含状态码。

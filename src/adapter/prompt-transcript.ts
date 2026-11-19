@@ -21,7 +21,6 @@
 import type { ContentBlock, TextContent } from '@agentclientprotocol/sdk'
 import type { RequestMessage, ToolSchema } from '@deepseek-ai/dsh-llm'
 import { llmError } from '../runtime/llm-error.js'
-import type { LlmError } from '@deepseek-ai/dsh-llm'
 import { renderToolSignatures } from './tool-args.js'
 
 /** 消息信封的起始标签前缀（后跟 `role="…"` 与 `>`）。 */
@@ -130,7 +129,7 @@ export function promptContentUtf8Bytes(blocks: readonly ContentBlock[]): number 
 export function assertPromptWithinBudget(blocks: readonly ContentBlock[], maxBytes = ACP_PROMPT_BYTE_BUDGET): void {
   const bytes = promptContentUtf8Bytes(blocks)
   if (bytes <= maxBytes) return
-  throw new LlmError(
+  throw llmError(
     `单次 ACP prompt 体积（${bytes} UTF-8 字节）超出 agy 安全上限（${maxBytes} 字节 / 硬限 192,001 字节），已阻止发送以避免静默截断；请精简当前输入、开启新对话或启用压缩`,
     'AGY_PROMPT_TOO_LARGE',
   )
