@@ -527,12 +527,22 @@ export class AgentLink {
   /** 创建会话并保存会话 id。 */
   async newSession(request: NewSessionRequest, options?: AgentLinkRequestOptions): Promise<NewSessionResponse> {
     this.#requireInitialized('session/new')
+    /*
+     * 只按**明确否定**拒绝。ACP v1 没有要求 agent 必须声明 `mcpCapabilities`，
+     * 而官方 `agy acp`（Antigravity CLI 1.5.x）正是这种情况：它的 initialize 不
+     * 带这个字段，却会在 session/new 里正常接受 http mcpServers——实测它拿到注册
+     * 后立刻对桥做 server/discover → initialize → tools/list。
+     * 把「未声明」当「不支持」会让官方 CLI 这条路径完全不可用（官方文档推荐用
+     * `agy acp` 接入编辑器，独立 ACP server 的节奏与版本都落后于 CLI）。
+     * 端口在这里仍保留：服务端一旦**声明** http:false，就不再发 session/new。
+     */
+    const mcpCapabilities = this.#initializeResponse?.agentCapabilities?.mcpCapabilities
     for (const server of request.mcpServers) {
-      if ('type' in server && server.type === 'http' && this.#initializeResponse?.agentCapabilities?.mcpCapabilities?.http !== true) {
-        throw new AgentLinkError(AGY_LINK_ERROR.UNSUPPORTED_CAPABILITY, 'ACP 服务端未声明 HTTP MCP 支持，无法安全接入 DSH 工具')
+      if ('type' in server && server.type === 'http' && mcpCapabilities?.http === false) {
+        throw new AgentLinkError(AGY_LINK_ERROR.UNSUPPORTED_CAPABILITY, 'ACP 服务端声明不支持 HTTP MCP，无法安全接入 DSH 工具')
       }
-      if ('type' in server && server.type === 'sse' && this.#initializeResponse?.agentCapabilities?.mcpCapabilities?.sse !== true) {
-        throw new AgentLinkError(AGY_LINK_ERROR.UNSUPPORTED_CAPABILITY, 'ACP 服务端未声明 SSE MCP 支持')
+      if ('type' in server && server.type === 'sse' && mcpCapabilities?.sse === false) {
+        throw new AgentLinkError(AGY_LINK_ERROR.UNSUPPORTED_CAPABILITY, 'ACP 服务端声明不支持 SSE MCP')
       }
     }
     const response = await this.request<NewSessionResponse>('session/new', request, options)

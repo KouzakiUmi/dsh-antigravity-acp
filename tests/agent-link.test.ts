@@ -254,18 +254,41 @@ describe('AgentLink v1 能力协商', () => {
     await link.close()
   })
 
-  it('未声明 HTTP MCP 或图像能力时在发请求之前明确拒绝', async () => {
+  it('未声明 mcpCapabilities 时放行 http mcpServers（官方 agy acp 正是这样）', async () => {
     const pair = fakePair()
     const methods: string[] = []
     pumpAgent(pair, async (message, reply) => {
       methods.push(message.method!)
-      await reply({ jsonrpc: '2.0', id: message.id!, result: { protocolVersion: 1, agentCapabilities: {} } })
+      if (message.method === 'initialize') {
+        await reply({ jsonrpc: '2.0', id: message.id!, result: { protocolVersion: 1, agentCapabilities: {} } })
+        return
+      }
+      await reply({ jsonrpc: '2.0', id: message.id!, result: { sessionId: 's-oauthless' } })
+    })
+    const link = new AgentLink({ stream: pair.stream })
+    link.start()
+    await link.initialize()
+    // ACP v1 不要求声明 mcpCapabilities；把「未声明」当「不支持」会让官方
+    // `agy acp` 这条路径完全不可用，因此只在明确 http:false 时拒绝。
+    const session = await link.newSession({ cwd: '/tmp', mcpServers: [{ type: 'http', name: 'tools', url: 'http://127.0.0.1:1/mcp', headers: [] }] })
+    expect(session.sessionId).toBe('s-oauthless')
+    expect(methods).toEqual(['initialize', 'session/new'])
+    // 能力声明的放宽只针对 MCP：图像能力未声明时仍然在发请求前拒绝。
+    await expect(link.prompt({ sessionId: 'test', prompt: [{ type: 'image', data: 'AA==', mimeType: 'image/png' }] })).rejects.toMatchObject({ code: AGY_LINK_ERROR.UNSUPPORTED_CAPABILITY })
+    await link.close()
+  })
+
+  it('服务端明确声明不支持 HTTP MCP 时在发请求之前拒绝', async () => {
+    const pair = fakePair()
+    const methods: string[] = []
+    pumpAgent(pair, async (message, reply) => {
+      methods.push(message.method!)
+      await reply({ jsonrpc: '2.0', id: message.id!, result: { protocolVersion: 1, agentCapabilities: { mcpCapabilities: { http: false } } } })
     })
     const link = new AgentLink({ stream: pair.stream })
     link.start()
     await link.initialize()
     await expect(link.newSession({ cwd: '/tmp', mcpServers: [{ type: 'http', name: 'tools', url: 'http://127.0.0.1:1/mcp', headers: [] }] })).rejects.toMatchObject({ code: AGY_LINK_ERROR.UNSUPPORTED_CAPABILITY })
-    await expect(link.prompt({ sessionId: 'test', prompt: [{ type: 'image', data: 'AA==', mimeType: 'image/png' }] })).rejects.toMatchObject({ code: AGY_LINK_ERROR.UNSUPPORTED_CAPABILITY })
     expect(methods).toEqual(['initialize'])
     await link.close()
   })
