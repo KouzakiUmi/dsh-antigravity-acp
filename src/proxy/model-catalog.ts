@@ -9,9 +9,31 @@ export const PROXY_MODEL_EFFORTS: readonly ModelEffort[] = ['low', 'medium', 'hi
 export interface LiveProxyModel {
   readonly defaultWire: string
   readonly efforts: readonly ModelEffort[]
+  readonly liveGemini?: { readonly name: string; readonly variants: ReadonlyMap<string, string> }
 }
 
 export type LiveProxyCatalog = ReadonlyMap<string, LiveProxyModel>
+
+const LIVE_GEMINI_FAMILIES = {
+  'antigravity-gemini-4-hydrogen': 'Gemini 4 Hydrogen',
+  'antigravity-gemini-4-neon': 'Gemini 4 Neon',
+} as const
+
+export function isLiveGeminiFamily(id: string): boolean {
+  return Object.hasOwn(LIVE_GEMINI_FAMILIES, id)
+}
+
+function addLiveGeminiFamilies(catalog: Map<string, LiveProxyModel>, live: ReadonlySet<string>): void {
+  for (const [id, name] of Object.entries(LIVE_GEMINI_FAMILIES)) {
+    const variants = new Map<string, string>()
+    for (const effort of [...PROXY_MODEL_EFFORTS, 'xhigh']) {
+      const wire = `${id.slice('antigravity-'.length)}-${effort}`
+      if (live.has(wire)) variants.set(effort, wire)
+    }
+    const defaultWire = variants.get('medium') ?? variants.values().next().value
+    if (defaultWire !== undefined) catalog.set(id, { defaultWire, efforts: [], liveGemini: { name, variants } })
+  }
+}
 
 export function parseLiveProxyCatalog(value: unknown, definitions: ReturnType<typeof getPublicModelDefinitions>): LiveProxyCatalog {
   const root = isRecord(value) && isRecord(value.response) ? value.response : value
@@ -52,6 +74,7 @@ export function parseLiveProxyCatalog(value: unknown, definitions: ReturnType<ty
       : available[0]?.wire ?? aliases.find(alias => live.has(alias))
     if (defaultWire !== undefined) catalog.set(id, { defaultWire, efforts: available.map(({ effort }) => effort) })
   }
+  addLiveGeminiFamilies(catalog, live)
   return catalog
 }
 

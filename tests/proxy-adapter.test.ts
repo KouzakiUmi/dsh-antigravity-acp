@@ -189,6 +189,32 @@ describe('代理凭据取消', () => {
 })
 
 describe('代理模型设置与调用准备', () => {
+  it('设置目录公布已观测的 Hydrogen 和 Neon，派发精确档位 ID', async () => {
+    const request = vi.fn(async ({ url }: { url: string; body: string | Uint8Array }) => url.includes('fetchAvailableModels')
+      ? Response.json({ models: {
+        'gemini-4-hydrogen-medium': {}, 'gemini-4-hydrogen-xhigh': {},
+        'gemini-4-neon-low': {}, 'gemini-4-neon-high': { disabled: true },
+        'gemini-4-hydrogen-sonar': {}, 'gemini-4-unrecognized-medium': {},
+      } }) : new Response(`data: ${JSON.stringify(event([{ text: 'ok' }], 'STOP'))}\n\n`))
+    const instance = new AntigravityProxyAdapter({
+      credential: { credential: async () => ({ accessToken: 'fixture', source: 'login', updatedAt: 'x' }) },
+      transport: { request },
+    })
+    const hydrogen = 'antigravity-gemini-4-hydrogen', neon = 'antigravity-gemini-4-neon'
+    const prepared = await instance.prepareCall(PROXY_PROVIDER_ID, hydrogen)
+    expect((await instance.discoverModels()).map(row => row.id)).toEqual([hydrogen, neon])
+    expect(prepared.model.reasoning?.efforts.map(x => x.id)).toEqual(['medium', 'xhigh'])
+    expect(prepared.model.context).toBeUndefined()
+    expect((await instance.resolveModel(PROXY_PROVIDER_ID, neon)).reasoning?.efforts.map(x => x.id)).toEqual(['low'])
+    await expect(collect(instance.stream({ ...options, model: neon, reasoningEffort: ReasoningEffortId('high') })))
+      .rejects.toMatchObject({ code: 'UNSUPPORTED_REASONING_EFFORT' })
+    await collect(prepared.stream({ ...options, model: hydrogen, reasoningEffort: ReasoningEffortId('xhigh') }))
+    const wire = JSON.parse(String(request.mock.lastCall?.[0].body))
+    expect(wire.model).toBe('gemini-4-hydrogen-xhigh')
+    expect(wire.request.generationConfig?.thinkingConfig).toBeUndefined()
+    expect(request).toHaveBeenCalledTimes(2)
+  })
+
   it('目录不再单独限 256 KiB，超过普通响应预算时报告目录错误', async () => {
     let metadataBytes = 300 * 1024
     const request = vi.fn(async () => Response.json({ models: {

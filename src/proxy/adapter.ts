@@ -60,8 +60,8 @@ import type { AntigravityHostConfig } from '../settings.js'
 import { modelDisplayName, modelSettingFor, modelVisible, normalizeModelSettings, resolveModelTarget } from '../adapter/model-settings.js'
 import type { ModelSetting } from '../adapter/model-settings.js'
 import { llmError } from '../runtime/llm-error.js'
-import { parseLiveProxyCatalog, PROXY_MODEL_EFFORTS } from './model-catalog.js'
-import type { LiveProxyCatalog } from './model-catalog.js'
+import { isLiveGeminiFamily, parseLiveProxyCatalog, PROXY_MODEL_EFFORTS } from './model-catalog.js'
+import type { LiveProxyCatalog, LiveProxyModel } from './model-catalog.js'
 
 export { PROXY_PROVIDER_ID }
 
@@ -170,12 +170,14 @@ export class AntigravityProxyAdapter extends LlmAdapter {
     return this.pinnedTextModelInfos(generation, catalog)
   }
 
-  override async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
-    return this.resolveModelInGeneration(provider, model, this.captureGeneration())
+  override async resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+    this.providerInfo(provider)
+    return this.resolveModelInGeneration(provider, model, await this.captureModelGeneration(model, signal))
   }
 
-  override async prepareCall(provider: string, model: string, _signal?: AbortSignal): Promise<AdapterPreparedCall> {
-    const generation = this.captureGeneration()
+  override async prepareCall(provider: string, model: string, signal?: AbortSignal): Promise<AdapterPreparedCall> {
+    this.providerInfo(provider)
+    const generation = await this.captureModelGeneration(model, signal)
     return {
       model: this.resolveModelInGeneration(provider, model, generation),
       stream: options => this.streamInGeneration(options, generation),
@@ -193,6 +195,12 @@ export class AntigravityProxyAdapter extends LlmAdapter {
       settings: normalizeModelSettings(this.options.readSettings?.().modelOverrides), attachments: this.options.attachments?.(),
       ...(catalog !== undefined && catalog.key === this.catalogKey ? { catalog } : {}),
     }
+  }
+
+  private async captureModelGeneration(model: string, signal?: AbortSignal): Promise<ProxyGeneration> {
+    const generation = this.captureGeneration()
+    if (!isLiveGeminiFamily(model) || generation.catalog !== undefined) return generation
+    return { ...generation, catalog: await this.readLiveCatalog(signal) }
   }
 
   private async readCredential(signal?: AbortSignal, forceRefresh = false): Promise<ProxyCredential | undefined> {
@@ -216,7 +224,7 @@ export class AntigravityProxyAdapter extends LlmAdapter {
   private wireModel(model: string, effort: string | undefined, generation: ProxyGeneration): string {
     const normalized = normalizeReasoningEffort(effort)
     const observed = generation.catalog?.models.get(model)
-    const wire = resolveModelTarget({
+    const wire = isLiveGeminiFamily(model) ? selectLiveGeminiWire(observed, modelSettingFor(generation.settings, model), effort) : resolveModelTarget({
       settings: generation.settings,
       model,
       ...(normalized === undefined ? {} : { effort: normalized }),
@@ -238,6 +246,7 @@ export class AntigravityProxyAdapter extends LlmAdapter {
   private resolveModelInGeneration(provider: string, model: string, generation: ProxyGeneration): LlmResolvedModelInfo {
     this.providerInfo(provider)
     if (typeof model !== 'string' || model.trim().length === 0 || model.length > 256) throw llmError('代理模式模型 id 无效', 'INVALID_MODEL')
+    if (isLiveGeminiFamily(model)) return this.resolveLiveGemini(model, generation)
     const definition = this.definitions[model]
     if (definition === undefined || definition.modalities.output.includes('image')) throw llmError('该模型不在代理模式审计文本快照内', 'INVALID_MODEL')
     const setting = modelSettingFor(generation.settings, model)
@@ -266,20 +275,41 @@ export class AntigravityProxyAdapter extends LlmAdapter {
     }
   }
 
+  private resolveLiveGemini(model: string, generation: ProxyGeneration): LlmResolvedModelInfo {
+    const wire = this.wireModel(model, undefined, generation)
+    const family = generation.catalog!.models.get(model)!.liveGemini!
+    const target = modelSettingFor(generation.settings, model).target
+    const selected = Array.from(family.variants).find(([, id]) => id === wire)?.[0]
+    return {
+      provider: PROXY_PROVIDER_ID, id: model, name: modelDisplayName(generation.settings, model, family.name), inputModalities: ['text'],
+      ...(target === undefined && selected !== undefined ? { reasoning: {
+        efforts: Array.from(family.variants.keys(), effort => ({ id: ReasoningEffortId(effort), name: effort === 'xhigh' ? 'Extra High' : effort[0]!.toUpperCase() + effort.slice(1) })),
+        defaultEffort: ReasoningEffortId(selected),
+      } } : {}),
+    }
+  }
+
   private definitionForWireModel(wireModel: string): ReturnType<typeof getPublicModelDefinitions>[string] | undefined {
     return Object.values(this.definitions).find(definition => !definition.modalities.output.includes('image')
       && [undefined, ...PROXY_MODEL_EFFORTS].some(effort => resolveProxyWireModel(definition.id, effort) === wireModel))
   }
 
   override async *stream(options: AdapterRequestOptions): AsyncIterable<StreamChunk> {
-    yield* this.streamInGeneration(options, this.captureGeneration())
+    this.providerInfo(options.provider)
+    const generation = this.captureGeneration()
+    if (!options.signal?.aborted && isLiveGeminiFamily(options.model) && generation.catalog === undefined) {
+      const catalog = await this.readLiveCatalog(options.signal)
+      yield* this.streamInGeneration(options, { ...generation, catalog })
+      return
+    }
+    yield* this.streamInGeneration(options, generation)
   }
 
   private async *streamInGeneration(options: AdapterRequestOptions, generation: ProxyGeneration): AsyncIterable<StreamChunk> {
     if (options.provider !== PROXY_PROVIDER_ID) throw new LlmError('代理模式 adapter 收到未知路由', 'NO_ADAPTER')
     const signal = options.signal
     const requested = this.definitions[options.model]
-    if (requested === undefined || requested.modalities.output.includes('image')) {
+    if (!isLiveGeminiFamily(options.model) && (requested === undefined || requested.modalities.output.includes('image'))) {
       throw llmError('该模型不在代理模式审计文本快照内', 'INVALID_MODEL')
     }
     if (signal?.aborted) { yield finishChunk('aborted', 'CANCELLED'); return }
@@ -665,6 +695,17 @@ function modelReasoningEfforts(modelId: string): { efforts: readonly { id: Retur
 
 function credentialCatalogKey(credential: ProxyCredential): string {
   return createHash('sha256').update(JSON.stringify([credential.email ?? credential.refreshToken ?? credential.accessToken, credential.projectId])).digest('hex')
+}
+
+function selectLiveGeminiWire(observed: LiveProxyModel | undefined, setting: ModelSetting, effort: string | undefined): string {
+  if (observed?.liveGemini === undefined) throw new LlmError('当前账户的模型目录未提供此模型', 'MODEL_UNSUPPORTED')
+  if (setting.target !== undefined) return setting.target
+  const { variants } = observed.liveGemini
+  if (effort === undefined) return (setting.effort === undefined ? undefined : variants.get(setting.effort)) ?? observed.defaultWire
+  const requested = effort.toLowerCase() === 'xhigh' ? 'xhigh' : normalizeReasoningEffort(effort)
+  const wire = requested === undefined ? undefined : variants.get(requested)
+  if (wire === undefined) throw new LlmError('当前账户的模型目录未提供所选思考档位', 'UNSUPPORTED_REASONING_EFFORT')
+  return wire
 }
 
 function containsControl(value: string): boolean {

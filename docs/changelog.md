@@ -4,6 +4,10 @@
 
 记录源码与发布内容，不将本地构建、npm 发布和本机升级混为同一状态。日期采用 Asia/Hong_Kong。更早历史见 [Git 提交记录](https://github.com/KouzakiUmi/dsh-antigravity-acp/commits/main/)。
 
+## 0.1.42 · 2026-11-19
+
+- 代理模式接入 Gemini 4 Hydrogen 和 Gemini 4 Neon；只列出当前账户目录中未停用的型号与档位，按观测到的 ID 派发。新增两组模型先提供文本输入。
+
 ## 0.1.41 · 2026-11-19
 
 - 代理模型目录移除单独的 256 KiB 限制，沿用既有的普通响应预算，仍最多解析 512 个条目。目录超限时明确标明读取目录失败。

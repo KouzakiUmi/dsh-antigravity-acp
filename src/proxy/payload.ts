@@ -152,6 +152,12 @@ export function completeProxyExecution(sessions: AgyRequestSessionStore, options
 // ---------------------------------------------------------------- internals
 
 function applyFamilyTransforms(request: Record<string, unknown>, wireModel: string, reasoningEffort?: string): void {
+  // These directories expose separate wire IDs per tier. Let the selected ID own
+  // its thinking defaults; the pinned core does not define their thinking config.
+  if (/^gemini-4-(?:hydrogen|neon)-(?:low|medium|high|xhigh)$/u.test(wireModel)) {
+    applyGeminiTransforms(request, { model: wireModel })
+    return
+  }
   const resolved = resolveModelWithTier(wireModel)
   const nativeModel = getAgyNativeModel(wireModel)
   const usesAdaptiveNativeThinking = isGeminiArgonModel(wireModel) || nativeModel?.supportsAdaptiveThinking === true
