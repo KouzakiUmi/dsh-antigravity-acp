@@ -12,11 +12,15 @@ import type { RequestMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock } from '@agentclientprotocol/sdk'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import {
+  assertPromptWithinBudget,
   buildPromptContent,
+  CURRENT_REQUEST_ANCHOR_OPEN,
   currentRequestBlock,
   HISTORY_OPEN,
+  HISTORY_TRUNCATED_OPEN,
   latestUserRequest,
   parsePromptTranscript,
+  promptContentUtf8Bytes,
   TOOL_POLICY_TEXT,
 } from '../src/adapter/prompt-transcript.js'
 
@@ -113,5 +117,37 @@ describe('取不到用户请求的情形', () => {
     const current = currentRequestBlock([imageMessage])
     expect(current?.type).toBe('text')
     expect(current?.type === 'text' ? current.text : '').toContain('附带图片')
+  })
+})
+
+describe('prompt 字节预算与头尾锚点', () => {
+  it('头部锚点位于历史说明之前，且不重复计入逆解析结果', () => {
+    const blocks = buildPromptContent(undefined, [user('第一问'), user('最新指令')])
+    const texts = textOf(blocks)
+    const anchorIndex = texts.findIndex((text) => text.startsWith(CURRENT_REQUEST_ANCHOR_OPEN))
+    const historyIndex = texts.findIndex((text) => text.startsWith(HISTORY_OPEN))
+    expect(anchorIndex).toBeGreaterThanOrEqual(0)
+    expect(anchorIndex).toBeLessThan(historyIndex)
+    expect(texts[anchorIndex]).toContain('最新指令')
+    expect(parsePromptTranscript(blocks).entries).toHaveLength(2)
+  })
+
+  it('历史超出单次 prompt 字节预算时从最旧消息裁剪，完整保留最新消息与请求锚点', () => {
+    const oldTask = user(`UNIQUE_OLD_TASK_MARKER：${'x'.repeat(2_000)}`)
+    const middle = user(`中间步骤：${'y'.repeat(2_000)}`)
+    const latest = user('请你继续帮我测试归一化统计量')
+    const blocks = buildPromptContent('系统提示', [oldTask, middle, latest], [], 5_000)
+    const texts = textOf(blocks)
+    expect(promptContentUtf8Bytes(blocks)).toBeLessThanOrEqual(5_000)
+    expect(texts.some((text) => text.startsWith(HISTORY_TRUNCATED_OPEN))).toBe(true)
+    expect(texts.some((text) => text.includes('UNIQUE_OLD_TASK_MARKER'))).toBe(false)
+    expect(texts.some((text) => text.includes('请你继续帮我测试归一化统计量'))).toBe(true)
+    expect(texts.at(-1)).toContain('请你继续帮我测试归一化统计量')
+    expect(texts.some((text) => text.startsWith(CURRENT_REQUEST_ANCHOR_OPEN))).toBe(true)
+  })
+
+  it('固定开销或单条消息本身超出预算时显式报 AGY_PROMPT_TOO_LARGE', () => {
+    const huge = buildPromptContent(undefined, [user('a'.repeat(5_000))], [])
+    expect(() => assertPromptWithinBudget(huge, 1_000)).toThrowError(expect.objectContaining({ code: 'AGY_PROMPT_TOO_LARGE' }))
   })
 })
