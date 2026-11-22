@@ -81,7 +81,7 @@ dsh plugin --profile web add ./dsh-bundle-antigravity-host-0.1.24.tgz
 工具链路：
 
 1. 插件通过宿主 `ctx.subprocess` 以 stdio 启动官方 ACP server。
-2. 会话使用厂商扩展 `_meta.antigravity.enabledTools: []` 关闭内置工具，使用 `eagerMcpServers: ["dsh-tools"]` 提供当前 DSH 工具 schema。此扩展的默认适配基准是官方 server 1.4.0，不保证任意版本同样实现。
+2. 会话使用厂商扩展 `_meta.antigravity.enabledTools: []` 关闭内置工具，使用 `eagerMcpServers: ["dsh-tools"]` 提供当前 DSH 工具 schema。此扩展的实测适配基准是官方 server 1.4.0；默认下载版本已升至 1.5.2（发行布局与入口命名经全平台离线核对一致），但 1.5.2 的协议行为与厂商扩展尚未实机验收，不保证任意版本同样实现。
 3. 私有 MCP 桥仅绑定 `127.0.0.1`，新建或重建带工具的 ACP 会话时轮换 token 与授权代次；同一会话复用时保留授权，目录/归属变化则重建。
 4. ACP 权限提示只对已识别私有桥请求选择 `allow_once`，不会自身产生 DSH 调用；真正的 `tools/call` 到桥后才挂起，并以 `tool-call` 交给 DSH。
 5. DSH 负责校验、审批、执行；工具结果按调用 ID 匹配，携带 `isError` 回填同一 ACP prompt。支持乱序结果与后续批次。
@@ -171,7 +171,7 @@ HTTP 额度回退只读 CLI 登录材料，换发 access token 仅留内存，�
 
 ## 运行目录与下载安全
 
-默认官方 server **1.4.0**，不随 registry 自动升级。自动下载限定 HTTPS / `dl.google.com`，拒绝任何重定向，按流写入临时文件；解压检查绝对路径、`..`、盘符、反斜杠与逃逸路径。成功后提交缓存，失败清理本次暂存。官方未提供校验和，不能据此宣称签名 / 校验和验证通过。
+默认官方 server **1.5.2**，不随 registry 自动升级。自动下载限定 HTTPS / `dl.google.com`，拒绝任何重定向，按流写入临时文件；解压检查绝对路径、`..`、盘符、反斜杠与逃逸路径，并在写盘前按压缩炸弹守卫校验：条目数上限 2000、单条目 1.5 GiB、解压总量 2 GiB（阈值按 2026-11-22 全平台官方包实测体积校准，Linux 主程序 .par 解压后约 681–890 MiB）。成功后提交缓存，失败清理本次暂存。官方未提供校验和，不能据此宣称签名 / 校验和验证通过。
 
 二进制默认**不放在 DSH home**：
 
@@ -217,7 +217,7 @@ onefile 临时展开使用用户级根目录内独立的 `runtime/instance-*`，
 | 取消后默认回收进程 | `session/cancel` 只是通知；默认安全优先，下一轮冷启动（热启动约 10 秒、冷启动可达 50 秒）。 | 开启 `keepProcessAfterCancel`，用 `cancelGraceMs` 等确认、`idleRecycleMs` 限制空闲保留。 |
 | `session/load` 会回放历史 | 官方通过 `session/update` 重放历史（含 `user_message_chunk`）；插件在加载期间全部丢弃，避免混入本轮输出。 | 无需操作。 |
 | 恢复缓存由其他 Host 占用 / 崩溃残留锁 | 排他租约不可取得时，仅禁用本实例的磁盘恢复，不影响普通聊天；不自动抢锁。 | 使用独立缓存目录，或确认相关 Host 全部退出后清理残留 `sessions.lock`。 |
-| 旧版本 load 回放异常 | 社区报告 agy_acp_server 1.2.1 上 `session/load` 可能回放零历史。本插件默认 1.4.0；恢复失败会自动重建。 | 遇到异常先升级 ACP server 版本。 |
+| 旧版本 load 回放异常 | 社区报告 agy_acp_server 1.2.1 上 `session/load` 可能回放零历史。本插件默认 1.5.2；恢复失败会自动重建。 | 遇到异常先升级 ACP server 版本。 |
 | 对端发来畸形 JSON-RPC 帧 | 既没有 `method`、也不是合法响应形状的帧此前会让整条链路判死（在途请求全部报 `AGY_LINK_CLOSED`）。现在只丢弃该帧并写一条告警。 | 看到「已丢弃无法路由的 JSON-RPC 帧」时核对官方 server 版本；单帧丢弃不影响本轮结果。 |
 
 ## 排障

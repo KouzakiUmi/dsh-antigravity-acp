@@ -33,7 +33,7 @@ export interface AntigravityHostConfig {
   autoDownload?: boolean
   /** 传给 ACP server 的额外命令行参数。 */
   extraArgs?: string[]
-  /** 自动下载的目标版本（默认 1.4.0）。 */
+  /** 自动下载的目标版本（默认 1.5.2）。 */
   acpVersion?: string
   /** 单个 ACP 请求默认超时（毫秒）。 */
   requestTimeoutMs?: number

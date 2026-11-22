@@ -16,7 +16,7 @@ import { pipeline } from 'node:stream/promises'
 import yauzl from 'yauzl'
 
 /** 默认下载的官方 server 版本（可经 config.acpVersion 配置）。 */
-export const DEFAULT_ACP_SERVER_VERSION = '1.4.0'
+export const DEFAULT_ACP_SERVER_VERSION = '1.5.2'
 /** 官方 zip 下载的整体超时（含读完响应体）。 */
 export const DOWNLOAD_TIMEOUT_MS = 10 * 60_000
 /** 唯一允许的下载域名。 */
@@ -28,14 +28,20 @@ export const INSTALL_DIR_NAME = 'dsh-antigravity-host'
 /**
  * 解压上限（压缩炸弹纵深防御）。
  *
- * 官方 zip 解压后约 200–300MB、条目数十个；给 4 倍余量既不误伤正常包，也挡住
- * 「几 KB 的 zip 解出几十 GB」这类攻击。下载源已限定 https + dl.google.com +
- * 拒绝重定向，因此这一层是纯纵深防御，不是唯一屏障。
+ * 2026-11-22 实测 dl.google.com 官方分发包 central directory 声明的解压大小：
+ * - Windows x86_64：单条目最大约 156 MiB（localharness_external.exe）；
+ * - macOS 两架构：单条目最大约 269 MiB；
+ * - Linux 两架构：主程序 .par 为 681–890 MiB，1.4.x 两条目合计最高约 1.06 GiB。
+ * 旧值 512 MiB / 1 GiB 只按 Windows/macOS 包校准，Linux 全版本（含当时默认的
+ * 1.4.0）都会在写盘前被拒（issue #13）。下载源已限定 https + dl.google.com +
+ * 拒绝重定向，这一层是纯纵深防御：条目数仍限 2000，单条目 1.5 GiB、总量
+ * 2 GiB 相对实测最大值分别保留约 73% 与 102% 余量（1.7×–2×），同时挡住伪造
+ * 的超大解压声明。
  */
 export const MAX_EXTRACT_ENTRIES = 2_000
-export const MAX_EXTRACT_BYTES = 1_024 * 1_024 * 1024
-/** 单个条目上限：官方最大条目就是主程序本身。 */
-export const MAX_EXTRACT_ENTRY_BYTES = 512 * 1_024 * 1_024
+export const MAX_EXTRACT_BYTES = 2 * 1_024 * 1_024 * 1_024
+/** 单个条目上限：官方最大条目是 Linux 主程序 .par（实测约 890 MiB）。 */
+export const MAX_EXTRACT_ENTRY_BYTES = 1_536 * 1_024 * 1_024
 /** 覆盖可执行文件安装根目录的环境变量名。 */
 export const INSTALL_ROOT_ENV = 'AGY_ACP_HOME'
 
@@ -84,8 +90,9 @@ export type AcpArch = 'x86_64' | 'aarch64'
 /** posix = darwin / linux（可执行文件挑选规则一致）。 */
 export type ExecutableFlavor = 'windows' | 'posix'
 
-/** 发行布局取自官方 ACP registry 的 antigravity-acp/agent.json（1.4.1）。
- * 默认版本仍是 1.4.0；该表描述命名与入口，不宣称旧版所有平台均已实机验证。
+/** 发行布局在 1.4.0–1.5.2 全平台实测一致：macOS/Linux 入口为 agy_acp_server.par，
+ * Windows 为 agy_acp_server.exe，zip 内均为主程序与 localharness_external[.exe]
+ * 两个条目。该表描述命名与入口，不宣称每个版本的协议行为都已实机验证。
  */
 export const ACP_DISTRIBUTIONS = {
   windows: { directory: 'windows', executable: 'agy_acp_server.exe', defaultArgs: [] },
@@ -694,7 +701,7 @@ export interface AgentBinaryOptions {
   binaryPath?: string
   /** 是否允许自动下载（默认 true）。 */
   autoDownload?: boolean
-  /** 目标版本（默认 1.4.0）。 */
+  /** 目标版本（默认 1.5.2）。 */
   version?: string
   /** 下载 URL 覆盖（未验证平台组合的逃生门；仍受域名白名单约束）。 */
   downloadUrl?: string

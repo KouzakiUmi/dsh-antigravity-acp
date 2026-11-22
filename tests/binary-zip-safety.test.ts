@@ -9,6 +9,8 @@ import { join } from 'node:path'
 import {
   AgyBinaryError,
   AGY_BINARY_ERROR,
+  MAX_EXTRACT_BYTES,
+  MAX_EXTRACT_ENTRY_BYTES,
   downloadBinary,
   downloadBinaryToFile,
   ensureAgentBinary,
@@ -305,6 +307,17 @@ describe('extractZipSafely', () => {
     } finally {
       await rm(dest, { recursive: true, force: true })
     }
+  })
+})
+
+describe('解压守卫常量覆盖官方分发包实测体积', () => {
+  it('单条目与总量上限严格高于 2026-11-22 实测的最大官方包（#13 回归）', () => {
+    // 实测最大单条目：linux arm64 1.4.1 的 agy_acp_server.par = 933,416,796 字节（约 890 MiB）。
+    // 旧常量 512 MiB 导致 Linux 全版本在写盘前被拒，ACP 连接直接失败。
+    expect(MAX_EXTRACT_ENTRY_BYTES).toBeGreaterThan(933_416_796)
+    // 实测最大解压总量：linux x86_64 1.4.1 两条目合计 = 1,062,014,265 字节（约 1.01 GiB）。
+    // 旧常量 1 GiB 只给单条目调阈值会立刻撞上第二道总量守卫。
+    expect(MAX_EXTRACT_BYTES).toBeGreaterThan(1_062_014_265)
   })
 })
 

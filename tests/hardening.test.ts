@@ -13,7 +13,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AnyMessage, Stream } from '@agentclientprotocol/sdk'
-import { versionCachePaths } from '../src/runtime/binary.js'
+import { DEFAULT_ACP_SERVER_VERSION, versionCachePaths } from '../src/runtime/binary.js'
 import { AgentLink } from '../src/protocol/agent-link.js'
 import { ensureAcpCredentials } from '../src/runtime/credentials.js'
 import { resolveOAuthClient } from '../src/runtime/quota.js'
@@ -196,7 +196,7 @@ describe('resolveOAuthClient 的二进制扫描', () => {
     const root = await mkdtemp(join(tmpdir(), 'agy-oauth-paths-'))
     const installRoot = join(root, 'install')
     const dataCache = join(root, 'old-dsh-cache')
-    const extractDir = versionCachePaths(installRoot, '1.4.0').extractDir
+    const extractDir = versionCachePaths(installRoot, DEFAULT_ACP_SERVER_VERSION).extractDir
     const serverName = process.platform === 'win32' ? 'agy_acp_server.exe' : 'agy_acp_server.par'
     const explicitCli = join(root, 'custom', process.platform === 'win32' ? 'agy.exe' : 'agy')
     try {

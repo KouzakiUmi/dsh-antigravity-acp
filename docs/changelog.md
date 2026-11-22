@@ -4,6 +4,12 @@
 
 记录源码与发布内容，不将本地构建、npm 发布和本机升级混为同一状态。日期采用 Asia/Hong_Kong。更早历史见 [Git 提交记录](https://github.com/KouzakiUmi/dsh-antigravity-acp/commits/main/)。
 
+## 0.1.47 · 2026-11-22
+
+- **修复 Linux 平台 ACP 连接被解压守卫拦截**（#13）：官方 Linux 分发包的 `agy_acp_server.par` 解压后实测为 681–890 MiB，1.4.x 两个条目合计最高约 1.06 GiB；旧守卫按 Windows/macOS 包校准为单条目 512 MiB、总量 1 GiB，导致 Linux 全版本（含当时默认的 1.4.0）在写盘前即报 `AGY_ARCHIVE_TOO_LARGE`（「zip 条目声明大小超过上限 536870912 字节」），ACP 连接失败。守卫调整为单条目 1.5 GiB、总量 2 GiB，条目数上限 2000 不变；阈值附 2026-11-22 全平台实测体积注释，并新增常量下限回归测试。这是平台校准缺口而非 agy 更新回归：macOS / Windows 包始终低于旧阈值，升级任何 `acpVersion` 都无法绕过旧守卫。
+- **默认 ACP server 升级到 1.5.2**：dl.google.com 现存最新版本（1.5.3 及以上全线 404）。全平台 zip 的 HTTP 可达性、条目命名与入口布局经离线核对与 1.4.x 一致；1.5.2 的协议行为与厂商 `_meta.antigravity` 扩展尚未实机验收，扩展实测基准仍为 1.4.0，需要时可经 `acpVersion` 回退。
+- **文档**：配置参考、使用参考、开发文档与 README 的默认版本、下载安全阈值与验证边界同步更新。
+
 ## 0.1.46 · 2026-11-20
 
 - **客户端 i18n**：设置卡片、额度药丸与 Host 回传的固定状态文本支持简体中文 / English。语言取自 `navigator.language`（缺失时看 `<html lang>`），非中文环境显示英文，判定不到时保持中文；字典缺项回落中文，Host 动态拼接的文本原样显示。字典与内核拆在 `src/client-i18n/`，构建时内联为单个 `dist/client.js`。宿主配置编辑器中的字段说明（`Config` schema）仍是中文。

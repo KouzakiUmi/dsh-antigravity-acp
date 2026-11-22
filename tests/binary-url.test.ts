@@ -24,9 +24,9 @@ describe('resolveDownloadUrl', () => {
     )
   })
 
-  it('默认版本常量为 1.4.0', () => {
-    expect(DEFAULT_ACP_SERVER_VERSION).toBe('1.4.0')
-    expect(resolveDownloadUrl('windows', 'x86_64')).toContain('agy-acp-server-1.4.0-windows-x86_64.zip')
+  it('默认版本常量为 1.5.2', () => {
+    expect(DEFAULT_ACP_SERVER_VERSION).toBe('1.5.2')
+    expect(resolveDownloadUrl('windows', 'x86_64')).toContain('agy-acp-server-1.5.2-windows-x86_64.zip')
   })
 
   it('darwin/linux 按官方 registry 发行命名拼接（不宣称旧版实机验证）', () => {

@@ -15,7 +15,7 @@
 | `binaryPath` | 未设置 | 本地官方 ACP server 入口，优先级最高；指定但不存在会报错，不静默换来源。 |
 | `autoDownload` | `true` | 无本地覆盖和有效缓存时从官方域名下载。 |
 | `extraArgs` | `[]` | 额外启动参数；不要传入会改变协议、工具隔离或认证边界的参数并假定仍兼容。 |
-| `acpVersion` | `"1.4.0"` | 自动下载与缓存目标版本；不是 ACP wire protocol 版本。更换版本需重新验证厂商扩展与发行布局。 |
+| `acpVersion` | `"1.5.2"` | 自动下载与缓存目标版本；不是 ACP wire protocol 版本。更换版本需重新验证厂商扩展与发行布局。 |
 | `requestTimeoutMs` | `30000` | 普通 ACP 请求超时（毫秒），覆盖 stdin 写入与响应等待。 |
 | `handshakeTimeoutMs` | `120000` | ACP `initialize` 握手上限（毫秒）。官方 PyInstaller 进程冷启动实测约 52 秒、热启动约 10 秒，旧默认 15 秒会使冷启动登录超时。 |
 | `authTimeoutMs` | `300000` | 交互式 `authenticate` 等待上限（毫秒），独立于普通请求超时。 |
@@ -40,7 +40,7 @@
   "queueTimeoutMs": 120000,
   "autoWarmup": true,
   "autoDownload": true,
-  "acpVersion": "1.4.0",
+  "acpVersion": "1.5.2",
   "reuseSessions": true,
   "resumeSessions": false,
   "proxyUrl": "http://127.0.0.1:7890"
@@ -117,7 +117,7 @@ ACP 官方 agent 在同一会话内会保留上下文（2026-10-23 真机验证�
 
 **ACP 程序：** `binaryPath` → `AGY_ACP_BIN` → 对应版本缓存 → 自动下载。手动覆盖先于自动平台映射，未知自动下载平台可使用明确指定的兼容程序。
 
-自动下载的 zip 解压受三道上限约束：条目数 2000、单条目 512MB、解压总量 1GB。官方包解压后约 200–300MB、条目数十个，正常下载不会触及；超过任一道即报 `AGY_ARCHIVE_TOO_LARGE` 并放弃本次安装，不留半成品。这是下载域名白名单之外的压缩炸弹纵深防御。
+自动下载的 zip 解压受三道上限约束：条目数 2000、单条目 1.5 GiB、解压总量 2 GiB。2026-11-22 实测官方包解压后：Windows 最大单条目约 156 MiB、macOS 约 269 MiB、Linux 主程序 `.par` 为 681–890 MiB（1.4.x 两条目合计最高约 1.06 GiB），正常下载不会触及；超过任一道即报 `AGY_ARCHIVE_TOO_LARGE` 并放弃本次安装，不留半成品。这是下载域名白名单之外的压缩炸弹纵深防御。
 
 **CLI：** `agyCliPath` → `AGY_CLI_BIN` → PATH → 平台默认位置。显式覆盖与候选读取细节以 [`agy-cli.ts`](https://github.com/KouzakiUmi/dsh-antigravity-acp/blob/main/src/runtime/agy-cli.ts) 为准；手动刷新会重新探测，不要求插件加载时 CLI 就已安装。
 

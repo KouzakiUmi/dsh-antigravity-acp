@@ -34,7 +34,7 @@ npm 包名为 `dsh-bundle-antigravity-host`，provider ID 为 `antigravity-acp`�
 | 可选 `dsh-attachment` | 开发依赖 `0.2.2-rc.3` | Host 服务在场时读取图片，缺少时文本降级 |
 | Cordis | 开发依赖 `4.1.0` | 生命周期与注入契约 |
 | ACP SDK / wire protocol | SDK `1.4.0` / wire **v1** | 两者不是同一版本；v2 / RFD 草案不能替代 v1 |
-| 默认官方 ACP server | `1.4.0` | 与 SDK 分别设置；厂商 `_meta.antigravity` 扩展不自动适用于任意上游版本 |
+| 默认官方 ACP server | `1.5.2` | 与 SDK 分别设置；1.5.2 仅离线核对全平台发行布局与解压体积，协议行为与厂商 `_meta.antigravity` 扩展的实测基准仍为 1.4.0，不自动适用于任意上游版本 |
 | MCP SDK | `1.32.1` | loopback 工具桥与结果内容 |
 | `@cortexkit/antigravity-auth-core` | `3.0.14`（生产依赖） | 代理模式的 agy 线头 / 分帧、OAuth 常量、请求变换与模型注册表；与 dsh-tool-antigravity 0.5.2 同版本同口径 |
 | undici | `8.12.3` | 本包直接依赖，HTTP / SOCKS 代理；SOCKS5 可能输出实验性 API 警告 |
@@ -67,12 +67,12 @@ ELECTRON_RUN_AS_NODE=1 "$DSH_NODE_EXECUTABLE" scripts/check-desktop-compat.cjs
 
 ## 本次验证矩阵
 
-0.1.35 本地检查日期：**2026-11-03**；0.1.36（额度取数解耦、设置页紧凑布局与隔离修复）复检日期：**2026-11-04**（Asia/Hong_Kong）；0.1.37（AI Credits 未开启时隐藏、删除代理积分说明、保存栏面板化样式）复检日期：**2026-11-04**（Asia/Hong_Kong）；0.1.38（无档位模型的元数据、模式总线回切、设置卡片只编辑即时字段、会话选模按会话判定、一次性请求不再占死 worker、账户刷新与资源回收修复）复检日期：**2026-11-12**（Asia/Hong_Kong）；开发契约基准升到 Core `0.2.2-rc.1` / Cordis `4.1.0` 与转发型请求 `purpose` 放宽的适配复检日期：**2026-11-13**（Asia/Hong_Kong）；peer 范围补 `0.2.2` prerelease 界标、契约基准升到 `0.2.2-rc.3` 与 `LlmError` 自定义码改走 `fromFailure` 的适配复检日期：**2026-11-16**（Asia/Hong_Kong）；0.1.46（客户端 i18n、`cloakSensitiveWords` 移除、Host 字典补齐与会话容量修复）复检日期：**2026-11-20**（Asia/Hong_Kong）。
+0.1.35 本地检查日期：**2026-11-03**；0.1.36（额度取数解耦、设置页紧凑布局与隔离修复）复检日期：**2026-11-04**（Asia/Hong_Kong）；0.1.37（AI Credits 未开启时隐藏、删除代理积分说明、保存栏面板化样式）复检日期：**2026-11-04**（Asia/Hong_Kong）；0.1.38（无档位模型的元数据、模式总线回切、设置卡片只编辑即时字段、会话选模按会话判定、一次性请求不再占死 worker、账户刷新与资源回收修复）复检日期：**2026-11-12**（Asia/Hong_Kong）；开发契约基准升到 Core `0.2.2-rc.1` / Cordis `4.1.0` 与转发型请求 `purpose` 放宽的适配复检日期：**2026-11-13**（Asia/Hong_Kong）；peer 范围补 `0.2.2` prerelease 界标、契约基准升到 `0.2.2-rc.3` 与 `LlmError` 自定义码改走 `fromFailure` 的适配复检日期：**2026-11-16**（Asia/Hong_Kong）；0.1.46（客户端 i18n、`cloakSensitiveWords` 移除、Host 字典补齐与会话容量修复）复检日期：**2026-11-20**（Asia/Hong_Kong）；0.1.47（Linux 解压守卫阈值修复、默认 ACP server 升 1.5.2）复检日期：**2026-11-22**（Asia/Hong_Kong）。
 
 | 验证项 | 状态与范围 |
 |---|---|
 | TypeScript | `npm run typecheck` 通过 |
-| 隔离回归 | 2026-11-20 使用系统 Node 24：48 个文件 / 864 项通过（契约基准 Core `0.2.2-rc.3` / Cordis `4.1.0`），包含旧宿主错误回退、目录停用项与档位、Schema 字段优先、已保存项目额度回退、会话表 LRU 容量与 429 限流文案 |
+| 隔离回归 | 2026-11-22 使用系统 Node 24：48 个文件 / 865 项通过（契约基准 Core `0.2.2-rc.3` / Cordis `4.1.0`），包含旧宿主错误回退、目录停用项与档位、Schema 字段优先、已保存项目额度回退、会话表 LRU 容量与 429 限流文案，以及解压守卫常量对官方分发包实测体积的下限回归 |
 | 构建 | `npm run build` 通过 |
 | 代理响应预算 | 合成 HTTP 与 SSE 测试覆盖：多帧生成超过旧 8 MiB 后仍能完成；解码后超过 64 MiB 正确失败；非生成和非成功生成响应仍受 8 MiB 传输预算约束 |
 | 代理目录预算 | 2026-11-19，同一账户真实 `fetchAvailableModels` 回包为 HTTP 200、解码后 303,104 字节、38 条；同一回包交给已安装 0.1.40 复现 `REQUEST_LIMIT`（262,144 字节），候选代码成功解析并返回 6 个可选模型。未保存原始回包、未发起生成请求。合成回归另外覆盖普通响应预算与同账户缓存回退 |
