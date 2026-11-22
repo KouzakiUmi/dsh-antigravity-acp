@@ -4,6 +4,11 @@
 
 记录源码与发布内容，不将本地构建、npm 发布和本机升级混为同一状态。日期采用 Asia/Hong_Kong。更早历史见 [Git 提交记录](https://github.com/KouzakiUmi/dsh-antigravity-acp/commits/main/)。
 
+## 0.1.48 · 2026-11-22
+
+- **修复 macOS / Linux 辅助程序缺执行位导致会话创建失败**（#3）：解压不还原 zip 中的 Unix 权限位，此前只给主程序 `agy_acp_server.par` 补 `0755`，同目录的 `localharness_external` 落盘为 `0644`；官方进程在 `session/new` 时拉起它，以 `PermissionError: [Errno 13]` 失败，DSH 只看到 `Internal error`。现在 posix 下同时为存在的普通文件 `localharness_external` 补执行位；缓存命中路径同样执行，旧版本遗留的缓存在下次启动时自动修复，无需重新下载。`binaryPath` / `AGY_ACP_BIN` 指定的文件不改权限。
+- **`session/new` 失败附带诊断**（#3）：会话创建被拒、超时或链路断开时（即链路层已归类的 `AGY_*` 错误；写出管道时的原生错误原样抛出），错误消息附加脱敏后的官方进程 stderr 尾部（与启动失败同一脱敏路径，最多 1500 字符），错误码与 JSON-RPC 细节不变；调用方主动取消时不附加。
+
 ## 0.1.47 · 2026-11-22
 
 - **修复 Linux 平台 ACP 连接被解压守卫拦截**（#13）：官方 Linux 分发包的 `agy_acp_server.par` 解压后实测为 681–890 MiB，1.4.x 两个条目合计最高约 1.06 GiB；旧守卫按 Windows/macOS 包校准为单条目 512 MiB、总量 1 GiB，导致 Linux 全版本（含当时默认的 1.4.0）在写盘前即报 `AGY_ARCHIVE_TOO_LARGE`（「zip 条目声明大小超过上限 536870912 字节」），ACP 连接失败。守卫调整为单条目 1.5 GiB、总量 2 GiB，条目数上限 2000 不变；阈值附 2026-11-22 全平台实测体积注释，并新增常量下限回归测试。这是平台校准缺口而非 agy 更新回归：macOS / Windows 包始终低于旧阈值，升级任何 `acpVersion` 都无法绕过旧守卫。

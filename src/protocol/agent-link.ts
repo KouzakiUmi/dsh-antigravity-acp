@@ -129,6 +129,12 @@ export interface AgentLinkOptions {
   handlers?: AgentLinkHandlers
   /** 关闭仅等待有界时间；进程回收仍由宿主负责。 */
   closeTimeoutMs?: number
+  /**
+   * session/new 失败时附加的诊断文本（如官方进程 stderr 尾部），调用方负责脱敏。
+   * 官方在创建会话时才拉起辅助程序，失败时 JSON-RPC 只回 `Internal error`。
+   * 返回空值不附加；调用方主动中止时不附加。
+   */
+  diagnostics?: () => string | undefined
 }
 
 export interface AgentLinkRequestOptions {
@@ -191,6 +197,7 @@ export class AgentLink {
   #authTimeoutMs: number
   #handlers: AgentLinkHandlers
   #closeTimeoutMs: number
+  readonly #diagnostics: (() => string | undefined) | undefined
   /** 无法路由的畸形帧只留痕并丢弃，不据此关闭链路（见 #route）。 */
   readonly #onProtocolViolation: ((detail: string) => void) | undefined
   #closePromise?: Promise<void>
@@ -215,6 +222,7 @@ export class AgentLink {
     this.#authTimeoutMs = options.authTimeoutMs ?? DEFAULT_AUTH_TIMEOUT_MS
     this.#handlers = options.handlers ?? {}
     this.#closeTimeoutMs = options.closeTimeoutMs ?? 250
+    this.#diagnostics = options.diagnostics
     this.#onProtocolViolation = options.handlers?.onProtocolViolation
   }
 
@@ -545,9 +553,27 @@ export class AgentLink {
         throw new AgentLinkError(AGY_LINK_ERROR.UNSUPPORTED_CAPABILITY, 'ACP 服务端声明不支持 SSE MCP')
       }
     }
-    const response = await this.request<NewSessionResponse>('session/new', request, options)
+    let response: NewSessionResponse
+    try {
+      response = await this.request<NewSessionResponse>('session/new', request, options)
+    } catch (error) {
+      throw this.#withDiagnostics(error, options?.signal)
+    }
     this.#boundSessionId = response.sessionId
     return response
+  }
+
+  /** 给链路错误附加诊断文本；保留错误码、JSON-RPC 细节与原始 cause。 */
+  #withDiagnostics(error: unknown, signal: AbortSignal | undefined): unknown {
+    if (!(error instanceof AgentLinkError) || signal?.aborted || !this.#diagnostics) return error
+    let detail: string | undefined
+    try {
+      detail = this.#diagnostics()?.trim()
+    } catch {
+      return error
+    }
+    if (!detail) return error
+    return new AgentLinkError(error.code, `${error.message}（诊断：${detail}）`, { cause: error, jsonRpc: error.jsonRpc })
   }
 
   /** 设置会话配置选项（configId/value 形状按 ACP v1 schema）。 */

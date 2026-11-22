@@ -128,7 +128,7 @@ flowchart LR
 | DSH Core peer 范围 | `>=0.2.0-rc.1 <0.2.1-0 \|\| >=0.2.1-0 <0.3.0-0 \|\| >=0.2.2-0 <0.3.0-0`，适用于所声明的三个 `dsh-*` peer；npm 与 DSH 分别检查准入 |
 | 开发契约基准 | `dsh-llm` / `dsh-subprocess` / `dsh-typert-protocol` / `dsh-attachment` **0.2.2-rc.3**，Cordis **4.1.0**（与实机内嵌版本一致，类型检查在该基准下运行） |
 | 上游协议 | ACP **v1**；SDK **1.4.0** 与默认 server **1.5.2** 是两个独立版本 |
-| 当前源码本地验证 | 0.1.47（契约基准 `0.2.2-rc.3` / Cordis `4.1.0`）：类型检查、48 个文件 / 865 项测试与构建通过；桌面契约用 2.0.24-next / Core `0.2.2-rc.5` 真实组件复检（路由互斥、Typert 注册与清理、自定义错误码）；另有无 CLI 的真实本地 OAuth 回调闭环及既有离线 Chrome 36 项布局检查 |
+| 当前源码本地验证 | 0.1.48（契约基准 `0.2.2-rc.3` / Cordis `4.1.0`）：类型检查、48 个文件 / 870 项测试（Windows 上 1 项 POSIX 权限位测试跳过）与构建通过；桌面契约用 2.0.24-next / Core `0.2.2-rc.5` 真实组件复检（路由互斥、Typert 注册与清理、自定义错误码）；另有无 CLI 的真实本地 OAuth 回调闭环及既有离线 Chrome 36 项布局检查 |
 | 实机运行时核对 | 2026-11-16 复核实机分发包（`app.asar`）内嵌 **dsh-llm / dsh-subprocess / dsh-typert-protocol / dsh-attachment 0.2.2-rc.3，cordis 4.1.0**；此前 2026-11-12 在 0.2.2-rc.1 逐项核对的导出（`LlmAdapter` 方法集、`registerAdapter().replace([])`、`LlmError`、品牌类型构造函数、`settings.describe/mutate`、`attachments` 服务名、Typert 远程注册形状、客户端 `__ModuleLoader__.load` / `$mount` / `settings.section`）在 rc.3 类型层复核通过——`LlmError` constructor 自 rc.3 起只接受 `BuiltinLlmFailureCode`，本包自定义码改经 `LlmError.fromFailure` 原样抛出；未在 0.2.2-rc.3 上跑真实生成 |
 | 桌面契约核对 | DSH NEXT **2.0.23-next**（Core **0.2.2-rc.3**，Cordis **4.1.0**）：使用分发包的真实组件在独立进程验证 peer 范围、ACP / 代理路由互斥切换、Typert 贡献注册与卸载清理、自定义错误码及其状态和原因。未加载桌面 Profile |
 | 尚未覆盖 | 0.1.39 安装后的 Desktop GUI、真实 Google 授权、真实上游生成与图片识别、非 Windows 实机 |

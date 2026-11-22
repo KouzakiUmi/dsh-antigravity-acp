@@ -470,6 +470,71 @@ describe('AgentLink 事件与会话', () => {
     expect(error.jsonRpc?.code).toBe(-32000)
     await link.close()
   })
+
+  it('session/new 失败附加诊断文本，错误码与 JSON-RPC 细节不变；无诊断时消息不变', async () => {
+    const pair = fakePair()
+    pumpAgent(pair, async (message, reply) => {
+      if (message.method === 'initialize') {
+        await reply({ jsonrpc: '2.0', id: message.id!, result: { protocolVersion: 1 } })
+      } else if (message.method === 'session/new') {
+        await reply({ jsonrpc: '2.0', id: message.id!, error: { code: -32603, message: 'Internal error' } })
+      }
+    })
+    let detail: string | undefined = "PermissionError: [Errno 13] Permission denied: '…/localharness_external'"
+    const link = new AgentLink({ stream: pair.stream, diagnostics: () => detail })
+    link.start()
+    await link.initialize()
+    const withDetail = await link.newSession({ cwd: '/tmp', mcpServers: [] }).then(() => null, (e: unknown) => e) as AgentLinkError
+    expect(withDetail).toBeInstanceOf(AgentLinkError)
+    expect(withDetail.code).toBe(AGY_LINK_ERROR.AGENT_REFUSED)
+    expect(withDetail.jsonRpc?.code).toBe(-32603)
+    expect(withDetail.message).toContain('Internal error')
+    expect(withDetail.message).toContain('（诊断：PermissionError: [Errno 13]')
+    expect(withDetail.jsonRpc).toEqual({ code: -32603, message: 'Internal error' })
+    expect(withDetail.cause).toBeInstanceOf(AgentLinkError)
+    const original = withDetail.cause as AgentLinkError
+    detail = '   '
+    const plain = await link.newSession({ cwd: '/tmp', mcpServers: [] }).then(() => null, (e: unknown) => e) as AgentLinkError
+    expect(plain.message).toBe(original.message)
+    await link.close()
+  })
+
+  it('诊断回调抛错时原错误原样抛出', async () => {
+    const pair = fakePair()
+    pumpAgent(pair, async (message, reply) => {
+      if (message.method === 'initialize') {
+        await reply({ jsonrpc: '2.0', id: message.id!, result: { protocolVersion: 1 } })
+      } else if (message.method === 'session/new') {
+        await reply({ jsonrpc: '2.0', id: message.id!, error: { code: -32603, message: 'Internal error' } })
+      }
+    })
+    const link = new AgentLink({ stream: pair.stream, diagnostics: () => { throw new Error('stderr unavailable') } })
+    link.start()
+    await link.initialize()
+    const error = await link.newSession({ cwd: '/tmp', mcpServers: [] }).then(() => null, (e: unknown) => e) as AgentLinkError
+    expect(error).toBeInstanceOf(AgentLinkError)
+    expect(error.code).toBe(AGY_LINK_ERROR.AGENT_REFUSED)
+    expect(error.message).not.toContain('诊断')
+    expect(error.cause).not.toBeInstanceOf(AgentLinkError)
+    await link.close()
+  })
+
+  it('调用方中止 session/new 时不附加诊断', async () => {
+    const pair = fakePair()
+    pumpAgent(pair, async (message, reply) => {
+      if (message.method === 'initialize') await reply({ jsonrpc: '2.0', id: message.id!, result: { protocolVersion: 1 } })
+    })
+    const link = new AgentLink({ stream: pair.stream, diagnostics: () => 'stderr tail' })
+    link.start()
+    await link.initialize()
+    const controller = new AbortController()
+    const pending = link.newSession({ cwd: '/tmp', mcpServers: [] }, { signal: controller.signal }).then(() => null, (e: unknown) => e)
+    controller.abort(new Error('user cancelled'))
+    const error = await pending as Error
+    expect(error).toBeInstanceOf(Error)
+    expect(error.message).not.toContain('诊断')
+    await link.close()
+  })
 })
 
 describe('AgentLink 关闭语义', () => {

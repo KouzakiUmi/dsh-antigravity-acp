@@ -228,6 +228,7 @@ onefile 临时展开使用用户级根目录内独立的 `runtime/instance-*`，
 | `AGY_BINARY_MISSING` | 无本地覆盖 / 有效缓存且关闭自动下载 | 开启 `autoDownload` 或指定可用 `binaryPath`。 |
 | 已有解压目录却缺少有效可执行文件，下载后仍重命名失败 | 同版本缓存损坏，当前不会自动删除并覆盖该目录 | 先确认相关进程已停止，再人工核对该版本缓存；也可使用明确指定的有效 `binaryPath`。不要在官方进程活跃时清理它。 |
 | `AGY_AUTH_TIMEOUT` | 需要浏览器授权但未在期限内完成，或上游认证失败 | 检查官方登录状态、浏览器和代理；日志不要附完整 OAuth URL。 |
+| `ACP 请求被拒绝 (session/new): Internal error` | 官方进程创建会话时失败；错误末尾「诊断：」附有脱敏的官方 stderr 尾部 | 按诊断内容处理。出现 `PermissionError` 且指向 `localharness_external` 时，确认使用的是插件管理的缓存（插件会补执行位）；若经 `binaryPath` / `AGY_ACP_BIN` 手动指定，需自行对同目录的 `localharness_external` 执行 `chmod 755`。 |
 | 连接已预热但目录为空 | 握手不等于已建会话 | 点击「连接 / 登录 ACP」或使用已登录 CLI 拉取目录；检查具体错误而不是反复发送聊天。 |
 | `AGY_INVALID_PROXY` / 代理相关失败（连接 Google 失败、换发或额度取数超时） | 代理格式、出口或宿主环境继承问题 | 非法地址不再阻断插件装载：直接在本插件设置卡片修正 `proxyUrl` 后重载 Host 即可。核对目标 Host 实际继承的环境；保存后已有 ACP 进程仍保留原启动环境。 |
 | `AGY_QUEUE_TIMEOUT` / `AGY_QUEUE_FULL` | worker 忙或保留工具回合，队列超时 / 已满 | 完成或取消旧工具审批；查看排队状态，按资源与账户限制调整并发。 |

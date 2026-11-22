@@ -100,6 +100,13 @@ export const ACP_DISTRIBUTIONS = {
   linux: { directory: 'linux', executable: 'agy_acp_server.par', defaultArgs: ['--uid='] },
 } as const
 
+/**
+ * 与主程序同目录、由主程序在 session/new 时拉起的 posix 辅助程序。
+ * 解压不还原 zip 中的 Unix 权限位，它落盘后是 0644，缺执行位时官方进程以
+ * `PermissionError: [Errno 13]` 失败，JSON-RPC 只回 `Internal error`（issue #3）。
+ */
+export const POSIX_HELPER_EXECUTABLES = ['localharness_external'] as const
+
 export function defaultAgentArgs(platform: NodeJS.Platform = process.platform): readonly string[] {
   return platform === 'linux' ? [...ACP_DISTRIBUTIONS.linux.defaultArgs] : []
 }
@@ -538,10 +545,19 @@ export function mapNodePlatform(platform: NodeJS.Platform, arch: string): { plat
   return { platform: mappedPlatform, arch: mappedArch }
 }
 
-/** posix 解压产物补执行位。 */
-export async function ensureExecutable(file: string, flavor: ExecutableFlavor): Promise<void> {
+/** posix 解压产物补执行位：主程序与同目录的辅助程序（存在且为普通文件时）。 */
+export async function ensureExecutable(
+  file: string,
+  flavor: ExecutableFlavor,
+  chmodImpl: (path: string, mode: number) => Promise<void> = chmod,
+): Promise<void> {
   if (flavor === 'posix') {
-    await chmod(file, 0o755)
+    await chmodImpl(file, 0o755)
+    for (const name of POSIX_HELPER_EXECUTABLES) {
+      const helper = join(dirname(file), name)
+      const info = await lstat(helper).catch(() => undefined)
+      if (info?.isFile()) await chmodImpl(helper, 0o755)
+    }
   } else {
     // windows 无需额外操作；存在性检查交给调用方。
     await access(file)

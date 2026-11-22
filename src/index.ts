@@ -346,6 +346,8 @@ async function startAcpRuntime(
         handshakeTimeoutMs: config.handshakeTimeoutMs ?? 120_000,
         // 认证需要人工在浏览器里点授权，走独立的更长超时（默认 5 分钟）。
         authTimeoutMs: config.authTimeoutMs,
+        // session/new 失败（如辅助程序缺执行位）只回 Internal error，附脱敏 stderr 尾部。
+        diagnostics: () => readStderr(handle) || undefined,
       })
       startupSignal.addEventListener('abort', cancelStartup, { once: true })
       link.start()

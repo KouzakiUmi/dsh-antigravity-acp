@@ -3,7 +3,7 @@
  * 临时文件失败清理。全部使用注入的 fake fetch / 真实临时目录，无网络。
  */
 import { describe, expect, it } from 'vitest'
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -14,6 +14,7 @@ import {
   downloadBinary,
   downloadBinaryToFile,
   ensureAgentBinary,
+  ensureExecutable,
   extractZipSafely,
   pickExecutablePath,
   validateZipEntryPath,
@@ -322,6 +323,64 @@ describe('解压守卫常量覆盖官方分发包实测体积', () => {
 })
 
 describe('ensureAgentBinary 临时文件清理', () => {
+  it('posix 下主程序与同目录 localharness_external 都补执行位（issue #3）', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'agy-exec-'))
+    try {
+      const main = join(dir, 'agy_acp_server.par')
+      await writeFile(main, 'main')
+      await writeFile(join(dir, 'localharness_external'), 'helper')
+      const calls: Array<[string, number]> = []
+      await ensureExecutable(main, 'posix', async (path, mode) => { calls.push([path, mode]) })
+      expect(calls).toEqual([[main, 0o755], [join(dir, 'localharness_external'), 0o755]])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('辅助程序缺失或不是普通文件时只处理主程序；windows 不改权限', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'agy-exec-'))
+    try {
+      const main = join(dir, 'agy_acp_server.par')
+      await writeFile(main, 'main')
+      const calls: string[] = []
+      const record = async (path: string): Promise<void> => { calls.push(path) }
+      await ensureExecutable(main, 'posix', record)
+      expect(calls).toEqual([main])
+      calls.length = 0
+      await mkdir(join(dir, 'localharness_external'))
+      await ensureExecutable(main, 'posix', record)
+      expect(calls).toEqual([main])
+      calls.length = 0
+      await ensureExecutable(main, 'windows', record)
+      expect(calls).toEqual([])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it.skipIf(process.platform === 'win32')('posix 整链下载后两个入口实际带执行位，旧缓存命中时补齐', async () => {
+    const cacheDir = await mkdtemp(join(tmpdir(), 'agy-exec-cache-'))
+    try {
+      const archive = zip([
+        { name: 'agy_acp_server.par', data: Buffer.from('main') },
+        { name: 'localharness_external', data: Buffer.from('helper') },
+      ])
+      const options = { cacheDir, version: '1.4.0', env: {}, fetchImpl: fakeFetch(200, Uint8Array.from(archive)) }
+      const first = await ensureAgentBinary(options)
+      const helper = join(first.executablePath, '..', 'localharness_external')
+      expect((await stat(first.executablePath)).mode & 0o111).toBe(0o111)
+      expect((await stat(helper)).mode & 0o111).toBe(0o111)
+      // 旧版本只给主程序补执行位：模拟遗留的 0644 辅助程序，缓存命中路径应修复它。
+      const { chmod } = await import('node:fs/promises')
+      await chmod(helper, 0o644)
+      const second = await ensureAgentBinary({ ...options, autoDownload: false })
+      expect(second.source).toBe('cache')
+      expect((await stat(helper)).mode & 0o111).toBe(0o111)
+    } finally {
+      await rm(cacheDir, { recursive: true, force: true })
+    }
+  })
+
   it('两个宿主并发下载同一版本时复用已提交产物，不删除另一个实例的文件', async () => {
     const cacheDir = await mkdtemp(join(tmpdir(), 'agy-concurrent-install-'))
     const executableName = process.platform === 'win32' ? 'agy_acp_server.exe' : 'agy_acp_server.par'
