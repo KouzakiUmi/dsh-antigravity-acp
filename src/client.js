@@ -166,15 +166,16 @@ window.__ModuleLoader__.load({
           ? t(account.runtime.error ?? account?.message ?? 'ACP 连接异常，请重试。')
           : registered === false ? t('请确认插件已启用，Host 与 Client 均已加载。')
             : startupHint(account) ?? t(account?.message ?? '连接后可读取模型目录，不发送聊天消息。')
-      return { label, description, ready, busy, error, color: error ? '#d97757' : ready ? '#25b879' : busy ? '#d99b28' : '#8b909a' }
+      return { label, description, ready, busy, error, color: error ? '#ef4444' : ready ? '#22c55e' : busy ? '#eab308' : '#94a3b8' }
     }
     function StatusDot({ color }) {
-      return h('span', { 'aria-hidden': true, style: { width: '8px', height: '8px', flex: '0 0 auto', borderRadius: '50%', background: color, boxShadow: '0 0 0 4px rgba(128,128,128,.10)' } })
+      return h('span', { 'aria-hidden': true, style: { width: '7px', height: '7px', flex: '0 0 auto', borderRadius: '50%', background: color } })
     }
     function StatusNotice({ status }) {
       if (!status) return null
       const error = status.kind === 'error'
-      return h('p', { role: error ? 'alert' : 'status', style: { margin: 0, padding: '10px 12px', borderRadius: '10px', borderLeft: '3px solid ' + (error ? '#e5534b' : status.kind === 'busy' ? '#d99b28' : '#25b879'), fontSize: '12px', lineHeight: 1.6, overflowWrap: 'anywhere', color: 'inherit', background: error ? 'rgba(217,119,87,.10)' : status.kind === 'busy' ? 'rgba(217,155,40,.10)' : 'rgba(37,184,121,.10)' } }, t(status.text))
+      const tone = error ? '#ef4444' : status.kind === 'busy' ? '#eab308' : '#22c55e'
+      return h('p', { role: error ? 'alert' : 'status', style: { margin: 0, padding: '8px 12px', borderRadius: '10px', border: '1px solid ' + tone + '47', fontSize: '12px', lineHeight: 1.5, overflowWrap: 'anywhere', color: error ? '#ef4444' : 'inherit', background: tone + '1a' } }, t(status.text))
     }
     function RuntimeDetails({ runtime }) {
       if (!runtime) return null
@@ -195,53 +196,64 @@ window.__ModuleLoader__.load({
         round?.firstChunkMs !== undefined ? row(t('发送 prompt → 首块'), duration(round.firstChunkMs)) : null,
         round?.firstToolMs !== undefined ? row(t('发送 prompt → 首个工具'), duration(round.firstToolMs)) : null,
         round?.continuations ? row(t('工具续轮'), t('{count} 次 · 最近 {last}', { count: round.continuations, last: duration(round.lastContinuationMs) })) : null,
-        runtime.error ? h('p', { role: 'alert', style: { margin: '4px 0 0', color: '#b42318', overflowWrap: 'anywhere' } }, t(runtime.error)) : null)
+        runtime.error ? h('p', { role: 'alert', style: { margin: '4px 0 0', color: '#ef4444', overflowWrap: 'anywhere' } }, t(runtime.error)) : null)
     }
     function SectionHeading({ eyebrow, title, description, action }) {
-      return h('div', { style: { display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '12px' } },
+      return h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', marginBottom: '8px', minHeight: '24px' } },
         h('div', { style: { flex: 1, minWidth: 0 } },
-          eyebrow ? h('div', { style: { fontSize: '10px', fontWeight: 650, letterSpacing: '.08em', opacity: .5, marginBottom: '3px' } }, eyebrow) : null,
-          h('h3', { style: { fontSize: '14px', lineHeight: 1.4, fontWeight: 650, margin: 0 } }, title),
-          description ? h('p', { style: { fontSize: '11px', lineHeight: 1.5, opacity: .6, margin: '3px 0 0' } }, description) : null),
+          eyebrow ? h('div', { style: { fontSize: '10px', fontWeight: 600, letterSpacing: '.06em', opacity: .55, marginBottom: '2px' } }, eyebrow) : null,
+          h('h3', { style: { fontSize: '12px', lineHeight: 1.4, fontWeight: 600, letterSpacing: '.01em', opacity: .72, margin: 0 } }, title),
+          description ? h('p', { style: { fontSize: '11.5px', lineHeight: 1.45, opacity: .62, margin: '2px 0 0' } }, description) : null),
         action ?? null)
     }
     function TextField({ field, value, disabled, invalid, onChange }) {
       const inputId = 'agy-setting-' + (React.useId?.() ?? field.key) + '-' + field.key
       return h('div', { style: { display: 'grid', gap: '4px', minWidth: 0 } },
-        h('label', { htmlFor: inputId, style: { fontSize: '12px', fontWeight: 550 } }, t(field.label)),
+        h('label', { htmlFor: inputId, style: { fontSize: '12.5px', fontWeight: 550 } }, t(field.label)),
         h(field.lines ? 'textarea' : 'input', {
           id: inputId, name: field.key, type: field.numeric ? 'number' : 'text',
           ...(field.numeric ? { min: field.min, max: field.max, step: 1 } : {}),
           ...(field.lines ? { rows: 2 } : {}),
           disabled, value: value ?? '', placeholder: t(field.placeholder),
           'aria-invalid': invalid || undefined, 'aria-describedby': field.hint ? inputId + '-hint' : undefined,
-          style: { ...ACTION, cursor: disabled ? 'not-allowed' : 'text', width: '100%', boxSizing: 'border-box', background: 'rgba(128,128,128,.035)', opacity: disabled ? .6 : 1 },
+          style: { ...ACTION, cursor: disabled ? 'not-allowed' : 'text', width: '100%', minHeight: '32px', boxSizing: 'border-box', background: 'transparent', opacity: disabled ? .55 : 1 },
           onChange: (event) => onChange(field.numeric && event.target.value !== '' ? Number(event.target.value) : event.target.value),
         }),
-        field.hint ? h('small', { id: inputId + '-hint', style: { fontSize: '10px', lineHeight: 1.45, opacity: .58 } }, t(field.hint)) : null)
+        field.hint ? h('small', { id: inputId + '-hint', style: { fontSize: '11px', lineHeight: 1.45, opacity: .6 } }, t(field.hint)) : null)
     }
     function SwitchField({ field, checked, disabled, onChange }) {
-      return h('label', { style: { display: 'flex', alignItems: 'flex-start', gap: '10px', cursor: disabled ? 'default' : 'pointer', padding: '2px 0', opacity: disabled ? .6 : 1 } },
-        h('input', { name: field.key, type: 'checkbox', checked: checked === true, disabled, onChange: (event) => onChange(event.target.checked), style: { width: '16px', height: '16px', flex: '0 0 auto', margin: '1px 0 0', accentColor: '#177c55', cursor: disabled ? 'not-allowed' : 'pointer' } }),
-        h('span', { style: { display: 'grid', gap: '2px', minWidth: 0 } },
-          h('span', { style: { fontSize: '12px', fontWeight: 550 } }, t(field.label)),
-          field.hint ? h('small', { style: { fontSize: '10px', lineHeight: 1.45, opacity: .6 } }, t(field.hint)) : null))
+      return h('label', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', cursor: disabled ? 'default' : 'pointer', padding: '4px 0', opacity: disabled ? .55 : 1 } },
+        h('span', { style: { display: 'grid', gap: '2px', minWidth: 0, flex: 1 } },
+          h('span', { style: { fontSize: '13px', fontWeight: 550 } }, t(field.label)),
+          field.hint ? h('small', { style: { fontSize: '11.5px', lineHeight: 1.45, opacity: .6 } }, t(field.hint)) : null),
+        h('input', { className: 'agy-switch', name: field.key, type: 'checkbox', checked: checked === true, disabled, style: { accentColor: '#3b82f6' }, onChange: (event) => onChange(event.target.checked) }))
     }
     function SettingsFields({ fields, draft, dirtyKeys, conflicts, disabled, editField }) {
       const numericGrid = fields.length > 1 && fields.every((field) => field.numeric)
-      return h('div', { style: { display: 'grid', gap: '12px', gridTemplateColumns: numericGrid ? 'repeat(auto-fit, minmax(180px, 1fr))' : undefined } }, ...fields.map((field) => {
+      return h('div', { style: { display: 'grid', gap: '10px', gridTemplateColumns: numericGrid ? 'repeat(auto-fit, minmax(180px, 1fr))' : undefined } }, ...fields.map((field) => {
         const onChange = (value) => editField(field.key, value)
         return field.checkbox
           ? h(SwitchField, { key: field.key, field, checked: draft[field.key], disabled, onChange })
           : h(TextField, { key: field.key, field, value: draft[field.key], disabled, invalid: dirtyKeys.includes(field.key) && field.numeric && !Number.isSafeInteger(draft[field.key]), onChange })
       }))
     }
+    function PlainConfigDisclosure({ labels }) {
+      const [open, setOpen] = React.useState(false)
+      return h('div', { className: 'agy-fold', role: 'group', 'aria-label': t('普通配置说明'), style: { border: '1px solid var(--agy-line)', borderRadius: '10px', background: 'color-mix(in srgb, currentColor 3%, transparent)', padding: '8px 12px', fontSize: '12px', lineHeight: 1.6 } },
+        h('button', { type: 'button', 'aria-expanded': open, onClick: () => setOpen((v) => !v), style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', width: '100%', padding: 0, border: 0, background: 'transparent', color: 'inherit', font: 'inherit', cursor: 'pointer', textAlign: 'left' } },
+          h('span', { style: { fontSize: '12.5px', fontWeight: 550 } }, (open ? '▾ ' : '▸ ') + t('普通配置（并发 / 二进制 / 超时）')),
+          h('small', { style: { fontSize: '11px', opacity: .58 } }, t('{count} 项', { count: labels.length }))),
+        h('div', { style: { display: open ? 'block' : 'none', marginTop: '10px', paddingTop: '10px', borderTop: '1px solid var(--agy-line)' } },
+          h('div', { style: { opacity: .75, fontSize: '11.5px' } }, t('这些不是即时配置：宿主只把即时字段投影到本卡片，也会拒绝在这里写入普通字段。请在插件的普通配置编辑器里修改，保存后由宿主重载生效。字段清单：')),
+          h('ul', { style: { margin: '6px 0 0', paddingLeft: '18px', opacity: .75, fontSize: '11.5px' } },
+            ...labels.map((label) => h('li', { key: label }, t(label))))))
+    }
     function SettingsGroup({ title, fields, fieldProps, open = false }) {
-      return h('details', { style: PANEL, 'aria-label': t('{title}设置', { title }), open: open || undefined },
+      return h('details', { className: 'agy-fold', style: { border: '1px solid var(--agy-line)', borderRadius: '10px', background: 'color-mix(in srgb, currentColor 3%, transparent)', padding: '8px 12px' }, 'aria-label': t('{title}设置', { title }), open: open || undefined },
         h('summary', { style: SUMMARY },
-          h('span', { style: { fontSize: '12px', fontWeight: 650 } }, title),
-          h('small', { style: { fontSize: '10px', opacity: .55 } }, t('{count} 项', { count: fields.length }))),
-        h('div', { style: { marginTop: '14px', paddingTop: '12px', borderTop: '1px solid rgba(128,128,128,.12)' } },
+          h('span', { style: { fontSize: '12.5px', fontWeight: 550 } }, title),
+          h('small', { style: { fontSize: '11px', opacity: .58 } }, t('{count} 项', { count: fields.length }))),
+        h('div', { style: { marginTop: '10px', paddingTop: '10px', borderTop: '1px solid var(--agy-line)' } },
           h(SettingsFields, { ...fieldProps, fields })))
     }
 
@@ -249,33 +261,35 @@ window.__ModuleLoader__.load({
     function ModelOverrideRow({ row, override, disabled, onEdit }) {
       const enabled = override.enabled !== false
       const inputId = 'agy-model-' + row.id.replace(/[^\w.-]/g, '_')
-      const labelStyle = { fontSize: '11px', opacity: .6 }
-      const inputStyle = { ...ACTION, width: '100%', minWidth: 0, boxSizing: 'border-box', background: 'rgba(128,128,128,.035)', cursor: disabled ? 'not-allowed' : 'text' }
+      const labelStyle = { fontSize: '11.5px', opacity: .66 }
+      const inputStyle = { ...ACTION, width: '100%', minWidth: 0, minHeight: '32px', boxSizing: 'border-box', background: 'transparent', cursor: disabled ? 'not-allowed' : 'text' }
       const displayName = override.name?.trim() || row.name
-      return h('div', { role: 'listitem', style: { padding: '9px 0', borderBottom: '1px solid rgba(128,128,128,.12)', opacity: enabled ? 1 : .58 } },
-        h('div', { style: { display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', alignItems: 'center', gap: '8px' } },
-          h('label', { title: displayName, style: { display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0, cursor: disabled ? 'default' : 'pointer' } },
-            h('input', { name: 'model-enabled-' + row.id, type: 'checkbox', checked: enabled, disabled,
-              onChange: (event) => onEdit(row.id, { enabled: event.target.checked }),
-              style: { width: '15px', height: '15px', flex: '0 0 auto', margin: 0, accentColor: '#177c55', cursor: disabled ? 'not-allowed' : 'pointer' } }),
-            h('span', { style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: '12px', fontWeight: 600 } }, displayName)),
-          h('label', { htmlFor: inputId + '-effort', style: { display: 'flex', alignItems: 'center', gap: '5px', fontSize: '11px' } },
-            h('span', { style: { opacity: .65 } }, t('思考')),
+      const toggleId = inputId + '-enabled'
+      return h('div', { role: 'listitem', style: { padding: '10px 14px', borderTop: '1px solid var(--agy-line)', opacity: enabled ? 1 : .54 } },
+        h('div', { style: { display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto auto', alignItems: 'center', gap: '10px' } },
+          h('label', { htmlFor: toggleId, title: displayName, style: { minWidth: 0, cursor: disabled ? 'default' : 'pointer' } },
+            h('div', { title: displayName, style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: '13px', fontWeight: 560 } }, displayName),
+            h('div', { style: { fontSize: '11px', opacity: .55, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, row.id)),
+          h('label', { htmlFor: inputId + '-effort', style: { display: 'flex', alignItems: 'center', gap: '5px', fontSize: '11.5px' } },
+            h('span', { style: { opacity: .62 } }, t('思考')),
             h('select', { id: inputId + '-effort', name: 'model-effort-' + row.id, disabled, value: EFFORT_IDS.has(override.effort) ? override.effort : '',
               'aria-label': t('{name} 默认思考档位', { name: displayName }),
               onChange: (event) => onEdit(row.id, { effort: event.target.value }),
-              style: { ...inputStyle, width: 'auto', minHeight: '29px', padding: '3px 7px', cursor: disabled ? 'not-allowed' : 'pointer' } },
-              ...EFFORT_OPTIONS.map((option) => h('option', { key: option.value, value: option.value }, t(option.label)))))),
-        h('details', { style: { marginLeft: '23px', marginTop: '5px' } },
-          h('summary', { style: { ...SUMMARY, justifyContent: 'flex-start', fontSize: '10px', opacity: .6 } }, t('模型设置')),
-          h('div', { style: { display: 'grid', gap: '10px', marginTop: '10px', padding: '10px', borderRadius: '8px', background: 'rgba(128,128,128,.04)' } },
+              style: { ...inputStyle, width: 'auto', minHeight: '26px', padding: '2px 7px', fontSize: '12px', colorScheme: 'inherit', cursor: disabled ? 'not-allowed' : 'pointer' } },
+              ...EFFORT_OPTIONS.map((option) => h('option', { key: option.value, value: option.value, style: { color: 'CanvasText', backgroundColor: 'Canvas' } }, t(option.label))))),
+          h('input', { id: toggleId, className: 'agy-switch', name: 'model-enabled-' + row.id, type: 'checkbox', checked: enabled, disabled,
+            'aria-label': displayName, style: { accentColor: '#3b82f6' },
+            onChange: (event) => onEdit(row.id, { enabled: event.target.checked }) })),
+        h('details', { style: { marginTop: '6px' } },
+          h('summary', { style: { ...SUMMARY, justifyContent: 'flex-start', fontSize: '11px', opacity: .62 } }, t('模型设置')),
+          h('div', { style: { display: 'grid', gap: '10px', marginTop: '8px', paddingLeft: '12px', borderLeft: '2px solid color-mix(in srgb, #3b82f6 55%, transparent)' } },
             h('div', { style: { display: 'grid', gap: '3px' } },
               h('span', { style: labelStyle }, t('模型 ID')),
-            h('code', { style: { fontSize: '10px', overflowWrap: 'anywhere', opacity: .75 } }, row.id),
-            row.inCatalog ? h('span', { style: labelStyle }, Number.isSafeInteger(row.contextWindow)
-              ? t('上下文窗口 {tokens} tokens（上游容量）', { tokens: row.contextWindow.toLocaleString() })
-              : t('上下文窗口：尚未观测')) : null,
-            Number.isSafeInteger(row.maxOutputTokens) ? h('span', { style: labelStyle }, t('输出上限 {tokens} tokens', { tokens: row.maxOutputTokens.toLocaleString() })) : null),
+              h('code', { style: { fontSize: '11px', overflowWrap: 'anywhere', opacity: .78 } }, row.id),
+              row.inCatalog ? h('span', { style: labelStyle }, Number.isSafeInteger(row.contextWindow)
+                ? t('上下文窗口 {tokens} tokens（上游容量）', { tokens: row.contextWindow.toLocaleString() })
+                : t('上下文窗口：尚未观测')) : null,
+              Number.isSafeInteger(row.maxOutputTokens) ? h('span', { style: labelStyle }, t('输出上限 {tokens} tokens', { tokens: row.maxOutputTokens.toLocaleString() })) : null),
             h('div', { style: { display: 'grid', gap: '10px', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))' } },
               h('div', { style: { display: 'grid', gap: '4px', minWidth: 0 } },
                 h('label', { htmlFor: inputId + '-name', style: labelStyle }, t('显示名')),
@@ -285,7 +299,7 @@ window.__ModuleLoader__.load({
                 h('label', { htmlFor: inputId + '-target', style: labelStyle }, t('官方模型 ID')),
                 h('input', { id: inputId + '-target', name: 'model-target-' + row.id, type: 'text', disabled, value: override.target ?? '',
                   placeholder: t('留空自动路由'), onChange: (event) => onEdit(row.id, { target: event.target.value }), style: inputStyle }))),
-            h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '4px 12px', fontSize: '10px', opacity: .6 } },
+            h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '4px 12px', fontSize: '11px', opacity: .62 } },
               h('span', null, t(row.inCatalog ? '当前目录' : '不在当前目录')),
               Array.isArray(row.inputModalities) && row.inputModalities.length
                 ? h('span', null, row.inputModalities.map((modality) => t(MODALITY_LABELS[modality] ?? modality)).join(' · ')) : null))))
@@ -322,7 +336,7 @@ window.__ModuleLoader__.load({
           ? h('p', { role: 'status', style: { margin: 0, fontSize: '11px', lineHeight: 1.5, color: '#946200' } }, t('全部隐藏后，Antigravity 将从模型选择器消失。'))
           : null,
         visible.length
-          ? h('div', { role: 'list', style: { display: 'grid' } }, ...visible.map((row) => h(ModelOverrideRow, {
+          ? h('div', { role: 'list', className: 'agy-list' }, ...visible.map((row) => h(ModelOverrideRow, {
             key: row.id, row, override: overrideFor(overrides, row.id), disabled, onEdit,
           })))
           : h('p', { role: 'status', style: { margin: 0, fontSize: '12px', opacity: .6 } }, t('没有符合条件的模型。')))
@@ -387,23 +401,23 @@ window.__ModuleLoader__.load({
       const phase = snapshot?.phase
       const stage = snapshot?.connectionStage
       const connecting = busy || stage === 'preparing' || stage === 'finishing' || phase === 'pending-login'
-      const dotColor = phase === 'signed-in' ? '#25b879' : connecting ? '#d99b28' : phase === 'login-failed' ? '#e5534b' : '#808080'
+      const dotColor = phase === 'signed-in' ? '#22c55e' : connecting ? '#eab308' : phase === 'login-failed' ? '#ef4444' : '#94a3b8'
       const phaseLabel = t(phase === 'signed-in' ? '代理账户已连接' : stage === 'finishing' ? '正在完成登录…' : stage === 'preparing' ? '正在检查登录态…' : phase === 'pending-login' ? '等待浏览器授权…' : phase === 'login-failed' ? '登录失败' : busy ? '正在连接…' : '未连接')
-      return h('div', { style: { display: 'grid', gap: '10px', padding: '12px', borderRadius: '10px', background: 'rgba(128,128,128,.045)' } },
-        h('div', { style: { display: 'flex', alignItems: 'flex-start', gap: '10px' } },
-          h(StatusDot, { color: dotColor }),
-          h('div', { style: { minWidth: 0 } },
-            h('div', { style: { fontSize: '12px', fontWeight: 650 } }, phaseLabel + (snapshot?.email ? ` (${snapshot.email})` : '') + (snapshot?.source === 'cli-import' ? t(' · 导入自官方 CLI') : '')),
-            h('p', { role: 'status', style: { fontSize: '12px', lineHeight: 1.6, opacity: .7, margin: '3px 0 0', overflowWrap: 'anywhere' } }, t(message || snapshot?.message || '')))),
+      return h('div', { style: { display: 'grid', gap: '12px' } },
+        h('div', { style: { display: 'flex', alignItems: 'center', gap: '12px', padding: '12px 14px', borderRadius: '12px', background: dotColor + '1a', border: '1px solid ' + dotColor + '47' } },
+          h('span', { 'aria-hidden': true, style: { width: '30px', height: '30px', borderRadius: '50%', background: dotColor, color: phase === 'pending-login' ? '#1f1300' : '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '14px', fontWeight: 700, flex: 'none' } }, phase === 'signed-in' ? '✓' : phase === 'login-failed' ? '×' : '!'),
+          h('div', { style: { minWidth: 0, flex: 1 } },
+            h('div', { style: { fontSize: '14px', fontWeight: 700, lineHeight: 1.25 } }, phaseLabel + (snapshot?.email ? ` (${snapshot.email})` : '') + (snapshot?.source === 'cli-import' ? t(' · 导入自官方 CLI') : '')),
+            h('p', { role: 'status', style: { fontSize: '11.5px', lineHeight: 1.45, opacity: .75, margin: '2px 0 0', overflowWrap: 'anywhere' } }, t(message || snapshot?.message || '')))),
         h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '8px' } },
           h('button', { type: 'button', style: phase === 'signed-in' ? ACTION : PRIMARY, disabled: disabled || connectDisabled || connecting || phase === 'signed-in', onClick: () => act('login') }, t(connecting ? '连接中…' : '连接代理账户')),
           connecting ? h('button', { type: 'button', style: ACTION, disabled, onClick: () => act('cancel') }, t('取消登录')) : null,
           phase === 'signed-in' ? h('button', { type: 'button', style: ACTION, disabled: disabled || busy, onClick: () => act('logout') }, t('退出登录')) : null),
         authUrl && stage !== 'finishing' ? h('div', { style: { display: 'grid', gap: '6px', justifyItems: 'start' } },
           h('a', { href: authUrl, target: '_blank', rel: 'noopener noreferrer', style: { ...PRIMARY, textDecoration: 'none', display: 'inline-flex', alignItems: 'center' } }, t('打开 Google 授权页')),
-          h('small', { style: { fontSize: '10px', opacity: .65, lineHeight: 1.5 } }, t('请在运行 DSH 的设备上完成授权（5 分钟内有效）。'))) : null,
-        phase === 'pending-login' && stage !== 'finishing' && !authUrl && !busy ? h('p', { role: 'status', style: { fontSize: '11px', margin: 0, opacity: .7 } }, t('授权页已打开；找不到时请取消后重试。')) : null,
-        h('p', { style: { opacity: .55, fontSize: '10px', lineHeight: 1.5, margin: 0 } }, t('生成与套餐额度使用此账户 · 无需 agy CLI · ACP 已停用')))
+          h('small', { style: { fontSize: '11px', opacity: .65, lineHeight: 1.5 } }, t('请在运行 DSH 的设备上完成授权（5 分钟内有效）。'))) : null,
+        phase === 'pending-login' && stage !== 'finishing' && !authUrl && !busy ? h('p', { role: 'status', style: { fontSize: '11.5px', margin: 0, opacity: .7 } }, t('授权页已打开；找不到时请取消后重试。')) : null,
+        h('p', { style: { opacity: .6, fontSize: '11.5px', lineHeight: 1.5, margin: 0 } }, t('生成与套餐额度使用此账户 · 无需 agy CLI · ACP 已停用')))
     }
 
     function AntigravitySettingsCard(props) {
@@ -688,87 +702,96 @@ window.__ModuleLoader__.load({
       const pageStyle = (id) => ({ display: settingsPage === id ? 'flex' : 'none', flexDirection: 'column', gap: '14px' })
       const pageButton = (id, label) => h('button', {
         type: 'button', role: 'tab', 'aria-selected': settingsPage === id, 'aria-controls': 'agy-settings-page-' + id,
+        className: 'agy-tab',
         onClick: () => setSettingsPage(id),
-        style: { ...ACTION, minHeight: '32px', padding: '5px 12px', fontWeight: settingsPage === id ? 650 : 450, borderColor: settingsPage === id ? '#177c55' : 'rgba(128,128,128,.22)', background: settingsPage === id ? 'rgba(23,124,85,.12)' : 'transparent' },
       }, label)
       const busy = ['connecting', 'cancelling'].includes(account?.state) || runtimeBusy(account?.runtime)
       const readonly = !loading && view && !writable
       const saveVisible = dirtyKeys.length > 0 || loading || readonly || conflicts.length > 0 || Boolean(status)
+      const modeColor = registered === false ? '#ef4444' : effectiveProxyMode ? '#eab308' : connection.color
 
-      return h('div', { className: 'antigravity-settings-card', style: { padding: '12px', display: 'flex', flexDirection: 'column', gap: '10px', maxWidth: '760px', boxSizing: 'border-box', lineHeight: 1.5 } },
+      return h('div', { className: 'antigravity-settings-card', style: { padding: '6px 2px 24px', display: 'flex', flexDirection: 'column', gap: '14px', maxWidth: '760px', margin: '0 auto', boxSizing: 'border-box', lineHeight: 1.5 } },
+        h('header', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', flexWrap: 'wrap' } },
+          h('div', { style: { display: 'flex', flexDirection: 'column', gap: '3px', minWidth: 0 } },
+            h('h2', { style: { margin: 0, fontSize: '20px', fontWeight: 700, lineHeight: 1.2, letterSpacing: '-.02em' } }, 'Antigravity ACP'),
+            h('div', { style: { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap', fontSize: '12px', opacity: .68 } },
+              h(StatusDot, { color: modeColor }),
+              h('span', null, t(registered === false ? '路由未注册' : effectiveProxyMode ? '代理模式' : 'ACP 模式')),
+              !effectiveProxyMode ? h('span', null, '· ' + connection.label) : null))),
         h('div', { role: 'region', 'aria-label': t('设置保存操作'), style: { position: 'sticky', top: 0, zIndex: 20, flexShrink: 0, margin: '-6px -6px 0', padding: '6px 0', display: saveVisible ? 'grid' : 'none', gap: '6px', background: 'var(--dsh-surface, Canvas)' } },
-          h('div', { style: { display: 'grid', gap: '6px', padding: '10px 12px', borderRadius: '12px', border: '1px solid rgba(128,128,128,.16)', background: 'rgba(128,128,128,.025)' } },
-          h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '7px', alignItems: 'center' } },
-            h('button', { type: 'button', onClick: save, disabled: editingDisabled || dirtyKeys.length === 0, style: { ...PRIMARY, minHeight: '30px', padding: '4px 10px' } }, t(saving ? '保存中…' : '保存')),
-            dirtyKeys.length ? h('button', { type: 'button', disabled: loading || saving, onClick: discardDraft, style: { ...ACTION, minHeight: '30px', padding: '4px 9px' } }, t('撤销')) : null,
-            h('span', { role: 'status', 'aria-live': 'polite', style: { fontSize: '11px', opacity: .7 } }, dirtyKeys.length ? t('{count} 项未保存', { count: dirtyKeys.length }) : loading ? t('正在读取…') : readonly ? t('只读设置') : ''),
-            h('button', { type: 'button', title: t('重新读取配置并保留草稿'), disabled: loading || saving, onClick: () => reload(), style: { ...ACTION, minHeight: '30px', padding: '4px 8px', borderColor: 'transparent', background: 'transparent', opacity: .7, marginLeft: 'auto' } }, t(loading ? '刷新中…' : '刷新'))),
-          conflicts.length ? h('p', { role: 'alert', style: { margin: 0, fontSize: '12px', lineHeight: 1.5 } }, t('以下内容已在其他位置更新，已保留你的输入：') + conflicts.map((key) => t(key === OVERRIDES_KEY ? OVERRIDES_LABEL : FIELDS.find((field) => field.key === key)?.label ?? key)).join(t('、'))) : null,
+          h('div', { style: { display: 'grid', gap: '6px', padding: '10px 14px', borderRadius: '12px', backdropFilter: 'blur(12px)', border: dirtyKeys.length ? '1px solid rgba(59,130,246,.35)' : '1px solid var(--agy-line)', background: dirtyKeys.length ? 'rgba(59,130,246,.12)' : 'color-mix(in srgb, currentColor 6%, transparent)' } },
+          h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '8px', alignItems: 'center' } },
+            h('button', { type: 'button', onClick: save, disabled: editingDisabled || dirtyKeys.length === 0, style: { ...PRIMARY, minHeight: '30px', padding: '4px 12px' } }, t(saving ? '保存中…' : '保存')),
+            dirtyKeys.length ? h('button', { type: 'button', disabled: loading || saving, onClick: discardDraft, style: { ...ACTION, minHeight: '30px', padding: '4px 10px' } }, t('撤销')) : null,
+            h('span', { role: 'status', 'aria-live': 'polite', style: { fontSize: '12px', opacity: .72 } }, dirtyKeys.length ? t('{count} 项未保存', { count: dirtyKeys.length }) : loading ? t('正在读取…') : readonly ? t('只读设置') : ''),
+            h('button', { type: 'button', title: t('重新读取配置并保留草稿'), disabled: loading || saving, onClick: () => reload(), style: { ...ACTION, minHeight: '30px', padding: '4px 9px', borderColor: 'transparent', background: 'transparent', opacity: .72, marginLeft: 'auto' } }, t(loading ? '刷新中…' : '刷新'))),
+          conflicts.length ? h('p', { role: 'alert', style: { margin: 0, fontSize: '12px', lineHeight: 1.5, color: 'var(--agy-warn-text, #ca8a04)' } }, t('以下内容已在其他位置更新，已保留你的输入：') + conflicts.map((key) => t(key === OVERRIDES_KEY ? OVERRIDES_LABEL : FIELDS.find((field) => field.key === key)?.label ?? key)).join(t('、'))) : null,
           h(StatusNotice, { status }))),
 
         connectionSettingsDirty ? h(StatusNotice, { status: { kind: 'busy', text: t('请先保存网络设置，再连接或登录。') } }) : null,
         proxyUnavailable ? h(StatusNotice, { status: { kind: 'error', text: t('代理路由未就绪，ACP 保持停用。请启用 Antigravity Proxy Router 组件。') } }) : null,
-        h('div', { role: 'tablist', 'aria-label': t('设置分页'), style: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '6px' } },
+        h('div', { role: 'tablist', 'aria-label': t('设置分页'), className: 'agy-tabs' },
           pageButton('connection', t('连接')),
           pageButton('models', t('模型')),
           pageButton('quota', t('额度')),
-          pageButton('advanced', t('高级')),
-          h('span', { style: { marginLeft: 'auto', padding: '3px 7px', borderRadius: '99px', fontSize: '10px', color: registered === false ? '#b42318' : effectiveProxyMode ? '#946200' : 'inherit', background: effectiveProxyMode ? 'rgba(217,159,4,.12)' : TRACK } }, t(registered === false ? '路由未注册' : effectiveProxyMode ? '代理模式' : 'ACP 模式'))),
+          pageButton('advanced', t('高级'))),
 
         h('div', { id: 'agy-settings-page-connection', role: 'tabpanel', style: pageStyle('connection') },
-          h('section', { style: PANEL, 'aria-label': t('运行模式') },
-            h(SettingsFields, { ...fieldProps, fields: fieldsFor('mode') }),
-            dirtyKeys.includes('proxyMode') ? h('p', { role: 'status', style: { margin: '8px 0 0', fontSize: '11px', color: '#946200' } }, t('保存后切换到{mode}', { mode: t(draft.proxyMode ? '代理模式' : 'ACP 模式') })) : null),
+          h('section', { 'aria-label': t('运行模式') },
+            h(SectionHeading, { title: t('运行模式') }),
+            h('div', { style: PANEL },
+              h(SettingsFields, { ...fieldProps, fields: fieldsFor('mode') }),
+              dirtyKeys.includes('proxyMode') ? h('p', { role: 'status', style: { margin: '8px 0 0', fontSize: '11.5px', color: 'var(--agy-warn-text, #ca8a04)' } }, t('保存后切换到{mode}', { mode: t(draft.proxyMode ? '代理模式' : 'ACP 模式') })) : null)),
           effectiveProxyMode
-            ? h('section', { style: PANEL, 'aria-label': t('代理账户') },
+            ? h('section', { 'aria-label': t('代理账户') },
               h(SectionHeading, { title: t('代理账户') }),
-              h(ProxyAccountPanel, { control: props.proxyControl, onAccountChanged: onProxyAccountChanged, disabled: !props.proxyControl || !view || !writable, connectDisabled: editingDisabled || connectionSettingsDirty }))
-            : h('section', { style: PANEL, 'aria-label': t('账户连接') },
+              h('div', { style: PANEL },
+                h(ProxyAccountPanel, { control: props.proxyControl, onAccountChanged: onProxyAccountChanged, disabled: !props.proxyControl || !view || !writable, connectDisabled: editingDisabled || connectionSettingsDirty })))
+            : h('section', { 'aria-label': t('账户连接') },
               h(SectionHeading, { title: t('ACP 账户与连接') }),
-              h('div', { style: { display: 'flex', alignItems: 'flex-start', gap: '10px', marginBottom: '12px' } },
-                h(StatusDot, { color: connection.color }),
-                h('div', { style: { minWidth: 0 } },
-                  h('div', { style: { fontSize: '12px', fontWeight: 650, color: connection.color } }, connection.label),
-                  h('p', { role: 'status', style: { fontSize: '11px', lineHeight: 1.5, opacity: .7, overflowWrap: 'anywhere', margin: '3px 0 0' } }, connection.description))),
-              h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '8px' } },
-                h('button', { type: 'button', style: PRIMARY, disabled: !props.control || busy || connectionSettingsDirty, onClick: () => accountAction('login') }, t(account?.state === 'connecting' ? '正在连接…' : '连接 / 登录 ACP')),
-                h('button', { type: 'button', style: ACTION, disabled: !props.control || busy || connection.ready || connectionSettingsDirty, onClick: () => accountAction('warmup') }, t(connection.ready ? '已预热' : '立即预热')),
-                ['connecting', 'cancelling'].includes(account?.state) ? h('button', { type: 'button', style: ACTION, disabled: account?.state === 'cancelling', onClick: () => accountAction('cancel') }, t(account?.state === 'cancelling' ? '正在取消…' : '取消连接')) : null))),
+              h('div', { style: PANEL },
+                h('div', { style: { display: 'flex', alignItems: 'center', gap: '12px', padding: '12px 14px', borderRadius: '12px', background: connection.color + '1a', border: '1px solid ' + connection.color + '47', marginBottom: '12px' } },
+                  h('span', { 'aria-hidden': true, style: { width: '30px', height: '30px', borderRadius: '50%', background: connection.color, color: connection.busy ? '#1f1300' : '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '14px', fontWeight: 700, flex: 'none' } }, connection.ready ? '✓' : connection.error ? '×' : '!'),
+                  h('div', { style: { minWidth: 0, flex: 1 } },
+                    h('div', { style: { fontSize: '14px', fontWeight: 700, lineHeight: 1.25 } }, connection.label),
+                    h('p', { role: 'status', style: { fontSize: '11.5px', lineHeight: 1.45, opacity: .75, overflowWrap: 'anywhere', margin: '2px 0 0' } }, connection.description))),
+                h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '8px' } },
+                  h('button', { type: 'button', style: PRIMARY, disabled: !props.control || busy || connectionSettingsDirty, onClick: () => accountAction('login') }, t(account?.state === 'connecting' ? '正在连接…' : '连接 / 登录 ACP')),
+                  h('button', { type: 'button', style: ACTION, disabled: !props.control || busy || connection.ready || connectionSettingsDirty, onClick: () => accountAction('warmup') }, t(connection.ready ? '已预热' : '立即预热')),
+                  ['connecting', 'cancelling'].includes(account?.state) ? h('button', { type: 'button', style: ACTION, disabled: account?.state === 'cancelling', onClick: () => accountAction('cancel') }, t(account?.state === 'cancelling' ? '正在取消…' : '取消连接')) : null)))),
 
         h('div', { id: 'agy-settings-page-models', role: 'tabpanel', style: pageStyle('models') },
-          h('section', { style: PANEL, 'aria-label': t('模型列表') },
+          h('section', { 'aria-label': t('模型列表') },
             h(SectionHeading, { title: t('模型'),
-              action: h('button', { type: 'button', title: t('刷新模型目录'), 'aria-label': t('刷新模型目录'), 'aria-busy': modelBusy || undefined, style: { ...ACTION, flex: '0 0 auto', whiteSpace: 'nowrap' }, disabled: modelBusy || !props.control, onClick: () => pullModels(true) }, t(modelBusy ? '正在刷新…' : '刷新')) }),
+              action: h('button', { type: 'button', title: t('刷新模型目录'), 'aria-label': t('刷新模型目录'), 'aria-busy': modelBusy || undefined, style: { ...ACTION, minHeight: '26px', padding: '3px 10px', flex: '0 0 auto', whiteSpace: 'nowrap' }, disabled: modelBusy || !props.control, onClick: () => pullModels(true) }, t(modelBusy ? '正在刷新…' : '刷新')) }),
             h(ModelOverrideList, { rows, overrides: draft[OVERRIDES_KEY], disabled: editingDisabled, onEdit: editOverride }),
-            modelMessage ? h('p', { role: 'status', style: { fontSize: '11px', lineHeight: 1.5, opacity: .65, margin: 0, overflowWrap: 'anywhere' } }, t(modelMessage)) : null)),
+            modelMessage ? h('p', { role: 'status', style: { fontSize: '11.5px', lineHeight: 1.5, opacity: .66, margin: '6px 0 0', overflowWrap: 'anywhere' } }, t(modelMessage)) : null)),
 
         h('div', { id: 'agy-settings-page-quota', role: 'tabpanel', style: pageStyle('quota') },
           h(SettingsQuotaPanel, { readQuota: props.readQuota, source: effectiveProxyMode ? PROXY_PROVIDER : PROVIDER,
             accountRevision: effectiveProxyMode ? previousProxyAccount.current?.revision : undefined,
             cliQuotaOn: (dirtyKeys.includes('cliQuotaEnabled') ? baseline.current.cliQuotaEnabled : draft.cliQuotaEnabled) === true,
             cliQuotaDirty: dirtyKeys.includes('cliQuotaEnabled') }),
-          h('section', { style: PANEL, 'aria-label': t('额度取数方式') },
+          h('section', { 'aria-label': t('额度取数方式') },
             h(SectionHeading, { title: t('CLI 额度（可选）') }),
-            h(SettingsFields, { ...fieldProps, fields: fieldsFor('quota') }))),
+            h('div', { style: PANEL },
+              h(SettingsFields, { ...fieldProps, fields: fieldsFor('quota') })))),
 
         h('div', { id: 'agy-settings-page-advanced', role: 'tabpanel', style: pageStyle('advanced') },
-          !effectiveProxyMode ? h('section', { style: PANEL, 'aria-label': t('常用设置') },
+          !effectiveProxyMode ? h('section', { 'aria-label': t('常用设置') },
             h(SectionHeading, { title: t('会话偏好') }),
-            h(SettingsFields, { ...fieldProps, fields: fieldsFor('general') })) : null,
+            h('div', { style: PANEL },
+              h(SettingsFields, { ...fieldProps, fields: fieldsFor('general') }))) : null,
           h(SettingsGroup, { title: t('网络与 CLI'), fields: fieldsFor('network'), fieldProps, open: effectiveProxyMode }),
           !effectiveProxyMode ? h(SettingsGroup, { title: t('会话与进程'), fields: fieldsFor('advanced'), fieldProps }) : null,
-          !effectiveProxyMode ? h('div', { style: { ...PANEL, padding: '12px 14px', fontSize: '11px', lineHeight: 1.6 }, 'aria-label': t('普通配置说明') },
-            h('strong', { style: { display: 'block', fontSize: '13px', marginBottom: '4px' } }, t('普通配置（并发 / 二进制 / 超时）')),
-            h('div', { style: { opacity: .75 } }, t('这些不是即时配置：宿主只把即时字段投影到本卡片，也会拒绝在这里写入普通字段。请在插件的普通配置编辑器里修改，保存后由宿主重载生效。字段清单：')),
-            h('ul', { style: { margin: '5px 0 0', paddingLeft: '18px', opacity: .75 } },
-              ...PLAIN_FIELD_LABELS.map((label) => h('li', { key: label }, t(label))))) : null,
-          !effectiveProxyMode ? h('details', { style: PANEL, 'aria-label': t('连接诊断') },
+          !effectiveProxyMode ? h(PlainConfigDisclosure, { labels: PLAIN_FIELD_LABELS }) : null,
+          !effectiveProxyMode ? h('details', { className: 'agy-fold', style: { border: '1px solid var(--agy-line)', borderRadius: '10px', background: 'color-mix(in srgb, currentColor 3%, transparent)', padding: '8px 12px' }, 'aria-label': t('连接诊断') },
             h('summary', { style: SUMMARY },
               h('span', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
                 h(StatusDot, { color: connection.color }),
-                h('span', { style: { fontSize: '13px', fontWeight: 650 } }, t('连接诊断'))),
-              h('small', { style: { fontSize: '11px', opacity: .6 } }, t('状态、并发与耗时'))),
-            h('div', { style: { marginTop: '16px', paddingTop: '14px', borderTop: '1px solid rgba(128,128,128,.14)' } },
+                h('span', { style: { fontSize: '12.5px', fontWeight: 550 } }, t('连接诊断'))),
+              h('small', { style: { fontSize: '11px', opacity: .58 } }, t('状态、并发与耗时'))),
+            h('div', { style: { marginTop: '10px', paddingTop: '10px', borderTop: '1px solid var(--agy-line)' } },
               account?.runtime ? RuntimeDetails({ runtime: account.runtime }) : h('p', { style: { margin: 0, fontSize: '12px', opacity: .6 } }, t('连接后显示运行详情。')))) : null))
     }
 
@@ -779,12 +802,12 @@ window.__ModuleLoader__.load({
      */
     const PILL_ID = 'antigravity-quota'
 
-    const TRACK = 'rgba(128,128,128,.18)'
-    const CARD = { padding: '12px', borderRadius: '12px', border: '1px solid rgba(128,128,128,.18)', background: 'rgba(128,128,128,.05)' }
-    const PANEL = { padding: '14px', borderRadius: '12px', border: '1px solid rgba(128,128,128,.16)', background: 'rgba(128,128,128,.025)' }
+    const TRACK = 'rgba(128,128,128,.22)'
+    const CARD = { padding: '10px 12px', borderRadius: '10px', background: 'rgba(128,128,128,.07)' }
+    const PANEL = { padding: '12px 14px', borderRadius: '12px', border: '1px solid color-mix(in srgb, currentColor 12%, transparent)', background: 'color-mix(in srgb, currentColor 4%, transparent)' }
     const SUMMARY = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', cursor: 'pointer', listStyle: 'none' }
-    const ACTION = { padding: '7px 12px', minHeight: '34px', borderRadius: '8px', border: '1px solid rgba(128,128,128,.22)', background: 'rgba(128,128,128,.06)', color: 'inherit', font: 'inherit', fontSize: '12px', cursor: 'pointer' }
-    const PRIMARY = { ...ACTION, background: '#177c55', border: '1px solid #177c55', color: '#fff', fontWeight: 600 }
+    const ACTION = { padding: '4px 12px', minHeight: '30px', borderRadius: '8px', border: '1px solid color-mix(in srgb, currentColor 20%, transparent)', background: 'transparent', color: 'inherit', font: 'inherit', fontSize: '12.5px', fontWeight: 500, cursor: 'pointer' }
+    const PRIMARY = { ...ACTION, background: '#3b82f6', border: '1px solid #3b82f6', color: '#fff', fontWeight: 500 }
     const GROUPS = [{ key: 'gemini', name: 'Gemini' }, { key: 'claude', name: 'Claude / GPT' }, { key: 'argon', name: 'Gemini 4 Argon' }]
     function groupKey(name) {
       const text = String(name ?? '').toLowerCase()
@@ -810,10 +833,11 @@ window.__ModuleLoader__.load({
     }
     function tone(bucket, stale) {
       const value = percentage(bucket)
-      if (bucket?.disabled || value === undefined) return '#8b909a'
+      if (bucket?.disabled || value === undefined) return '#94a3b8'
       if (value <= 10) return '#ef4444'
-      if (value <= 25 || stale) return '#d99b28'
-      return '#25b879'
+      if (value <= 25) return '#f97316'
+      if (value <= 50 || stale) return '#eab308'
+      return '#22c55e'
     }
     function windowName(bucket) {
       return t(({ '5h': '5 小时', weekly: '每周', '7d': '每周' })[bucket.window] ?? bucket.window ?? bucket.name ?? '额度窗口')
@@ -891,62 +915,70 @@ window.__ModuleLoader__.load({
       if (credits?.error?.code === 'cli-disabled') return null
       const valid = credits?.status === 'ok' && Number.isSafeInteger(credits.remainingCredits) && credits.remainingCredits >= 0
       const label = valid ? credits.remainingCredits.toLocaleString() : t(pending ? '正在读取…' : credits?.status === 'error' ? '查询失败' : '未提供')
-      return h('section', { style: { padding: '9px 0', borderTop: '1px solid rgba(128,128,128,.16)' }, 'aria-label': t('AI Credits 余额') },
+      return h('section', { style: { padding: '9px 0', borderTop: '1px solid color-mix(in srgb, currentColor 12%, transparent)' }, 'aria-label': t('AI Credits 余额') },
         h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: '12px' } },
           h('strong', { style: { fontSize: '12px' } }, 'AI Credits'),
-          h('strong', { style: { fontSize: valid ? '17px' : '12px', fontVariantNumeric: 'tabular-nums', color: credits?.stale ? '#d99b28' : 'inherit' } }, label)),
-        credits?.planName || credits?.updatedAt ? h('div', { style: { display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', gap: '3px 10px', fontSize: '10px', opacity: .55, marginTop: '3px' } },
+          h('strong', { style: { fontSize: valid ? '17px' : '12px', fontVariantNumeric: 'tabular-nums', color: credits?.stale ? 'var(--agy-warn-text, #ca8a04)' : 'inherit' } }, label)),
+        credits?.planName || credits?.updatedAt ? h('div', { style: { display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', gap: '3px 10px', fontSize: '10.5px', opacity: .6, marginTop: '3px' } },
           credits?.planName ? h('span', null, credits.planName) : null,
           credits?.updatedAt ? h('span', null, t(valid ? '余额更新于 {time}' : '最近查询 {time}', { time: new Date(credits.updatedAt).toLocaleString() })) : null) : null,
-        credits?.stale ? h('p', { role: 'status', style: { margin: '4px 0 0', fontSize: '10px', color: '#d99b28' } }, t('余额缓存 · {reason}', { reason: t(credits.staleReason ?? '余额刷新失败') })) : null,
-        credits?.error?.message ? h('p', { role: credits.status === 'error' ? 'alert' : 'status', style: { margin: '4px 0 0', fontSize: '10px', overflowWrap: 'anywhere' } }, t(credits.error.message)) : null)
+        credits?.stale ? h('p', { role: 'status', style: { margin: '4px 0 0', fontSize: '10.5px', color: 'var(--agy-warn-text, #ca8a04)' } }, t('余额缓存 · {reason}', { reason: t(credits.staleReason ?? '余额刷新失败') })) : null,
+        credits?.error?.message ? h('p', { role: credits.status === 'error' ? 'alert' : 'status', style: { margin: '4px 0 0', fontSize: '10.5px', overflowWrap: 'anywhere' } }, t(credits.error.message)) : null)
     }
     function SettingsQuotaPanel({ readQuota, source, accountRevision, cliQuotaOn, cliQuotaDirty }) {
       const { data, refreshing, load } = useQuota(readQuota, true, source, undefined, accountRevision)
-      return h('section', { style: PANEL, 'aria-label': t('套餐额度查询') },
+      return h('section', { 'aria-label': t('套餐额度查询') },
         h(SectionHeading, { title: t('套餐额度'), description: t(source === PROXY_PROVIDER ? '代理账户' : 'ACP 账户') + (cliQuotaDirty ? t(' · CLI 开关未保存') : cliQuotaOn ? t(' · CLI 补充取数') : ''),
-          action: h('button', { type: 'button', style: ACTION, disabled: !readQuota || refreshing, 'aria-busy': refreshing || undefined, onClick: () => load(true) }, t(refreshing ? '正在拉取…' : '拉取额度')) }),
-        data && (data.error?.code !== 'not-fetched' || data.credits?.status === 'ok') ? QuotaDetails({ data, refreshing, source }) : h('p', { role: 'status', style: { margin: 0, fontSize: '12px', lineHeight: 1.5, opacity: .65 } }, t(refreshing ? '正在拉取…' : '暂无额度快照')))
+          action: h('button', { type: 'button', style: { ...ACTION, minHeight: '26px', padding: '3px 10px' }, disabled: !readQuota || refreshing, 'aria-busy': refreshing || undefined, onClick: () => load(true) }, t(refreshing ? '正在拉取…' : '拉取额度')) }),
+        h('div', { style: PANEL },
+          data && (data.error?.code !== 'not-fetched' || data.credits?.status === 'ok') ? QuotaDetails({ data, refreshing, source }) : h('p', { role: 'status', style: { margin: 0, fontSize: '12px', lineHeight: 1.5, opacity: .65 } }, t(refreshing ? '正在拉取…' : '暂无额度快照'))))
     }
     function QuotaDetails({ data, refreshing, load, model, source, onClose }) {
+      const groups = quotaGroups(data)
+      const allBuckets = groups.flatMap((g) => g.buckets ?? [])
+      const worstPill = quotaPillStatus(data, allBuckets)
+      const bannerColor = data?.status === 'error' ? (data.error?.code === 'not-fetched' ? '#94a3b8' : '#ef4444') : data?.stale ? '#eab308' : worstPill.color
+      const headerStyle = onClose
+        ? { position: 'sticky', top: -14, zIndex: 2, margin: '-14px -14px 0', padding: '14px 14px 8px', background: 'var(--dsh-surface, var(--dsw-alias-bg-layer-1, Canvas))', display: 'flex', gap: '8px', alignItems: 'center', borderBottom: '1px solid color-mix(in srgb, currentColor 12%, transparent)' }
+        : { display: 'flex', gap: '8px', alignItems: 'center', paddingBottom: '10px', borderBottom: '1px solid color-mix(in srgb, currentColor 12%, transparent)' }
       return h('div', { style: { display: 'grid', gap: 0 } },
-        h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', paddingBottom: '9px', borderBottom: '1px solid rgba(128,128,128,.16)' } },
+        h('div', { style: headerStyle },
           h('strong', { style: { fontSize: '14px', flex: 1 } }, t('Antigravity · 套餐额度')),
-          data?.plan ? h('span', { style: { fontSize: '11px', padding: '2px 8px', background: TRACK, borderRadius: '99px' } }, data.plan) : null,
-          onClose ? h('button', { type: 'button', 'aria-label': t('关闭额度详情'), onClick: onClose, style: { ...ACTION, padding: '2px 7px', minHeight: '26px', borderColor: 'transparent' } }, '×') : null),
-        data?.stale ? h('p', { role: 'status', style: { margin: '8px 0', padding: '6px 8px', borderRadius: '7px', background: 'rgba(217,155,40,.10)', color: '#d99b28', fontSize: '11px' } }, t('缓存数据 · {reason}', { reason: t(data.staleReason ?? '刷新失败') })) : null,
-         data?.status === 'error' ? h('p', { role: data.error?.code === 'not-fetched' ? 'status' : 'alert', style: { margin: '8px 0', color: data.error?.code === 'not-fetched' ? '#8b909a' : '#ef4444', fontSize: '11px', overflowWrap: 'anywhere' } }, t(data.error?.message ?? data.error?.text ?? '额度读取失败')) : null,
-        ...quotaGroups(data).map((group) => h('section', { key: group.key, style: { padding: '9px 0', borderBottom: '1px solid rgba(128,128,128,.14)' }, 'aria-label': t('{name}额度', { name: group.name }) },
+          data?.plan ? h('span', { style: { fontSize: '11px', padding: '2px 8px', background: 'rgba(128,128,128,.12)', borderRadius: '99px' } }, data.plan) : null,
+          onClose ? h('button', { type: 'button', 'aria-label': t('关闭额度详情'), onClick: onClose, style: { ...ACTION, padding: '2px 7px', minHeight: '26px', minWidth: '26px', borderColor: 'transparent' } }, '×') : null),
+        data?.stale ? h('p', { role: 'status', style: { margin: '8px 0 0', padding: '8px 10px', borderRadius: '10px', background: 'rgba(234,179,8,.10)', border: '1px solid rgba(234,179,8,.28)', color: 'var(--agy-warn-text, #ca8a04)', fontSize: '11.5px' } }, t('缓存数据 · {reason}', { reason: t(data.staleReason ?? '刷新失败') })) : null,
+        data?.status === 'error' ? h('p', { role: data.error?.code === 'not-fetched' ? 'status' : 'alert', style: { margin: '8px 0 0', padding: '8px 10px', borderRadius: '10px', background: bannerColor + '1a', border: '1px solid ' + bannerColor + '47', color: data.error?.code === 'not-fetched' ? 'inherit' : '#ef4444', fontSize: '11.5px', overflowWrap: 'anywhere' } }, t(data.error?.message ?? data.error?.text ?? '额度读取失败')) : null,
+        ...groups.map((group) => h('section', { key: group.key, style: { padding: '9px 0', borderBottom: '1px solid color-mix(in srgb, currentColor 12%, transparent)' }, 'aria-label': t('{name}额度', { name: group.name }) },
           h('div', { style: { display: 'flex', alignItems: 'center', gap: '7px', marginBottom: '7px' } },
             h('strong', { style: { fontSize: '12px' } }, group.name),
-            group.key === modelGroup(model) ? h('span', { style: { fontSize: '9px', padding: '1px 5px', borderRadius: '5px', color: '#25b879', background: 'rgba(37,184,121,.12)' } }, t('当前模型')) : null),
-          group.buckets.length ? h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', gap: '9px 12px' } }, ...group.buckets.map((bucket, index) => {
+            group.key === modelGroup(model) ? h('span', { style: { fontSize: '10px', padding: '1px 6px', borderRadius: '99px', color: '#22c55e', background: 'rgba(34,197,94,.12)', fontWeight: 560 } }, t('当前模型')) : null),
+          group.buckets.length ? h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', gap: '8px' } }, ...group.buckets.map((bucket, index) => {
             const pct = percentage(bucket)
-            return h('div', { key: index, style: { minWidth: 0 } },
-              h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: '8px', marginBottom: '4px' } },
-                h('span', { style: { fontSize: '11px', opacity: .7 } }, windowName(bucket)),
-                h('strong', { style: { fontSize: bucket.disabled ? '12px' : '15px', fontVariantNumeric: 'tabular-nums' } }, bucket.disabled ? t('已停用') : pct === undefined ? t('未知') : Math.round(pct) + '%')),
+            return h('div', { key: index, style: CARD },
+              h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: '6px', marginBottom: '4px' } },
+                h('span', { style: { fontSize: '11.5px', fontWeight: 600 } }, windowName(bucket)),
+                h('strong', { style: { fontSize: bucket.disabled ? '12px' : '16px', fontVariantNumeric: 'tabular-nums' } }, bucket.disabled ? t('已停用') : pct === undefined ? t('未知') : Math.round(pct) + '%')),
               remainingBar(bucket, false, data?.stale, t('{name} {window}剩余额度', { name: group.name, window: windowName(bucket) })),
-              h('div', { title: bucket.disabled ? bucket.description : bucket.resetTime, style: { display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden', fontSize: '10px', lineHeight: 1.35, opacity: .58, marginTop: '4px' } }, bucket.disabled ? t(bucket.description ?? '此窗口不可用') : resetCountdown(bucket.resetTime)))
+              h('div', { title: bucket.disabled ? bucket.description : bucket.resetTime, style: { display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden', fontSize: '10.5px', lineHeight: 1.35, opacity: .62, marginTop: '5px' } }, bucket.disabled ? t(bucket.description ?? '此窗口不可用') : resetCountdown(bucket.resetTime)))
           })) : h('span', { style: { opacity: .55, fontSize: '11px' } }, t(data ? '未提供额度数据' : '正在读取…')))),
         CreditsDetails({ credits: data?.credits, pending: !data }),
-        h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', paddingTop: '8px' } },
-           h('small', { style: { flex: 1, opacity: .5, minWidth: 0, fontSize: '10px' } }, data?.status === 'ok' && data.updatedAt ? t('更新于 {time}', { time: new Date(data.updatedAt).toLocaleString() }) : t('尚无成功快照')),
-          load ? h('button', { type: 'button', disabled: refreshing, onClick: () => load(true), style: { ...ACTION, minHeight: '27px', padding: '3px 9px', fontSize: '11px' } }, t(refreshing ? '刷新中…' : '刷新额度')) : null))
+        h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', paddingTop: '10px' } },
+          h('small', { style: { flex: 1, opacity: .55, minWidth: 0, fontSize: '11px' } }, data?.status === 'ok' && data.updatedAt ? t('更新于 {time}', { time: new Date(data.updatedAt).toLocaleString() }) : t('尚无成功快照')),
+          load ? h('button', { type: 'button', disabled: refreshing, onClick: () => load(true), style: { padding: '4px 12px', borderRadius: '8px', border: 'none', background: 'rgba(59,130,246,.14)', color: '#3b82f6', font: 'inherit', fontSize: '12px', fontWeight: 500, cursor: 'pointer' } }, t(refreshing ? '刷新中…' : '刷新额度')) : null))
     }
     /** 紧凑余量条与单词状态的交互参考 dsh-subusage；取数仍由本插件负责。 */
     function quotaPillStatus(data, buckets) {
-      if (!data) return { short: '', icon: '…', color: '#8b909a' }
-      if (data.error?.code === 'not-fetched') return { short: t('暂无'), icon: '?', color: '#8b909a' }
-      if (data.status === 'error') return { short: t('失败'), icon: '!', color: '#e5534b', tint: true }
-      if (data.stale) return { short: t('缓存'), icon: '!', color: '#d99b28', tint: true }
+      if (!data) return { short: '', icon: '…', color: '#94a3b8' }
+      if (data.error?.code === 'not-fetched') return { short: t('暂无'), icon: '?', color: '#94a3b8' }
+      if (data.status === 'error') return { short: t('失败'), icon: '!', color: '#ef4444', tint: true }
+      if (data.stale) return { short: t('缓存'), icon: '!', color: '#eab308', tint: true }
       const usable = buckets.filter(bucket => !bucket.disabled && percentage(bucket) !== undefined)
-      if (!usable.length) return { short: t(buckets.some(bucket => bucket.disabled) ? '受限' : '未知'), icon: '?', color: '#8b909a' }
+      if (!usable.length) return { short: t(buckets.some(bucket => bucket.disabled) ? '受限' : '未知'), icon: '?', color: '#94a3b8' }
       const minimum = Math.min(...usable.map(percentage))
-      if (minimum === 0) return { short: t('已用尽'), color: '#e5534b', tint: true }
-      if (minimum <= 10) return { short: t('紧张'), color: '#e5534b', tint: true }
-      if (minimum <= 25) return { short: t('偏少'), color: '#d99b28', tint: true }
-      return { short: '', color: '#25b879' }
+      if (minimum === 0) return { short: t('已用尽'), color: '#ef4444', tint: true }
+      if (minimum <= 10) return { short: t('紧张'), color: '#ef4444', tint: true }
+      if (minimum <= 25) return { short: t('偏少'), color: '#f97316', tint: true }
+      return { short: '', color: '#22c55e' }
     }
     function AgYQuotaPill({ store, readQuota, proxyControl }) {
       const state = React.useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot)
@@ -1025,7 +1057,7 @@ window.__ModuleLoader__.load({
           miniBuckets.length ? h('span', { style: { display: 'grid', gap: miniBuckets.length <= 2 ? '3px' : '2px', opacity: quota.data?.stale ? .5 : 1 } }, ...miniBuckets.map((b, i) => h('span', { key: i }, remainingBar(b, true, quota.data?.stale, t('{name} {window}剩余额度', { name: group.name, window: windowName(b) }), miniHeight))))
             : h('span', { 'aria-hidden': true, style: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: '16px', height: '16px', borderRadius: '50%', background: pillStatus.color, color: '#fff', fontSize: '11px' } }, pillStatus.icon),
           pillStatus.short ? h('span', null, pillStatus.short) : null),
-        expanded ? h('div', { role: 'dialog', 'aria-label': t('Antigravity 额度详情'), style: { position: 'absolute', bottom: 'calc(100% + 8px)', right: 0, zIndex: 50, width: 'min(340px, calc(100vw - 24px))', maxHeight: 'min(70vh, calc(100vh - 72px))', overflowY: 'auto', boxSizing: 'border-box', overflowWrap: 'anywhere', padding: '12px', borderRadius: '12px', background: 'var(--dsh-surface, Canvas)', color: 'var(--dsh-text, CanvasText)', border: '1px solid rgba(128,128,128,.28)', boxShadow: '0 12px 32px rgba(0,0,0,.28)', fontSize: '12px', ...position } },
+        expanded ? h('div', { className: 'antigravity-quota-popover', role: 'dialog', 'aria-label': t('Antigravity 额度详情'), style: { position: 'absolute', bottom: 'calc(100% + 6px)', right: 0, zIndex: 50, width: 'min(340px, calc(100vw - 24px))', maxHeight: 'min(70vh, calc(100vh - 72px))', overflowY: 'auto', boxSizing: 'border-box', overflowWrap: 'anywhere', padding: '14px', borderRadius: '14px', background: 'var(--dsh-surface, var(--dsw-alias-bg-layer-1, Canvas))', color: 'var(--dsh-text, var(--dsw-alias-label-primary, CanvasText))', border: '1px solid rgba(128,128,128,.28)', boxShadow: '0 12px 32px rgba(0,0,0,.28)', font: '12px/1.5 sans-serif', ...position } },
           QuotaDetails({ ...quota, model, source: state?.current?.provider, onClose: () => { setExpanded(false); button.current?.focus?.() } })) : null)
     }
 
@@ -1252,7 +1284,30 @@ window.__ModuleLoader__.load({
         ctx.effect(() => {
           if (typeof document === 'undefined' || !document.head || !document.createElement) return () => {}
           const style = document.createElement('style')
-          style.textContent = '.antigravity-usage-pill>button:hover{filter:brightness(1.08)}.antigravity-usage-pill button:focus-visible,.antigravity-settings-card button:focus-visible,.antigravity-settings-card a:focus-visible{outline:2px solid #4a90e2;outline-offset:3px}.antigravity-settings-card button:disabled{cursor:not-allowed;opacity:.55}'
+          style.textContent = [
+            ':where(.antigravity-settings-card,.antigravity-usage-pill,.antigravity-quota-popover){--agy-accent:#3b82f6;--agy-warn-text:#ca8a04;--agy-line:color-mix(in srgb,currentColor 12%,transparent);--agy-line-strong:color-mix(in srgb,currentColor 20%,transparent);--agy-surface:color-mix(in srgb,currentColor 4%,transparent);--agy-surface-2:color-mix(in srgb,currentColor 7%,transparent);color-scheme:light}',
+            ':where(body[data-ds-dark-theme],.dark,[data-theme=dark],[data-color-scheme=dark]) :is(.antigravity-settings-card,.antigravity-quota-popover),:is(.antigravity-settings-card,.antigravity-quota-popover):where(.dark,[data-theme=dark],[data-color-scheme=dark]){--agy-warn-text:#eab308;color-scheme:dark}',
+            '@media (prefers-color-scheme:dark){:where(:root:not(.light,[data-theme=light],[data-color-scheme=light],[data-ds-theme-source=light],[data-ds-dark-theme=false])) :is(.antigravity-settings-card,.antigravity-quota-popover){--agy-warn-text:#eab308;color-scheme:dark}}',
+            '.antigravity-settings-card select option,.antigravity-quota-popover select option{color:CanvasText;background:Canvas}',
+            '.antigravity-settings-card .agy-tabs{display:flex;gap:2px;overflow-x:auto;border-bottom:1px solid var(--agy-line)}',
+            '.antigravity-settings-card .agy-tab{flex:none;min-height:34px;padding:6px 12px;margin-bottom:-1px;border:0;border-bottom:2px solid transparent;border-radius:8px 8px 0 0;background:transparent;color:inherit;opacity:.68;font:inherit;font-size:13px;font-weight:500;cursor:pointer;white-space:nowrap}',
+            '.antigravity-settings-card .agy-tab:hover{opacity:.95;background:var(--agy-surface)}',
+            '.antigravity-settings-card .agy-tab[aria-selected=true]{opacity:1;font-weight:600;border-bottom-color:var(--agy-accent)}',
+            '.antigravity-settings-card .agy-list{display:flex;flex-direction:column;border:1px solid var(--agy-line);border-radius:12px;background:var(--agy-surface);overflow:hidden}',
+            '.antigravity-settings-card .agy-list>[role=listitem]:first-child{border-top:0!important}',
+            '.antigravity-settings-card .agy-switch{appearance:none;-webkit-appearance:none;position:relative;flex:none;width:36px;height:20px;margin:0;border:0;border-radius:999px;background:var(--agy-line-strong);cursor:pointer;transition:background .15s ease}',
+            '.antigravity-settings-card .agy-switch::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.25);transition:transform .15s ease}',
+            '.antigravity-settings-card .agy-switch:checked{background:var(--agy-accent)}',
+            '.antigravity-settings-card .agy-switch:checked::after{transform:translateX(16px)}',
+            '.antigravity-settings-card .agy-switch:disabled{opacity:.85;cursor:not-allowed}',
+            '.antigravity-settings-card .agy-fold summary::-webkit-details-marker{display:none}',
+            '.antigravity-settings-card .agy-fold summary::before{content:"▸";font-size:11px;margin-right:6px;display:inline-block;transition:transform .15s ease}',
+            '.antigravity-settings-card .agy-fold[open] summary::before{transform:rotate(90deg)}',
+            '.antigravity-usage-pill>button:hover{background:color-mix(in srgb,currentColor 7%,transparent)}',
+            '.antigravity-usage-pill button:focus-visible,.antigravity-settings-card button:focus-visible,.antigravity-settings-card input:focus-visible,.antigravity-settings-card select:focus-visible,.antigravity-settings-card a:focus-visible{outline:2px solid var(--agy-accent,#3b82f6);outline-offset:2px}',
+            '.antigravity-settings-card button:disabled{cursor:not-allowed;opacity:.45}',
+            'html[data-dsh-go-island][data-dsh-go-island-form="panel"] .antigravity-quota-popover{position:static!important;top:auto!important;bottom:auto!important;left:auto!important;right:auto!important;width:100%!important;max-height:none!important;overflow:visible!important;margin-top:8px;box-shadow:none!important;background:transparent!important;border-color:rgba(128,128,128,.2)!important}',
+          ].join('')
           document.head.appendChild(style)
           return () => style.remove()
         }, 'antigravity: scoped control styles')

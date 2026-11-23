@@ -7,7 +7,7 @@
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
-import { pill, settings, models, escape } from './preview-kit.mjs'
+import { pill, settings, models, escape, injectedStyles } from './preview-kit.mjs'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const work = join(root, '.local-preview', 'render')
@@ -19,7 +19,7 @@ const themes = {
   light: { surface: '#ffffff', text: '#222936', bg: '#f3f5f9', color: 'light' },
   dark: { surface: '#20252e', text: '#e6e9ef', bg: '#121720', color: 'dark' },
 }
-const baseCss = (theme) => `*{box-sizing:border-box}html,body{margin:0}body{--dsh-surface:${theme.surface};--dsh-text:${theme.text};color:${theme.text};color-scheme:${theme.color};font-family:'Segoe UI','Microsoft YaHei','PingFang SC','Noto Sans CJK SC',system-ui,sans-serif}*::-webkit-scrollbar{display:none}input,select{padding:9px;border:1px solid #8885;border-radius:8px;background:transparent;color:inherit}.card{border:1px solid #8883;border-radius:18px;background:var(--dsh-surface)}`
+const baseCss = (theme) => `*{box-sizing:border-box}html,body{margin:0}body{--dsh-surface:${theme.surface};--dsh-text:${theme.text};color:${theme.text};color-scheme:${theme.color};font-family:'Segoe UI','Microsoft YaHei','PingFang SC','Noto Sans CJK SC',system-ui,sans-serif}*::-webkit-scrollbar{display:none}input,select{padding:9px;border:1px solid #8885;border-radius:8px;background:transparent;color:inherit}.card{border:1px solid #8883;border-radius:18px;background:var(--dsh-surface)}${injectedStyles}`
 
 const manifest = []
 function shot(name, html, width, height, out) {

@@ -9,7 +9,19 @@ const quota = { status: 'ok', updatedAt: '2026-10-22T03:00:00+08:00', plan: '示
   { name: 'Gemini 4 Argon', buckets: [{ window: '5h', remainingPct: 8 }, { window: 'weekly', remainingPct: 31 }] },
 ], credits: { status: 'ok', remainingCredits: 1234, planName: '示例套餐', updatedAt: '2026-10-22T03:00:00+08:00' } }
 let plugin
-runInNewContext(source, { window: { __ModuleLoader__: { load(value) { plugin = value } } } })
+// 客户端样式在浏览器里由 ctx.effect 注入 document.head；离线夹具没有 DOM，
+// 这里给一个最小 document 桩，捕获同一份样式串供静态预览页复用。
+let injectedStyles = ''
+const documentStub = {
+  visibilityState: 'visible',
+  documentElement: { clientWidth: 1024 },
+  createElement: () => ({ textContent: '', style: {}, remove() {}, setAttribute() {} }),
+  head: { appendChild(element) { injectedStyles = String(element.textContent ?? '') } },
+  querySelector: () => null,
+  addEventListener() {},
+  removeEventListener() {},
+}
+runInNewContext(source, { window: { __ModuleLoader__: { load(value) { plugin = value } } }, document: documentStub })
 let index = 0
 let states = {}
 const React = {
@@ -78,4 +90,4 @@ const proxyLoginSettings = render('antigravity-acp', {
   16: 'https://accounts.google.com/o/oauth2/v2/auth?synthetic=offline-preview',
   17: '', 18: false, 19: '', 20: 'all',
 }, { remote: {}, control() {}, proxyControl() {}, readQuota() {} })
-export { quota, models, settings, proxySettings, proxyLoginSettings, pill, render, escape }
+export { quota, models, settings, proxySettings, proxyLoginSettings, pill, render, escape, injectedStyles }

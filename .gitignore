@@ -2,6 +2,7 @@ node_modules/
 dist/
 .local-install/
 .local-preview/
+reports/
 *.tsbuildinfo
 *.log
 *.tgz
