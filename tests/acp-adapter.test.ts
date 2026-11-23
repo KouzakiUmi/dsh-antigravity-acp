@@ -2571,7 +2571,7 @@ describe('ACP 会话复用与跨进程恢复', () => {
     expect(Object.keys(map)).not.toContain('conv-0::chat')
   }, 30_000)
 
-  it('usage 按协议原样上报，不做累计换算（官方 1.4.0 实测不返回）', async () => {
+  it('无 usage_update 时 usage 按协议原样上报，不做累计换算', async () => {
     const harness = createHarness()
     const first = collect(harness.adapter.stream(baseOptions({ sessionId: DSH_SESSION })))
     await waitForRequest(harness.agent, 'session/prompt')
@@ -2602,6 +2602,56 @@ describe('ACP 会话复用与跨进程恢复', () => {
     // 协议把 PromptResponse.usage 标为「本轮用量」：原样上报，不擅自从累计值求差。
     expect(secondChunks.find((chunk) => chunk.type === 'usage')).toMatchObject({
       usage: { inputTokens: 150, outputTokens: 25, totalTokens: 175 },
+    })
+  })
+
+  it('回合用量是内部多步累加时，按 usage_update.used 把上下文压力校正为真实占用', async () => {
+    const harness = createHarness()
+    const streaming = collect(harness.adapter.stream(baseOptions({ sessionId: DSH_SESSION })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    for (const used of [13_517, 16_965, 18_638]) {
+      await harness.agent.notify('session/update', {
+        sessionId: SESSION_1,
+        update: { sessionUpdate: 'usage_update', used, size: 1_048_576 },
+      })
+    }
+    await harness.agent.notify('session/update', {
+      sessionId: SESSION_1,
+      update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'done' } },
+    })
+    // 官方 1.5.2 实测：4 次内部调用的累加，input + cacheRead = 63_757，远超真实占用 18_638。
+    await harness.agent.reply('session/prompt', {
+      stopReason: 'end_turn',
+      usage: { totalTokens: 64_361, inputTokens: 24_641, outputTokens: 604, thoughtTokens: 264, cachedReadTokens: 39_116, cachedWriteTokens: 0 },
+    }, 0)
+    const usage = (await streaming).find((chunk) => chunk.type === 'usage')
+    if (usage?.type !== 'usage') throw new Error('缺少 usage chunk')
+    const { inputTokens, cacheReadTokens = 0, cacheWriteTokens = 0 } = usage.usage
+    expect(inputTokens + cacheReadTokens + cacheWriteTokens).toBe(18_638)
+    expect(cacheReadTokens / (inputTokens + cacheReadTokens)).toBeCloseTo(39_116 / 63_757, 3)
+    expect(usage.usage).toMatchObject({ outputTokens: 604, reasoningTokens: 264 })
+    // 缩放后不再是精确整轮合计，不能带着 totalTokens。
+    expect(usage.usage.totalTokens).toBeUndefined()
+  })
+
+  it('累加值不超过 usage_update.used 时原样上报', async () => {
+    const harness = createHarness()
+    const streaming = collect(harness.adapter.stream(baseOptions({ sessionId: DSH_SESSION })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    await harness.agent.notify('session/update', {
+      sessionId: SESSION_1,
+      update: { sessionUpdate: 'usage_update', used: 500, size: 1_048_576 },
+    })
+    await harness.agent.notify('session/update', {
+      sessionId: SESSION_1,
+      update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'hi' } },
+    })
+    await harness.agent.reply('session/prompt', {
+      stopReason: 'end_turn',
+      usage: { totalTokens: 110, inputTokens: 100, outputTokens: 10 },
+    }, 0)
+    expect((await streaming).find((chunk) => chunk.type === 'usage')).toMatchObject({
+      usage: { inputTokens: 100, outputTokens: 10, totalTokens: 110 },
     })
   })
 
