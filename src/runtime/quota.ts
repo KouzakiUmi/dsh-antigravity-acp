@@ -2,7 +2,9 @@
  * Antigravity 套餐额度取数（Cloud Code Assist quota summary）。
  *
  * 数据面（用户 2026-10-16 明确选择 A 方案，放宽「bundle 不读 OAuth 凭据」约束）：
- * 1. 读官方 CLI 登录态 `~/.gemini/antigravity-cli/antigravity-oauth-token`；
+ * 1. 读官方 CLI 登录态 `~/.gemini/antigravity-cli/antigravity-oauth-token`；该文件不存在
+ *    （如 Windows 上 CLI 未落盘登录态、只用 ACP 登录）时回退读 ACP 凭据
+ *    `~/.gemini/antigravity-acp/acp_token.json`（同样只读，并优先用其中的 client 元数据换发）；
  * 2. access token 过期时用其中的 refresh_token 向 Google OAuth token 端点换新
  *    （client 元数据取自官方二进制或 AGY_OAUTH_CLIENT_ID/SECRET 环境变量）；
  * 3. 调用 Cloud Code Assist 的 `loadCodeAssist` → `retrieveUserQuotaSummary`。
@@ -34,6 +36,10 @@ export const CODE_ASSIST_BASE_URL = 'https://daily-cloudcode-pa.googleapis.com/v
 export const OAUTH_TOKEN_URL = 'https://oauth2.googleapis.com/token'
 /** 官方 CLI 登录态文件（只读）。 */
 export const TOKEN_SUBPATH = ['.gemini', 'antigravity-cli', 'antigravity-oauth-token'] as const
+/** ACP 凭据文件（只读回退；官方 ACP server 与本插件导入流程写入）。 */
+export const ACP_TOKEN_SUBPATH = ['.gemini', 'antigravity-acp', 'acp_token.json'] as const
+/** 额度取数依次尝试的登录态文件。 */
+export const QUOTA_TOKEN_SUBPATHS = [TOKEN_SUBPATH, ACP_TOKEN_SUBPATH] as const
 
 /** 提前多少毫秒视为「将过期」并触发换发。 */
 export const TOKEN_EXPIRY_MARGIN_MS = 60_000
@@ -213,10 +219,20 @@ export function parseTokenState(raw: unknown): QuotaTokenState {
   const readOuter = (key: string): string | undefined => (token === root ? undefined : outer(key))
   const first = (nested: string, flat: string): string | undefined => pick(nested) ?? readOuter(flat)
   return {
-    accessToken: pick('access_token') ?? pick('AccessToken') ?? readOuter('access_token') ?? readOuter('AccessToken'),
+    // `acp_token.json` 是 google-auth 序列化形态：access token 平铺在字符串字段 `token` 上。
+    accessToken: pick('access_token') ?? pick('AccessToken') ?? pick('token')
+      ?? readOuter('access_token') ?? readOuter('AccessToken'),
     refreshToken: first('refresh_token', 'refresh_token'),
     expiry: first('expiry', 'expiry'),
   }
+}
+
+/** 凭据文件自带的 OAuth client 元数据（`acp_token.json` 的 client_id / client_secret）。 */
+export function parseOAuthClientFromToken(raw: unknown): OAuthClientMeta | undefined {
+  if (!isRecord(raw)) return undefined
+  const clientId = typeof raw.client_id === 'string' ? raw.client_id.trim() : ''
+  const clientSecret = typeof raw.client_secret === 'string' ? raw.client_secret.trim() : ''
+  return clientId && clientSecret ? { clientId, clientSecret } : undefined
 }
 
 /** 是否还可直接使用（缺 expiry 视为不过期，由调用方按请求失败再兜底）。 */
@@ -449,18 +465,31 @@ async function fetchQuotaSnapshotUncached(deps: QuotaDeps): Promise<QuotaSnapsho
   try {
     const readFileImpl = deps.readFileImpl ?? defaultReadFile
     const home = (deps.homedir ?? homedir)()
-    const tokenPath = join(home, ...TOKEN_SUBPATH)
-    let state: QuotaTokenState
-    try {
-      state = parseTokenState(JSON.parse(await readFileImpl(tokenPath)))
-    } catch {
-      return failure(stamp(), 'token-missing', '读不到官方 CLI 登录态（antigravity-oauth-token）')
+    let state: QuotaTokenState | undefined
+    let embeddedClient: OAuthClientMeta | undefined
+    let readable = false
+    for (const subpath of QUOTA_TOKEN_SUBPATHS) {
+      let raw: unknown
+      try {
+        raw = JSON.parse(await readFileImpl(join(home, ...subpath)))
+      } catch {
+        continue
+      }
+      readable = true
+      const candidate = parseTokenState(raw)
+      if (candidate.accessToken || candidate.refreshToken) {
+        state = candidate
+        embeddedClient = parseOAuthClientFromToken(raw)
+        break
+      }
     }
-    if (!state.accessToken && !state.refreshToken) {
-      return failure(stamp(), 'token-missing', '官方 CLI 登录态里没有可用 token，请先在 Antigravity 登录')
+    if (!state) {
+      return readable
+        ? failure(stamp(), 'token-missing', 'Antigravity 登录态里没有可用 token，请先在 Antigravity 登录')
+        : failure(stamp(), 'token-missing', '读不到官方 CLI 或 ACP 登录态（antigravity-oauth-token / acp_token.json）')
     }
     if (!isTokenUsable(state, now())) {
-      const client = await resolveOAuthClient(deps)
+      const client = embeddedClient ?? await resolveOAuthClient(deps)
       if (!client) {
         return failure(stamp(), 'refresh-unavailable', 'access token 已过期且无法取得 OAuth client 元数据（可设 AGY_OAUTH_CLIENT_ID/SECRET）')
       }
@@ -484,7 +513,7 @@ async function fetchQuotaSnapshotUncached(deps: QuotaDeps): Promise<QuotaSnapsho
       // 401/403：token 被上游拒绝（可能刚换发也失效），换发一次再试。
       if (error instanceof QuotaError && error.code === 'request-failed'
         && (error.status === 401 || error.status === 403)) {
-        return retryAfterRefresh(state, stamp, deps)
+        return retryAfterRefresh(state, stamp, deps, embeddedClient)
       }
       return failure(stamp(), errorCodeOf(error), describeError(error))
     }
@@ -497,9 +526,10 @@ async function retryAfterRefresh(
   state: QuotaTokenState,
   stamp: () => string,
   deps: QuotaDeps,
+  embeddedClient?: OAuthClientMeta,
 ): Promise<QuotaSnapshot> {
   try {
-    const client = await resolveOAuthClient(deps)
+    const client = embeddedClient ?? await resolveOAuthClient(deps)
     if (!client) return failure(stamp(), 'refresh-unavailable', '请求被拒（401/403）且无法取得 OAuth client 元数据')
     const refreshed = await refreshAccessToken(state, client, deps)
     const project = await loadCodeAssist(refreshed.accessToken as string, deps)

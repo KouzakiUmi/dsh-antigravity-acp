@@ -2,22 +2,28 @@ import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, open, rename, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { parseTokenState, QUOTA_CACHE_MS, TOKEN_SUBPATH } from '../runtime/quota.js'
+import { parseTokenState, QUOTA_CACHE_MS, QUOTA_TOKEN_SUBPATHS } from '../runtime/quota.js'
 import type { QuotaDeps, QuotaSnapshot } from '../runtime/quota.js'
 
 export type QuotaMode = 'acp' | 'proxy'
 export const quotaIdentity = (...parts: string[]): string => createHash('sha256').update(JSON.stringify(parts)).digest('hex')
 const MAX_SNAPSHOT_BYTES = 512 * 1024
 
-/** Identifies the CLI credential without refreshing it or persisting a token. */
+/**
+ * Identifies the credential the quota fetch will use (CLI token, else ACP token)
+ * without refreshing it or persisting a token.
+ */
 export async function cliQuotaIdentity(deps: QuotaDeps): Promise<string | undefined> {
-  const file = join((deps.homedir ?? homedir)(), ...TOKEN_SUBPATH)
-  try {
-    const raw = deps.readFileImpl ? await deps.readFileImpl(file) : await readBounded(file)
-    const state = parseTokenState(JSON.parse(raw))
-    const token = state.refreshToken ?? state.accessToken
-    return token ? quotaIdentity(token) : undefined
-  } catch { return undefined }
+  for (const subpath of QUOTA_TOKEN_SUBPATHS) {
+    const file = join((deps.homedir ?? homedir)(), ...subpath)
+    try {
+      const raw = deps.readFileImpl ? await deps.readFileImpl(file) : await readBounded(file)
+      const state = parseTokenState(JSON.parse(raw))
+      const token = state.refreshToken ?? state.accessToken
+      if (token) return quotaIdentity(token)
+    } catch { /* try the next credential file */ }
+  }
+  return undefined
 }
 
 /** One slot per mode. The stored identifier must match the current credential before use. */
