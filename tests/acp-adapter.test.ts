@@ -18,7 +18,7 @@ import {
 import type { RequestMessage, StreamChunk, ToolSchema } from '@deepseek-ai/dsh-llm'
 import type { AdapterRequestOptions } from '../src/adapter/request-options.js'
 import type { ContentBlock, RequestPermissionRequest, SessionConfigOption } from '@agentclientprotocol/sdk'
-import { AntigravityAcpAdapter, AGY_PROVIDER_ID, AGY_PLACEHOLDER_MODEL_ID, AGY_ADAPTER_ERROR } from '../src/adapter/antigravity-adapter.js'
+import { AntigravityAcpAdapter, AGY_PROVIDER_ID, AGY_PLACEHOLDER_MODEL_ID, AGY_ADAPTER_ERROR, explainUnavailableModel } from '../src/adapter/antigravity-adapter.js'
 import type { ModelOverride } from '../src/settings.js'
 import type { AdapterLog, AntigravityAcpAdapterOptions } from '../src/adapter/antigravity-adapter.js'
 import type { ImageReader } from '../src/adapter/image-content.js'
@@ -28,7 +28,7 @@ import type { SessionMapEntry } from '../src/runtime/session-map.js'
 import { outputHash, prefixHash, routeFingerprint } from '../src/adapter/session-reuse.js'
 import { AGY_TURN_ERROR } from '../src/adapter/prompt-turn.js'
 import { AGY_BRIDGE_ERROR } from '../src/bridge/mcp-bridge.js'
-import { AgentLink, AGY_LINK_ERROR } from '../src/protocol/agent-link.js'
+import { AgentLink, AgentLinkError, AGY_LINK_ERROR } from '../src/protocol/agent-link.js'
 import { AGY_CLIENT_CAPABILITIES } from '../src/index.js'
 import { parsePromptTranscript } from '../src/adapter/prompt-transcript.js'
 import { FakeAcpAgent, NO_REPLY } from './helpers/fake-acp-agent.js'
@@ -702,11 +702,38 @@ describe('模型目录来自 ACP 会话配置', () => {
     expect(resolved).toMatchObject({ id: '未登记的模型', name: '未登记的模型', inputModalities: ['text'] })
   })
 
-  it('listModels 折叠成家族（Opus 5.5 / Sonnet 5.5 / Argon），不把思考强度放进模型', async () => {
+  it('ACP 目录已知时，CLI 清单只补已知家族的档位，不新增 ACP 不提供的型号', async () => {
     const harness = createHarness({
-      loadCachedCatalog: async () => [{ id: 'gemini-3-flash', name: 'Gemini 3 Flash' }],
+      loadCachedCatalog: async () => [{ id: 'gemini-4-argon', name: 'Gemini 4 Argon' }],
       loadCliCatalog: async () => [
-        { id: 'gemini-3-flash', name: '重复条目以目录为准' },
+        { id: 'gemini-4-argon-low', name: 'Gemini 4 Argon (Low)' },
+        { id: 'gemini-4-argon-high', name: 'Gemini 4 Argon (High)' },
+        { id: 'claude-opus-5-5-medium', name: 'Claude Opus 5.5 (Medium)' },
+      ],
+    })
+    expect((await harness.adapter.listModels(AGY_PROVIDER_ID)).map((model) => model.id)).toEqual(['gemini-4-argon'])
+    const resolved = await harness.adapter.resolveModel(AGY_PROVIDER_ID, 'gemini-4-argon')
+    expect(resolved.reasoning?.efforts.map((effort) => String(effort.id))).toEqual(['low', 'high'])
+  })
+
+  it('官方以认证方式拒绝型号时，报错补充可操作说明并保留错误码', () => {
+    const original = new AgentLinkError('AGY_AGENT_REFUSED', "ACP 请求被拒绝 (session/set_config_option): Model 'claude-opus-5-5-medium' is not available for the current authentication method.", {
+      jsonRpc: { code: -32602, message: "Model 'claude-opus-5-5-medium' is not available for the current authentication method." },
+    })
+    const explained = explainUnavailableModel(original, 'claude-opus-5-5-medium') as AgentLinkError
+    expect(explained).toBeInstanceOf(AgentLinkError)
+    expect(explained.code).toBe('AGY_AGENT_REFUSED')
+    expect(explained.jsonRpc?.code).toBe(-32602)
+    expect(explained.message).toContain('代理模式')
+    const other = new Error('boom')
+    expect(explainUnavailableModel(other, 'x')).toBe(other)
+  })
+
+  it('listModels 折叠成家族（Opus 5.5 / Sonnet 5.5 / Argon），不把思考强度放进模型', async () => {
+    // 尚无 ACP 目录（冷启动、无磁盘缓存）时，CLI 清单整份兜底。
+    const harness = createHarness({
+      loadCliCatalog: async () => [
+        { id: 'gemini-3-flash', name: 'Gemini 3 Flash' },
         { id: 'claude-opus-5-5-high', name: 'Claude Opus 5.5 (High)' },
         { id: 'claude-opus-5-5-low', name: 'Claude Opus 5.5 (Low)' },
         { id: 'gemini-4-argon-medium', name: 'Gemini 4 Argon (Medium)' },
@@ -723,7 +750,6 @@ describe('模型目录来自 ACP 会话配置', () => {
     // 选择器里不出现档位化 id，也不出现临近下架的 gpt-oss-120b。
     expect(ids.some((id) => /-(low|medium|high)$/.test(id))).toBe(false)
     expect(ids.some((id) => id.includes('gpt-oss'))).toBe(false)
-    // 同 id 时保留目录侧的名称。
     expect(models.find((model) => model.id === 'gemini-3-flash')?.name).toBe('Gemini 3 Flash')
     expect(models.find((model) => model.id === 'claude-opus-5-5')?.name).toBe('Claude Opus 5.5')
   })

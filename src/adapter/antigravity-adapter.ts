@@ -21,6 +21,7 @@ import type {
 } from '@deepseek-ai/dsh-llm'
 import type { AdapterPreparedCall, AdapterRequestOptions, AdapterRequestOwner } from './request-options.js'
 import type { AnyRequest, McpServer as AcpMcpServer, SessionConfigOption, SessionNotification, Usage } from '@agentclientprotocol/sdk'
+import { AgentLinkError } from '../protocol/agent-link.js'
 import type { AgentLink, AgentLinkHandlers } from '../protocol/agent-link.js'
 import { BRIDGE_MCP_SERVER_NAME, McpToolBridge } from '../bridge/mcp-bridge.js'
 import type { BridgeToolResult } from '../bridge/mcp-bridge.js'
@@ -561,7 +562,9 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   override async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
     const folded = await this.#foldCatalog(_provider)
     // 用户设置只作用于已观测到的条目：停用的不列入选择器，显示名可覆盖。
-    const models = applyModelSettings(this.#modelSettingsSnapshot(), folded.models)
+    const offered = folded.offered
+    const models = applyModelSettings(this.#modelSettingsSnapshot(),
+      offered === undefined ? folded.models : folded.models.filter((model) => offered.has(model.id)))
     return [
       ...models.map((model) => ({
         provider: _provider,
@@ -581,28 +584,36 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   async #foldCatalog(provider: string): Promise<{
     models: Array<{ id: string; name: string; description?: string }>
     tiers: Map<string, ReadonlySet<AgyModelTier>>
+    /** ACP 目录已知时，当前认证方式实际提供的家族；缺省表示尚无 ACP 目录。 */
+    offered?: ReadonlySet<string>
   }> {
     const generation = ++this.#catalogFoldGeneration
     // 未观测到真实目录时用磁盘缓存兜住选择器空窗。
     // 磁盘缓存来自 ACP 原始档位观测，优先于其它 worker 的 CLI 家族兜底。
     const cached = this.#catalog.length > 0 ? this.#catalog : await this.#cachedModels(provider)
     const source = cached.length > 0 ? cached : [...this.#fallbackCatalog]
+    const observed = source.filter((model) => model.id !== AGY_PLACEHOLDER_MODEL_ID)
+    // ACP 目录（会话观测或其磁盘缓存）是当前认证方式下的权威清单：官方 server
+    // 对清单外的型号直接拒绝 set_config_option（实测 oauth-personal 下 Claude 报
+    // 「not available for the current authentication method」）。此时 CLI 清单仍
+    // 参与档位表（路由不变），但选择器只列 ACP 提供的家族；尚无 ACP 目录时整份兜底。
+    const offered = observed.length > 0 && cached.length > 0 ? new Set(observed.map((model) => modelFamilyId(model.id))) : undefined
+    const cliRows = await this.#cliRawRows()
     const folded = foldAgyModelFamilies([
-      ...source
-        .filter((model) => model.id !== AGY_PLACEHOLDER_MODEL_ID)
+      ...observed
         .map((model) => ({
           id: model.id,
           name: model.name,
           ...(model.description === undefined ? {} : { description: model.description }),
         })),
-      ...await this.#cliRawRows(),
+      ...cliRows,
     ])
     // 目录可能在 CLI 缓存读取期间更新；旧折叠结果不能覆盖新观测。
     if (generation === this.#catalogFoldGeneration) {
       this.#familyTiers = folded.tiers
       this.#foldedFamilies = new Map(folded.models.map((model) => [model.id, model]))
     }
-    return folded
+    return { ...folded, ...(offered === undefined ? {} : { offered }) }
   }
 
   /**
@@ -1735,13 +1746,28 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         `antigravity-acp: session/set_config_option 失败（configId=${selector.configId} value=${requested}）`,
         error,
       )
-      throw error
+      throw explainUnavailableModel(error, requested)
     }
     // RPC 成功即接受选模；服务端可归一化模型 ID，不再额外要求回显逐字一致。
     // 缺少模型配置时保留现有目录，后续 config_option_update 仍可更新它。
     this.#rememberSessionModelValue(sessionId, requested)
     if (findModelSelector(response.configOptions)) this.observeSessionConfigOptions(response.configOptions)
   }
+}
+
+/**
+ * 官方 server 按认证方式限定可选型号（oauth-personal 下实测只有 Gemini）。
+ * 原始报错只说「not available for the current authentication method」，补一句
+ * 用户能照做的说明；错误码与 JSON-RPC 细节保持不变。
+ */
+export function explainUnavailableModel(error: unknown, model: string): unknown {
+  if (!(error instanceof AgentLinkError)) return error
+  if (!/not available for the current authentication method/i.test(error.jsonRpc?.message ?? error.message)) return error
+  return new AgentLinkError(
+    error.code,
+    `${error.message}（官方 ACP 当前登录方式不提供 ${model}，请在模型选择里换用 ACP 目录内的型号，或改用代理模式）`,
+    { cause: error, ...(error.jsonRpc === undefined ? {} : { jsonRpc: error.jsonRpc }) },
+  )
 }
 
 function throwIfAborted(signal?: AbortSignal): void {
