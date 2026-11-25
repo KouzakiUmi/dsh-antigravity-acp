@@ -1030,10 +1030,65 @@ describe('StreamChunk 序列映射', () => {
     expect(resolved.context).toEqual({ contextWindow: 1_048_576 })
   })
 
-  it('未实测容量的模型不声明 context（官方目录不报告，绝不填猜测值）', async () => {
+  it('未实测且不在审计表的模型不声明 context（绝不填猜测值）', async () => {
     const harness = createHarness()
     const resolved = await harness.adapter.resolveModel(AGY_PROVIDER_ID, 'gemini-3-pro')
     expect(resolved.context).toBeUndefined()
+  })
+
+  it('未实测容量的已知家族声明审计参考容量（issue #17）', async () => {
+    const harness = createHarness()
+    // Neon / Hydrogen 不在 auth-core 快照，用登记的上游实测值；其余家族取原生快照。
+    expect((await harness.adapter.resolveModel(AGY_PROVIDER_ID, 'gemini-4-neon')).context).toEqual({ contextWindow: 1_048_576 })
+    expect((await harness.adapter.resolveModel(AGY_PROVIDER_ID, 'claude-opus-5-5')).context).toEqual({ contextWindow: 1_000_000 })
+    const models = await harness.adapter.listModels(AGY_PROVIDER_ID) as unknown as Array<{ id: string; contextWindow?: number; contextWindowSource?: string }>
+    const neon = models.find((model) => model.id === 'gemini-4-neon')
+    // 默认假目录只有 gemini-3-pro/flash；Neon 不在目录时不出现在列表。
+    expect(neon).toBeUndefined()
+  })
+
+  it('实测容量优先于审计参考，目录行标注容量来源（issue #17）', async () => {
+    const tiered: SessionConfigOption[] = [{
+      id: 'model',
+      type: 'select',
+      name: 'Model',
+      category: 'model',
+      currentValue: 'claude-opus-5-5-medium',
+      options: [
+        { value: 'claude-opus-5-5-low', name: 'Claude Opus 5.5 (Low)' },
+        { value: 'claude-opus-5-5-medium', name: 'Claude Opus 5.5 (Medium)' },
+        { value: 'claude-opus-5-5-high', name: 'Claude Opus 5.5 (High)' },
+      ],
+    }]
+    // 关闭会话复用：两轮各自新建会话，避免第二轮增量为空。
+    const harness = createHarness({ configOptions: tiered, reuseSessions: false })
+    // 第一轮不带 usage_update：目录已观测、容量未实测 → 审计参考 1_000_000，来源 audited。
+    const first = collect(harness.adapter.stream(baseOptions({ model: 'claude-opus-5-5' })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    await harness.agent.notify('session/update', {
+      sessionId: SESSION_1,
+      update: { sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: '好' } },
+    })
+    await harness.agent.reply('session/prompt', { stopReason: 'end_turn' })
+    await first
+    const before = await harness.adapter.listModels(AGY_PROVIDER_ID) as unknown as Array<{ id: string; contextWindow?: number; contextWindowSource?: string }>
+    expect(before.find((model) => model.id === 'claude-opus-5-5')).toMatchObject({ contextWindow: 1_000_000, contextWindowSource: 'audited' })
+    // 第二轮实测 500_000：优先于审计值，来源 observed。
+    const streaming = collect(harness.adapter.stream(baseOptions({ model: 'claude-opus-5-5' })))
+    await waitForRequest(harness.agent, 'session/prompt', 2)
+    await harness.agent.notify('session/update', {
+      sessionId: SESSION_2,
+      update: { sessionUpdate: 'usage_update', used: 10, size: 500_000 },
+    })
+    await harness.agent.notify('session/update', {
+      sessionId: SESSION_2,
+      update: { sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: '好' } },
+    })
+    await harness.agent.reply('session/prompt', { stopReason: 'end_turn' }, 1)
+    await streaming
+    expect((await harness.adapter.resolveModel(AGY_PROVIDER_ID, 'claude-opus-5-5')).context).toEqual({ contextWindow: 500_000 })
+    const after = await harness.adapter.listModels(AGY_PROVIDER_ID) as unknown as Array<{ id: string; contextWindow?: number; contextWindowSource?: string }>
+    expect(after.find((model) => model.id === 'claude-opus-5-5')).toMatchObject({ contextWindow: 500_000, contextWindowSource: 'observed' })
   })
 
   it('家族折叠下实测容量按家族 id 落盘，且 resolveModel 用家族显示名', async () => {

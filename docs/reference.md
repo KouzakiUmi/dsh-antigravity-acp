@@ -64,7 +64,7 @@ dsh plugin --profile web add ./dsh-bundle-antigravity-host-0.1.24.tgz
 - 旧 `server-default` 路由仍兼容：默认沿用上游模型，配置了映射时才写入映射目标；不再新增占位选择项。
 - 官方将思考档位编码进 ID 时，选择器折叠为模型家族；DSH 思考强度低 / 中 / 高路由至 `-low` / `-medium` / `-high`。缺档取最近档位，未指定通常使用 `medium`；显式钉住档位 ID 时尊重该 ID。官方公告即将下线的家族（见 `src/adapter/model-retirement.ts`）在未显式配置时默认不列入选择器，设置页保留条目与「即将下线」徽章，手动启用后恢复显示。目录里没有任何档位变体的家族 id **不声明**思考强度菜单（省略 `reasoning` 字段）：宿主把 `efforts: []` 判为非法元数据（`INVALID_MODEL_REASONING`）并使该模型不可用，空数组不等于「没有档位」。
 - `antigravity-orchestrator` 是唯一由插件合成的条目：只有配置的 planner 与 executor 都已在当前目录可见时追加，代理侧与 ACP 侧同名。它不是观测到的上游模型；依赖缺失时不出现，直接请求它会得到可读错误（代理侧 `INVALID_MODEL`，ACP 侧 `AGY_INVALID_MODEL`）。官方 `gemini-pro-orchestrator-*` 条目保持原样，仍由官方 agent 自己编排。
-- 上下文容量不填猜测值。收到官方 `usage_update.size` 后才记录到模型上下文并缓存；首次观测前未知。
+- 上下文容量不填猜测值：实测（官方 `usage_update.size`）优先并缓存；未实测的已知家族用有来源的审计参考值（auth-core 原生快照 + 登记的上游实测记录，见 `src/adapter/model-capacity.ts`），设置页标注「审计参考，实测后更新」。宿主压缩引擎对无容量路由在模型切换 / 溢出恢复时直接报错，审计回退让首次观测前也能量化上下文；未知家族仍省略容量。
 - 模型、容量与图片能力在 worker 间同步；不因增加 worker 就虚构新模型权益。
 
 | 请求项 | 行为 |

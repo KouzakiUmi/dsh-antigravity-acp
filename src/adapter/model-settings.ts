@@ -21,6 +21,8 @@ import { isRetiringModel } from './model-retirement.js'
 export interface ModelCapacity {
   contextWindow?: number
   maxOutputTokens?: number
+  /** 容量来源：实测（usage_update / 磁盘缓存）或审计参考；缺省表示未知。 */
+  contextWindowSource?: 'observed' | 'audited'
 }
 
 /** 与 runtime/agy-cli.ts 的档位顺序一致（弱 → 强）。 */

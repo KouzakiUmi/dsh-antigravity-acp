@@ -40,6 +40,7 @@ import { acpOrchestratorFamily, findModeSelector, findModelSelector, findThought
 import type { ModelSelector } from './model-catalog.js'
 import { applyModelSettings, modelDisplayName, modelSettingFor, normalizeModelSettings, resolveModelTarget } from './model-settings.js'
 import type { ModelSetting } from './model-settings.js'
+import { auditedAcpContextWindow } from './model-capacity.js'
 import { buildPromptDeltaWithImages, buildPromptWithImages, buildToolResultContent } from './image-content.js'
 import type { ImageReader } from './image-content.js'
 import { ACP_PROMPT_BYTE_BUDGET } from './prompt-transcript.js'
@@ -673,13 +674,13 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     const folded = await this.#foldCatalog(_provider)
     const orch = this.#orchestratorSettingsSnapshot()
     const observedFamilies = await this.#observedAcpFamilies(_provider)
-    const orchContextWindow = this.#orchestratorContextWindow(orch)
+    const orchContext = this.#orchestratorContextWindow(orch)
     const orchModel = synthesizeAcpOrchestratorModel({
       provider: _provider,
       settings: orch,
       observedFamilies,
       ...(this.#inputModalities() === undefined ? {} : { inputModalities: this.#inputModalities() }),
-      ...(orchContextWindow === undefined ? {} : { contextWindow: orchContextWindow }),
+      ...(orchContext === undefined ? {} : { contextWindow: orchContext.contextWindow }),
     })
     const candidates = orchModel === undefined
       ? folded.models
@@ -694,9 +695,15 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     const models = applyModelSettings(this.#modelSettingsSnapshot(), visible)
     return [
       ...models.map((model) => {
+        // 实测容量优先；未实测时用审计参考值（issue #17），来源随目录行下发，
+        // 设置页据此区分「上游容量」与「审计参考」。
+        const observedWindow = model.id === ORCHESTRATOR_MODEL_ID ? undefined : this.#contextWindows.get(model.id)
         const contextWindow = model.id === ORCHESTRATOR_MODEL_ID
-          ? orchContextWindow
-          : this.#contextWindows.get(model.id)
+          ? orchContext?.contextWindow
+          : observedWindow ?? auditedAcpContextWindow(model.id)
+        const contextWindowSource = model.id === ORCHESTRATOR_MODEL_ID
+          ? orchContext?.source
+          : contextWindow === undefined ? undefined : observedWindow !== undefined ? 'observed' : 'audited'
         return {
           provider: _provider,
           id: model.id,
@@ -704,6 +711,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
           ...(model.description === undefined ? {} : { description: model.description }),
           ...(this.#inputModalities() === undefined ? {} : { inputModalities: this.#inputModalities() }),
           ...(contextWindow === undefined ? {} : { contextWindow }),
+          ...(contextWindowSource === undefined ? {} : { contextWindowSource }),
         }
       }),
     ]
@@ -724,11 +732,19 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     return new Set(folded.models.map((model) => model.id))
   }
 
-  #orchestratorContextWindow(orch: OrchestratorSettings): number | undefined {
-    const plannerWindow = this.#contextWindows.get(acpOrchestratorFamily(orch.plannerModel))
-    const executorWindow = this.#contextWindows.get(acpOrchestratorFamily(orch.executorModel))
+  /** 编排容量取 planner / executor 的较小值；实测优先，未实测用审计参考（issue #17）。 */
+  #orchestratorContextWindow(orch: OrchestratorSettings): { contextWindow: number; source: 'observed' | 'audited' } | undefined {
+    const plannerFamily = acpOrchestratorFamily(orch.plannerModel)
+    const executorFamily = acpOrchestratorFamily(orch.executorModel)
+    const plannerObserved = this.#contextWindows.get(plannerFamily)
+    const executorObserved = this.#contextWindows.get(executorFamily)
+    const plannerWindow = plannerObserved ?? auditedAcpContextWindow(plannerFamily)
+    const executorWindow = executorObserved ?? auditedAcpContextWindow(executorFamily)
     if (plannerWindow === undefined || executorWindow === undefined) return undefined
-    return Math.min(plannerWindow, executorWindow)
+    return {
+      contextWindow: Math.min(plannerWindow, executorWindow),
+      source: plannerObserved !== undefined && executorObserved !== undefined ? 'observed' : 'audited',
+    }
   }
 
   /**
@@ -842,13 +858,13 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       const orch = this.#orchestratorSettingsSnapshot()
       const observedFamilies = await withAbort(this.#observedAcpFamilies(provider), signal)
       throwIfAborted(signal)
-      const contextWindow = this.#orchestratorContextWindow(orch)
+      const orchContext = this.#orchestratorContextWindow(orch)
       const synthesized = synthesizeAcpOrchestratorModel({
         provider,
         settings: orch,
         observedFamilies,
         ...(this.#inputModalities() === undefined ? {} : { inputModalities: this.#inputModalities() }),
-        ...(contextWindow === undefined ? {} : { contextWindow }),
+        ...(orchContext === undefined ? {} : { contextWindow: orchContext.contextWindow }),
       })
       if (synthesized === undefined) {
         throw llmError('编排模式的 planner/executor 模型不在当前目录', AGY_ADAPTER_ERROR.INVALID_ORCHESTRATOR_MODEL)
@@ -870,7 +886,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         id: ORCHESTRATOR_MODEL_ID,
         name: displayName,
         ...(this.#inputModalities() === undefined ? {} : { inputModalities: this.#inputModalities() }),
-        ...(contextWindow === undefined ? {} : { context: { contextWindow } }),
+        ...(orchContext === undefined ? {} : { context: { contextWindow: orchContext.contextWindow } }),
         reasoning: {
           efforts: exposedEfforts.map((effort) => ({
             id: ReasoningEffortId(effort),
@@ -890,9 +906,11 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     // 显示名覆盖对已知与未知路由键都生效：用户在设置页改了名字，选择器与
     // 会话标题都要一致，不能只在 listModels 里生效。
     const displayName = modelDisplayName(this.#modelSettingsSnapshot(), model, known?.name ?? model)
-    // 上下文容量只在**实测**过（usage_update.size）或缓存过时才声明；官方目录
-    // 不报告容量，绝不填猜测值。缺省时不带 context，压缩引擎按未知处理。
-    const contextWindow = this.#contextWindows.get(model)
+    // 上下文容量：实测（usage_update.size / 磁盘缓存）优先；未实测时用审计参考值
+    // （model-capacity.ts：auth-core 原生快照 + 登记的上游实测记录）。宿主压缩引擎
+    // 对无容量路由在模型切换 / 溢出恢复时直接报错（issue #17）；未知家族仍省略
+    // context，绝不填猜测值。
+    const contextWindow = this.#contextWindows.get(model) ?? auditedAcpContextWindow(model)
     // 没有档位变体的模型必须省略 reasoning（宿主拒绝空 efforts）。
     const reasoning = this.#reasoningInfo(model, tiers)
     return {

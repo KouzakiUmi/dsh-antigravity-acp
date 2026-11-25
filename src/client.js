@@ -212,9 +212,9 @@ window.__ModuleLoader__.load({
      * 前缀来猜（ACP 模式的编排合成条目同样带该前缀，会导致补行写错 ID 风格）。
      */
     function modelRows(models, overrides, proxyMode = false) {
-      const rows = models.map(({ id, name, inputModalities, contextWindow, maxOutputTokens }) => {
+      const rows = models.map(({ id, name, inputModalities, contextWindow, maxOutputTokens, contextWindowSource }) => {
         const retiring = retirementForModel(id)
-        return { id, name, inputModalities, contextWindow, maxOutputTokens, inCatalog: true, ...(retiring ? { retiring } : {}) }
+        return { id, name, inputModalities, contextWindow, maxOutputTokens, contextWindowSource, inCatalog: true, ...(retiring ? { retiring } : {}) }
       })
       const known = new Set(rows.map((row) => row.id))
       // 按家族去重：同一退役家族只要已有任意档位/前缀的观测行在场，就不再补行，
@@ -451,7 +451,9 @@ window.__ModuleLoader__.load({
               h('span', { style: labelStyle }, t('模型 ID')),
               h('code', { style: { fontSize: '11px', overflowWrap: 'anywhere', opacity: .78 } }, row.id),
               row.inCatalog ? h('span', { style: labelStyle }, Number.isSafeInteger(row.contextWindow)
-                ? t('上下文窗口 {tokens} tokens（上游容量）', { tokens: row.contextWindow.toLocaleString() })
+                ? (row.contextWindowSource === 'audited'
+                  ? t('上下文窗口 {tokens} tokens（审计参考，实测后更新）', { tokens: row.contextWindow.toLocaleString() })
+                  : t('上下文窗口 {tokens} tokens（上游容量）', { tokens: row.contextWindow.toLocaleString() }))
                 : t('上下文窗口：尚未观测')) : null,
               Number.isSafeInteger(row.maxOutputTokens) ? h('span', { style: labelStyle }, t('输出上限 {tokens} tokens', { tokens: row.maxOutputTokens.toLocaleString() })) : null),
             h('div', { style: { display: 'grid', gap: '10px', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))' } },

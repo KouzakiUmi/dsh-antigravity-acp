@@ -98,6 +98,7 @@ const EN_UI = {
   '模型设置': 'Model settings',
   '模型 ID': 'Model ID',
   '上下文窗口 {tokens} tokens（上游容量）': 'Context window {tokens} tokens (upstream capacity)',
+  '上下文窗口 {tokens} tokens（审计参考，实测后更新）': 'Context window {tokens} tokens (audited reference; updated once observed)',
   '上下文窗口：尚未观测': 'Context window: not observed yet',
   '输出上限 {tokens} tokens': 'Output limit {tokens} tokens',
   '显示名': 'Display name',

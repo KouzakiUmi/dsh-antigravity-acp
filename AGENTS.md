@@ -52,7 +52,7 @@ npm 包名 `dsh-bundle-antigravity-host`、provider ID `antigravity-acp` / `anti
 - 编排模式的 planner 阶段不经过 DSH 审批：ACP 链路在会话工作目录下运行官方 `mode=plan`，官方内置工具仍会执行只读命令，计划文件写在官方 brain 目录；代理链路的 planner 请求不声明工具。两条链路的 planner 会话都不注册 MCP 桥，DSH 工具只由 executor 轮次调用。
 - `temperature` / `stop` 无 ACP v1 会话通道，记录警告并忽略；`maxTokens` 忽略；`reasoningEffort` 是家族 → 档位的路由键。
 - 额度与 AI Credits 仅为参考值，不是计费依据；ACP 登录、CLI 登录与代理账户登录是三条链路。
-- ACP 上下文容量来自 `usage_update.size`，不把 `used` 记成单轮计费用量；代理容量来自账户目录的实际线模型（家族取已观测共同上限，既有模型保留审计回退）。设置页只读显示容量，目录输出上限不自动改成请求默认值。
+- ACP 上下文容量实测（`usage_update.size`）优先，不把 `used` 记成单轮计费用量；未实测的已知家族用有来源的审计参考回退（[`model-capacity.ts`](src/adapter/model-capacity.ts)：auth-core 原生快照 + Neon/Hydrogen 的 2026-11-19 上游实测登记值），因为宿主压缩引擎对无容量路由在模型切换 / 溢出恢复时直接报错（issue #17）；未知家族仍省略容量，绝不填猜测值，审计值不落盘。代理容量来自账户目录的实际线模型（家族取已观测共同上限，既有模型保留审计回退）。设置页只读显示容量并区分实测 / 审计来源，目录输出上限不自动改成请求默认值。
 - 代理模式接受图片输入（宿主附件服务在场时，单图 4MP / 1MB、整请求 12MB 内联预算，超预算协商 offload）；附件服务缺席时仅声明文本能力，图片请求报 `UNSUPPORTED_MODALITY`。端点白名单含 Cloud Code Assist 生成、目录、项目、额度方法与 Google token 端点；代理账户凭据不进日志与客户端响应。
 - 版本与测试范围见 [README 兼容性矩阵](README.md#兼容性与验证范围)；宽 peer 范围是安装条件，不是全部 Core / 平台实机兼容证明。
 - 自定义 LLM 错误统一经 [`llmError`](src/runtime/llm-error.ts) 构造：新宿主走 `fromFailure`，没有工厂方法的旧宿主走原构造函数；两条路径均保留自定义码和 provider 失败事实。
