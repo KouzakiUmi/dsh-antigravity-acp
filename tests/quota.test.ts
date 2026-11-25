@@ -343,6 +343,45 @@ describe('fetchQuotaSnapshot 链路', () => {
     expect(at(calls, 1).authorization).toBe('Bearer fresh-token')
   })
 
+  it('CLI 登录态缺失时回退读 ACP 凭据（google-auth 形态），并用其自带 client 换发', async () => {
+    const EMBEDDED_ID = ['555', '-embedded.apps.googleusercontent.com'].join('')
+    const EMBEDDED_SECRET = ['GOCSPX-', 'EmbeddedSecretValue000000000'].join('')
+    const file = memoryTokenFile({
+      client_id: EMBEDDED_ID,
+      client_secret: EMBEDDED_SECRET,
+      refresh_token: REFRESH_TOKEN,
+      token_uri: OAUTH_TOKEN_URL,
+      scopes: [],
+      token: 'ya29.stale-acp-token',
+      expiry: '2026-10-01T00:00:00Z',
+    }, ['acp_token.json'])
+    const { fetchImpl, calls } = fakeFetch(quotaRoutes([
+      { match: (url) => url === OAUTH_TOKEN_URL, respond: () => json({ access_token: 'fresh-token', expires_in: 3600 }) },
+    ]))
+    const snapshot = await fetchQuotaSnapshot({}, {
+      ...file.deps,
+      fetchImpl,
+      env: {},
+      binaryPaths: [],
+      now: () => Date.parse('2026-10-16T00:00:00Z'),
+    })
+    expect(snapshot.status).toBe('ok')
+    expect(file.reads.at(0)).toMatch(/antigravity-oauth-token$/)
+    expect(at(calls, 0).url).toBe(OAUTH_TOKEN_URL)
+    expect(at(calls, 0).body).toContain(encodeURIComponent(EMBEDDED_ID))
+    expect(at(calls, 1).authorization).toBe('Bearer fresh-token')
+  })
+
+  it('ACP 凭据里未过期的 token 字段直接用于取数', async () => {
+    const file = memoryTokenFile({ refresh_token: REFRESH_TOKEN, token: ACCESS_TOKEN, expiry: '2099-01-01T00:00:00Z' },
+      ['acp_token.json'])
+    const { fetchImpl, calls } = fakeFetch(quotaRoutes())
+    const snapshot = await fetchQuotaSnapshot({}, { ...file.deps, fetchImpl, env: {}, binaryPaths: [],
+      now: () => Date.parse('2026-10-16T00:00:00Z') })
+    expect(snapshot.status).toBe('ok')
+    expect(at(calls, 0).authorization).toBe(`Bearer ${ACCESS_TOKEN}`)
+  })
+
   it('token 缺失时折叠成可读错误，不触网', async () => {
     const file = memoryTokenFile({})
     const { fetchImpl, calls } = fakeFetch(quotaRoutes())

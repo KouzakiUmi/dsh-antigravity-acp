@@ -18,7 +18,7 @@ import {
 import type { RequestMessage, StreamChunk, ToolSchema } from '@deepseek-ai/dsh-llm'
 import type { AdapterRequestOptions } from '../src/adapter/request-options.js'
 import type { ContentBlock, RequestPermissionRequest, SessionConfigOption } from '@agentclientprotocol/sdk'
-import { AntigravityAcpAdapter, AGY_PROVIDER_ID, AGY_PLACEHOLDER_MODEL_ID, AGY_ADAPTER_ERROR } from '../src/adapter/antigravity-adapter.js'
+import { AntigravityAcpAdapter, AGY_PROVIDER_ID, AGY_PLACEHOLDER_MODEL_ID, AGY_ADAPTER_ERROR, explainUnavailableModel } from '../src/adapter/antigravity-adapter.js'
 import type { ModelOverride } from '../src/settings.js'
 import type { AdapterLog, AntigravityAcpAdapterOptions } from '../src/adapter/antigravity-adapter.js'
 import type { ImageReader } from '../src/adapter/image-content.js'
@@ -28,7 +28,7 @@ import type { SessionMapEntry } from '../src/runtime/session-map.js'
 import { outputHash, prefixHash, routeFingerprint } from '../src/adapter/session-reuse.js'
 import { AGY_TURN_ERROR } from '../src/adapter/prompt-turn.js'
 import { AGY_BRIDGE_ERROR } from '../src/bridge/mcp-bridge.js'
-import { AgentLink, AGY_LINK_ERROR } from '../src/protocol/agent-link.js'
+import { AgentLink, AgentLinkError, AGY_LINK_ERROR } from '../src/protocol/agent-link.js'
 import { AGY_CLIENT_CAPABILITIES } from '../src/index.js'
 import { parsePromptTranscript } from '../src/adapter/prompt-transcript.js'
 import { FakeAcpAgent, NO_REPLY } from './helpers/fake-acp-agent.js'
@@ -702,11 +702,38 @@ describe('模型目录来自 ACP 会话配置', () => {
     expect(resolved).toMatchObject({ id: '未登记的模型', name: '未登记的模型', inputModalities: ['text'] })
   })
 
-  it('listModels 折叠成家族（Opus 5.5 / Sonnet 5.5 / Argon），不把思考强度放进模型', async () => {
+  it('ACP 目录已知时，CLI 清单只补已知家族的档位，不新增 ACP 不提供的型号', async () => {
     const harness = createHarness({
-      loadCachedCatalog: async () => [{ id: 'gemini-3-flash', name: 'Gemini 3 Flash' }],
+      loadCachedCatalog: async () => [{ id: 'gemini-4-argon', name: 'Gemini 4 Argon' }],
       loadCliCatalog: async () => [
-        { id: 'gemini-3-flash', name: '重复条目以目录为准' },
+        { id: 'gemini-4-argon-low', name: 'Gemini 4 Argon (Low)' },
+        { id: 'gemini-4-argon-high', name: 'Gemini 4 Argon (High)' },
+        { id: 'claude-opus-5-5-medium', name: 'Claude Opus 5.5 (Medium)' },
+      ],
+    })
+    expect((await harness.adapter.listModels(AGY_PROVIDER_ID)).map((model) => model.id)).toEqual(['gemini-4-argon'])
+    const resolved = await harness.adapter.resolveModel(AGY_PROVIDER_ID, 'gemini-4-argon')
+    expect(resolved.reasoning?.efforts.map((effort) => String(effort.id))).toEqual(['low', 'high'])
+  })
+
+  it('官方以认证方式拒绝型号时，报错补充可操作说明并保留错误码', () => {
+    const original = new AgentLinkError('AGY_AGENT_REFUSED', "ACP 请求被拒绝 (session/set_config_option): Model 'claude-opus-5-5-medium' is not available for the current authentication method.", {
+      jsonRpc: { code: -32602, message: "Model 'claude-opus-5-5-medium' is not available for the current authentication method." },
+    })
+    const explained = explainUnavailableModel(original, 'claude-opus-5-5-medium') as AgentLinkError
+    expect(explained).toBeInstanceOf(AgentLinkError)
+    expect(explained.code).toBe('AGY_AGENT_REFUSED')
+    expect(explained.jsonRpc?.code).toBe(-32602)
+    expect(explained.message).toContain('代理模式')
+    const other = new Error('boom')
+    expect(explainUnavailableModel(other, 'x')).toBe(other)
+  })
+
+  it('listModels 折叠成家族（Opus 5.5 / Sonnet 5.5 / Argon），不把思考强度放进模型', async () => {
+    // 尚无 ACP 目录（冷启动、无磁盘缓存）时，CLI 清单整份兜底。
+    const harness = createHarness({
+      loadCliCatalog: async () => [
+        { id: 'gemini-3-flash', name: 'Gemini 3 Flash' },
         { id: 'claude-opus-5-5-high', name: 'Claude Opus 5.5 (High)' },
         { id: 'claude-opus-5-5-low', name: 'Claude Opus 5.5 (Low)' },
         { id: 'gemini-4-argon-medium', name: 'Gemini 4 Argon (Medium)' },
@@ -723,7 +750,6 @@ describe('模型目录来自 ACP 会话配置', () => {
     // 选择器里不出现档位化 id，也不出现临近下架的 gpt-oss-120b。
     expect(ids.some((id) => /-(low|medium|high)$/.test(id))).toBe(false)
     expect(ids.some((id) => id.includes('gpt-oss'))).toBe(false)
-    // 同 id 时保留目录侧的名称。
     expect(models.find((model) => model.id === 'gemini-3-flash')?.name).toBe('Gemini 3 Flash')
     expect(models.find((model) => model.id === 'claude-opus-5-5')?.name).toBe('Claude Opus 5.5')
   })
@@ -2571,7 +2597,7 @@ describe('ACP 会话复用与跨进程恢复', () => {
     expect(Object.keys(map)).not.toContain('conv-0::chat')
   }, 30_000)
 
-  it('usage 按协议原样上报，不做累计换算（官方 1.4.0 实测不返回）', async () => {
+  it('无 usage_update 时 usage 按协议原样上报，不做累计换算', async () => {
     const harness = createHarness()
     const first = collect(harness.adapter.stream(baseOptions({ sessionId: DSH_SESSION })))
     await waitForRequest(harness.agent, 'session/prompt')
@@ -2602,6 +2628,56 @@ describe('ACP 会话复用与跨进程恢复', () => {
     // 协议把 PromptResponse.usage 标为「本轮用量」：原样上报，不擅自从累计值求差。
     expect(secondChunks.find((chunk) => chunk.type === 'usage')).toMatchObject({
       usage: { inputTokens: 150, outputTokens: 25, totalTokens: 175 },
+    })
+  })
+
+  it('回合用量是内部多步累加时，按 usage_update.used 把上下文压力校正为真实占用', async () => {
+    const harness = createHarness()
+    const streaming = collect(harness.adapter.stream(baseOptions({ sessionId: DSH_SESSION })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    for (const used of [13_517, 16_965, 18_638]) {
+      await harness.agent.notify('session/update', {
+        sessionId: SESSION_1,
+        update: { sessionUpdate: 'usage_update', used, size: 1_048_576 },
+      })
+    }
+    await harness.agent.notify('session/update', {
+      sessionId: SESSION_1,
+      update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'done' } },
+    })
+    // 官方 1.5.2 实测：4 次内部调用的累加，input + cacheRead = 63_757，远超真实占用 18_638。
+    await harness.agent.reply('session/prompt', {
+      stopReason: 'end_turn',
+      usage: { totalTokens: 64_361, inputTokens: 24_641, outputTokens: 604, thoughtTokens: 264, cachedReadTokens: 39_116, cachedWriteTokens: 0 },
+    }, 0)
+    const usage = (await streaming).find((chunk) => chunk.type === 'usage')
+    if (usage?.type !== 'usage') throw new Error('缺少 usage chunk')
+    const { inputTokens, cacheReadTokens = 0, cacheWriteTokens = 0 } = usage.usage
+    expect(inputTokens + cacheReadTokens + cacheWriteTokens).toBe(18_638)
+    expect(cacheReadTokens / (inputTokens + cacheReadTokens)).toBeCloseTo(39_116 / 63_757, 3)
+    expect(usage.usage).toMatchObject({ outputTokens: 604, reasoningTokens: 264 })
+    // 缩放后不再是精确整轮合计，不能带着 totalTokens。
+    expect(usage.usage.totalTokens).toBeUndefined()
+  })
+
+  it('累加值不超过 usage_update.used 时原样上报', async () => {
+    const harness = createHarness()
+    const streaming = collect(harness.adapter.stream(baseOptions({ sessionId: DSH_SESSION })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    await harness.agent.notify('session/update', {
+      sessionId: SESSION_1,
+      update: { sessionUpdate: 'usage_update', used: 500, size: 1_048_576 },
+    })
+    await harness.agent.notify('session/update', {
+      sessionId: SESSION_1,
+      update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'hi' } },
+    })
+    await harness.agent.reply('session/prompt', {
+      stopReason: 'end_turn',
+      usage: { totalTokens: 110, inputTokens: 100, outputTokens: 10 },
+    }, 0)
+    expect((await streaming).find((chunk) => chunk.type === 'usage')).toMatchObject({
+      usage: { inputTokens: 100, outputTokens: 10, totalTokens: 110 },
     })
   })
 

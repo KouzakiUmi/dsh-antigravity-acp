@@ -134,6 +134,8 @@ export class PromptTurn {
   #abortCleanup: (() => void) | undefined
   #terminated = false
   #hasOutput = false
+  /** 本回合最后一次 `usage_update.used`：agent 实测的当前上下文占用。 */
+  #contextUsed: number | undefined
   readonly #permissionIds = new Set<string>()
   readonly #onBridgePermission: PromptTurnOptions['onBridgePermission']
   readonly #onArgumentIssues: PromptTurnOptions['onArgumentIssues']
@@ -416,7 +418,7 @@ export class PromptTurn {
       }, true)
       return
     }
-    this.finishRound(mapUsage(response.usage))
+    this.finishRound(mapUsage(response.usage, this.#contextUsed))
   }
 
   #mapStopReason(stopReason: StopReason): LlmFailure | undefined {
@@ -498,13 +500,19 @@ export class PromptTurn {
       case 'agent_thought_chunk':
         this.#appendText('reasoning', update.messageId ?? undefined, update.content)
         return
+      case 'usage_update': {
+        // 只记录当前占用，供回合结束时校正上下文压力；容量（size）由 adapter 观察。
+        const used = update.used
+        if (typeof used === 'number' && Number.isFinite(used) && used > 0) this.#contextUsed = used
+        return
+      }
       case 'config_option_update': {
         const configUpdate: ConfigOptionUpdate = update
         this.#onConfigOptions?.(configUpdate.configOptions)
         return
       }
       default:
-        // 其余 update（plan / tool_call / usage_update / mode / compaction …）
+        // 其余 update（plan / tool_call / mode / compaction …）
         // 是进度或遥测信息，DSH StreamChunk 词表无对应表达；内容只存在于上面
         // 两个 *_chunk 分支，因此这里丢弃的只有进度信息。
         return
@@ -599,17 +607,41 @@ function renderContentText(content: unknown): string | undefined {
 /**
  * ACP Usage → DSH TokenUsage。
  *
- * 协议把 `PromptResponse.usage` 标为「本轮用量」（UNSTABLE），但官方
- * agy_acp_server 1.4.0 实测不返回该字段，因此本 adapter 通常不上报 usage；
- * 返回时按原值上报，不做任何估算或累计换算。
+ * 协议把 `PromptResponse.usage` 标为「本轮用量」：agy_acp_server（1.5.2 实测）
+ * 会返回它，但它是 agent 一个回合内**所有内部模型调用**的累加——每一步
+ * （读文件、抓网页…）都会重发一遍上下文，因此 input + cacheRead 远大于真实
+ * 上下文占用。DSH 却按单次调用解读 TokenUsage：token meter 以
+ * `inputTokens + cacheReadTokens + cacheWriteTokens` 作为上下文压力，压缩据此触发。
+ *
+ * 若本回合收到过 `usage_update.used`（ACP 定义为当前上下文占用），就把三项
+ * prompt 计数按比例缩放到 `used`：压力与真实占用一致，缓存命中比例保持不变。
+ * 缩放后的数不再是精确的整轮合计，按 TokenUsage 约定省略 `totalTokens`。
+ * 输出 / 推理 token 不影响上下文压力，原样保留。没有 `used`、或累加值本就
+ * 不超过 `used` 时按原值上报。
  */
-export function mapUsage(usage: Usage | null | undefined): TokenUsage | undefined {
+export function mapUsage(usage: Usage | null | undefined, contextUsed?: number): TokenUsage | undefined {
   if (!usage) return undefined
   let mapped: TokenUsage = { inputTokens: usage.inputTokens, outputTokens: usage.outputTokens }
   if (usage.totalTokens !== undefined) mapped = { ...mapped, totalTokens: usage.totalTokens }
   if (usage.cachedReadTokens != null) mapped = { ...mapped, cacheReadTokens: usage.cachedReadTokens }
   if (usage.cachedWriteTokens != null) mapped = { ...mapped, cacheWriteTokens: usage.cachedWriteTokens }
   if (usage.thoughtTokens != null) mapped = { ...mapped, reasoningTokens: usage.thoughtTokens }
-  return mapped
+  return contextUsed === undefined ? mapped : fitPromptToContext(mapped, contextUsed)
+}
+
+function fitPromptToContext(usage: TokenUsage, contextUsed: number): TokenUsage {
+  const cacheRead = usage.cacheReadTokens ?? 0
+  const cacheWrite = usage.cacheWriteTokens ?? 0
+  const prompt = usage.inputTokens + cacheRead + cacheWrite
+  if (!(contextUsed > 0) || prompt <= contextUsed) return usage
+  const ratio = contextUsed / prompt
+  const { totalTokens: _aggregateTotal, ...rest } = usage
+  let fitted: TokenUsage = { ...rest }
+  const scaledRead = Math.floor(cacheRead * ratio)
+  const scaledWrite = Math.floor(cacheWrite * ratio)
+  if (usage.cacheReadTokens != null) fitted = { ...fitted, cacheReadTokens: scaledRead }
+  if (usage.cacheWriteTokens != null) fitted = { ...fitted, cacheWriteTokens: scaledWrite }
+  // 余数归入 inputTokens，保证三项之和恰为 contextUsed。
+  return { ...fitted, inputTokens: Math.round(contextUsed) - scaledRead - scaledWrite }
 }
 
