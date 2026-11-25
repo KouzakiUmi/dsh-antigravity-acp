@@ -696,11 +696,13 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     return [
       ...models.map((model) => {
         // 实测容量优先；未实测时用审计参考值（issue #17），来源随目录行下发，
-        // 设置页据此区分「上游容量」与「审计参考」。
-        const observedWindow = model.id === ORCHESTRATOR_MODEL_ID ? undefined : this.#contextWindows.get(model.id)
+        // 设置页据此区分「上游容量」与「审计参考」。配置了官方 ID 映射时，
+        // 容量按映射目标取值（映射优先于家族路由，AGENTS.md 契约）。
+        const mappedTarget = model.id === ORCHESTRATOR_MODEL_ID ? undefined : modelSettingFor(this.#modelSettingsSnapshot(), model.id).target
+        const observedWindow = model.id === ORCHESTRATOR_MODEL_ID ? undefined : this.#observedContextWindow(model.id, mappedTarget)
         const contextWindow = model.id === ORCHESTRATOR_MODEL_ID
           ? orchContext?.contextWindow
-          : observedWindow ?? auditedAcpContextWindow(model.id)
+          : observedWindow ?? auditedAcpContextWindow(mappedTarget ?? model.id)
         const contextWindowSource = model.id === ORCHESTRATOR_MODEL_ID
           ? orchContext?.source
           : contextWindow === undefined ? undefined : observedWindow !== undefined ? 'observed' : 'audited'
@@ -736,15 +738,32 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   #orchestratorContextWindow(orch: OrchestratorSettings): { contextWindow: number; source: 'observed' | 'audited' } | undefined {
     const plannerFamily = acpOrchestratorFamily(orch.plannerModel)
     const executorFamily = acpOrchestratorFamily(orch.executorModel)
-    const plannerObserved = this.#contextWindows.get(plannerFamily)
-    const executorObserved = this.#contextWindows.get(executorFamily)
+    // planner 会话直接写家族档位、不经用户映射；executor 走常规路由，映射优先。
+    const executorTarget = modelSettingFor(this.#modelSettingsSnapshot(), executorFamily).target
+    const plannerObserved = this.#observedContextWindow(plannerFamily, undefined)
+    const executorObserved = this.#observedContextWindow(executorFamily, executorTarget)
     const plannerWindow = plannerObserved ?? auditedAcpContextWindow(plannerFamily)
-    const executorWindow = executorObserved ?? auditedAcpContextWindow(executorFamily)
+    const executorWindow = executorObserved ?? auditedAcpContextWindow(executorTarget ?? executorFamily)
     if (plannerWindow === undefined || executorWindow === undefined) return undefined
     return {
       contextWindow: Math.min(plannerWindow, executorWindow),
       source: plannerObserved !== undefined && executorObserved !== undefined ? 'observed' : 'audited',
     }
+  }
+
+  /**
+   * 实测容量查找：精确路由键 → 映射目标 → 各自的家族键，全部未命中才返回
+   * undefined。家族路由的观测记在家族键上，固定档位 ID 的请求也要能命中；
+   * 映射目标才是实际上游模型，其观测与家族键同样优先于审计值。
+   */
+  #observedContextWindow(model: string, target: string | undefined): number | undefined {
+    const candidates = [model, target, modelFamilyId(model), target === undefined ? undefined : modelFamilyId(target)]
+    for (const key of candidates) {
+      if (key === undefined) continue
+      const size = this.#contextWindows.get(key)
+      if (size !== undefined) return size
+    }
+    return undefined
   }
 
   /**
@@ -906,11 +925,13 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     // 显示名覆盖对已知与未知路由键都生效：用户在设置页改了名字，选择器与
     // 会话标题都要一致，不能只在 listModels 里生效。
     const displayName = modelDisplayName(this.#modelSettingsSnapshot(), model, known?.name ?? model)
-    // 上下文容量：实测（usage_update.size / 磁盘缓存）优先；未实测时用审计参考值
-    // （model-capacity.ts：auth-core 原生快照 + 登记的上游实测记录）。宿主压缩引擎
-    // 对无容量路由在模型切换 / 溢出恢复时直接报错（issue #17）；未知家族仍省略
-    // context，绝不填猜测值。
-    const contextWindow = this.#contextWindows.get(model) ?? auditedAcpContextWindow(model)
+    // 上下文容量：实测（usage_update.size / 磁盘缓存）优先，按路由键 / 映射目标 /
+    // 家族键查找；未实测时用审计参考值（model-capacity.ts），且按映射目标取值——
+    // 映射才是实际上游模型（AGENTS.md 映射优先契约）。宿主压缩引擎对无容量路由
+    // 在模型切换 / 溢出恢复时直接报错（issue #17）；未知家族仍省略 context，
+    // 绝不填猜测值。
+    const mappedTarget = modelSettingFor(this.#modelSettingsSnapshot(), model).target
+    const contextWindow = this.#observedContextWindow(model, mappedTarget) ?? auditedAcpContextWindow(mappedTarget ?? model)
     // 没有档位变体的模型必须省略 reasoning（宿主拒绝空 efforts）。
     const reasoning = this.#reasoningInfo(model, tiers)
     return {

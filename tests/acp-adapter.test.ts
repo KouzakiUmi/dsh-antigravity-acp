@@ -1087,8 +1087,21 @@ describe('StreamChunk 序列映射', () => {
     await harness.agent.reply('session/prompt', { stopReason: 'end_turn' }, 1)
     await streaming
     expect((await harness.adapter.resolveModel(AGY_PROVIDER_ID, 'claude-opus-5-5')).context).toEqual({ contextWindow: 500_000 })
+    // 固定档位 ID 的请求也命中家族键上的实测值，不退化到审计值（Codex 审查）。
+    expect((await harness.adapter.resolveModel(AGY_PROVIDER_ID, 'claude-opus-5-5-medium')).context).toEqual({ contextWindow: 500_000 })
     const after = await harness.adapter.listModels(AGY_PROVIDER_ID) as unknown as Array<{ id: string; contextWindow?: number; contextWindowSource?: string }>
     expect(after.find((model) => model.id === 'claude-opus-5-5')).toMatchObject({ contextWindow: 500_000, contextWindowSource: 'observed' })
+  })
+
+  it('容量按映射目标取值：审计回退跟随实际上游模型（Codex 审查）', async () => {
+    const harness = createHarness({
+      readSettings: () => ({ modelOverrides: { 'gemini-3-pro': { target: 'gpt-oss-120b-medium' } } }),
+      loadCachedCatalog: async () => [{ id: 'gemini-3-pro', name: 'Gemini 3 Pro' }],
+    })
+    // 未实测：取映射目标 gpt-oss-120b 的审计值 131072，而不是原家族。
+    expect((await harness.adapter.resolveModel(AGY_PROVIDER_ID, 'gemini-3-pro')).context).toEqual({ contextWindow: 131_072 })
+    const models = await harness.adapter.listModels(AGY_PROVIDER_ID) as unknown as Array<{ id: string; contextWindow?: number; contextWindowSource?: string }>
+    expect(models.find((model) => model.id === 'gemini-3-pro')).toMatchObject({ contextWindow: 131_072, contextWindowSource: 'audited' })
   })
 
   it('家族折叠下实测容量按家族 id 落盘，且 resolveModel 用家族显示名', async () => {
