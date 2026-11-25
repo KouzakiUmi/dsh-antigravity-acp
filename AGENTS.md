@@ -29,7 +29,8 @@ npm 包名 `dsh-bundle-antigravity-host`、provider ID `antigravity-acp` / `anti
 
 ## 关键设计取舍
 
-- **模型目录只观测，不自造**：ACP 模式目录来自会话 `configOptions` 与官方 CLI 只读清单；代理模式由 [`model-catalog.ts`](src/proxy/model-catalog.ts) 将支持的模型与当前账户的可用项取交集，排除上游停用项。审计快照之外的 Hydrogen 和 Neon 只按已观测档位派发，不借用其他家族的容量和能力。用户设置（`modelOverrides`）只作用于已存在的条目。
+- **模型目录只观测，不自造**：ACP 模式目录来自会话 `configOptions` 与官方 CLI 只读清单；代理模式由 [`model-catalog.ts`](src/proxy/model-catalog.ts) 将支持的模型与当前账户的可用项取交集，排除上游停用项。审计快照之外的 Hydrogen 和 Neon 只按已观测档位派发，不借用其他家族的容量和能力。用户设置（`modelOverrides`）只作用于已存在的条目。唯一例外是受约束的合成条目 `antigravity-orchestrator`：只有配置的 planner 与 executor 都已在当前目录可见时才出现，它是插件编排入口而不是观测到的上游模型，条件不满足时不出现在选择器里。
+- **编排由插件自己驱动**：`antigravity-orchestrator` 的 planner 与 executor 选择、计划解析、交回判定都在插件内（[`src/orchestrator/`](src/orchestrator/)），两模式行为一致。代理链路是两次独立上游请求（planner 用独立会话存储，不写 `ContinuationState`）；ACP 链路是独立 planner 会话 + 同会话切模型执行。官方 `gemini-pro-orchestrator-*` 条目保持原样，透传给官方 agent 自己编排。
 - **停用 ≠ 删除**：停用只是不列入选择器，已知模型的显示名、上下文容量与路由仍保留，重新启用不会退回裸 ID。
 - **映射优先于家族路由**：`target` 原样写入 `session/set_config_option`，由官方 agent 判定是否接受；未登记 ID 不被静默改写。没有映射时才走「显式选择 → 该模型默认档位 → 官方默认档位」。
 - **默认档位必须存在**：配置的档位若未被官方声明，退回官方默认档位，不指向不存在的选项。
@@ -47,6 +48,7 @@ npm 包名 `dsh-bundle-antigravity-host`、provider ID `antigravity-acp` / `anti
 ## 实现边界
 
 - 协议约束不是 OS 沙箱；ACP fs / terminal 与未知原生权限请求一律拒绝。
+- 编排模式的 planner 阶段不经过 DSH 审批：ACP 链路在会话工作目录下运行官方 `mode=plan`，官方内置工具仍会执行只读命令，计划文件写在官方 brain 目录；代理链路的 planner 请求不声明工具。两条链路的 planner 会话都不注册 MCP 桥，DSH 工具只由 executor 轮次调用。
 - `temperature` / `stop` 无 ACP v1 会话通道，记录警告并忽略；`maxTokens` 忽略；`reasoningEffort` 是家族 → 档位的路由键。
 - 额度与 AI Credits 仅为参考值，不是计费依据；ACP 登录、CLI 登录与代理账户登录是三条链路。
 - ACP 上下文容量来自 `usage_update.size`，不把 `used` 记成单轮计费用量；代理容量来自账户目录的实际线模型（家族取已观测共同上限，既有模型保留审计回退）。设置页只读显示容量，目录输出上限不自动改成请求默认值。
@@ -58,6 +60,7 @@ npm 包名 `dsh-bundle-antigravity-host`、provider ID `antigravity-acp` / `anti
 ## 维护约定
 
 - 字段以 [`src/settings.ts`](src/settings.ts) 的 `Config` 为唯一来源；`LIVE_SETTING_KEYS` 只管理即时字段。设置卡片只编辑即时字段与 `modelOverrides`（逐模型编辑器），并以指引块列出普通配置字段名（并发、二进制、各段超时）——宿主只把 volatile 字段投影进设置文档，也会拒绝 `mutate` 非 volatile 路径，把它们渲染成可编辑控件只会得到「值不是真值、保存整批失败」；`proxyBypass` 仅保留配置兼容性、不显示控制项（有测试锁定）。
+- 编排核心只在 [`src/orchestrator/`](src/orchestrator/) 实现（计划解析、触发判定、提示词、状态存储）；代理与 ACP 适配器只做接入，不改写这些纯逻辑。`orchestrator` 作为整份对象字段参与草稿脏值与冲突判断，与 `modelOverrides` 同模式。
 - 模型设置的纯逻辑集中在 [`src/adapter/model-settings.ts`](src/adapter/model-settings.ts)，适配器与客户端只消费其结论。
 - 代理模式的线身份、传输、凭据、payload 与路由分别在 [`src/proxy/`](src/proxy/) 下独立模块；模式总线（`mode-bus.ts`）是互斥语义的唯一实现处。
 - 客户端 [`src/client.js`](src/client.js) 不得导入 Node 原生模块；`remote.settings` / `remote.llm` 必须逐个声明注入。一个包只注册一次 Host Typert contribution、只执行一次客户端 `$mount`，合并 `agyQuota` 与 `agyProxyAccount` 描述符；宿主拒绝重复 package-face / Remote package 身份。

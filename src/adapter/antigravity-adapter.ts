@@ -18,9 +18,10 @@ import type {
   LlmResolvedModelInfo,
   RequestMessage,
   StreamChunk,
+  TokenUsage,
 } from '@deepseek-ai/dsh-llm'
 import type { AdapterPreparedCall, AdapterRequestOptions, AdapterRequestOwner } from './request-options.js'
-import type { AnyRequest, McpServer as AcpMcpServer, SessionConfigOption, SessionNotification, Usage } from '@agentclientprotocol/sdk'
+import type { AnyRequest, McpServer as AcpMcpServer, PromptResponse, SessionConfigOption, SessionNotification, Usage } from '@agentclientprotocol/sdk'
 import { AgentLinkError } from '../protocol/agent-link.js'
 import type { AgentLink, AgentLinkHandlers } from '../protocol/agent-link.js'
 import { BRIDGE_MCP_SERVER_NAME, McpToolBridge } from '../bridge/mcp-bridge.js'
@@ -35,19 +36,35 @@ import {
   tierForModelId,
 } from '../runtime/agy-cli.js'
 import type { AgyModelTier, AgyReasoningEffort } from '../runtime/agy-cli.js'
-import { findModelSelector, toModelCatalog } from './model-catalog.js'
+import { acpOrchestratorFamily, findModeSelector, findModelSelector, findThoughtLevelSelector, synthesizeAcpOrchestratorModel, toModelCatalog } from './model-catalog.js'
 import type { ModelSelector } from './model-catalog.js'
 import { applyModelSettings, modelDisplayName, modelSettingFor, normalizeModelSettings, resolveModelTarget } from './model-settings.js'
 import type { ModelSetting } from './model-settings.js'
 import { buildPromptDeltaWithImages, buildPromptWithImages, buildToolResultContent } from './image-content.js'
 import type { ImageReader } from './image-content.js'
-import { AGY_TURN_ERROR, PromptTurn } from './prompt-turn.js'
+import { AGY_TURN_ERROR, mapUsage, PromptTurn } from './prompt-turn.js'
 import type { AcpLifecycle } from '../runtime/lifecycle.js'
 import { ContinuationState } from './continuation-state.js'
 import { incrementalMessages, outputHash, outputMatches, prefixHash, prefixMatches, reusableSessionKey, routeFingerprint } from './session-reuse.js'
 import { SessionMapStore } from '../runtime/session-map.js'
 import type { SessionMapEntry } from '../runtime/session-map.js'
-import type { ModelOverride } from '../settings.js'
+import type { ModelOverride, OrchestratorConfig } from '../settings.js'
+import {
+  ORCHESTRATOR_MODEL_ID,
+  ORCHESTRATOR_MODEL_NAME,
+  OrchestratorStore,
+  PLANNER_SYSTEM_SUFFIX,
+  buildExecutorSystem,
+  buildPlannerMessages,
+  computeTurnKey,
+  convergeOrchestratorEffort,
+  extractGoalAndEvidence,
+  normalizeOrchestratorSettings,
+  parsePlan,
+  renderPlanForExecutor,
+  shouldPlan,
+} from '../orchestrator/index.js'
+import type { OrchestratorPlan, OrchestratorSettings } from '../orchestrator/index.js'
 
 /** DSH 侧 provider 标识符；与 cordis.patch.yml 的 id 及文档保持一致。 */
 export const AGY_PROVIDER_ID = 'antigravity-acp'
@@ -77,6 +94,8 @@ export const AGY_ADAPTER_ERROR = {
   MODEL_SELECTION_MISMATCH: 'AGY_MODEL_SELECTION_MISMATCH',
   /** 单次 session/prompt 体积超出 agy 192 KB 安全预算，拒绝发送以避免静默截断。 */
   PROMPT_TOO_LARGE: 'AGY_PROMPT_TOO_LARGE',
+  /** 编排模式的 planner/executor 模型不在当前 ACP 目录，或编排已禁用。 */
+  INVALID_ORCHESTRATOR_MODEL: 'AGY_INVALID_MODEL',
 } as const
 
 /** MCP 桥与回合的可调参数（由 index.ts 从插件配置注入）。 */
@@ -146,8 +165,10 @@ export interface AntigravityAcpAdapterOptions {
   idleRecycleMs?: number
   /** 所有 worker 共享的映射存储（含键所有权与串行提交）。 */
   sessionStore?: SessionMapStore
+  /** 编排模式配置（`antigravity-orchestrator`）。 */
+  orchestrator?: OrchestratorConfig
   /** Capture live preferences only between ACP turns, never during tool continuation. */
-  readSettings?: () => Pick<AntigravityAcpAdapterOptions, 'modelOverrides' | 'reuseSessions' | 'resumeSessions' | 'keepProcessAfterCancel' | 'cancelGraceMs' | 'idleRecycleMs' | 'sessionStore'>
+  readSettings?: () => Pick<AntigravityAcpAdapterOptions, 'modelOverrides' | 'reuseSessions' | 'resumeSessions' | 'keepProcessAfterCancel' | 'cancelGraceMs' | 'idleRecycleMs' | 'sessionStore' | 'orchestrator'>
   /** 独立 adapter 的兼容读取回调；连接池必须改用共享 sessionStore。 */
   loadSessionMap?: () => Promise<Record<string, SessionMapEntry>>
   /** 保存 ACP 会话映射；失败由实现方吞掉。 */
@@ -217,6 +238,43 @@ interface ReusedSession {
 
 const DEFAULT_PROMPT_TIMEOUT_MS = 30 * 60_000
 const DEFAULT_PARK_SETTLE_MS = 50
+const ACP_DEFAULT_PLANNER_TIMEOUT_MS = 120_000
+
+interface PlannerSessionEntry {
+  sessionId: string
+  link: AgentLink
+  cwd: string
+  configOptions: readonly SessionConfigOption[]
+  modeChanged?: boolean
+  previousMode?: string
+}
+
+interface PlannerCollector {
+  readonly sessionId: string
+  onUpdate(notification: SessionNotification): void
+}
+
+function mergeAcpTokenUsage(a?: TokenUsage, b?: TokenUsage): TokenUsage | undefined {
+  if (a === undefined) return b
+  if (b === undefined) return a
+  const inputTokens = a.inputTokens + b.inputTokens
+  const outputTokens = a.outputTokens + b.outputTokens
+  const cacheReadTokens = a.cacheReadTokens === undefined && b.cacheReadTokens === undefined ? undefined : (a.cacheReadTokens ?? 0) + (b.cacheReadTokens ?? 0)
+  const cacheWriteTokens = a.cacheWriteTokens === undefined && b.cacheWriteTokens === undefined ? undefined : (a.cacheWriteTokens ?? 0) + (b.cacheWriteTokens ?? 0)
+  const reasoningTokens = a.reasoningTokens === undefined && b.reasoningTokens === undefined ? undefined : (a.reasoningTokens ?? 0) + (b.reasoningTokens ?? 0)
+  const knownSum = inputTokens + outputTokens + (cacheReadTokens ?? 0) + (cacheWriteTokens ?? 0) + (reasoningTokens ?? 0)
+  const totalCandidate = a.totalTokens !== undefined && b.totalTokens !== undefined
+    ? a.totalTokens + b.totalTokens
+    : undefined
+  return {
+    inputTokens,
+    outputTokens,
+    ...(cacheReadTokens === undefined ? {} : { cacheReadTokens }),
+    ...(cacheWriteTokens === undefined ? {} : { cacheWriteTokens }),
+    ...(reasoningTokens === undefined ? {} : { reasoningTokens }),
+    ...(totalCandidate === undefined || totalCandidate < knownSum ? {} : { totalTokens: totalCandidate }),
+  }
+}
 
 export class AntigravityAcpAdapter extends LlmAdapter {
   readonly #lifecycle: AcpLifecycle | undefined
@@ -234,6 +292,12 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   readonly #cwd: string
   /** 用户模型设置的只读快照；每次读取设置时整体替换。 */
   #modelSettings: ReadonlyMap<string, ModelSetting> = new Map()
+  #orchestratorConfig: OrchestratorConfig | undefined
+  readonly #orchestrators = new OrchestratorStore()
+  /** 按 DSH 会话隔离的独立 planner ACP 会话缓存（最多 64 条，按 link 与 cwd 失效）。 */
+  readonly #plannerSessions = new Map<string, PlannerSessionEntry>()
+  /** 正在运行中的 planner 通知采集器；绝不借用 chat 的 #turn。 */
+  #plannerCollector: PlannerCollector | undefined
   readonly #readSettings?: AntigravityAcpAdapterOptions['readSettings']
   readonly #loadCachedCatalog?: AntigravityAcpAdapterOptions['loadCachedCatalog']
   readonly #saveCatalog?: AntigravityAcpAdapterOptions['saveCatalog']
@@ -295,6 +359,9 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   #turnSubscription: { turn: PromptTurn; unsubscribe: () => void } | undefined
   #catalog: LlmModelInfo[] = []
   #modelSelector: ModelSelector | undefined
+  #thoughtLevelSelector: ModelSelector | undefined
+  /** 各会话观测到的 thought_level 选择器（随 session/new 与 set_config_option 刷新）。 */
+  #sessionThoughtSelectors = new Map<string, ModelSelector>()
   /**
    * 已经为某个 ACP 会话确认写入过的模型值。`#modelSelector.currentValue` 是
    * **连接级**缓存（可能来自别的会话、也可能来自上一次 `session/new`），新会话
@@ -331,6 +398,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     this.#parkSettleMs = options.parkSettleMs ?? DEFAULT_PARK_SETTLE_MS
     this.#cwd = options.cwd ?? process.cwd()
     this.#modelSettings = normalizeModelSettings(options.modelOverrides)
+    this.#orchestratorConfig = options.orchestrator
     this.#readSettings = options.readSettings
     this.#loadCachedCatalog = options.loadCachedCatalog
     this.#saveCatalog = options.saveCatalog
@@ -360,6 +428,9 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       this.#turn?.dispose()
       this.#releaseTurnSubscription()
       this.#dropAllSessions('adapter 卸载')
+      this.#dropAllPlannerSessions()
+      this.#orchestrators.dispose()
+      this.#plannerCollector = undefined
       for (const [turn, link] of this.#ephemeral) this.#closeSession(link, turn.sessionId)
       this.#ephemeral.clear()
       this.#clearCancelGrace()
@@ -373,11 +444,20 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       onSessionUpdate: (notification) => {
         // session/load 会把整段历史重放回来；那不是本轮输出，必须丢弃。
         if (this.#disposed || this.#suppressUpdates > 0) return
+        if (this.#plannerCollector && notification.sessionId === this.#plannerCollector.sessionId) {
+          this.#plannerCollector.onUpdate(notification)
+          return
+        }
         this.#observeUsageUpdate(notification)
         return this.#turn?.handleSessionUpdate(notification)
       },
-      onRequestPermission: (request) => (!this.#disposed ? this.#turn?.handleRequestPermission(request) : undefined)
-        ?? { outcome: { outcome: 'cancelled' } },
+      onRequestPermission: (request) => {
+        if (this.#disposed) return { outcome: { outcome: 'cancelled' } }
+        if (this.#plannerCollector && request.sessionId === this.#plannerCollector.sessionId) {
+          return { outcome: { outcome: 'cancelled' } }
+        }
+        return this.#turn?.handleRequestPermission(request) ?? { outcome: { outcome: 'cancelled' } }
+      },
       onUnexpectedAgentRequest: (method, request) => this.#handleUnexpectedRequest(method, request),
       onProtocolViolation: (detail) =>
         this.#log?.warn(`antigravity-acp: 已丢弃无法路由的 JSON-RPC 帧（链路与在途请求不受影响）：${detail}`),
@@ -437,10 +517,25 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     return this.#modelSettings
   }
 
+  #orchestratorSettingsSnapshot(): OrchestratorSettings {
+    const settings = this.#readSettings?.()
+    const raw = settings !== undefined ? settings.orchestrator : this.#orchestratorConfig
+    const hasExplicitTimeout = raw !== undefined
+      && typeof raw === 'object'
+      && raw !== null
+      && typeof raw.plannerTimeoutMs === 'number'
+      && Number.isFinite(raw.plannerTimeoutMs)
+      && raw.plannerTimeoutMs >= 5000
+      && raw.plannerTimeoutMs <= 300_000
+    const normalized = normalizeOrchestratorSettings(raw)
+    return hasExplicitTimeout ? normalized : { ...normalized, plannerTimeoutMs: ACP_DEFAULT_PLANNER_TIMEOUT_MS }
+  }
+
   #refreshSettings(): void {
     const settings = this.#readSettings?.()
     if (!settings) return
     this.#modelSettings = normalizeModelSettings(settings.modelOverrides)
+    this.#orchestratorConfig = settings.orchestrator
     this.#reuseSessions = settings.reuseSessions ?? true
     this.#resumeSessions = settings.resumeSessions ?? false
     this.#keepProcessAfterCancel = settings.keepProcessAfterCancel ?? false
@@ -561,20 +656,64 @@ export class AntigravityAcpAdapter extends LlmAdapter {
    */
   override async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
     const folded = await this.#foldCatalog(_provider)
+    const orch = this.#orchestratorSettingsSnapshot()
+    const observedFamilies = await this.#observedAcpFamilies(_provider)
+    const orchContextWindow = this.#orchestratorContextWindow(orch)
+    const orchModel = synthesizeAcpOrchestratorModel({
+      provider: _provider,
+      settings: orch,
+      observedFamilies,
+      ...(this.#inputModalities() === undefined ? {} : { inputModalities: this.#inputModalities() }),
+      ...(orchContextWindow === undefined ? {} : { contextWindow: orchContextWindow }),
+    })
+    const candidates = orchModel === undefined
+      ? folded.models
+      : [...folded.models, { id: orchModel.id, name: orchModel.name }]
     // 用户设置只作用于已观测到的条目：停用的不列入选择器，显示名可覆盖。
+    // ACP 目录已知时只列当前登录方式实际提供的家族；orchestrator 合成条目的可见性
+    // 已由 synthesizeAcpOrchestratorModel 的 observedFamilies 门槛保证，豁免此过滤。
     const offered = folded.offered
-    const models = applyModelSettings(this.#modelSettingsSnapshot(),
-      offered === undefined ? folded.models : folded.models.filter((model) => offered.has(model.id)))
+    const visible = offered === undefined
+      ? candidates
+      : candidates.filter((model) => model.id === ORCHESTRATOR_MODEL_ID || offered.has(model.id))
+    const models = applyModelSettings(this.#modelSettingsSnapshot(), visible)
     return [
-      ...models.map((model) => ({
-        provider: _provider,
-        id: model.id,
-        name: model.name,
-        ...(model.description === undefined ? {} : { description: model.description }),
-        ...(this.#inputModalities() === undefined ? {} : { inputModalities: this.#inputModalities() }),
-        ...(this.#contextWindows.has(model.id) ? { contextWindow: this.#contextWindows.get(model.id) } : {}),
-      })),
+      ...models.map((model) => {
+        const contextWindow = model.id === ORCHESTRATOR_MODEL_ID
+          ? orchContextWindow
+          : this.#contextWindows.get(model.id)
+        return {
+          provider: _provider,
+          id: model.id,
+          name: model.name,
+          ...(model.description === undefined ? {} : { description: model.description }),
+          ...(this.#inputModalities() === undefined ? {} : { inputModalities: this.#inputModalities() }),
+          ...(contextWindow === undefined ? {} : { contextWindow }),
+        }
+      }),
     ]
+  }
+
+  async #observedAcpFamilies(provider: string): Promise<ReadonlySet<string>> {
+    const observed = this.#catalog.length > 0 ? this.#catalog : await this.#cachedModels(provider)
+    if (observed.length === 0) return new Set()
+    const folded = foldAgyModelFamilies(
+      observed
+        .filter((model) => model.id !== AGY_PLACEHOLDER_MODEL_ID)
+        .map((model) => ({
+          id: model.id,
+          name: model.name,
+          ...(model.description === undefined ? {} : { description: model.description }),
+        })),
+    )
+    return new Set(folded.models.map((model) => model.id))
+  }
+
+  #orchestratorContextWindow(orch: OrchestratorSettings): number | undefined {
+    const plannerWindow = this.#contextWindows.get(acpOrchestratorFamily(orch.plannerModel))
+    const executorWindow = this.#contextWindows.get(acpOrchestratorFamily(orch.executorModel))
+    if (plannerWindow === undefined || executorWindow === undefined) return undefined
+    return Math.min(plannerWindow, executorWindow)
   }
 
   /**
@@ -684,6 +823,48 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     // 也要走同一份折叠结果。这里仅读缓存，不启动 ACP 连接。
     const folded = await withAbort(this.#foldCatalog(provider), signal)
     throwIfAborted(signal)
+    if (model === ORCHESTRATOR_MODEL_ID) {
+      const orch = this.#orchestratorSettingsSnapshot()
+      const observedFamilies = await withAbort(this.#observedAcpFamilies(provider), signal)
+      throwIfAborted(signal)
+      const contextWindow = this.#orchestratorContextWindow(orch)
+      const synthesized = synthesizeAcpOrchestratorModel({
+        provider,
+        settings: orch,
+        observedFamilies,
+        ...(this.#inputModalities() === undefined ? {} : { inputModalities: this.#inputModalities() }),
+        ...(contextWindow === undefined ? {} : { contextWindow }),
+      })
+      if (synthesized === undefined) {
+        throw llmError('编排模式的 planner/executor 模型不在当前目录', AGY_ADAPTER_ERROR.INVALID_ORCHESTRATOR_MODEL)
+      }
+      const displayName = modelDisplayName(this.#modelSettingsSnapshot(), ORCHESTRATOR_MODEL_ID, synthesized.name)
+      const plannerFamily = acpOrchestratorFamily(orch.plannerModel)
+      const plannerTiers = folded.tiers.get(plannerFamily)
+      const thoughtOptions = this.#thoughtLevelSelector?.options.map((opt) => opt.value)
+      const availableEfforts = AGY_REASONING_EFFORTS.filter((effort) => {
+        if (plannerTiers !== undefined && plannerTiers.size > 0) return plannerTiers.has(effort)
+        if (thoughtOptions !== undefined && thoughtOptions.length > 0) return thoughtOptions.includes(effort)
+        return true
+      })
+      const exposedEfforts = availableEfforts.length > 0 ? availableEfforts : AGY_REASONING_EFFORTS
+      const preferredRaw = modelSettingFor(this.#modelSettingsSnapshot(), ORCHESTRATOR_MODEL_ID).effort ?? orch.plannerEffort
+      const defaultEffort = convergeOrchestratorEffort(preferredRaw, exposedEfforts) ?? exposedEfforts[0]!
+      return {
+        provider,
+        id: ORCHESTRATOR_MODEL_ID,
+        name: displayName,
+        ...(this.#inputModalities() === undefined ? {} : { inputModalities: this.#inputModalities() }),
+        ...(contextWindow === undefined ? {} : { context: { contextWindow } }),
+        reasoning: {
+          efforts: exposedEfforts.map((effort) => ({
+            id: ReasoningEffortId(effort),
+            name: AGY_REASONING_EFFORT_NAMES[effort],
+          })),
+          defaultEffort: ReasoningEffortId(defaultEffort),
+        },
+      }
+    }
     const families = new Map(folded.models.map((entry) => [entry.id, entry]))
     const tiers = folded.tiers
     // DSH 的路由键是折叠后的家族 id（`claude-opus-5-5`），而 `#catalog` 只含
@@ -761,6 +942,8 @@ export class AntigravityAcpAdapter extends LlmAdapter {
    * 并发防御：主对话与标题/压缩请求可以同时进入同一个 adapter；从首个 await
    * 之前串行化 stream。工具 park 保留回合所有权，辅助请求等待而不是抢占主回合。
    */
+  #leadingEmittedBlock: ContentBlock | undefined
+
   override async *stream(options: AdapterRequestOptions): AsyncIterable<StreamChunk> {
     // temperature / stop 在 ACP v1 没有会话通道：不因它们拒绝整个请求（否则宿主里
     // 任何携带这两个字段的流程都会整单失败），只明确告知「值不生效」。
@@ -779,13 +962,17 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     this.#clearIdleRecycle()
     let handedOff = false
     try {
-      for await (const chunk of this.#streamExclusive(options)) {
-        if (chunk.type === 'block-end') this.#continuationState?.emitted(chunk.block)
+      const inner = options.model === ORCHESTRATOR_MODEL_ID
+        ? this.#streamOrchestrated(options)
+        : this.#streamExclusive(options)
+      for await (const chunk of inner) {
+        if (chunk.type === 'block-end' && chunk.block !== this.#leadingEmittedBlock) this.#continuationState?.emitted(chunk.block)
         // 消费者在收到 finish 后 return 是合法的（尤其是工具续轮）。
         if (chunk.type === 'finish') handedOff = true
         yield chunk
       }
     } finally {
+      this.#leadingEmittedBlock = undefined
       if (!handedOff && this.#turn && !this.#isTurnClosed(this.#turn)) {
         this.#abandonTurn('消费者提前关闭流，取消未完成回合')
       }
@@ -851,7 +1038,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         mcpServers,
         _meta: { antigravity: { enabledTools: [], eagerMcpServers: tools.length > 0 ? [BRIDGE_MCP_SERVER_NAME] : [] } },
       }, { signal: options.signal, timeoutMs: Math.min(this.#promptTimeoutMs, 120_000) })
-      this.observeSessionConfigOptions(response.configOptions)
+      this.observeSessionConfigOptions(response.configOptions, entry.sessionId)
       if (findModelSelector(response.configOptions)) this.#rememberSessionModelSelector(entry.sessionId)
       await this.#applyModelSelection(link, entry.sessionId, options.model, options.reasoningEffort, options.signal)
       throwIfAborted(options.signal)
@@ -1006,6 +1193,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     this.#sessionStore?.delete(record.key, this.#sessionOwner)
     this.#sessionModelValues.delete(record.sessionId)
     this.#sessionModelDeclared.delete(record.sessionId)
+    this.#sessionThoughtSelectors.delete(record.sessionId)
     this.#log?.info(`antigravity-acp: 放弃 ACP 会话复用（${reason}）`)
     this.#closeSession(record.link, record.sessionId)
   }
@@ -1013,6 +1201,16 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   #dropSessionsForLink(link: AgentLink, reason: string): void {
     for (const record of [...this.#sessions.values()]) {
       if (record.link === link) this.#dropSession(record, reason)
+    }
+    for (const [key, entry] of [...this.#plannerSessions.entries()]) {
+      if (entry.link === link) this.#plannerSessions.delete(key)
+    }
+  }
+
+  #dropAllPlannerSessions(): void {
+    for (const [key, entry] of [...this.#plannerSessions.entries()]) {
+      this.#plannerSessions.delete(key)
+      this.#closeSession(entry.link, entry.sessionId)
     }
   }
 
@@ -1182,6 +1380,339 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     yield* this.#runNewRound(options)
   }
 
+  /**
+   * ACP 编排入口（在 #acquireStream 取得 worker 独占权后进入）。
+   *
+   * - `enabled === false`：改写为 executor 家族/档位直走 `#streamExclusive`。
+   * - 需要规划：用独立 `plannerSessions`（`cwd = this.#cwd`、`mcpServers = []`、
+   *   `mode = plan`）运行 planner；不碰 `#turn`、不碰 `#continuationState`、不碰 MCP 桥。
+   * - 续轮一致性：`#continuationState` 记录的是 executor 视角 options（含注入后的 `system`），
+   *   只在计划真正改变（或新轮）时才不匹配并触发 `#abandonTurn` 全量重建；
+   *   相同计划或规划失败降级时沿用原 `system`，工具结果经原 MCP 桥只回填一次。
+   */
+  async *#streamOrchestrated(options: AdapterRequestOptions): AsyncGenerator<StreamChunk> {
+    const orch = this.#orchestratorSettingsSnapshot()
+    if (!orch.enabled) {
+      const executorOptions: AdapterRequestOptions = {
+        ...options,
+        model: acpOrchestratorFamily(orch.executorModel),
+        reasoningEffort: ReasoningEffortId(orch.executorEffort),
+      }
+      yield* this.#streamExclusive(executorOptions)
+      return
+    }
+
+    const sessionId = options.sessionId === undefined ? undefined : String(options.sessionId)
+    const storedState = this.#orchestrators.get(sessionId)
+    const currentTurnKey = computeTurnKey(options.messages, sessionId)
+    const effectiveState = storedState.turnKey !== undefined && currentTurnKey !== undefined && currentTurnKey !== storedState.turnKey
+      ? { ...storedState, plansThisTurn: 0 }
+      : storedState
+    const { goal, evidence } = extractGoalAndEvidence(options.messages)
+    const decision = shouldPlan({
+      messages: options.messages,
+      state: effectiveState,
+      goal,
+      settings: orch,
+      ...(sessionId === undefined ? {} : { sessionId }),
+    })
+
+    const requestedPlannerEffort = normalizeEffort(options.reasoningEffort) ?? orch.plannerEffort
+    let activePlan: OrchestratorPlan | undefined = storedState.plan
+    let plannerUsage: TokenUsage | undefined
+    let emittedShowPlan = false
+
+    if (decision.plan) {
+      const result = await this.#runAcpPlanner(options, orch, requestedPlannerEffort, goal, evidence, storedState.plan, sessionId)
+      if (options.signal?.aborted) {
+        yield {
+          type: 'finish',
+          reason: { kind: 'aborted', failure: { code: AGY_TURN_ERROR.ABORTED, message: 'Antigravity ACP 编排规划被取消' } },
+        }
+        return
+      }
+      plannerUsage = result.usage
+      if (result.plan !== undefined) {
+        activePlan = result.plan
+        const nextPlansThisTurn = (decision.reason === 'new-goal' ? 0 : effectiveState.plansThisTurn) + 1
+        this.#orchestrators.update(sessionId, (prev) => ({
+          ...prev,
+          plan: result.plan,
+          stage: 'executing',
+          plansThisTurn: nextPlansThisTurn,
+          ...(currentTurnKey === undefined ? {} : { turnKey: currentTurnKey }),
+        }))
+        if (orch.showPlan) {
+          const planText = renderPlanForExecutor(result.plan)
+          const planBlock: ContentBlock = { type: 'text', text: planText }
+          this.#leadingEmittedBlock = planBlock
+          yield { type: 'block-start', index: 0, blockType: 'text' }
+          yield { type: 'text-delta', index: 0, text: planText }
+          yield { type: 'block-end', index: 0, block: planBlock }
+          emittedShowPlan = true
+        }
+      }
+    }
+
+    const executorOptions: AdapterRequestOptions = {
+      ...options,
+      model: acpOrchestratorFamily(orch.executorModel),
+      reasoningEffort: ReasoningEffortId(orch.executorEffort),
+      ...(activePlan === undefined ? {} : { system: buildExecutorSystem(options.system, activePlan) }),
+    }
+
+    let mergedUsageEmitted = false
+    for await (const rawChunk of this.#streamExclusive(executorOptions)) {
+      const chunk = emittedShowPlan ? shiftAcpChunkIndex(rawChunk, 1) : rawChunk
+      if (chunk.type === 'usage') {
+        const merged = mergeAcpTokenUsage(plannerUsage, chunk.usage)
+        if (merged !== undefined) {
+          mergedUsageEmitted = true
+          yield { type: 'usage', usage: merged }
+        }
+        continue
+      }
+      if (chunk.type === 'finish') {
+        if (!mergedUsageEmitted && plannerUsage !== undefined && chunk.reason.kind !== 'aborted') {
+          mergedUsageEmitted = true
+          yield { type: 'usage', usage: plannerUsage }
+        }
+        yield chunk
+        continue
+      }
+      yield chunk
+    }
+  }
+
+  async #runAcpPlanner(
+    options: AdapterRequestOptions,
+    orch: OrchestratorSettings,
+    plannerEffort: string,
+    goal: string,
+    evidence: readonly string[],
+    priorPlan: OrchestratorPlan | undefined,
+    sessionKey?: string,
+  ): Promise<{ plan?: OrchestratorPlan; usage?: TokenUsage }> {
+    const callerSignal = options.signal
+    if (callerSignal?.aborted) return {}
+    const timeoutController = new AbortController()
+    const timeoutTimer = setTimeout(() => timeoutController.abort(new Error('planner timeout')), orch.plannerTimeoutMs)
+    timeoutTimer.unref?.()
+    const combinedSignal = callerSignal
+      ? AbortSignal.any([callerSignal, timeoutController.signal])
+      : timeoutController.signal
+
+    const key = sessionKey ?? 'anonymous'
+    let entry: PlannerSessionEntry | undefined
+    let promptSettled = false
+    let plannerUsage: TokenUsage | undefined
+    let linkForPrompt: AgentLink | undefined
+    let sessionIdForPrompt: string | undefined
+
+    try {
+      await withAbort(this.#settleRecycle(), combinedSignal)
+      if (this.#disposed) return {}
+      const link = await this.#getLink(this.#handlers, combinedSignal)
+      linkForPrompt = link
+      this.#observeCapabilities(link)
+      throwIfAborted(combinedSignal)
+
+      // 复用前提：同一链路且尚未关闭且 cwd 一致
+      const cached = this.#plannerSessions.get(key)
+      if (cached && !cached.link.closed && cached.link === link && cached.cwd === this.#cwd) {
+        this.#plannerSessions.delete(key)
+        this.#plannerSessions.set(key, cached)
+        entry = cached
+      } else {
+        if (cached) {
+          this.#plannerSessions.delete(key)
+          if (!cached.link.closed) this.#closeSession(cached.link, cached.sessionId)
+        }
+        const created = await link.newSession({
+          cwd: this.#cwd,
+          mcpServers: [],
+          _meta: { antigravity: { enabledTools: [], eagerMcpServers: [] } },
+        }, { signal: combinedSignal, timeoutMs: orch.plannerTimeoutMs })
+        throwIfAborted(combinedSignal)
+        if (created.configOptions) this.observeSessionConfigOptions(created.configOptions, created.sessionId)
+        entry = {
+          sessionId: created.sessionId,
+          link,
+          cwd: this.#cwd,
+          configOptions: created.configOptions ?? [],
+        }
+        this.#rememberPlannerSession(key, entry)
+      }
+      sessionIdForPrompt = entry.sessionId
+
+      // 写配置顺序：先写 model（基于 planner 会话自己的 configOptions，显式带档位或同步 thought_level），
+      // 再按回执重读 thought_level / mode 并写入。
+      await withAbort(this.#foldCatalog(AGY_PROVIDER_ID), combinedSignal)
+      throwIfAborted(combinedSignal)
+      const plannerFamily = acpOrchestratorFamily(orch.plannerModel)
+      const plannerTiers = this.#familyTiers.get(plannerFamily)
+      const initialThoughtSel = findThoughtLevelSelector(entry.configOptions)
+      const initialEfforts = plannerTiers !== undefined && plannerTiers.size > 0
+        ? [...plannerTiers]
+        : initialThoughtSel && initialThoughtSel.options.length > 0
+          ? initialThoughtSel.options.map((opt) => opt.value)
+          : [...AGY_REASONING_EFFORTS]
+      const initialConverged = convergeOrchestratorEffort(plannerEffort, initialEfforts) ?? plannerEffort
+      const plannerRoute = plannerTiers !== undefined && plannerTiers.size > 0
+        ? routeTieredModelId(plannerFamily, (AGY_REASONING_EFFORTS.find((e) => e === initialConverged) ?? DEFAULT_AGY_REASONING_EFFORT), plannerTiers)
+        : `${plannerFamily}-${initialConverged}`
+
+      const modelSel = findModelSelector(entry.configOptions)
+      if (!modelSel) {
+        throw llmError('ACP planner 会话未声明 model 配置选项', AGY_ADAPTER_ERROR.NO_MODEL_SELECTOR)
+      }
+      if (modelSel.currentValue !== plannerRoute) {
+        const modelResp = await link.setConfigOption({
+          sessionId: entry.sessionId,
+          configId: modelSel.configId,
+          value: plannerRoute,
+        }, { signal: combinedSignal, timeoutMs: orch.plannerTimeoutMs })
+        throwIfAborted(combinedSignal)
+        if (modelResp.configOptions.length > 0) entry.configOptions = modelResp.configOptions
+      }
+
+      const thoughtSel = findThoughtLevelSelector(entry.configOptions)
+      if (thoughtSel && thoughtSel.options.length > 0) {
+        const convergedThought = convergeOrchestratorEffort(plannerEffort, thoughtSel.options.map((opt) => opt.value))
+        if (convergedThought !== undefined && thoughtSel.currentValue !== convergedThought) {
+          const thoughtResp = await link.setConfigOption({
+            sessionId: entry.sessionId,
+            configId: thoughtSel.configId,
+            value: convergedThought,
+          }, { signal: combinedSignal, timeoutMs: orch.plannerTimeoutMs })
+          throwIfAborted(combinedSignal)
+          if (thoughtResp.configOptions.length > 0) entry.configOptions = thoughtResp.configOptions
+        }
+      }
+
+      const modeSel = findModeSelector(entry.configOptions)
+      if (modeSel && modeSel.options.some((opt) => opt.value === 'plan') && modeSel.currentValue !== 'plan') {
+        const modeResp = await link.setConfigOption({
+          sessionId: entry.sessionId,
+          configId: modeSel.configId,
+          value: 'plan',
+        }, { signal: combinedSignal, timeoutMs: orch.plannerTimeoutMs })
+        throwIfAborted(combinedSignal)
+        if (modeResp.configOptions.length > 0) entry.configOptions = modeResp.configOptions
+      }
+
+      const plannerMessages = buildPlannerMessages(goal, evidence, priorPlan)
+      const userPromptText = plannerMessages
+        .flatMap((msg) => msg.content.flatMap((b) => b.type === 'text' ? [b.text] : []))
+        .join('\n\n')
+      const baseSystem = [
+        ...(typeof options.system === 'string' && options.system.trim() ? [options.system] : []),
+        ...options.messages.flatMap((msg) => msg.role === 'system'
+          ? msg.content.flatMap((b) => b.type === 'text' && b.text.trim() ? [b.text] : [])
+          : []),
+      ].join('\n\n')
+      const fullPlannerText = baseSystem
+        ? `${baseSystem}\n\n${PLANNER_SYSTEM_SUFFIX}\n\n${userPromptText}`
+        : `${PLANNER_SYSTEM_SUFFIX}\n\n${userPromptText}`
+
+      let collectedText = ''
+      const collector: PlannerCollector = {
+        sessionId: entry.sessionId,
+        onUpdate: (notification) => {
+          const update = notification.update
+          switch (update.sessionUpdate) {
+            case 'agent_message_chunk': {
+              const content = update.content as { type?: unknown; text?: unknown } | undefined
+              if (content?.type === 'text' && typeof content.text === 'string') {
+                collectedText += content.text
+              }
+              return
+            }
+            case 'config_option_update': {
+              if (entry && Array.isArray(update.configOptions)) entry.configOptions = update.configOptions
+              return
+            }
+            default:
+              // current_mode_update / available_commands_update / session_info_update / tool_call 等未知或辅助通知一律静默忽略
+              return
+          }
+        },
+      }
+      this.#plannerCollector = collector
+
+      let promptResponse: PromptResponse
+      let promptPromise: Promise<PromptResponse> | undefined
+      try {
+        // 不传 signal 给 link.prompt：与 PromptTurn 一致，我们需要在 session/cancel 后
+        // 保留 JSON-RPC pending 槽位以观察对端是否回复了终态 PromptResponse。
+        promptPromise = link.prompt({
+          sessionId: entry.sessionId,
+          prompt: [{ type: 'text', text: fullPlannerText }],
+        }, { timeoutMs: orch.plannerTimeoutMs })
+        // 预防超时/取消分支未 await 前出现未捕获 rejection
+        void promptPromise.catch(() => undefined)
+        promptResponse = await withAbort(promptPromise, combinedSignal)
+        promptSettled = true
+      } catch (error) {
+        if (promptPromise && sessionIdForPrompt) {
+          this.#plannerSessions.delete(key)
+          void link.cancel(sessionIdForPrompt).catch(() => undefined)
+          const graceMs = callerSignal?.aborted
+            ? (this.#keepProcessAfterCancel ? this.#cancelGraceMs : 0)
+            : Math.min(Math.max(this.#cancelGraceMs, 0), 500)
+          const confirmed = graceMs > 0
+            ? await waitForPromptSettlement(promptPromise, graceMs)
+            : false
+          if (confirmed) {
+            promptSettled = true
+            this.#closeSession(link, sessionIdForPrompt)
+          } else {
+            this.#scheduleRecycle(link)
+          }
+        }
+        throw error
+      } finally {
+        if (this.#plannerCollector === collector) this.#plannerCollector = undefined
+      }
+
+      plannerUsage = mapUsage(promptResponse.usage)
+      if (callerSignal?.aborted) return {}
+
+      const plan = parsePlan(collectedText, priorPlan)
+      if (plan === undefined) {
+        this.#log?.warn('antigravity-acp: 编排 planner 未产出有效计划，降级直接执行')
+        return { ...(plannerUsage === undefined ? {} : { usage: plannerUsage }) }
+      }
+      return { plan, ...(plannerUsage === undefined ? {} : { usage: plannerUsage }) }
+    } catch (error) {
+      if (linkForPrompt && !promptSettled && !this.#unrecycledLink) {
+        // setup 阶段（newSession / setConfigOption）超时或取消，未进入 prompt
+        this.#plannerSessions.delete(key)
+        this.#scheduleRecycle(linkForPrompt)
+      }
+      if (callerSignal?.aborted) return {}
+      this.#log?.warn('antigravity-acp: 编排 planner 失败，降级直接执行', error)
+      return { ...(plannerUsage === undefined ? {} : { usage: plannerUsage }) }
+    } finally {
+      clearTimeout(timeoutTimer)
+      if (this.#plannerCollector?.sessionId === sessionIdForPrompt) {
+        this.#plannerCollector = undefined
+      }
+    }
+  }
+
+  #rememberPlannerSession(key: string, entry: PlannerSessionEntry): void {
+    this.#plannerSessions.delete(key)
+    this.#plannerSessions.set(key, entry)
+    while (this.#plannerSessions.size > 64) {
+      const oldest = this.#plannerSessions.entries().next().value
+      if (!oldest) break
+      const [oldKey, oldEntry] = oldest
+      this.#plannerSessions.delete(oldKey)
+      if (!oldEntry.link.closed) this.#closeSession(oldEntry.link, oldEntry.sessionId)
+    }
+  }
+
   #wakeAccessWaiters(): void {
     const waiters = [...this.#accessWaiters]
     this.#accessWaiters.clear()
@@ -1252,7 +1783,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         _meta: { antigravity: { enabledTools: [], eagerMcpServers: tools.length > 0 ? [BRIDGE_MCP_SERVER_NAME] : [] } },
       }, { signal: options.signal })
       check()
-      this.observeSessionConfigOptions(session.configOptions)
+      this.observeSessionConfigOptions(session.configOptions, session.sessionId)
       if (findModelSelector(session.configOptions)) this.#rememberSessionModelSelector(session.sessionId)
       this.#lifecycle?.roundPhase('model')
       await this.#applyModelSelection(link, session.sessionId, options.model, options.reasoningEffort, options.signal)
@@ -1289,6 +1820,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       ...(options.purpose === undefined ? {} : { purpose: options.purpose }),
     }
     this.#continuationState = new ContinuationState(options)
+    if (this.#leadingEmittedBlock) this.#continuationState.emitted(this.#leadingEmittedBlock)
     // usage_update 的上下文容量归属到本次请求的 DSH 路由键。
     this.#routeModelId = options.model
     this.#lifecycle?.beginRound(options.model)
@@ -1449,7 +1981,11 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         if (chunk.type === 'block-end') emitted.push(structuredClone(chunk.block))
         if (chunk.type === 'finish') {
           finish = chunk.reason.kind
-          if (record) this.#advanceSession(record, options, emitted, turn.promptSettled)
+          if (record) {
+            const allEmitted = this.#leadingEmittedBlock ? [this.#leadingEmittedBlock, ...emitted] : emitted
+            this.#advanceSession(record, options, allEmitted, turn.promptSettled)
+          }
+          this.#leadingEmittedBlock = undefined
         }
         if (chunks === 0) this.#log?.info(`antigravity-acp: 回合首块到达（type=${chunk.type}）`)
         if (chunk.type !== 'finish') this.#lifecycle?.firstOutput(chunk.type === 'block-end' && chunk.block.type === 'tool-call')
@@ -1587,7 +2123,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   }
 
   #handleUnexpectedRequest(method: string, _request: AnyRequest): void {
-    if (this.#disposed || !this.#turn) return
+    if (this.#disposed || this.#plannerCollector || !this.#turn) return
     const params = _request.params as { sessionId?: unknown } | undefined
     if (params?.sessionId !== undefined && params.sessionId !== this.#turn.sessionId) return
     this.#turn.handleUnexpectedAgentRequest(method)
@@ -1634,9 +2170,14 @@ export class AntigravityAcpAdapter extends LlmAdapter {
    * 观察一次 ACP 会话配置：刷新模型目录缓存与 model 选择器。
    * `session/new`、`session/set_config_option` 与 `config_option_update` 共用。
    */
-  observeSessionConfigOptions(configOptions: readonly SessionConfigOption[] | null | undefined): void {
+  observeSessionConfigOptions(configOptions: readonly SessionConfigOption[] | null | undefined, sessionId?: string): void {
     ++this.#catalogFoldGeneration
     const selector = findModelSelector(configOptions)
+    const thoughtSelector = findThoughtLevelSelector(configOptions)
+    if (thoughtSelector) {
+      this.#thoughtLevelSelector = thoughtSelector
+      if (sessionId) this.#rememberSessionThoughtSelector(sessionId, thoughtSelector)
+    }
     this.#catalogObserved = true
     // session/new 与 session/load 允许省略 configOptions。一次不完整观测
     // 不能抹掉已知目录或选择器，否则后续会话会无故失去模型路由能力。
@@ -1651,6 +2192,16 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     // 真实目录只在会话建立后才能观测到；落盘后重启不必退化成占位模型。
     // 写入失败与并发写冲突都无所谓：缓存是优化，不是功能。
     if (selector) this.#persistCatalog()
+  }
+
+  #rememberSessionThoughtSelector(sessionId: string, selector: ModelSelector): void {
+    this.#sessionThoughtSelectors.delete(sessionId)
+    this.#sessionThoughtSelectors.set(sessionId, selector)
+    while (this.#sessionThoughtSelectors.size > 64) {
+      const oldest = this.#sessionThoughtSelectors.keys().next().value
+      if (oldest === undefined) break
+      this.#sessionThoughtSelectors.delete(oldest)
+    }
   }
 
   /** 把当前目录（含实测上下文容量）落盘；写失败不影响功能。 */
@@ -1706,17 +2257,27 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     const pinnedTier = tierForModelId(model)
     const effortTier = normalizeEffort(effort)
     const tiers = this.#familyTiers.get(family)
+    const sessionThoughtSel = this.#sessionThoughtSelectors.get(sessionId)
+    const hasExplicitTarget = modelSettingFor(settings, model).target !== undefined
     const requested = resolveModelTarget({
       settings,
       model,
       effort: effortTier,
-      route: (tier) => tier !== undefined
-        ? routeTieredModelId(family, tier, tiers)
-        : pinnedTier !== undefined
+      route: (tier) => {
+        if (tier !== undefined) {
+          if (tiers !== undefined && tiers.size > 0) return routeTieredModelId(family, tier, tiers)
+          if (sessionThoughtSel && sessionThoughtSel.options.length > 0) {
+            const converged = convergeOrchestratorEffort(tier, sessionThoughtSel.options.map((opt) => opt.value)) ?? tier
+            return `${family}-${converged}`
+          }
+          return routeTieredModelId(family, tier, tiers)
+        }
+        return pinnedTier !== undefined
           ? model
           : tiers !== undefined && tiers.size > 0
             ? routeTieredModelId(family, DEFAULT_AGY_REASONING_EFFORT, tiers)
-            : family,
+            : family
+      },
     })
     const selector = this.#modelSelector
     if (!selector) {
@@ -1727,31 +2288,50 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     }
     // 两种短路都只认本会话自己的证据：已确认写入过的值，或本会话建立时自己
     // 声明的选择器当前值。连接级选择器可能来自别的会话，不能用。
-    if (this.#sessionModelValues.get(sessionId) === requested) return
-    if (this.#sessionModelDeclared.has(sessionId) && selector.currentValue === requested) return
-    // 自诊断：把路由结果落进宿主日志（模型选择出问题时，这是唯一能看到「DSH
-    // 给的 id → 我们发出去的 configId/value」的地方）。
-    this.#log?.info(
-      `antigravity-acp: 模型路由 dsh=${model} → configId=${selector.configId} value=${requested}` +
-        `（family=${family}${effortTier ? ` effort=${effortTier}` : ''}${pinnedTier ? ' 档位已钉住' : ''}` +
-        `${modelSettingFor(settings, model).target === undefined ? '' : ' 已按映射改写'}）`,
-    )
-    // 目录成员资格按 dsh-llm 语义是建议性的：未登记的 id 仍然照发，由 ACP
-    // agent 自己判定是否接受，而不是在这里静默改写成别的模型。
-    let response: { configOptions?: readonly SessionConfigOption[] }
-    try {
-      response = await link.setConfigOption({ sessionId, configId: selector.configId, value: requested }, { signal })
-    } catch (error) {
-      this.#log?.warn(
-        `antigravity-acp: session/set_config_option 失败（configId=${selector.configId} value=${requested}）`,
-        error,
+    const modelAlreadySet = this.#sessionModelValues.get(sessionId) === requested
+      || (this.#sessionModelDeclared.has(sessionId) && selector.currentValue === requested)
+    if (!modelAlreadySet) {
+      // 自诊断：把路由结果落进宿主日志（模型选择出问题时，这是唯一能看到「DSH
+      // 给的 id → 我们发出去的 configId/value」的地方）。
+      this.#log?.info(
+        `antigravity-acp: 模型路由 dsh=${model} → configId=${selector.configId} value=${requested}` +
+          `（family=${family}${effortTier ? ` effort=${effortTier}` : ''}${pinnedTier ? ' 档位已钉住' : ''}` +
+          `${hasExplicitTarget ? ' 已按映射改写' : ''}）`,
       )
-      throw explainUnavailableModel(error, requested)
+      // 目录成员资格按 dsh-llm 语义是建议性的：未登记的 id 仍然照发，由 ACP
+      // agent 自己判定是否接受，而不是在这里静默改写成别的模型。
+      let response: { configOptions?: readonly SessionConfigOption[] }
+      try {
+        response = await link.setConfigOption({ sessionId, configId: selector.configId, value: requested }, { signal })
+      } catch (error) {
+        this.#log?.warn(
+          `antigravity-acp: session/set_config_option 失败（configId=${selector.configId} value=${requested}）`,
+          error,
+        )
+        throw explainUnavailableModel(error, requested)
+      }
+      // RPC 成功即接受选模；服务端可归一化模型 ID，不再额外要求回显逐字一致。
+      // 缺少模型配置时保留现有目录，后续 config_option_update 仍可更新它。
+      this.#rememberSessionModelValue(sessionId, requested)
+      if (response.configOptions) this.observeSessionConfigOptions(response.configOptions, sessionId)
     }
-    // RPC 成功即接受选模；服务端可归一化模型 ID，不再额外要求回显逐字一致。
-    // 缺少模型配置时保留现有目录，后续 config_option_update 仍可更新它。
-    this.#rememberSessionModelValue(sessionId, requested)
-    if (findModelSelector(response.configOptions)) this.observeSessionConfigOptions(response.configOptions)
+
+    // 切换 model 后重新读取该会话的 thought_level：若目标带有明确档位且未同步，显式写入 thought_level
+    const wantedThought = !hasExplicitTarget
+      ? (effortTier ?? modelSettingFor(settings, model).effort ?? pinnedTier)
+      : undefined
+    const thoughtAfter = this.#sessionThoughtSelectors.get(sessionId)
+    if (wantedThought !== undefined && thoughtAfter && thoughtAfter.options.length > 0) {
+      const convergedThought = convergeOrchestratorEffort(wantedThought, thoughtAfter.options.map((opt) => opt.value))
+      if (convergedThought !== undefined && thoughtAfter.currentValue !== convergedThought) {
+        const thoughtResp = await link.setConfigOption({
+          sessionId,
+          configId: thoughtAfter.configId,
+          value: convergedThought,
+        }, { signal })
+        if (thoughtResp.configOptions) this.observeSessionConfigOptions(thoughtResp.configOptions, sessionId)
+      }
+    }
   }
 }
 
@@ -1847,6 +2427,38 @@ function trailingToolResults(messages: readonly RequestMessage[]): RequestMessag
  * 交付后仍留在 `parkedCalls` 里作为回合账本；若把它们一并计入长度比较，
  * 第二批之后的续轮永远匹配不上，会被迫放弃回合、重建会话。
  */
+function shiftAcpChunkIndex(chunk: StreamChunk, offset: number): StreamChunk {
+  if (offset === 0) return chunk
+  switch (chunk.type) {
+    case 'block-start':
+    case 'text-delta':
+    case 'reasoning-delta':
+    case 'tool-call-delta':
+    case 'block-end':
+      return { ...chunk, index: chunk.index + offset }
+    default:
+      return chunk
+  }
+}
+
+async function waitForPromptSettlement(promptPromise: Promise<PromptResponse>, graceMs: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promptPromise.then(
+        (response) => ['cancelled', 'end_turn', 'max_tokens', 'max_turn_requests', 'refusal'].includes(response.stopReason),
+        () => false,
+      ),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), graceMs)
+        timer.unref?.()
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
 function matchesParkedCalls(turn: PromptTurn, tail: readonly RequestMessage[], bridge: McpToolBridge): boolean {
   if (tail.length === 0) return false
   const parked = turn.parkedCalls.filter((call) => bridge.hasPending(call.callId))

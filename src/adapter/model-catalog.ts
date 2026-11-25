@@ -12,6 +12,13 @@
  */
 import type { LlmModelInfo } from '@deepseek-ai/dsh-llm'
 import type { SessionConfigOption, SessionConfigSelect, SessionConfigSelectGroup, SessionConfigSelectOption } from '@agentclientprotocol/sdk'
+import {
+  ORCHESTRATOR_MODEL_ID,
+  ORCHESTRATOR_MODEL_NAME,
+  normalizeOrchestratorSettings,
+} from '../orchestrator/index.js'
+import type { OrchestratorSettings } from '../orchestrator/index.js'
+import { modelFamilyId } from '../runtime/agy-cli.js'
 
 /** 一个被识别为「模型选择器」的 select 配置项。 */
 export interface ModelSelector {
@@ -86,4 +93,70 @@ export function toModelCatalog(provider: string, selector: ModelSelector | undef
     }
     return description === undefined ? entry : { ...entry, description }
   })
+}
+
+/**
+ * 从 configOptions 中找出 mode 选择器（优先显式 `category === "mode"`，
+ * 无 category 时退回 `id === "mode"`）。
+ */
+export function findModeSelector(configOptions: readonly SessionConfigOption[] | null | undefined): ModelSelector | undefined {
+  if (!configOptions?.length) return undefined
+  const selects = configOptions.filter(isSelect)
+  const picked = selects.find((option) => option.category === 'mode')
+    ?? selects.find((option) => option.category === undefined && option.id === 'mode')
+  if (!picked) return undefined
+  const selector: ModelSelector = {
+    configId: picked.id,
+    options: flattenSelectOptions(picked.options),
+  }
+  return picked.currentValue === undefined ? selector : { ...selector, currentValue: picked.currentValue }
+}
+
+/**
+ * 从 configOptions 中找出 thought_level 选择器（优先显式 `category === "thought_level"`，
+ * 无 category 时退回 `id === "thought_level"`）。
+ */
+export function findThoughtLevelSelector(configOptions: readonly SessionConfigOption[] | null | undefined): ModelSelector | undefined {
+  if (!configOptions?.length) return undefined
+  const selects = configOptions.filter(isSelect)
+  const picked = selects.find((option) => option.category === 'thought_level')
+    ?? selects.find((option) => option.category === undefined && option.id === 'thought_level')
+  if (!picked) return undefined
+  const selector: ModelSelector = {
+    configId: picked.id,
+    options: flattenSelectOptions(picked.options),
+  }
+  return picked.currentValue === undefined ? selector : { ...selector, currentValue: picked.currentValue }
+}
+
+/** 将配置里的编排模型名规约到 ACP 家族 ID。 */
+export function acpOrchestratorFamily(model: string): string {
+  return modelFamilyId(model.trim().replace(/^antigravity-/u, ''))
+}
+
+/**
+ * 仅当编排启用且 planner 与配置的 executor 家族值都出现在
+ * `configOptions.model` 选项里时合成 `antigravity-orchestrator` 目录条目。
+ */
+export function synthesizeAcpOrchestratorModel(options: {
+  provider: string
+  settings: OrchestratorSettings
+  observedFamilies: ReadonlySet<string>
+  inputModalities?: readonly ('text' | 'image')[]
+  contextWindow?: number
+}): LlmModelInfo | undefined {
+  const settings = normalizeOrchestratorSettings(options.settings)
+  if (!settings.enabled) return undefined
+  const plannerFamily = acpOrchestratorFamily(settings.plannerModel)
+  const executorFamily = acpOrchestratorFamily(settings.executorModel)
+  if (!options.observedFamilies.has(plannerFamily) || !options.observedFamilies.has(executorFamily)) {
+    return undefined
+  }
+  return {
+    provider: options.provider,
+    id: ORCHESTRATOR_MODEL_ID,
+    name: ORCHESTRATOR_MODEL_NAME,
+    ...(options.inputModalities === undefined ? {} : { inputModalities: options.inputModalities }),
+    ...(options.contextWindow === undefined ? {} : { contextWindow: options.contextWindow }),
+  }
 }

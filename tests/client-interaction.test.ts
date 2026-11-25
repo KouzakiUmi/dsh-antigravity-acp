@@ -423,7 +423,7 @@ describe('settings card with real React state and effects', () => {
 
   it('设置卡片只提交即时字段，普通配置以重载指引呈现', async () => {
     const liveKeys: readonly string[] = [...LIVE_SETTING_KEYS]
-    const fields = liveKeys.filter(key => key !== 'modelOverrides' && key !== 'proxyBypass')
+    const fields = liveKeys.filter(key => key !== 'modelOverrides' && key !== 'proxyBypass' && key !== 'orchestrator')
     // 普通（非 volatile）配置：宿主既不投影也不接受写入，不能出现在可编辑控件里。
     const plainFields = Object.keys(Config.dict ?? {}).filter(key => !liveKeys.includes(key))
     expect(plainFields).toEqual(expect.arrayContaining(['binaryPath', 'autoDownload', 'acpVersion', 'extraArgs', 'maxConcurrentSessions', 'queueTimeoutMs', 'requestTimeoutMs', 'handshakeTimeoutMs', 'authTimeoutMs', 'promptTimeoutMs', 'bridgeParkSettleMs']))
@@ -435,7 +435,7 @@ describe('settings card with real React state and effects', () => {
       expect(revision).toBe(1)
       for (const value of ops) {
         const op = value as { path: string[]; value: unknown }
-        expect([...fields, 'modelOverrides']).toContain(op.path[0])
+        expect([...fields, 'modelOverrides', 'orchestrator']).toContain(op.path[0])
         projected[op.path[0]!] = op.value
       }
       service.change(document(projected, 2))
@@ -727,4 +727,147 @@ describe('settings card with real React state and effects', () => {
     service.notify()
     expect(service.describe.mock.calls.length).toBe(before)
   })
+
+  it('编排分组渲染 7 个可编辑控件，Executor 可在 Hydrogen / Sonnet 间选择，作为单个顶层对象字段提交且保留 plannerTimeoutMs', async () => {
+    const service = transport(document({ orchestrator: { plannerTimeoutMs: 45000, executorModel: 'legacy-executor' } }))
+    const { renderer } = await mount(service.remote)
+    expect(fieldInput(renderer, 'orchestratorEnabled').props.checked).toBe(true)
+    const plannerSelect = fieldInput(renderer, 'orchestratorPlannerModel')
+    expect(plannerSelect.type).toBe('select')
+    expect(plannerSelect.props.value).toBe('claude-opus-5-5')
+    expect(plannerSelect.findAllByType('option').map((opt) => opt.props.value)).toEqual([
+      'gemini-4-neon',
+      'gemini-4-argon',
+      'claude-opus-5-5',
+    ])
+    expect(fieldInput(renderer, 'orchestratorPlannerEffort').props.value).toBe('medium')
+    // 非法 executorModel 回落默认 Hydrogen。
+    const executorSelect = fieldInput(renderer, 'orchestratorExecutorModel')
+    expect(executorSelect.type).toBe('select')
+    expect(executorSelect.props.value).toBe('gemini-4-hydrogen')
+    expect(executorSelect.findAllByType('option').map((opt) => opt.props.value)).toEqual([
+      'gemini-4-hydrogen',
+      'claude-sonnet-5-5',
+    ])
+    expect(fieldInput(renderer, 'orchestratorExecutorEffort').props.value).toBe('medium')
+    expect(fieldInput(renderer, 'orchestratorMaxPlans').props.value).toBe(2)
+    expect(fieldInput(renderer, 'orchestratorShowPlan').props.checked).toBe(false)
+    expect(button(renderer, '保存').props.disabled).toBe(true)
+
+    await act(async () => {
+      fieldInput(renderer, 'orchestratorEnabled').props.onChange({ target: { checked: false } })
+      fieldInput(renderer, 'orchestratorPlannerModel').props.onChange({ target: { value: 'gemini-4-neon' } })
+      fieldInput(renderer, 'orchestratorPlannerEffort').props.onChange({ target: { value: 'low' } })
+      fieldInput(renderer, 'orchestratorExecutorModel').props.onChange({ target: { value: 'claude-sonnet-5-5' } })
+      fieldInput(renderer, 'orchestratorExecutorEffort').props.onChange({ target: { value: 'high' } })
+      fieldInput(renderer, 'orchestratorMaxPlans').props.onChange({ target: { value: '4' } })
+      fieldInput(renderer, 'orchestratorShowPlan').props.onChange({ target: { checked: true } })
+    })
+
+    // 7 个控件归属同一个顶层 orchestrator 字段，只计 1 项未保存。
+    expect(renderedText(renderer)).toContain('1 项未保存')
+    expect(button(renderer, '保存').props.disabled).toBe(false)
+    await act(async () => { await button(renderer, '保存').props.onClick() })
+    expect(service.mutate).toHaveBeenCalledWith('llm-antigravity-acp', [{
+      op: 'set',
+      path: ['orchestrator'],
+      value: {
+        enabled: false,
+        plannerModel: 'gemini-4-neon',
+        plannerEffort: 'low',
+        executorModel: 'claude-sonnet-5-5',
+        executorEffort: 'high',
+        maxPlansPerTurn: 4,
+        plannerTimeoutMs: 45000,
+        showPlan: true,
+      },
+    }], 1)
+  })
+
+  it('编排设置按规范化比较，键序差异、非法 executorModel 或写回默认值不误判为未保存', async () => {
+    const service = transport(document({
+      orchestrator: {
+        showPlan: false,
+        maxPlansPerTurn: 2,
+        executorEffort: 'medium',
+        executorModel: 'gemini-4-hydrogen',
+        plannerEffort: 'medium',
+        plannerModel: 'claude-opus-5-5',
+        enabled: true,
+      },
+    }))
+    const { renderer } = await mount(service.remote)
+    expect(button(renderer, '保存').props.disabled).toBe(true)
+    expect(renderedText(renderer)).not.toContain('项未保存')
+
+    await act(async () => {
+      fieldInput(renderer, 'orchestratorShowPlan').props.onChange({ target: { checked: true } })
+    })
+    expect(button(renderer, '保存').props.disabled).toBe(false)
+
+    // 改回默认值后应恢复干净状态。
+    await act(async () => {
+      fieldInput(renderer, 'orchestratorShowPlan').props.onChange({ target: { checked: false } })
+    })
+    expect(button(renderer, '保存').props.disabled).toBe(true)
+    expect(renderedText(renderer)).not.toContain('项未保存')
+
+    // 外部以不同键序写回等价默认值、非法 plannerModel 或非法 executorModel，均保持干净并回落默认。
+    await act(async () => {
+      service.change(document({
+        orchestrator: { enabled: true, plannerModel: 'unknown-planner', executorModel: 'other-executor', showPlan: false },
+      }, 2))
+    })
+    expect(fieldInput(renderer, 'orchestratorPlannerModel').props.value).toBe('claude-opus-5-5')
+    expect(fieldInput(renderer, 'orchestratorExecutorModel').props.value).toBe('gemini-4-hydrogen')
+    expect(button(renderer, '保存').props.disabled).toBe(true)
+  })
+
+  it('编排设置支持外部更新冲突提示与撤销，且在代理模式下同样可编辑', async () => {
+    const service = transport(document({
+      proxyMode: true,
+      proxyUrl: 'http://old:7890',
+      orchestrator: { plannerEffort: 'low', maxPlansPerTurn: 2 },
+    }))
+    const { renderer } = await mount(service.remote)
+    await act(async () => {
+      fieldInput(renderer, 'orchestratorShowPlan').props.onChange({ target: { checked: true } })
+    })
+    await act(async () => {
+      service.change(document({
+        proxyMode: true,
+        proxyUrl: 'http://new:7890',
+        orchestrator: { plannerModel: 'gemini-4-argon', plannerEffort: 'high', maxPlansPerTurn: 3 },
+      }, 2))
+    })
+    expect(fieldInput(renderer, 'orchestratorShowPlan').props.checked).toBe(true)
+    expect(fieldInput(renderer, 'orchestratorMaxPlans').props.value).toBe(2)
+    expect(fieldInput(renderer, 'proxyUrl').props.value).toBe('http://new:7890')
+    expect(renderedText(renderer)).toContain('已保留你的输入')
+    expect(renderedText(renderer)).toContain('编排（Orchestrator）')
+    expect(renderedText(renderer)).toContain('1 项未保存')
+
+    await act(async () => { button(renderer, '撤销').props.onClick() })
+    expect(fieldInput(renderer, 'orchestratorShowPlan').props.checked).toBe(false)
+    expect(fieldInput(renderer, 'orchestratorPlannerModel').props.value).toBe('gemini-4-argon')
+    expect(fieldInput(renderer, 'orchestratorPlannerEffort').props.value).toBe('high')
+    expect(fieldInput(renderer, 'orchestratorMaxPlans').props.value).toBe(3)
+    expect(button(renderer, '保存').props.disabled).toBe(true)
+    expect(renderedText(renderer)).not.toContain('已保留你的输入')
+  })
+
+  for (const invalid of ['', '0', '5', '1.5', 'NaN']) {
+    it(`编排最大规划次数拒绝非法值 ${JSON.stringify(invalid)} 且保留草稿`, async () => {
+      const service = transport(document())
+      const { renderer } = await mount(service.remote)
+      await act(async () => {
+        fieldInput(renderer, 'orchestratorMaxPlans').props.onChange({ target: { value: invalid } })
+      })
+      expect(button(renderer, '保存').props.disabled).toBe(false)
+      await act(async () => { await button(renderer, '保存').props.onClick() })
+      expect(service.mutate).not.toHaveBeenCalled()
+      expect(renderedText(renderer)).toContain('必须是 1–4 的整数')
+      expect(button(renderer, '保存').props.disabled).toBe(false)
+    })
+  }
 })

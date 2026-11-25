@@ -85,6 +85,10 @@ dsh plugin --profile web add dsh-bundle-antigravity-host
 
 这是输入能力，不包含图片生成、音频或视频；真实图片识别效果尚未实机验收。[多模态限制](docs/reference.md#图片输入)
 
+### 规划与执行分开
+
+选择 `antigravity-orchestrator` 后，插件先让 planner 产出一份带步骤与交回条件的计划，再由 executor 执行；executor 遇到工具失败、同一工具连续失败两次或用户改向时停下重新规划。两个角色均可配置：planner 三选一（Neon / Argon / Opus 5.5），executor 两选一（Hydrogen / Sonnet 5.5，默认 Hydrogen，对齐官方 Antigravity 编排设置），各带思考档位。代理模式是两次独立上游请求，ACP 模式在独立 planner 会话里跑官方 `mode=plan` 再回 chat 会话切模型执行。每回合规划次数有上限，planner 失败或超时降级为单模型执行，计划只在需要时注入。[编排模式](docs/configuration.md) · [实现规格](docs/orchestrator-design.md)
+
 ### 额度、余额与连接状态，就在对话旁
 
 - **额度药丸**：随当前模型切换对应额度组；展开查看三个组的窗口、剩余百分比、重置时间与缓存状态。上游未单列 Argon 组时使用 Gemini 共享额度，不误报未知。

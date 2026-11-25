@@ -58,7 +58,29 @@ import type { AntigravityHostConfig } from '../settings.js'
 import { modelDisplayName, modelSettingFor, modelVisible, normalizeModelSettings, resolveModelTarget } from '../adapter/model-settings.js'
 import type { ModelCapacity, ModelSetting } from '../adapter/model-settings.js'
 import { llmError } from '../runtime/llm-error.js'
-import { isLiveGeminiFamily, parseLiveProxyCatalog, PROXY_MODEL_EFFORTS } from './model-catalog.js'
+import {
+  ORCHESTRATOR_MODEL_ID,
+  ORCHESTRATOR_MODEL_NAME,
+  OrchestratorStore,
+  PLANNER_SYSTEM_SUFFIX,
+  buildExecutorSystem,
+  buildPlannerMessages,
+  computeTurnKey,
+  extractGoalAndEvidence,
+  normalizeOrchestratorSettings,
+  parsePlan,
+  renderPlanForExecutor,
+  shouldPlan,
+} from '../orchestrator/index.js'
+import type { OrchestratorPlan, OrchestratorSettings } from '../orchestrator/index.js'
+import {
+  isLiveGeminiFamily,
+  parseLiveProxyCatalog,
+  PROXY_MODEL_EFFORTS,
+  resolveProxyOrchestrator,
+  synthesizeProxyOrchestratorModel,
+  toProxyFamilyId,
+} from './model-catalog.js'
 import type { LiveProxyCatalog, LiveProxyModel } from './model-catalog.js'
 
 export { PROXY_PROVIDER_ID }
@@ -84,7 +106,7 @@ export interface ProxyAdapterOptions {
   responseHeaderTimeoutMs?: number
   /** 宿主附件服务的惰性读取面；缺席时图片输入报 UNSUPPORTED_MODALITY，文本能力不受影响。 */
   attachments?: () => ProxyAttachmentReader | undefined
-  readSettings?: () => Pick<AntigravityHostConfig, 'modelOverrides'>
+  readSettings?: () => Pick<AntigravityHostConfig, 'modelOverrides' | 'orchestrator'>
   log?: { info(message: string): void; warn(message: string, error?: unknown): void }
 }
 
@@ -95,6 +117,7 @@ interface CatalogSnapshot {
 
 interface ProxyGeneration {
   readonly settings: ReadonlyMap<string, ModelSetting>
+  readonly orchestrator: OrchestratorSettings
   readonly attachments: ProxyAttachmentReader | undefined
   readonly catalog?: CatalogSnapshot
 }
@@ -111,6 +134,8 @@ interface BlockState {
 
 export class AntigravityProxyAdapter extends LlmAdapter {
   private readonly sessions = createProxySessionStore()
+  private readonly plannerSessions = createProxySessionStore()
+  private readonly orchestrators = new OrchestratorStore()
   private readonly definitions = getPublicModelDefinitions()
   private catalogKey: string | undefined
   private catalogRevision = 0
@@ -120,6 +145,10 @@ export class AntigravityProxyAdapter extends LlmAdapter {
 
   constructor(private readonly options: ProxyAdapterOptions & { transport: ProxyTransport }) {
     super()
+  }
+
+  dispose(): void {
+    this.orchestrators.dispose()
   }
 
   override providerInfo(provider: string): LlmProviderInfo {
@@ -178,7 +207,9 @@ export class AntigravityProxyAdapter extends LlmAdapter {
     const generation = await this.captureModelGeneration(model, signal)
     return {
       model: this.resolveModelInGeneration(provider, model, generation),
-      stream: options => this.streamInGeneration(options, generation),
+      stream: options => options.model === ORCHESTRATOR_MODEL_ID
+        ? this.streamOrchestrated(options, generation)
+        : this.streamInGeneration(options, generation),
     }
   }
 
@@ -189,15 +220,18 @@ export class AntigravityProxyAdapter extends LlmAdapter {
 
   private captureGeneration(): ProxyGeneration {
     const catalog = this.catalogLastGood
+    const rawSettings = this.options.readSettings?.()
     return {
-      settings: normalizeModelSettings(this.options.readSettings?.().modelOverrides), attachments: this.options.attachments?.(),
+      settings: normalizeModelSettings(rawSettings?.modelOverrides),
+      orchestrator: normalizeOrchestratorSettings(rawSettings?.orchestrator),
+      attachments: this.options.attachments?.(),
       ...(catalog !== undefined && catalog.key === this.catalogKey ? { catalog } : {}),
     }
   }
 
   private async captureModelGeneration(model: string, signal?: AbortSignal): Promise<ProxyGeneration> {
     const generation = this.captureGeneration()
-    if (!isLiveGeminiFamily(model) || generation.catalog !== undefined) return generation
+    if ((!isLiveGeminiFamily(model) && model !== ORCHESTRATOR_MODEL_ID) || generation.catalog !== undefined) return generation
     return { ...generation, catalog: await this.readLiveCatalog(signal) }
   }
 
@@ -244,6 +278,7 @@ export class AntigravityProxyAdapter extends LlmAdapter {
   private resolveModelInGeneration(provider: string, model: string, generation: ProxyGeneration): LlmResolvedModelInfo {
     this.providerInfo(provider)
     if (typeof model !== 'string' || model.trim().length === 0 || model.length > 256) throw llmError('代理模式模型 id 无效', 'INVALID_MODEL')
+    if (model === ORCHESTRATOR_MODEL_ID) return this.resolveOrchestratorModel(generation)
     if (isLiveGeminiFamily(model)) return this.resolveLiveGemini(model, generation)
     const definition = this.definitions[model]
     if (definition === undefined || definition.modalities.output.includes('image')) throw llmError('该模型不在代理模式审计文本快照内', 'INVALID_MODEL')
@@ -272,6 +307,50 @@ export class AntigravityProxyAdapter extends LlmAdapter {
         defaultMaxTokens: native?.maxOutputTokens ?? routedDefinition.limit.output,
       }),
       ...(reasoning === undefined || reasoning.efforts.length === 0 ? {} : { reasoning }),
+    }
+  }
+
+  private resolveOrchestratorModel(generation: ProxyGeneration): LlmResolvedModelInfo {
+    const orch = generation.orchestrator
+    const resolved = resolveProxyOrchestrator(
+      orch,
+      generation.catalog?.data,
+      this.definitions,
+      orch.plannerEffort,
+      orch.executorEffort,
+    )
+    if (resolved === undefined || generation.catalog === undefined) {
+      throw llmError('编排模式的 planner/executor 模型不在当前目录', 'INVALID_MODEL')
+    }
+    const synthesized = synthesizeProxyOrchestratorModel({
+      settings: orch,
+      catalog: generation.catalog.data,
+      definitions: this.definitions,
+      attachmentsAvailable: generation.attachments !== undefined,
+      modelSettings: generation.settings,
+      plannerEffort: orch.plannerEffort,
+      executorEffort: orch.executorEffort,
+    })
+    if (synthesized === undefined) {
+      throw llmError('编排模式的 planner/executor 模型不在当前目录', 'INVALID_MODEL')
+    }
+    const efforts = resolved.planner.availableEfforts.length > 0
+      ? resolved.planner.availableEfforts
+      : [resolved.planner.effort]
+    return {
+      provider: PROXY_PROVIDER_ID,
+      id: ORCHESTRATOR_MODEL_ID,
+      name: synthesized.name || ORCHESTRATOR_MODEL_NAME,
+      inputModalities: synthesized.inputModalities ?? ['text'],
+      ...(synthesized.contextWindow === undefined ? {} : { context: { contextWindow: synthesized.contextWindow } }),
+      ...(synthesized.maxOutputTokens === undefined ? {} : { defaultMaxTokens: synthesized.maxOutputTokens }),
+      reasoning: {
+        efforts: efforts.map((effort) => ({
+          id: ReasoningEffortId(effort),
+          name: effort[0]!.toUpperCase() + effort.slice(1),
+        })),
+        defaultEffort: ReasoningEffortId(resolved.planner.effort),
+      },
     }
   }
 
@@ -329,12 +408,267 @@ export class AntigravityProxyAdapter extends LlmAdapter {
   override async *stream(options: AdapterRequestOptions): AsyncIterable<StreamChunk> {
     this.providerInfo(options.provider)
     const generation = this.captureGeneration()
+    if (options.model === ORCHESTRATOR_MODEL_ID) {
+      if (!options.signal?.aborted && generation.orchestrator.enabled && generation.catalog === undefined) {
+        const catalog = await this.readLiveCatalog(options.signal)
+        yield* this.streamOrchestrated(options, { ...generation, catalog })
+        return
+      }
+      yield* this.streamOrchestrated(options, generation)
+      return
+    }
     if (!options.signal?.aborted && isLiveGeminiFamily(options.model) && generation.catalog === undefined) {
       const catalog = await this.readLiveCatalog(options.signal)
       yield* this.streamInGeneration(options, { ...generation, catalog })
       return
     }
     yield* this.streamInGeneration(options, generation)
+  }
+
+  private async *streamOrchestrated(options: AdapterRequestOptions, initialGeneration: ProxyGeneration): AsyncIterable<StreamChunk> {
+    if (options.provider !== PROXY_PROVIDER_ID) throw new LlmError('代理模式 adapter 收到未知路由', 'NO_ADAPTER')
+    const signal = options.signal
+    if (signal?.aborted) { yield finishChunk('aborted', 'CANCELLED'); return }
+    const orch = initialGeneration.orchestrator
+    if (!orch.enabled) {
+      const executorFamily = toProxyFamilyId(orch.executorModel)
+      const nextGeneration = isLiveGeminiFamily(executorFamily) && initialGeneration.catalog === undefined
+        ? { ...initialGeneration, catalog: await this.readLiveCatalog(signal) }
+        : initialGeneration
+      yield* this.streamInGeneration({
+        ...options,
+        model: executorFamily,
+        reasoningEffort: ReasoningEffortId(orch.executorEffort),
+      }, nextGeneration)
+      return
+    }
+
+    const generation = initialGeneration.catalog === undefined
+      ? { ...initialGeneration, catalog: await this.readLiveCatalog(signal) }
+      : initialGeneration
+    if (signal?.aborted) { yield finishChunk('aborted', 'CANCELLED'); return }
+
+    const plannerEffort = normalizeReasoningEffort(options.reasoningEffort) ?? orch.plannerEffort
+    const executorEffort = orch.executorEffort
+    const resolved = resolveProxyOrchestrator(
+      orch,
+      generation.catalog?.data,
+      this.definitions,
+      plannerEffort,
+      executorEffort,
+    )
+    if (resolved === undefined) {
+      throw llmError('编排模式的 planner/executor 模型不在当前目录', 'INVALID_MODEL')
+    }
+
+    const sessionId = options.sessionId === undefined ? undefined : String(options.sessionId)
+    const storedState = this.orchestrators.get(sessionId)
+    const currentTurnKey = computeTurnKey(options.messages, sessionId)
+    const effectiveState = storedState.turnKey !== undefined && currentTurnKey !== undefined && currentTurnKey !== storedState.turnKey
+      ? { ...storedState, plansThisTurn: 0 }
+      : storedState
+    const { goal, evidence } = extractGoalAndEvidence(options.messages)
+    const decision = shouldPlan({
+      messages: options.messages,
+      state: effectiveState,
+      goal,
+      settings: orch,
+      ...(sessionId === undefined ? {} : { sessionId }),
+    })
+
+    let activePlan: OrchestratorPlan | undefined = storedState.plan
+    let plannerUsage: TokenUsage | undefined
+    let emittedShowPlan = false
+
+    if (decision.plan) {
+      const result = await this.runPlanner(options, resolved.planner, goal, evidence, storedState.plan, orch, resolved.planner.effort)
+      if (signal?.aborted) { yield finishChunk('aborted', 'CANCELLED'); return }
+      plannerUsage = result.usage
+      if (result.plan !== undefined) {
+        activePlan = result.plan
+        const nextPlansThisTurn = (decision.reason === 'new-goal' ? 0 : effectiveState.plansThisTurn) + 1
+        this.orchestrators.update(sessionId, (prev) => ({
+          ...prev,
+          plan: result.plan,
+          stage: 'executing',
+          plansThisTurn: nextPlansThisTurn,
+          ...(currentTurnKey === undefined ? {} : { turnKey: currentTurnKey }),
+        }))
+        if (orch.showPlan) {
+          const planText = renderPlanForExecutor(result.plan)
+          yield { type: 'block-start', index: 0, blockType: 'text' }
+          yield { type: 'text-delta', index: 0, text: planText }
+          yield { type: 'block-end', index: 0, block: { type: 'text', text: planText } }
+          emittedShowPlan = true
+        }
+      }
+    }
+
+    const executorOptions: AdapterRequestOptions = {
+      ...options,
+      model: resolved.executor.familyId,
+      reasoningEffort: ReasoningEffortId(resolved.executor.effort),
+      ...(activePlan === undefined ? {} : { system: buildExecutorSystem(options.system, activePlan) }),
+    }
+
+    let mergedUsageEmitted = false
+    for await (const rawChunk of this.streamInGeneration(executorOptions, generation)) {
+      const chunk = emittedShowPlan ? shiftChunkIndex(rawChunk, 1) : rawChunk
+      if (chunk.type === 'usage') {
+        const merged = mergeTokenUsage(plannerUsage, chunk.usage)
+        if (merged !== undefined) {
+          mergedUsageEmitted = true
+          yield { type: 'usage', usage: merged }
+        }
+        continue
+      }
+      if (chunk.type === 'finish') {
+        if (!mergedUsageEmitted && plannerUsage !== undefined && chunk.reason.kind !== 'aborted') {
+          mergedUsageEmitted = true
+          yield { type: 'usage', usage: plannerUsage }
+        }
+        if (emittedShowPlan && chunk.replayState !== undefined && Array.isArray(chunk.replayState.blocks)) {
+          yield {
+            ...chunk,
+            replayState: {
+              ...chunk.replayState,
+              blocks: [{ kind: 'text' }, ...chunk.replayState.blocks],
+            },
+          }
+          continue
+        }
+        yield chunk
+        continue
+      }
+      yield chunk
+    }
+  }
+
+  private async runPlanner(
+    options: AdapterRequestOptions,
+    plannerEndpoint: { readonly familyId: string; readonly wire: string },
+    goal: string,
+    evidence: readonly string[],
+    priorPlan: OrchestratorPlan | undefined,
+    orch: OrchestratorSettings,
+    plannerEffort = orch.plannerEffort,
+  ): Promise<{ plan?: OrchestratorPlan; usage?: TokenUsage }> {
+    const signal = options.signal
+    const timeoutSignal = AbortSignal.timeout(orch.plannerTimeoutMs)
+    const plannerSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal
+
+    const baseSystemParts = [
+      ...(typeof options.system === 'string' && options.system.trim() ? [options.system] : []),
+      ...options.messages.flatMap((message) => message.role === 'system'
+        ? message.content.flatMap((block) => block.type === 'text' && block.text.trim() ? [block.text] : [])
+        : []),
+    ]
+    const plannerSystem = baseSystemParts.length > 0
+      ? `${baseSystemParts.join('\n\n')}\n\n${PLANNER_SYSTEM_SUFFIX}`
+      : PLANNER_SYSTEM_SUFFIX
+
+    const plannerOptions: AdapterRequestOptions = {
+      provider: PROXY_PROVIDER_ID,
+      model: plannerEndpoint.familyId,
+      reasoningEffort: ReasoningEffortId(plannerEffort),
+      messages: [...buildPlannerMessages(goal, evidence, priorPlan)],
+      system: plannerSystem,
+      tools: [],
+      ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
+    }
+
+    let usage: TokenUsage | undefined
+    let refreshed = false
+    let refreshNext = false
+    try {
+      for (;;) {
+        const credential = await this.readCredential(plannerSignal, refreshNext)
+        refreshNext = false
+        if (credential === undefined) throw new LlmError('代理模式需要登录：请在设置页连接代理账户', 'AUTH')
+        const payload = await buildProxyGeneratePayload(
+          plannerOptions,
+          credential,
+          this.plannerSessions,
+          Date.now(),
+          undefined,
+          plannerSignal,
+          plannerEndpoint.wire,
+        )
+        const serialized = JSON.stringify({
+          ...(payload.project === undefined ? {} : { project: payload.project }),
+          requestId: payload.requestId,
+          request: payload.request,
+          model: payload.model,
+          userAgent: payload.userAgent,
+          requestType: payload.requestType,
+        })
+        if (new TextEncoder().encode(serialized).byteLength > 16 * 1024 * 1024) {
+          throw llmError('代理模式请求超出传输字节上限', 'REQUEST_LIMIT')
+        }
+        const response = await this.options.transport.request({
+          url: STREAM_ENDPOINT,
+          accessToken: credential.accessToken,
+          body: serialized,
+          signal: plannerSignal,
+          ...(this.options.responseHeaderTimeoutMs === undefined ? {} : { responseHeaderTimeoutMs: this.options.responseHeaderTimeoutMs }),
+        })
+        const statusError = proxyStatusError(response.status)
+        if (statusError !== undefined) {
+          if (statusError.code === 'authentication' || statusError.code === 'forbidden') {
+            const suspended = await suspendedAccountError(response, plannerSignal)
+            if (suspended !== undefined) throw suspended
+            if (!refreshed && !plannerSignal.aborted) {
+              await cancelResponse(response)
+              refreshed = true
+              refreshNext = true
+              continue
+            }
+          }
+          await cancelResponse(response)
+          throw toLlmError(statusError)
+        }
+
+        let collectedText = ''
+        let retryAuth = false
+        for await (const sse of iterateProxySse(response, {
+          signal: plannerSignal,
+          idleTimeoutMs: Math.min(PROXY_IDLE_TIMEOUT_MS, orch.plannerTimeoutMs),
+          totalTimeoutMs: orch.plannerTimeoutMs,
+          maxBytes: PROXY_STREAM_RESPONSE_BYTES,
+          maxFrameBytes: PROXY_FRAME_BYTES,
+        })) {
+          if (sse.data.trim() === '[DONE]') break
+          const event = parseProxyProviderEvent(sse.data)
+          if (event.error !== undefined) {
+            if ((event.error.status === 401 || isAuthenticationCode(event.error.code) || event.error.status === 403 || event.error.code?.toUpperCase() === 'PERMISSION_DENIED')
+              && !refreshed && !plannerSignal.aborted && collectedText.length === 0) {
+              refreshed = true
+              refreshNext = true
+              retryAuth = true
+              break
+            }
+            throw llmError(`编排 planner 上游错误: ${event.error.message ?? event.error.code ?? String(event.error.status ?? 'unknown')}`, 'UPSTREAM')
+          }
+          if (event.usage !== undefined) usage = event.usage
+          for (const part of event.parts) {
+            if (part.kind === 'text' && part.text) collectedText += part.text
+          }
+        }
+        if (retryAuth) continue
+        if (signal?.aborted) return {}
+
+        const plan = parsePlan(collectedText, priorPlan)
+        if (plan === undefined) {
+          this.options.log?.warn('antigravity-proxy: 编排 planner 未产出有效计划，降级直接执行')
+          return { ...(usage === undefined ? {} : { usage }) }
+        }
+        return { plan, ...(usage === undefined ? {} : { usage }) }
+      }
+    } catch (error) {
+      if (signal?.aborted) return {}
+      this.options.log?.warn('antigravity-proxy: 编排 planner 失败，降级直接执行', error)
+      return { ...(usage === undefined ? {} : { usage }) }
+    }
   }
 
   private async *streamInGeneration(options: AdapterRequestOptions, generation: ProxyGeneration): AsyncIterable<StreamChunk> {
@@ -569,13 +903,21 @@ export class AntigravityProxyAdapter extends LlmAdapter {
 
   private pinnedTextModelInfos(generation: ProxyGeneration, catalog: CatalogSnapshot): readonly (LlmModelInfo & ModelCapacity)[] {
     const bound = { ...generation, catalog }
-    return Array.from(catalog.data.models.keys(), id => {
+    const rows = Array.from(catalog.data.models.keys(), id => {
       const resolved = this.resolveModelInGeneration(PROXY_PROVIDER_ID, id, bound)
       const wire = this.wireModel(id, undefined, bound)
       const { maxOutputTokens } = this.liveLimits(this.possibleWires(id, wire, bound), bound)
       return { provider: resolved.provider, id: resolved.id, name: resolved.name, inputModalities: resolved.inputModalities,
         contextWindow: resolved.context?.contextWindow, maxOutputTokens }
     })
+    const orchestrated = synthesizeProxyOrchestratorModel({
+      settings: generation.orchestrator,
+      catalog: catalog.data,
+      definitions: this.definitions,
+      attachmentsAvailable: generation.attachments !== undefined,
+      modelSettings: generation.settings,
+    })
+    return orchestrated === undefined ? rows : [...rows, orchestrated]
   }
 
   private async readLiveCatalog(signal?: AbortSignal, force = false, revision = this.catalogRevision, onCredentialKey?: (key: string) => void): Promise<CatalogSnapshot> {
@@ -912,6 +1254,50 @@ function toLlmError(error: unknown): LlmError {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function shiftChunkIndex(chunk: StreamChunk, offset: number): StreamChunk {
+  if (offset === 0) return chunk
+  switch (chunk.type) {
+    case 'block-start':
+    case 'text-delta':
+    case 'reasoning-delta':
+    case 'tool-call-delta':
+    case 'block-end':
+      return { ...chunk, index: chunk.index + offset }
+    default:
+      return chunk
+  }
+}
+
+export function mergeTokenUsage(a?: TokenUsage, b?: TokenUsage): TokenUsage | undefined {
+  if (a === undefined) return b
+  if (b === undefined) return a
+  const inputTokens = a.inputTokens + b.inputTokens
+  const outputTokens = a.outputTokens + b.outputTokens
+  const cacheReadTokens = sumOptionalCount(a.cacheReadTokens, b.cacheReadTokens)
+  const cacheWriteTokens = sumOptionalCount(a.cacheWriteTokens, b.cacheWriteTokens)
+  const reasoningTokens = sumOptionalCount(a.reasoningTokens, b.reasoningTokens)
+  const knownSum = inputTokens + outputTokens + (cacheReadTokens ?? 0) + (cacheWriteTokens ?? 0) + (reasoningTokens ?? 0)
+  const totalCandidate = a.totalTokens !== undefined || b.totalTokens !== undefined
+    ? (a.totalTokens ?? knownUsageTotal(a)) + (b.totalTokens ?? knownUsageTotal(b))
+    : undefined
+  return {
+    inputTokens,
+    outputTokens,
+    ...(cacheReadTokens === undefined ? {} : { cacheReadTokens }),
+    ...(cacheWriteTokens === undefined ? {} : { cacheWriteTokens }),
+    ...(reasoningTokens === undefined ? {} : { reasoningTokens }),
+    ...(totalCandidate === undefined || totalCandidate < knownSum ? {} : { totalTokens: totalCandidate }),
+  }
+}
+
+function sumOptionalCount(a: number | undefined, b: number | undefined): number | undefined {
+  return a === undefined && b === undefined ? undefined : (a ?? 0) + (b ?? 0)
+}
+
+function knownUsageTotal(usage: TokenUsage): number {
+  return usage.inputTokens + usage.outputTokens + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0) + (usage.reasoningTokens ?? 0)
 }
 
 export { PROXY_RESPONSE_HEADER_TIMEOUT_MS }

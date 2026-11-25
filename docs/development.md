@@ -67,13 +67,17 @@ ELECTRON_RUN_AS_NODE=1 "$DSH_NODE_EXECUTABLE" scripts/check-desktop-compat.cjs
 
 ## 本次验证矩阵
 
-0.1.35 本地检查日期：**2026-11-03**；0.1.36（额度取数解耦、设置页紧凑布局与隔离修复）复检日期：**2026-11-04**（Asia/Hong_Kong）；0.1.37（AI Credits 未开启时隐藏、删除代理积分说明、保存栏面板化样式）复检日期：**2026-11-04**（Asia/Hong_Kong）；0.1.38（无档位模型的元数据、模式总线回切、设置卡片只编辑即时字段、会话选模按会话判定、一次性请求不再占死 worker、账户刷新与资源回收修复）复检日期：**2026-11-12**（Asia/Hong_Kong）；开发契约基准升到 Core `0.2.2-rc.1` / Cordis `4.1.0` 与转发型请求 `purpose` 放宽的适配复检日期：**2026-11-13**（Asia/Hong_Kong）；peer 范围补 `0.2.2` prerelease 界标、契约基准升到 `0.2.2-rc.3` 与 `LlmError` 自定义码改走 `fromFailure` 的适配复检日期：**2026-11-16**（Asia/Hong_Kong）；0.1.46（客户端 i18n、`cloakSensitiveWords` 移除、Host 字典补齐与会话容量修复）复检日期：**2026-11-20**（Asia/Hong_Kong）；0.1.47（Linux 解压守卫阈值修复、默认 ACP server 升 1.5.2）复检日期：**2026-11-22**（Asia/Hong_Kong）；0.1.48（posix 辅助程序执行位、`session/new` 失败诊断）复检日期：**2026-11-22**（Asia/Hong_Kong）。
+0.1.35 本地检查日期：**2026-11-03**；0.1.36（额度取数解耦、设置页紧凑布局与隔离修复）复检日期：**2026-11-04**（Asia/Hong_Kong）；0.1.37（AI Credits 未开启时隐藏、删除代理积分说明、保存栏面板化样式）复检日期：**2026-11-04**（Asia/Hong_Kong）；0.1.38（无档位模型的元数据、模式总线回切、设置卡片只编辑即时字段、会话选模按会话判定、一次性请求不再占死 worker、账户刷新与资源回收修复）复检日期：**2026-11-12**（Asia/Hong_Kong）；开发契约基准升到 Core `0.2.2-rc.1` / Cordis `4.1.0` 与转发型请求 `purpose` 放宽的适配复检日期：**2026-11-13**（Asia/Hong_Kong）；peer 范围补 `0.2.2` prerelease 界标、契约基准升到 `0.2.2-rc.3` 与 `LlmError` 自定义码改走 `fromFailure` 的适配复检日期：**2026-11-16**（Asia/Hong_Kong）；0.1.46（客户端 i18n、`cloakSensitiveWords` 移除、Host 字典补齐与会话容量修复）复检日期：**2026-11-20**（Asia/Hong_Kong）；0.1.47（Linux 解压守卫阈值修复、默认 ACP server 升 1.5.2）复检日期：**2026-11-22**（Asia/Hong_Kong）；0.1.48（posix 辅助程序执行位、`session/new` 失败诊断）复检日期：**2026-11-22**（Asia/Hong_Kong）；0.1.50（编排模式 planner → executor、设置页编排分组、目录合成条目；PR #15 合并、executor 两选一 Hydrogen / Sonnet 5.5）复检日期：**2026-11-25**（Asia/Hong_Kong）。
 
 | 验证项 | 状态与范围 |
 |---|---|
 | TypeScript | `npm run typecheck` 通过 |
 | 隔离回归 | 2026-11-22 使用系统 Node 24：48 个文件 / 865 项通过（契约基准 Core `0.2.2-rc.3` / Cordis `4.1.0`），包含旧宿主错误回退、目录停用项与档位、Schema 字段优先、已保存项目额度回退、会话表 LRU 容量与 429 限流文案，以及解压守卫常量对官方分发包实测体积的下限回归 |
 | 辅助程序执行位与会话诊断（0.1.48） | 2026-11-22 Windows / 系统 Node 24：48 个文件 / 870 项通过、1 项跳过。注入 chmod 覆盖主程序与 `localharness_external` 同时补位、辅助程序缺失或为目录时跳过、windows 不改权限；`session/new` 拒绝时附加诊断且错误码、JSON-RPC 细节与 cause 保留，空诊断、诊断回调抛错与主动取消不附加。真实权限位整链测试（下载 → 解压 → 两个入口带执行位、旧 0644 缓存命中后修复）只在 POSIX 运行，本机跳过，未在 macOS / Linux 实机执行 |
+| 编排模式（代理链路） | 2026-11-25 系统 Node 24：`tests/orchestrator/orchestrator-core.test.ts` 覆盖设置规范化（含 executor 两值枚举与非法值回落）、计划解析与稳定渲染、`shouldPlan` 六分支、证据截断与状态 LRU；`tests/proxy/orchestrator-proxy.test.ts` 覆盖目录合成与依赖缺失报错、两阶段隔离、`showPlan` 块索引偏移与 replay 块、预算上限、失败降级、usage 合并与中止，并分别断言 executor 走 Hydrogen（默认/非法回落）与 Sonnet 5.5（显式配置，wire 带档位后缀）。均为合成依赖，不触真实上游与账户 |
+| 编排模式（ACP 链路） | 2026-11-25 同上：`tests/adapter/orchestrator-acp.test.ts` 10 项，覆盖目录合成、关闭直通、`new → set model → set mode → prompt` 顺序与空 `mcpServers`、辅助通知忽略、两阶段 usage 合并且 `usage_update` 不计费、`session/cancel` 只发目标 ID 与迟到通知屏蔽、120s 超时降级、正常 park / 规划失败 / 计划改变三组续轮断言，以及 executor 配置 Sonnet 5.5 时 chat 会话写入 `claude-sonnet-5-5-medium`、非法 `executorModel` 回落 Hydrogen。全部在 `FakeAcpAgent` + 真实 loopback MCP 桥下执行，未用真实官方二进制 |
+| 设置页编排分组 | 真实 React 18 renderer：7 个可编辑控件的默认值与整份 `orchestrator` 提交（含 executor 在 Hydrogen / Sonnet 间切换）、`plannerTimeoutMs` 透传保留、键序无关与写回默认值的规范化比较、非法 `executorModel` 回落、代理模式可见性、外部冲突合并与撤销、`maxPlansPerTurn` 5 种非法值拒绝 |
+| 真实官方二进制（编排） | 未验收：`mode=plan` 只在独立探针中确认过行为（官方 agent 仍执行内置只读命令、计划写在 brain 目录、无 `plan` 通知），尚未在真实 `agy-acp-server` 上跑完整 planner → executor 编排，也没有真实账号下的计划质量对照 |
 | 构建 | `npm run build` 通过 |
 | 代理响应预算 | 合成 HTTP 与 SSE 测试覆盖：多帧生成超过旧 8 MiB 后仍能完成；解码后超过 64 MiB 正确失败；非生成和非成功生成响应仍受 8 MiB 传输预算约束 |
 | 代理目录预算 | 2026-11-19，同一账户真实 `fetchAvailableModels` 回包为 HTTP 200、解码后 303,104 字节、38 条；同一回包交给已安装 0.1.40 复现 `REQUEST_LIMIT`（262,144 字节），候选代码成功解析并返回 6 个可选模型。未保存原始回包、未发起生成请求。合成回归另外覆盖普通响应预算与同账户缓存回退 |
@@ -99,7 +103,7 @@ ELECTRON_RUN_AS_NODE=1 "$DSH_NODE_EXECUTABLE" scripts/check-desktop-compat.cjs
 | 代理（出网） | 合成依赖、动态变更与清空、不打断旧响应、卸载释放、失败不直连、运行期地址变坏时按 Promise 拒绝、装载期非法地址不阻断插件、本地 SOCKS 测试；不是 Google 网络可达性保证 |
 | 代理环境继承 | HTTPS / ALL / HTTP 优先级、显式值覆盖及清空恢复、OAuth 与原生 TLS 接线、本地 CONNECT 首包和 NO_PROXY。无凭据 Google 探针对比直连超时与环境代理收到 401，只验证工具进程所见网络，不代表运行中 Host 的环境或账户可用性 |
 | 额度取数 | 假 fetch 覆盖超时折叠、401/403 按状态码重试一次、401 后成功、非 401/403 不重试、OAuth 元数据配对；`cliQuotaEnabled` 默认关闭时即使注入 CLI 也不 spawn，打开后才走 `/usage` 与 `/credits`，关闭后旧快照失效；代理模式默认零 `agy` 调用且套餐额度仍取代理账户，打开开关后只有 Credits 走 CLI；不触真实账户 |
-| 真实上游 / GUI | 本次 OAuth 使用真实本地 HTTP 与模拟 Google 响应，浏览器使用离线夹具；0.1.38 安装后的 GUI、真实 Google 授权、真实生成或图片识别尚未验收 |
+| 真实上游 / GUI | 本次 OAuth 使用真实本地 HTTP 与模拟 Google 响应，浏览器使用离线夹具；0.1.38 安装后的 GUI、真实 Google 授权、真实生成或图片识别尚未验收。编排模式的真实账号端到端与桌面 GUI 同样未验收 |
 | 非 Windows | 有平台映射与契约测试，未实机验收 |
 | 生产依赖漏洞 | `check` 不包含漏洞审计；没有单独成功审计证据就不声明通过 |
 

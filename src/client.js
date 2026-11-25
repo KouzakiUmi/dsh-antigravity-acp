@@ -106,6 +106,82 @@ window.__ModuleLoader__.load({
       const row = overrides && typeof overrides === 'object' ? overrides[id] : undefined
       return row && typeof row === 'object' ? row : {}
     }
+
+    /** 编排设置：整份对象作为一个字段参与脏值与冲突判断（与 modelOverrides 同模式）。 */
+    const ORCHESTRATOR_KEY = 'orchestrator'
+    const ORCHESTRATOR_LABEL = msg('编排（Orchestrator）')
+    const ORCHESTRATOR_EXECUTOR_MODEL = 'gemini-4-hydrogen'
+    const ORCHESTRATOR_PLANNER_OPTIONS = [
+      { value: 'gemini-4-neon', label: 'Gemini 4 Neon' },
+      { value: 'gemini-4-argon', label: 'Gemini 4 Argon' },
+      { value: 'claude-opus-5-5', label: 'Claude Opus 5.5' },
+    ]
+    const ORCHESTRATOR_PLANNER_IDS = new Set(ORCHESTRATOR_PLANNER_OPTIONS.map((entry) => entry.value))
+    const ORCHESTRATOR_EXECUTOR_OPTIONS = [
+      { value: 'gemini-4-hydrogen', label: 'Gemini 4 Hydrogen' },
+      { value: 'claude-sonnet-5-5', label: 'Claude Sonnet 5.5' },
+    ]
+    const ORCHESTRATOR_EXECUTOR_IDS = new Set(ORCHESTRATOR_EXECUTOR_OPTIONS.map((entry) => entry.value))
+    const ORCHESTRATOR_EFFORT_OPTIONS = EFFORT_OPTIONS.filter((entry) => Boolean(entry.value))
+    const ORCHESTRATOR_DEFAULTS = {
+      enabled: true,
+      plannerModel: 'claude-opus-5-5',
+      plannerEffort: 'medium',
+      executorModel: ORCHESTRATOR_EXECUTOR_MODEL,
+      executorEffort: 'medium',
+      maxPlansPerTurn: 2,
+      plannerTimeoutMs: 20000,
+      showPlan: false,
+    }
+    const ORCHESTRATOR_FIELDS = {
+      enabled: { key: 'orchestratorEnabled', checkbox: true, label: msg('启用编排'), hint: msg('关闭后不生成编排模型条目，也不执行规划编排。') },
+      plannerModel: { key: 'orchestratorPlannerModel', options: ORCHESTRATOR_PLANNER_OPTIONS, label: msg('规划模型（Planner）'), hint: msg('从预设规划模型中选择（默认 Claude Opus 5.5）。') },
+      plannerEffort: { key: 'orchestratorPlannerEffort', options: ORCHESTRATOR_EFFORT_OPTIONS, label: msg('规划思考档位'), hint: msg('规划阶段使用的思考档位（low / medium / high）。') },
+      executorModel: { key: 'orchestratorExecutorModel', options: ORCHESTRATOR_EXECUTOR_OPTIONS, label: msg('执行模型（Executor）'), hint: msg('从预设执行模型中选择（默认 Gemini 4 Hydrogen）；仅当前账户目录可见时生效。') },
+      executorEffort: { key: 'orchestratorExecutorEffort', options: ORCHESTRATOR_EFFORT_OPTIONS, label: msg('执行思考档位'), hint: msg('执行阶段使用的思考档位（low / medium / high）。') },
+      maxPlansPerTurn: { key: 'orchestratorMaxPlans', numeric: true, min: 1, max: 4, label: msg('每轮最多规划次数'), hint: msg('单次用户回合内的规划次数上限（1–4）。') },
+      showPlan: { key: 'orchestratorShowPlan', checkbox: true, label: msg('在对话中显示计划'), hint: msg('开启后在对话中以文本块展示规划结果。') },
+    }
+    function isValidOrchestratorMaxPlans(value) {
+      return Number.isSafeInteger(value) && value >= 1 && value <= 4
+    }
+    /** 规范化编排配置：固定键序、省略默认值，非法值回落默认。 */
+    function canonicalOrchestrator(value) {
+      const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+      const result = {}
+      if (source.enabled === false) result.enabled = false
+      const plannerModel = typeof source.plannerModel === 'string' ? source.plannerModel.trim() : ''
+      if (ORCHESTRATOR_PLANNER_IDS.has(plannerModel) && plannerModel !== ORCHESTRATOR_DEFAULTS.plannerModel) result.plannerModel = plannerModel
+      const executorModel = typeof source.executorModel === 'string' ? source.executorModel.trim() : ''
+      if (ORCHESTRATOR_EXECUTOR_IDS.has(executorModel) && executorModel !== ORCHESTRATOR_DEFAULTS.executorModel) result.executorModel = executorModel
+      if (EFFORT_IDS.has(source.plannerEffort) && source.plannerEffort !== ORCHESTRATOR_DEFAULTS.plannerEffort) result.plannerEffort = source.plannerEffort
+      if (EFFORT_IDS.has(source.executorEffort) && source.executorEffort !== ORCHESTRATOR_DEFAULTS.executorEffort) result.executorEffort = source.executorEffort
+      if (isValidOrchestratorMaxPlans(source.maxPlansPerTurn) && source.maxPlansPerTurn !== ORCHESTRATOR_DEFAULTS.maxPlansPerTurn) result.maxPlansPerTurn = source.maxPlansPerTurn
+      if (Number.isSafeInteger(source.plannerTimeoutMs) && source.plannerTimeoutMs >= 5000 && source.plannerTimeoutMs <= 300000 && source.plannerTimeoutMs !== ORCHESTRATOR_DEFAULTS.plannerTimeoutMs) {
+        result.plannerTimeoutMs = source.plannerTimeoutMs
+      }
+      if (source.showPlan === true) result.showPlan = true
+      return result
+    }
+    function sameOrchestrator(a, b) {
+      return JSON.stringify(canonicalOrchestrator(a)) === JSON.stringify(canonicalOrchestrator(b))
+    }
+    function orchestratorDraftFrom(value) {
+      const canonical = canonicalOrchestrator(value)
+      return {
+        enabled: canonical.enabled ?? ORCHESTRATOR_DEFAULTS.enabled,
+        plannerModel: canonical.plannerModel ?? ORCHESTRATOR_DEFAULTS.plannerModel,
+        plannerEffort: canonical.plannerEffort ?? ORCHESTRATOR_DEFAULTS.plannerEffort,
+        executorModel: canonical.executorModel ?? ORCHESTRATOR_DEFAULTS.executorModel,
+        executorEffort: canonical.executorEffort ?? ORCHESTRATOR_DEFAULTS.executorEffort,
+        maxPlansPerTurn: canonical.maxPlansPerTurn ?? ORCHESTRATOR_DEFAULTS.maxPlansPerTurn,
+        showPlan: canonical.showPlan ?? ORCHESTRATOR_DEFAULTS.showPlan,
+        ...(canonical.plannerTimeoutMs !== undefined ? { plannerTimeoutMs: canonical.plannerTimeoutMs } : {}),
+      }
+    }
+    function isOrchestratorDraftValid(value) {
+      return Boolean(value && typeof value === 'object' && isValidOrchestratorMaxPlans(value.maxPlansPerTurn))
+    }
     /** 目录条目 + 已配置但当前目录没有的 ID，都要能在此编辑。 */
     function modelRows(models, overrides) {
       const rows = models.map(({ id, name, inputModalities, contextWindow, maxOutputTokens }) => ({ id, name, inputModalities, contextWindow, maxOutputTokens, inCatalog: true }))
@@ -227,6 +303,36 @@ window.__ModuleLoader__.load({
           h('span', { style: { fontSize: '13px', fontWeight: 550 } }, t(field.label)),
           field.hint ? h('small', { style: { fontSize: '11.5px', lineHeight: 1.45, opacity: .6 } }, t(field.hint)) : null),
         h('input', { className: 'agy-switch', name: field.key, type: 'checkbox', checked: checked === true, disabled, style: { accentColor: '#3b82f6' }, onChange: (event) => onChange(event.target.checked) }))
+    }
+    function SelectField({ field, value, disabled, onChange }) {
+      const inputId = 'agy-setting-' + (React.useId?.() ?? field.key) + '-' + field.key
+      return h('div', { style: { display: 'grid', gap: '4px', minWidth: 0 } },
+        h('label', { htmlFor: inputId, style: { fontSize: '12.5px', fontWeight: 550 } }, t(field.label)),
+        h('select', {
+          id: inputId, name: field.key, disabled, value: value ?? '',
+          'aria-describedby': field.hint ? inputId + '-hint' : undefined,
+          style: { ...ACTION, cursor: disabled ? 'not-allowed' : 'pointer', width: '100%', minHeight: '32px', boxSizing: 'border-box', background: 'transparent', colorScheme: 'inherit', opacity: disabled ? .55 : 1 },
+          onChange: (event) => onChange(event.target.value),
+        }, ...(field.options ?? []).map((option) => h('option', { key: option.value, value: option.value, style: { color: 'CanvasText', backgroundColor: 'Canvas' } }, t(option.label)))),
+        field.hint ? h('small', { id: inputId + '-hint', style: { fontSize: '11px', lineHeight: 1.45, opacity: .6 } }, t(field.hint)) : null)
+    }
+    function OrchestratorSection({ value, dirty, disabled, onEdit }) {
+      const current = value && typeof value === 'object' ? value : orchestratorDraftFrom(undefined)
+      const maxPlansInvalid = dirty && !isValidOrchestratorMaxPlans(current.maxPlansPerTurn)
+      const pairGrid = { display: 'grid', gap: '10px', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))' }
+      return h('section', { 'aria-label': t(ORCHESTRATOR_LABEL) },
+        h(SectionHeading, { title: t(ORCHESTRATOR_LABEL), description: t('先由 Planner 生成计划，再由 Executor 按步骤执行；ACP 模式下 Planner 在工作区运行内置只读命令，不经过 DSH 审批。') }),
+        h('div', { style: PANEL },
+          h('div', { style: { display: 'grid', gap: '10px' } },
+            h(SwitchField, { field: ORCHESTRATOR_FIELDS.enabled, checked: current.enabled, disabled, onChange: (checked) => onEdit({ enabled: checked }) }),
+            h('div', { style: pairGrid },
+              h(SelectField, { field: ORCHESTRATOR_FIELDS.plannerModel, value: current.plannerModel, disabled, onChange: (next) => onEdit({ plannerModel: next }) }),
+              h(SelectField, { field: ORCHESTRATOR_FIELDS.plannerEffort, value: current.plannerEffort, disabled, onChange: (next) => onEdit({ plannerEffort: next }) })),
+            h('div', { style: pairGrid },
+              h(SelectField, { field: ORCHESTRATOR_FIELDS.executorModel, value: current.executorModel, disabled, onChange: (next) => onEdit({ executorModel: next }) }),
+              h(SelectField, { field: ORCHESTRATOR_FIELDS.executorEffort, value: current.executorEffort, disabled, onChange: (next) => onEdit({ executorEffort: next }) })),
+            h(TextField, { field: ORCHESTRATOR_FIELDS.maxPlansPerTurn, value: current.maxPlansPerTurn, disabled, invalid: maxPlansInvalid, onChange: (next) => onEdit({ maxPlansPerTurn: next }) }),
+            h(SwitchField, { field: ORCHESTRATOR_FIELDS.showPlan, checked: current.showPlan, disabled, onChange: (checked) => onEdit({ showPlan: checked }) }))))
     }
     function SettingsFields({ fields, draft, dirtyKeys, conflicts, disabled, editField }) {
       const numericGrid = fields.length > 1 && fields.every((field) => field.numeric)
@@ -549,6 +655,25 @@ window.__ModuleLoader__.load({
         setDraft(next)
       }, [])
 
+      /** 编排设置：合并成整份 orchestrator 对象再参与脏值、冲突与通用保存路径。 */
+      const editOrchestrator = React.useCallback((patch) => {
+        if (savingRef.current) return
+        const current = draftRef.current[ORCHESTRATOR_KEY] && typeof draftRef.current[ORCHESTRATOR_KEY] === 'object'
+          ? draftRef.current[ORCHESTRATOR_KEY]
+          : orchestratorDraftFrom(undefined)
+        const value = { ...current, ...patch }
+        const next = { ...draftRef.current, [ORCHESTRATOR_KEY]: value }
+        draftRef.current = next
+        if (isOrchestratorDraftValid(value) && sameOrchestrator(value, baseline.current[ORCHESTRATOR_KEY])) {
+          dirty.current.delete(ORCHESTRATOR_KEY)
+        } else {
+          dirty.current.add(ORCHESTRATOR_KEY)
+        }
+        setDirtyKeys([...dirty.current])
+        setConflicts((previous) => previous.filter((field) => field !== ORCHESTRATOR_KEY))
+        setDraft(next)
+      }, [])
+
       const reload = React.useCallback(async (preserveStatus = false) => {
         const version = ++settingsVersion.current
         // 同步段整体兜底：remote.<ns> 是代理属性，缺 inject 时连「读属性」都会抛；
@@ -582,18 +707,23 @@ window.__ModuleLoader__.load({
           // 整份 map 作为一个字段参与脏值比较；规范化后再比，避免键序或
           // 「显式写回默认值」被误判为未保存修改。
           server[OVERRIDES_KEY] = canonicalOverrides(current[OVERRIDES_KEY])
+          server[ORCHESTRATOR_KEY] = orchestratorDraftFrom(current[ORCHESTRATOR_KEY])
           const changed = []
           const next = { ...server }
           for (const key of dirty.current) {
             const same = key === OVERRIDES_KEY
               ? sameOverrides(draftRef.current[key], server[key])
-              : draftRef.current[key] === server[key]
+              : key === ORCHESTRATOR_KEY
+                ? isOrchestratorDraftValid(draftRef.current[key]) && sameOrchestrator(draftRef.current[key], server[key])
+                : draftRef.current[key] === server[key]
             if (same) dirty.current.delete(key)
             else {
               next[key] = draftRef.current[key]
               const beforeSame = key === OVERRIDES_KEY
                 ? sameOverrides(baseline.current[key], server[key])
-                : baseline.current[key] === server[key]
+                : key === ORCHESTRATOR_KEY
+                  ? sameOrchestrator(baseline.current[key], server[key])
+                  : baseline.current[key] === server[key]
               if (!beforeSame) changed.push(key)
             }
           }
@@ -623,16 +753,23 @@ window.__ModuleLoader__.load({
             : t('{label}必须是 {min}–{max} 的整数。', { label: t(invalid.label), min: invalid.min, max: invalid.max }) })
           return
         }
+        if (dirty.current.has(ORCHESTRATOR_KEY) && !isOrchestratorDraftValid(draftRef.current[ORCHESTRATOR_KEY])) {
+          const maxField = ORCHESTRATOR_FIELDS.maxPlansPerTurn
+          setStatus({ kind: 'error', text: t('{label}必须是 {min}–{max} 的整数。', { label: t(maxField.label), min: maxField.min, max: maxField.max }) })
+          return
+        }
         savingRef.current = true
         setSaving(true)
         setStatus({ kind: 'busy', text: t('保存中…') })
         // 只提交用户改动过的字段，空串也是有效改动；未编辑字段遵循最新服务端值。
-        // modelOverrides 是整份 map 一个字段，按同样方式提交。
-        const ops = [...FIELDS.map((field) => field.key), OVERRIDES_KEY]
+        // modelOverrides 与 orchestrator 均为整份对象字段，按同样方式提交。
+        const ops = [...FIELDS.map((field) => field.key), OVERRIDES_KEY, ORCHESTRATOR_KEY]
           .filter((key) => dirty.current.has(key))
           .map((key) => {
             const field = FIELDS.find((entry) => entry.key === key)
-            const value = field?.lines ? String(draftRef.current[key] ?? '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean) : draftRef.current[key]
+            const value = key === ORCHESTRATOR_KEY
+              ? canonicalOrchestrator(draftRef.current[key])
+              : field?.lines ? String(draftRef.current[key] ?? '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean) : draftRef.current[key]
             return { op: 'set', path: [key], value }
           })
         try {
@@ -641,7 +778,9 @@ window.__ModuleLoader__.load({
           for (const operation of ops) {
             const key = operation.path[0]
             const field = FIELDS.find((entry) => entry.key === key)
-            const currentValue = field?.lines ? String(draftRef.current[key] ?? '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean) : draftRef.current[key]
+            const currentValue = key === ORCHESTRATOR_KEY
+              ? canonicalOrchestrator(draftRef.current[key])
+              : field?.lines ? String(draftRef.current[key] ?? '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean) : draftRef.current[key]
             if (JSON.stringify(currentValue) === JSON.stringify(operation.value)) dirty.current.delete(key)
           }
           setDirtyKeys([...dirty.current])
@@ -725,7 +864,7 @@ window.__ModuleLoader__.load({
             dirtyKeys.length ? h('button', { type: 'button', disabled: loading || saving, onClick: discardDraft, style: { ...ACTION, minHeight: '30px', padding: '4px 10px' } }, t('撤销')) : null,
             h('span', { role: 'status', 'aria-live': 'polite', style: { fontSize: '12px', opacity: .72 } }, dirtyKeys.length ? t('{count} 项未保存', { count: dirtyKeys.length }) : loading ? t('正在读取…') : readonly ? t('只读设置') : ''),
             h('button', { type: 'button', title: t('重新读取配置并保留草稿'), disabled: loading || saving, onClick: () => reload(), style: { ...ACTION, minHeight: '30px', padding: '4px 9px', borderColor: 'transparent', background: 'transparent', opacity: .72, marginLeft: 'auto' } }, t(loading ? '刷新中…' : '刷新'))),
-          conflicts.length ? h('p', { role: 'alert', style: { margin: 0, fontSize: '12px', lineHeight: 1.5, color: 'var(--agy-warn-text, #ca8a04)' } }, t('以下内容已在其他位置更新，已保留你的输入：') + conflicts.map((key) => t(key === OVERRIDES_KEY ? OVERRIDES_LABEL : FIELDS.find((field) => field.key === key)?.label ?? key)).join(t('、'))) : null,
+          conflicts.length ? h('p', { role: 'alert', style: { margin: 0, fontSize: '12px', lineHeight: 1.5, color: 'var(--agy-warn-text, #ca8a04)' } }, t('以下内容已在其他位置更新，已保留你的输入：') + conflicts.map((key) => t(key === OVERRIDES_KEY ? OVERRIDES_LABEL : key === ORCHESTRATOR_KEY ? ORCHESTRATOR_LABEL : FIELDS.find((field) => field.key === key)?.label ?? key)).join(t('、'))) : null,
           h(StatusNotice, { status }))),
 
         connectionSettingsDirty ? h(StatusNotice, { status: { kind: 'busy', text: t('请先保存网络设置，再连接或登录。') } }) : null,
@@ -782,6 +921,7 @@ window.__ModuleLoader__.load({
             h(SectionHeading, { title: t('会话偏好') }),
             h('div', { style: PANEL },
               h(SettingsFields, { ...fieldProps, fields: fieldsFor('general') }))) : null,
+          h(OrchestratorSection, { value: draft[ORCHESTRATOR_KEY], dirty: dirtyKeys.includes(ORCHESTRATOR_KEY), disabled: editingDisabled, onEdit: editOrchestrator }),
           h(SettingsGroup, { title: t('网络与 CLI'), fields: fieldsFor('network'), fieldProps, open: effectiveProxyMode }),
           !effectiveProxyMode ? h(SettingsGroup, { title: t('会话与进程'), fields: fieldsFor('advanced'), fieldProps }) : null,
           !effectiveProxyMode ? h(PlainConfigDisclosure, { labels: PLAIN_FIELD_LABELS }) : null,

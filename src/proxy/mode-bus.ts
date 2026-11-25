@@ -15,7 +15,7 @@ export interface ProxyModeBus {
   subscribe(listener: (mode: boolean) => void): () => void
   /** 代理链路的出网代理设置（与官方进程同一套 proxyUrl / proxyBypass）。 */
   proxySettings(): { url?: string; bypass?: string }
-  modelSettings?(): { modelOverrides?: import('../settings.js').AntigravityHostConfig['modelOverrides'] }
+  modelSettings?(): Pick<import('../settings.js').AntigravityHostConfig, 'modelOverrides' | 'orchestrator'>
 }
 
 export type GenerationMode = 'acp' | 'proxy'
@@ -45,7 +45,7 @@ export function modeFromFlag(proxyMode: boolean | undefined): GenerationMode {
 export function createProxyModeBus(read: {
   mode(): boolean | undefined
   proxySettings(): { url?: string; bypass?: string }
-  modelSettings?(): { modelOverrides?: import('../settings.js').AntigravityHostConfig['modelOverrides'] }
+  modelSettings?(): Pick<import('../settings.js').AntigravityHostConfig, 'modelOverrides' | 'orchestrator'>
 }): ProxyModeBus & { notify(): void } {
   const listeners = new Set<(mode: boolean) => void>()
   let ready = false

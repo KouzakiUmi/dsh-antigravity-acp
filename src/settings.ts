@@ -100,11 +100,25 @@ export interface AntigravityHostConfig {
    * 套餐额度仍用代理账户，只有 AI Credits 调用 `agy -p /credits`。
    */
   cliQuotaEnabled?: boolean
+  /** 编排模式（antigravity-orchestrator）配置。 */
+  orchestrator?: OrchestratorConfig
+}
+
+/** 编排模式（planner → executor）的用户配置。 */
+export interface OrchestratorConfig {
+  enabled?: boolean
+  plannerModel?: 'gemini-4-neon' | 'gemini-4-argon' | 'claude-opus-5-5'
+  plannerEffort?: 'low' | 'medium' | 'high'
+  executorModel?: 'gemini-4-hydrogen' | 'claude-sonnet-5-5'
+  executorEffort?: 'low' | 'medium' | 'high'
+  maxPlansPerTurn?: number
+  plannerTimeoutMs?: number
+  showPlan?: boolean
 }
 
 // Only fields owned by the custom settings card are live. Ordinary launch/pool
 // configuration remains ordinary, so editing it still follows the host lifecycle.
-export const LIVE_SETTING_KEYS = ['autoWarmup', 'reuseSessions', 'modelOverrides', 'proxyUrl', 'proxyBypass', 'agyCliPath', 'resumeSessions', 'keepProcessAfterCancel', 'cancelGraceMs', 'idleRecycleMs', 'proxyMode', 'cliQuotaEnabled'] as const
+export const LIVE_SETTING_KEYS = ['autoWarmup', 'reuseSessions', 'modelOverrides', 'proxyUrl', 'proxyBypass', 'agyCliPath', 'resumeSessions', 'keepProcessAfterCancel', 'cancelGraceMs', 'idleRecycleMs', 'proxyMode', 'cliQuotaEnabled', 'orchestrator'] as const
 export type LiveSettingKey = typeof LIVE_SETTING_KEYS[number]
 export type AntigravityPluginConfig = Omit<AntigravityHostConfig, LiveSettingKey> & {
   [K in LiveSettingKey]?: AntigravityHostConfig[K] | Volatile<AntigravityHostConfig[K]>
@@ -114,8 +128,9 @@ function readSetting(value: string | Volatile<string | undefined> | undefined): 
 function readSetting(value: boolean | Volatile<boolean | undefined> | undefined): boolean | undefined
 function readSetting(value: number | Volatile<number | undefined> | undefined): number | undefined
 function readSetting(value: Record<string, ModelOverride> | Volatile<Record<string, ModelOverride> | undefined> | undefined): Record<string, ModelOverride> | undefined
-function readSetting(value: string | boolean | number | Record<string, ModelOverride> | Volatile<string | boolean | number | Record<string, ModelOverride> | undefined> | undefined): string | boolean | number | Record<string, ModelOverride> | undefined {
-  return typeof value === 'object' && value !== null && 'get' in value ? (value as Volatile<unknown>).get() as Record<string, ModelOverride> : value as string | boolean | number | Record<string, ModelOverride> | undefined
+function readSetting(value: OrchestratorConfig | Volatile<OrchestratorConfig | undefined> | undefined): OrchestratorConfig | undefined
+function readSetting(value: string | boolean | number | Record<string, ModelOverride> | OrchestratorConfig | Volatile<string | boolean | number | Record<string, ModelOverride> | OrchestratorConfig | undefined> | undefined): string | boolean | number | Record<string, ModelOverride> | OrchestratorConfig | undefined {
+  return typeof value === 'object' && value !== null && 'get' in value ? (value as Volatile<unknown>).get() as OrchestratorConfig : value as string | boolean | number | Record<string, ModelOverride> | OrchestratorConfig | undefined
 }
 
 /** Keep references live; callers may spread this view to capture one operation. */
@@ -134,6 +149,7 @@ export function liveHostConfig(config: AntigravityPluginConfig): AntigravityHost
     get idleRecycleMs() { return readSetting(config.idleRecycleMs) },
     get proxyMode() { return readSetting(config.proxyMode) },
     get cliQuotaEnabled() { return readSetting(config.cliQuotaEnabled) },
+    get orchestrator() { return readSetting(config.orchestrator) },
   }
 }
 
@@ -154,6 +170,20 @@ const ModelOverrideSchema = Schema.object({
   effort: Schema.union(MODEL_EFFORTS).description('默认思考档位：low / medium / high'),
   name: Schema.string().description('显示名覆盖'),
   target: Schema.string().description('映射到的官方模型 ID，优先于家族 + 档位路由'),
+})
+
+const ORCHESTRATOR_PLANNER_MODELS = ['gemini-4-neon', 'gemini-4-argon', 'claude-opus-5-5'] as const
+const ORCHESTRATOR_EXECUTOR_MODELS = ['gemini-4-hydrogen', 'claude-sonnet-5-5'] as const
+
+const OrchestratorSchema = Schema.object({
+  enabled: Schema.boolean().default(true).description('启用编排模式（planner → executor）'),
+  plannerModel: Schema.union(ORCHESTRATOR_PLANNER_MODELS).default('claude-opus-5-5').description('规划阶段模型：gemini-4-neon / gemini-4-argon / claude-opus-5-5'),
+  plannerEffort: Schema.union(MODEL_EFFORTS).default('medium').description('规划阶段思考档位：low / medium / high'),
+  executorModel: Schema.union(ORCHESTRATOR_EXECUTOR_MODELS).default('gemini-4-hydrogen').description('执行阶段模型：gemini-4-hydrogen / claude-sonnet-5-5'),
+  executorEffort: Schema.union(MODEL_EFFORTS).default('medium').description('执行阶段思考档位：low / medium / high'),
+  maxPlansPerTurn: Schema.natural().min(1).max(4).default(2).description('单回合最多规划次数（1–4）'),
+  plannerTimeoutMs: Schema.natural().min(5000).max(300_000).default(20_000).description('单次规划请求超时（毫秒，5000–300000）'),
+  showPlan: Schema.boolean().default(false).description('在对话中显示计划文本块'),
 })
 
 export const Config = Schema.object({
@@ -184,4 +214,9 @@ export const Config = Schema.object({
   idleRecycleMs: Schema.natural().max(3_600_000).default(300_000).volatile().description('保留进程的最长空闲时间（毫秒），超时回收；0 表示不设上限。默认 5 分钟是本插件的资源回收策略，不代表上游缓存 TTL'),
   proxyMode: Schema.boolean().default(false).volatile().description('代理模式（默认关闭）：开启后模型生成改由本 bundle 的代理路由直连上游（自有 OAuth 登录态 + agy 线身份），并停用官方 ACP 路由；关闭恢复 ACP 模式'),
   cliQuotaEnabled: Schema.boolean().default(false).volatile().description('允许额度取数调用本机 agy CLI（默认关闭）。关闭时不启动 agy，套餐额度走内置直连，AI Credits 不查询。开启后 ACP 模式运行 agy -p /usage 与 agy -p /credits；代理模式套餐额度仍用代理账户，仅 AI Credits 调用 agy -p /credits'),
+  orchestrator: OrchestratorSchema.default({}).volatile().description('编排模式（antigravity-orchestrator）配置：planner/executor 模型与档位、规划预算、超时与展示开关') as Schema<
+    OrchestratorConfig,
+    OrchestratorConfig,
+    'volatile-defined'
+  >,
 })

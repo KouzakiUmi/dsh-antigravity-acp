@@ -22,6 +22,7 @@
 | `promptTimeoutMs` | `1800000` | 单个 `session/prompt` 上限（毫秒）；工具 park 不表示上游 prompt 已结束。 |
 | `bridgeParkSettleMs` | `50` | 并发 MCP 工具调用聚合窗口（毫秒）；不是工具执行超时。 |
 | `modelOverrides` | `{}` | 按模型 ID 的目录设置，键是 DSH 选择器里的模型 ID：`enabled`（默认 `true`）决定是否出现在选择器，`effort` 是该模型未选思考强度时的默认档位，`name` 覆盖显示名，`target` 把该 ID 映射到官方模型 ID。只作用于目录中已存在的条目，不新增自造模型。 |
+| `orchestrator` | `{}` | 编排模式（`antigravity-orchestrator`）配置，整份对象字段：`enabled`（默认 `true`）、`plannerModel`（三选一：`gemini-4-neon` / `gemini-4-argon` / `claude-opus-5-5`，默认后者）、`plannerEffort`（默认 `medium`）、`executorModel`（两选一：`gemini-4-hydrogen` / `claude-sonnet-5-5`，默认前者）、`executorEffort`（默认 `medium`）、`maxPlansPerTurn`（默认 `2`，范围 1–4）、`plannerTimeoutMs`（显式设置才生效；代理侧默认 20000，ACP 侧未设置时用 120000）、`showPlan`（默认 `false`）。档位按目标模型的实际可选集合收敛（Opus / Sonnet 只有 low/medium/high，Hydrogen 另有 xhigh），非法值退回 medium 或默认模型。只有 planner 与配置的 executor 都已在当前目录可见时，`antigravity-orchestrator` 才会出现在选择器里。 |
 | `proxyUrl` | 未设置 | 显式出网代理；留空继承 Host 代理环境，Host 也未配置才直连。代理模式支持 HTTP/HTTPS CONNECT；ACP 模式另支持 SOCKS5、SOCKS5H。 |
 | `proxyBypass` | 未设置 | 兼容既有配置的逗号分隔排除列表，支持域名匹配，不支持 CIDR；始终合并 localhost、127.0.0.1、::1。设置页不提供此控制项。 |
 | `reuseSessions` | `true` | 复用同一个 ACP 会话：同一 DSH 对话的后续回合只发送**新增消息**，不再每轮 `session/new` 并重放全部历史。历史被压缩、回退或编辑，模型/思考强度变化，工具目录变化，或 MCP 桥被其他对话接管时自动重建。关闭后回到旧的「每轮新会话 + 全量重放」。 |
@@ -71,6 +72,16 @@ ACP 官方 agent 在同一会话内会保留上下文（2026-10-23 真机验证�
 - 保留进程不等于复用会话：被取消的会话一律作废，避免沿用可能仍在执行的 turn。
 
 实测（2026-10-23，官方 1.4.0）：同一会话空闲 60s、120s 后仍能复述上一轮暗号，响应耗时稳定（约 3s）；`usage_update.used` 持续累计（3463 → 3628 → 3745）。官方会话空闲 TTL 未知；ACP 会话上下文、Gemini 显式缓存与模型前缀缓存不是同一个保证。默认 5 分钟仅是本插件在启动延迟与常驻资源之间选取的回收策略，可自行调整或设 0 禁用。
+
+### 编排模式（planner → executor）
+
+选择 `antigravity-orchestrator` 后，插件自己驱动两段式生成：planner 先产出一份计划（目标、步骤、每步验证方式、交回条件），executor 只执行不重新规划；命中交回条件（工具失败、同一工具连续失败两次、用户改向）时停下并重新规划。计划默认只注入 executor 的上下文，不占对话正文；打开「在对话中显示计划」后以文本块显示。
+
+- **可配置组合**：planner 三选一（Gemini 4 Neon / Gemini 4 Argon / Claude Opus 5.5，默认 Opus 5.5），executor 两选一（Gemini 4 Hydrogen / Claude Sonnet 5.5，默认 Hydrogen，对齐官方 Antigravity 编排设置）。两个角色各带一个思考档位（默认都是 medium），选项随目标模型收敛：Opus / Sonnet 只有 low/medium/high，Hydrogen 另有 xhigh。
+- **代理链路**：planner 与 executor 是两次独立上游请求，档位编码在 wire 模型 ID 后缀里。planner 不声明工具、不接收图片，其用量与 executor 合并成一个 `usage` 结算。
+- **ACP 链路**：planner 在独立 ACP 会话里运行官方 `mode=plan`（不注册 MCP 桥，DSH 工具不会被 planner 调用），计划正文从 `agent_message_chunk` 采集；executor 回到 chat 会话切模型执行。切角色时必须显式带档位（写 `<family>-<effort>` 或分两步写 model 再写 thought_level），否则会继承上一个角色的档位。官方 `mode=plan` 只限制工作区写入，planner 仍会用内置工具执行只读命令、把计划写到官方 brain 目录，这些动作不经过 DSH 审批；planner 会话的 `cwd` 与会话工作目录一致，目录变化时重建。
+- **预算与降级**：每个用户回合最多 `maxPlansPerTurn` 次规划（默认 2）。planner 超时、失败或计划解析失败不阻塞对话，直接降级为 executor 单模型执行。
+- **目录条目**：`antigravity-orchestrator` 是插件合成的条目，只有 planner 与配置的 executor 都已在当前目录可见时才出现；关闭 `enabled` 后不出现，也不编排。
 
 ### 代理模式（默认关闭）
 

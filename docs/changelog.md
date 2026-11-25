@@ -4,12 +4,17 @@
 
 记录源码与发布内容，不将本地构建、npm 发布和本机升级混为同一状态。日期采用 Asia/Hong_Kong。更早历史见 [Git 提交记录](https://github.com/KouzakiUmi/dsh-antigravity-acp/commits/main/)。
 
-## 未发布
+## 0.1.50 · 2026-11-25
 
+- **新增编排模式（`antigravity-orchestrator`）**：planner → executor 两段式生成，两条链路行为一致。**组合可配置**：planner 三选一（Gemini 4 Neon / Gemini 4 Argon / Claude Opus 5.5，默认 Opus 5.5），executor 两选一（Gemini 4 Hydrogen / Claude Sonnet 5.5，默认 Hydrogen，对齐官方 Antigravity 编排设置）；两个角色各带思考档位（默认 medium），可选档位按目标模型收敛。planner 产出一份带步骤、每步验证方式与交回条件的计划，executor 只执行不重规划，命中交回条件后下一轮重新规划。代理链路是两次独立上游请求（planner 不写会话续轮状态，档位编码在 wire 模型后缀里）；ACP 链路在不挂 MCP 桥的独立 planner 会话里运行官方 `mode=plan`，再回 chat 会话切模型执行，切角色时显式带档位以免继承上一角色。计划默认只注入上下文，`showPlan` 打开时以文本块显示；每回合最多 `maxPlansPerTurn` 次规划，planner 失败或超时降级为单模型执行。该条目只有在 planner 与配置的 executor 都已在当前目录可见时才出现。设置页新增「编排」分组（planner / executor 两个模型下拉、两个档位、规划预算、计划显示）。
+- **文档**：新增 [`orchestrator-design.md`](orchestrator-design.md)（实现规格、实测记录与已决策取舍）。
+- **修复（#15，致谢 [@Walker-HK](https://github.com/Walker-HK)）**：
+  - ACP 登录态下额度恒为「读不到 CLI 登录态」：CLI 凭据缺失时回退只读 `acp_token.json`，识别 google-auth 序列化形态的 `token` 字段，并优先用凭据自带的 OAuth client 元数据换发（401/403 重试同路径）。
+  - 上下文占用虚高、可能提前触发压缩：按 `usage_update.used`（ACP 定义的当前上下文占用）把回合内多步累加的 prompt 计数按比例校正，缓存命中比例不变；缩放后省略不再精确的 `totalTokens`，输出与推理 token 原样保留。
+  - ACP 选择器列出当前登录方式不提供的型号：ACP 目录已知时只列认证方式实际提供的家族（CLI 清单仍参与档位表），官方以 `not available for the current authentication method` 拒绝时补充可操作说明，错误码与 JSON-RPC 细节不变。
 - **设置卡片与额度药丸视觉重构**：状态色改为语义色（`#22c55e` / `#eab308` / `#ef4444`），状态点缩小去掉外发光；设置卡片改为分页结构（连接 / 模型 / 额度 / 高级），加入行内开关（`agy-switch`）、折叠组（`agy-fold`）与模型列表容器（`agy-list`），标题、字号与间距整体收紧。主题色经 `--agy-*` 变量下发，亮暗取值跟随宿主主题属性；OS 为暗色但显式选择亮色时不再误用暗色警告色。
 - **普通配置改为折叠说明**：并发、二进制与超时字段不再渲染成设置控件，改为折叠面板列出字段名，并说明这些字段由宿主的普通配置编辑器维护、卡片内写入会被拒绝。
 - **修复**：滚动时保存栏恢复不透明底色，下层内容不再从 padding 条与半透明面板下透出；模型行点击名称可重新切换启用状态（命中区不再只有 36×20 的开关本身）；禁用开关不再叠加两层透明度而近乎不可见；离线预览夹具注入同一份客户端样式，预览中的列表、开关与折叠块不再退化。
-- **文档**：本次改动尚未发版，版本号与 npm 发布状态另计。
 
 ## 0.1.48 · 2026-11-22
 

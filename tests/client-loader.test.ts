@@ -428,6 +428,38 @@ describe('browser client module', () => {
     const tree = Card({ remote })
     expect(texts(tree).join('\n')).toContain('ACP 模式')
   })
+
+  it('设置卡片包含编排（Orchestrator）分组：7 个可编辑控件，Executor 可在 Hydrogen / Sonnet 间选择', () => {
+    const tree = loadCard()({ remote: {} })
+    const text = texts(tree).join(' ')
+    expect(text).toContain('编排（Orchestrator）')
+    expect(text).toContain('Gemini 4 Hydrogen')
+    expect(text).toContain('Claude Sonnet 5.5')
+    for (const name of [
+      'orchestratorEnabled',
+      'orchestratorPlannerModel',
+      'orchestratorPlannerEffort',
+      'orchestratorExecutorModel',
+      'orchestratorExecutorEffort',
+      'orchestratorMaxPlans',
+      'orchestratorShowPlan',
+    ]) {
+      expect(elements(tree).filter((item) => item.props.name === name), name).toHaveLength(1)
+    }
+    const planner = elements(tree).find((item) => item.props.name === 'orchestratorPlannerModel')!
+    expect(planner.type).toBe('select')
+    expect(elements(planner).filter((item) => item.type === 'option').map((item) => item.props.value)).toEqual([
+      'gemini-4-neon',
+      'gemini-4-argon',
+      'claude-opus-5-5',
+    ])
+    const executor = elements(tree).find((item) => item.props.name === 'orchestratorExecutorModel')!
+    expect(executor.type).toBe('select')
+    expect(elements(executor).filter((item) => item.type === 'option').map((item) => item.props.value)).toEqual([
+      'gemini-4-hydrogen',
+      'claude-sonnet-5-5',
+    ])
+  })
 })
 
 describe('AI Credits 展示', () => {
