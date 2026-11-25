@@ -40,6 +40,17 @@ describe('live settings schema and runtime references', () => {
     expect(config.modelOverrides).toEqual({})
   })
 
+  it('prompt 字节预算是普通配置：默认 176000，越界在装载期拒绝（issue #16）', () => {
+    const config = liveHostConfig(Config({}))
+    expect(config.promptByteBudget).toBe(176_000)
+    expect(Config({ promptByteBudget: 190_000 }).promptByteBudget).toBe(190_000)
+    // 上游硬上限 192001 字节；预算不得达到或超过它，也不得过小失去实用价值。
+    expect(() => Config({ promptByteBudget: 192_001 })).toThrow()
+    expect(() => Config({ promptByteBudget: 1_000 })).toThrow()
+    // 非 volatile：不进设置卡片即时编辑，走普通配置编辑器。
+    expect(LIVE_SETTING_KEYS).not.toContain('promptByteBudget')
+  })
+
   it('模型设置缺省启用，未知档位由 schema 拒绝而不是静默改写成别的值', () => {
     expect(Config({ modelOverrides: { 'gemini-3-pro': {} } }).modelOverrides.get()).toEqual({ 'gemini-3-pro': { enabled: true } })
     // 配置可能来自手写 JSON，档位拼错必须在装载期失败，不能静默退回默认档位。

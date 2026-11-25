@@ -28,6 +28,7 @@ import type { ProxyTransport } from '../proxy/transport.js'
 import { AGY_PROXY_ACCOUNT_INVOCATIONS } from '../proxy/account-remote.js'
 import { cliQuotaIdentity, markQuotaAge, quotaIdentity, QuotaSnapshotStore } from './snapshot-store.js'
 import type { QuotaMode } from './snapshot-store.js'
+import type { HistoryTruncationNotice } from '../runtime/history-notices.js'
 
 export const PACKAGE_NAME = 'dsh-bundle-antigravity-host'
 /** Typert service / wire namespace。 */
@@ -194,6 +195,8 @@ export interface AgYQuotaServiceOptions {
   onScopeChange?: (tick: () => void) => () => void
   /** 宿主日志（index.ts 接 `ctx.logger`）；用于记录每次取数的来源与结果。 */
   log?: { info(message: string): void; warn(message: string, error?: unknown): void }
+  /** 最近历史裁剪事件的只读来源（issue #16）；read 结果附带，不落盘。 */
+  historyNotices?: () => readonly HistoryTruncationNotice[]
 }
 
 /**
@@ -217,6 +220,7 @@ export class AgYQuotaService extends TypertRemoteService {
   private readonly _proxyQuota: AgYQuotaServiceOptions['proxyQuota']
   private readonly _log: AgYQuotaServiceOptions['log']
   private readonly _control: SettingsControl | undefined
+  private readonly _historyNotices: AgYQuotaServiceOptions['historyNotices']
   private _inflight?: { key: string; result: Promise<boolean> }
 
   constructor(ctx: Context, options: AgYQuotaServiceOptions = {}) {
@@ -233,6 +237,7 @@ export class AgYQuotaService extends TypertRemoteService {
     this._proxyQuota = options.proxyQuota
     this._log = options.log
     this._control = options.control
+    this._historyNotices = options.historyNotices
     if (options.background) {
       ctx.effect(() => {
         const tick = () => { void this.refresh().catch(error => this._log?.warn('antigravity-acp: 额度刷新失败：' + redactSensitiveText(String(error)))) }
@@ -264,7 +269,10 @@ export class AgYQuotaService extends TypertRemoteService {
     if (scope.epoch !== this.epoch()) return this.read(request)
     const value = snapshot === undefined ? this.emptySnapshot() : markQuotaAge(snapshot, (this._deps.now ?? Date.now)())
     if (!scope.cliOn && value.credits === undefined) value.credits = this.creditsUnavailable(false, value.updatedAt)
-    return request?.model ? { ...value, requestedModel: request.model, routeModel: this._modelTarget?.(request.model) || request.model } : value
+    // 历史裁剪是内存态事件，只随 read 附带，不进入快照存储与 stale 回退。
+    const notices = this._historyNotices?.() ?? []
+    const withNotices = notices.length > 0 ? { ...value, historyNotices: notices } : value
+    return request?.model ? { ...withNotices, requestedModel: request.model, routeModel: this._modelTarget?.(request.model) || request.model } : withNotices
   }
 
   /** Sole upstream entry point; host timer and explicit refresh share in-flight work. */

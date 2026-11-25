@@ -120,6 +120,8 @@ function createHarness(
     keepProcessAfterCancel?: boolean
     cancelGraceMs?: number
     idleRecycleMs?: number
+    promptByteBudget?: number
+    onHistoryNotice?: AntigravityAcpAdapterOptions['onHistoryNotice']
   } = {},
 ): Harness {
   let agent = new FakeAcpAgent()
@@ -212,6 +214,8 @@ function createHarness(
     keepProcessAfterCancel: options.keepProcessAfterCancel,
     cancelGraceMs: options.cancelGraceMs,
     idleRecycleMs: options.idleRecycleMs,
+    promptByteBudget: options.promptByteBudget,
+    onHistoryNotice: options.onHistoryNotice,
     loadSessionMap: options.loadSessionMap,
     saveSessionMap: options.saveSessionMap,
   })
@@ -2153,6 +2157,37 @@ describe('审查回归：取消、身份、目录和历史', () => {
 })
 
 describe('prompt 重建与并发防御', () => {
+  it('字节预算可配置：超限裁剪最旧历史、触发事件回调并写入提示块（issue #16）', async () => {
+    const notices: Array<{ omittedCount: number; omittedBytes: number; totalBytes: number }> = []
+    const harness = createHarness({
+      readSettings: () => ({ promptByteBudget: 16_000 }),
+      onHistoryNotice: (info) => notices.push(info),
+    })
+    const big = '很长的历史内容'.repeat(2_000)
+    const messages: RequestMessage[] = [
+      createUserMessage({ content: [{ type: 'text', text: big }], source: { kind: 'user' } }),
+      createAssistantMessage({ content: [{ type: 'text', text: big }], source: { provider: AGY_PROVIDER_ID, model: 'gemini-3-pro' } }),
+      createUserMessage({ content: [{ type: 'text', text: '当前请求' }], source: { kind: 'user' } }),
+    ]
+    const streaming = collect(harness.adapter.stream(baseOptions({ messages })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    await harness.agent.notify('session/update', {
+      sessionId: SESSION_1,
+      update: { sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: '收到' } },
+    })
+    await harness.agent.reply('session/prompt', { stopReason: 'end_turn' })
+    expect((await streaming).at(-1)).toMatchObject({ type: 'finish', reason: { kind: 'stop' } })
+    expect(notices).toHaveLength(1)
+    expect(notices[0]!.omittedCount).toBe(2)
+    expect(notices[0]!.totalBytes).toBeLessThanOrEqual(16_000)
+    const prompt = harness.agent.requestsFor('session/prompt').at(-1)!.params.prompt as ContentBlock[]
+    const text = prompt.filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text').map(block => block.text).join('\n')
+    expect(text).toContain('<dsh-history-truncated>')
+    expect(text).toContain('当前请求')
+    expect(text).not.toContain(big)
+    expect(Buffer.byteLength(text, 'utf8')).toBeLessThanOrEqual(16_000)
+  })
+
   it('完整 messages + system 被重建进同一条 ACP prompt，且可逆还原', async () => {
     const harness = createHarness()
     const streaming = collect(harness.adapter.stream(baseOptions({

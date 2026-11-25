@@ -58,6 +58,7 @@ window.__ModuleLoader__.load({
       msg('握手超时（handshakeTimeoutMs）'),
       msg('浏览器登录超时（authTimeoutMs）'),
       msg('单轮生成超时（promptTimeoutMs）'),
+      msg('单次 prompt 字节预算（promptByteBudget）'),
       msg('工具调用聚合窗口（bridgeParkSettleMs）'),
       msg('ACP Server 路径（binaryPath）'),
       msg('自动下载 ACP Server（autoDownload）'),
@@ -1171,9 +1172,32 @@ window.__ModuleLoader__.load({
               h('div', { title: bucket.disabled ? bucket.description : bucket.resetTime, style: { display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden', fontSize: '10.5px', lineHeight: 1.35, opacity: .62, marginTop: '5px' } }, bucket.disabled ? t(bucket.description ?? '此窗口不可用') : resetCountdown(bucket.resetTime)))
           })) : h('span', { style: { opacity: .55, fontSize: '11px' } }, t(data ? '未提供额度数据' : '正在读取…')))),
         CreditsDetails({ credits: data?.credits, pending: !data }),
+        HistoryNoticesDetails({ notices: data?.historyNotices }),
         h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', paddingTop: '10px' } },
           h('small', { style: { flex: 1, opacity: .55, minWidth: 0, fontSize: '11px' } }, data?.status === 'ok' && data.updatedAt ? t('更新于 {time}', { time: new Date(data.updatedAt).toLocaleString() }) : t('尚无成功快照')),
           load ? h('button', { type: 'button', disabled: refreshing, onClick: () => load(true), style: { padding: '4px 12px', borderRadius: '8px', border: 'none', background: 'rgba(59,130,246,.14)', color: '#3b82f6', font: 'inherit', fontSize: '12px', fontWeight: 500, cursor: 'pointer' } }, t(refreshing ? '刷新中…' : '刷新额度')) : null))
+    }
+    /** 历史裁剪提示的展示窗口：只提示最近 10 分钟内的裁剪事件（issue #16）。 */
+    const HISTORY_NOTICE_WINDOW_MS = 10 * 60_000
+    function recentHistoryNotices(notices, now = Date.now()) {
+      if (!Array.isArray(notices)) return []
+      return notices.filter((notice) => {
+        const at = notice && typeof notice.at === 'string' ? Date.parse(notice.at) : NaN
+        return Number.isFinite(at) && now - at <= HISTORY_NOTICE_WINDOW_MS
+      })
+    }
+    /** 历史裁剪详情：字节预算裁掉的历史在这里可见，DSH 上下文条不反映被裁部分。 */
+    function HistoryNoticesDetails({ notices }) {
+      const recent = recentHistoryNotices(notices)
+      if (!recent.length) return null
+      return h('section', { style: { padding: '9px 0', borderTop: '1px solid color-mix(in srgb, currentColor 12%, transparent)' }, 'aria-label': t('历史裁剪记录') },
+        h('div', { style: { display: 'flex', alignItems: 'center', gap: '7px', marginBottom: '5px' } },
+          h('span', { 'aria-hidden': true, style: { width: '8px', height: '8px', borderRadius: '50%', background: '#eab308' } }),
+          h('strong', { style: { fontSize: '12px' } }, t('历史已裁剪'))),
+        h('p', { style: { margin: '0 0 5px', fontSize: '10.5px', lineHeight: 1.45, opacity: .62 } }, t('单次 ACP prompt 有字节上限，超限时先裁剪最旧历史；DSH 上下文条不反映被裁剪部分。')),
+        h('div', { style: { display: 'grid', gap: '3px' } }, ...recent.slice(0, 5).map((notice, index) =>
+          h('div', { key: index, style: { fontSize: '10.5px', fontVariantNumeric: 'tabular-nums', opacity: .75 } },
+            t('{time} · 省略 {count} 条消息（约 {kb} KB）', { time: new Date(notice.at).toLocaleString(), count: notice.omittedCount, kb: Math.ceil(notice.omittedBytes / 1024) })))))
     }
     /** 紧凑余量条与单词状态的交互参考 dsh-subusage；取数仍由本插件负责。 */
     function quotaPillStatus(data, buckets) {
@@ -1252,16 +1276,19 @@ window.__ModuleLoader__.load({
       const group = groups.find((g) => g.key === family)
       const buckets = orderedBuckets(group?.buckets ?? [])
       const pillStatus = quotaPillStatus(quota.data, buckets)
+      const notices = recentHistoryNotices(quota.data?.historyNotices)
       const miniBuckets = buckets.slice(0, 5)
       const miniHeight = miniBuckets.length <= 1 ? 6 : miniBuckets.length === 2 ? 5 : miniBuckets.length === 3 ? 4 : miniBuckets.length === 4 ? 3 : 2
       const modeTag = t(isProxy ? '代理' : 'ACP')
       const label = quota.data?.error?.code === 'not-fetched' ? t('暂无额度快照') : quota.data?.status === 'error' ? t('额度读取失败') : !quota.data ? t('正在读取额度') : !group ? t('额度未匹配，请选择具体模型') : !buckets.length ? t('额度未知') : buckets.map((b) => windowName(b) + ' ' + (b.disabled ? t('已停用') : percentage(b) === undefined ? t('额度未知') : t('{pct}% 剩余', { pct: Math.round(percentage(b)) }))).join(' · ')
       const title = modeTag + ' · ' + String(model ?? t('未选择模型')) + ' · ' + label + (quota.data?.stale ? t(' · 缓存数据') : '')
+        + (notices.length ? t(' · 历史已裁剪') : '')
       return h('span', { ref: root, className: 'antigravity-usage-pill', 'data-expanded': String(expanded), style: { position: 'relative', display: 'inline-flex', alignItems: 'center' } },
         h('button', { ref: button, type: 'button', title, 'aria-label': title, 'aria-expanded': expanded, 'aria-haspopup': 'dialog', onClick: () => setExpanded((value) => !value),
           style: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: '8px', padding: pillStatus.short ? '4px 11px 4px 9px' : '5px 10px', minHeight: '26px', boxSizing: 'border-box', borderRadius: '99px', border: '1px solid ' + (pillStatus.tint ? pillStatus.color + '73' : 'rgba(128,128,128,.3)'), background: pillStatus.tint ? pillStatus.color + '1a' : 'transparent', color: 'inherit', cursor: 'pointer', font: 'inherit', fontSize: '12px', fontWeight: 600, whiteSpace: 'nowrap', maxWidth: 'min(46vw, 240px)' } },
           miniBuckets.length ? h('span', { style: { display: 'grid', gap: miniBuckets.length <= 2 ? '3px' : '2px', opacity: quota.data?.stale ? .5 : 1 } }, ...miniBuckets.map((b, i) => h('span', { key: i }, remainingBar(b, true, quota.data?.stale, t('{name} {window}剩余额度', { name: group.name, window: windowName(b) }), miniHeight))))
             : h('span', { 'aria-hidden': true, style: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: '16px', height: '16px', borderRadius: '50%', background: pillStatus.color, color: '#fff', fontSize: '11px' } }, pillStatus.icon),
+          notices.length ? h('span', { 'aria-hidden': true, style: { width: '8px', height: '8px', borderRadius: '50%', background: '#eab308', flexShrink: 0 } }) : null,
           pillStatus.short ? h('span', null, pillStatus.short) : null),
         expanded ? h('div', { className: 'antigravity-quota-popover', role: 'dialog', 'aria-label': t('Antigravity 额度详情'), style: { zIndex: 50, width: 'min(340px, calc(100vw - 24px))', maxHeight: 'min(70vh, calc(100vh - 72px))', overflowY: 'auto', boxSizing: 'border-box', overflowWrap: 'anywhere', padding: '14px', borderRadius: '14px', background: 'var(--dsh-surface, var(--dsw-alias-bg-layer-1, Canvas))', color: 'var(--dsh-text, var(--dsw-alias-label-primary, CanvasText))', border: '1px solid rgba(128,128,128,.28)', boxShadow: '0 12px 32px rgba(0,0,0,.28)', font: '12px/1.5 sans-serif',
           // 坐标全部由 useLayoutEffect 的 fixed 定位给出；首帧未算好时放屏外，

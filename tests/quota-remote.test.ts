@@ -61,6 +61,29 @@ describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
     } finally { await second.close() }
   })
 
+  it('历史裁剪事件只随 read 附带，不写入快照存储（issue #16）', async () => {
+    const path = mkdtempSync(join(tmpdir(), 'dsh-quota-test-'))
+    using directory = { path, [Symbol.dispose]: () => rmSync(path, { recursive: true, force: true }) }
+    const credential = vi.fn(async () => ({ accessToken: 'unsaved-test-token', projectId: 'synthetic-project', source: 'login' as const, updatedAt: 'x' }))
+    const request = vi.fn(async ({ url }: { url: string }) => new Response(JSON.stringify(url.includes('loadCodeAssist') ? {} : {
+      groups: [{ displayName: 'Gemini', buckets: [{ remainingFraction: 0.7 }] }],
+    })))
+    const notices = [{ at: '2026-11-26T00:00:00.000Z', omittedCount: 3, omittedBytes: 90_000, totalBytes: 170_000 }]
+    const ctx = new Context()
+    const fiber = await ctx.plugin(AgYQuotaService, { mode: () => 'proxy', snapshotDirectory: directory.path,
+      proxyIdentity: async () => 'account-a', proxyQuota: { credential: { credential }, transport: { request } },
+      historyNotices: () => notices })
+    try {
+      const service = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
+      await service.refresh()
+      const value = await service.read({ model: 'gemini-flash' })
+      expect(value.historyNotices).toEqual(notices)
+      expect(value.requestedModel).toBe('gemini-flash')
+      // 落盘快照不含裁剪事件：它是内存态，重启即清空。
+      expect(readFileSync(join(directory.path, 'quota-proxy.json'), 'utf8')).not.toContain('historyNotices')
+    } finally { await fiber.dispose(); await ctx.fiber.dispose() }
+  })
+
   it('不打开界面也由宿主定时拉取，卸载后停止', async () => {
     vi.useFakeTimers()
     const ctx = new Context()
