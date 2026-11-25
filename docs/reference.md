@@ -130,7 +130,7 @@ ACP fs / terminal 与未知原生权限请求始终拒绝并记录，但不因�
 - 取消登录也覆盖回调后的 token 交换；退出时使旧刷新失效并清除副本，本次插件生命周期内保持退出，用户显式连接后才恢复自动取凭据。
 - 页面区分检查登录态、等待浏览器、完成登录；取消也覆盖授权前的凭据换发与项目请求。失败显示授权、项目或保存的具体原因。授权链接过期或遗失时取消后重连；端口占用时先结束占用端口的旧授权流程。
 - 线身份：User-Agent 为 `antigravity/cli/<version> (aidev_client; os_type=…; arch=…; cl=…; auth_method=consumer)`（取自 `@cortexkit/antigravity-auth-core` 3.0.14 的审计实现），头顺序 Host → User-Agent → (Transfer-Encoding|Content-Length) → Authorization → Content-Type → Accept-Encoding；`:streamGenerateContent` 固定 chunked。端点白名单仅 Cloud Code Assist 的 `streamGenerateContent` / `generateContent` / `fetchAvailableModels` / `loadCodeAssist` / `retrieveUserQuotaSummary` 与 `oauth2.googleapis.com/token`。
-- 与参考实现（dsh-tool-antigravity）的差异：不携带 DSH 归属第二头（归属 User-Agent 与 agy 伪装互斥，代理模式是用户显式开启的功能）；SOCKS 代理在代理模式明确报错而非静默直连；单账户，429 不轮转。
+- 与参考实现（dsh-tool-antigravity）的差异：不携带 DSH 归属第二头（归属 User-Agent 与 agy 伪装互斥，代理模式是用户显式开启的功能）；SOCKS 代理在代理模式明确报错而非静默直连；单账户，429 不轮转、不自动重试。429 错误（HTTP 与流内事件）附带上游原话（脱敏、最多 300 字符），配额耗尽时的重置时间等诊断信息随错误可见；ACP 登录与代理账户是不同额度池，一侧有额度不代表另一侧可用。
 - 图片输入：宿主附件服务在场时经 `readImageRequest` 有界投影（单图 4MP / 1MB）转 `inlineData`；整请求 12MB 内联预算，超预算报 `IMAGE_OFFLOAD_REQUIRED` 并按最旧优先协商 offload；已 offload 的图片投影为占位文本。附件服务缺席时报 `UNSUPPORTED_MODALITY`。输出含图片的型号（图像生成类）不在代理路由内；上游对文本模型返回媒体输出按协议漂移拒绝。
 - 工具调用：同一响应中的多个完整 `functionCall` 分别交给 DSH，即使上游省略调用 ID 也保持独立；同一 ID 的字符串参数分片继续组装为一条调用。工具响应即使附带 `STOP` 也进入工具续轮。文本与思考块的后到签名随历史回放保留，模型映射或档位改变后不误用旧签名；未收到完成标记就断开会报告传输错误。
 - Claude 续聊会保留中断前已经取得的工具结果。历史批次缺失的结果会标记为「未取得结果，工具可能已执行」，插件不会重跑该工具。当前批次若仍缺结果，先提示检查该批次的执行状态。

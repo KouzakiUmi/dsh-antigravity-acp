@@ -767,12 +767,14 @@ export class AntigravityProxyAdapter extends LlmAdapter {
           const body = await readProxyText(response, { signal }).catch(() => '')
           await cancelResponse(response)
           const lowered = body.toLowerCase()
-          const exhausted = lowered.includes('resource has been exhausted') || lowered.includes('exhausted your capacity')
-          const detail = redactSensitiveText(body.trim().slice(0, 200))
+          const exhausted = lowered.includes('resource has been exhausted') || lowered.includes('exhausted your capacity') || lowered.includes('reached your current quota')
+          // 两个分支都附带上游原话（脱敏有界）：配额耗尽时重置时间等关键诊断
+          // 信息在上游 message 里，丢掉它用户只看到一句泛化的「稍后重试」（issue #14）。
+          const detail = rateLimitDetail(body)
           throw new LlmError(
             !exhausted
               ? `代理模式请求被上游拒绝（429）${detail.length > 0 ? `：${detail}` : ''}；可稍后重试或切换回 ACP 模式`
-              : '代理模式账户被上游限流（429 Resource has been exhausted，配额或容量已耗尽）；稍后重试或切换回 ACP 模式',
+              : `代理模式账户被上游限流（429，配额或容量已耗尽）${detail.length > 0 ? `：${detail}` : ''}；稍后重试或切换回 ACP 模式`,
             'RATE_LIMIT',
             { status: response.status },
           )
@@ -883,10 +885,15 @@ export class AntigravityProxyAdapter extends LlmAdapter {
       // 停用也会以流内 error 事件出现（magpie 记录过这条形态）：先认它，再谈别的。
       const suspended = suspendedErrorFor(eventError.message ?? '', eventError.status)
       if (suspended !== undefined) throw suspended
+      const code = eventError.contextWindowExceeded === true ? CONTEXT_WINDOW_EXCEEDED_CODE : safeProviderErrorCode(eventError.code, eventError.status)
+      // 限流事件附带上游原话（脱敏有界），配额重置时间等诊断不丢（issue #14）。
+      const detail = code === 'RATE_LIMIT' ? redactSensitiveText((eventError.message ?? '').trim().slice(0, 300)) : ''
       yield finishChunk(
         'error',
-        eventError.contextWindowExceeded === true ? CONTEXT_WINDOW_EXCEEDED_CODE : safeProviderErrorCode(eventError.code, eventError.status),
+        code,
         eventError.status,
+        undefined,
+        detail === '' ? undefined : detail,
       )
       return false
     }
@@ -1125,11 +1132,11 @@ function endBlock(state: BlockState): StreamChunk {
   return { type: 'block-end', index: state.index, block: { type: 'tool-call', id: state.id, name: state.name, arguments: state.text || '{}' } }
 }
 
-function finishChunk(kind: FinishReason['kind'], code: string, status?: number, replayState?: ReplayEnvelope): StreamChunk {
+function finishChunk(kind: FinishReason['kind'], code: string, status?: number, replayState?: ReplayEnvelope, detail?: string): StreamChunk {
   const reason: FinishReason = kind === 'aborted'
     ? { kind: 'aborted', failure: { code, message: '代理模式请求已取消' } }
     : kind === 'error'
-      ? { kind: 'error', failure: { code, message: '代理模式上游请求失败', ...(status === undefined ? {} : { status }) } }
+      ? { kind: 'error', failure: { code, message: detail === undefined ? '代理模式上游请求失败' : `代理模式上游请求失败：${detail}`, ...(status === undefined ? {} : { status }) } }
       : kind === 'max-tokens'
         ? { kind: 'max-tokens' }
         : kind === 'tool-calls'
@@ -1148,9 +1155,9 @@ function mapFinishReason(value: string | undefined): FinishReason['kind'] {
 }
 
 function safeProviderErrorCode(code: string | undefined, status?: number): string {
+  if (status === 429) return 'RATE_LIMIT'
   if (status === 401) return 'AUTH'
   if (status === 403) return 'FORBIDDEN'
-  if (status === 429) return 'RATE_LIMIT'
   const normalized = code?.toUpperCase()
   if (normalized === undefined) return 'UPSTREAM'
   if (normalized.includes('RATE') || normalized === 'RESOURCE_EXHAUSTED') return 'RATE_LIMIT'
@@ -1250,6 +1257,16 @@ function toLlmError(error: unknown): LlmError {
     return llmError(transport.message, code, ...(transport.status === undefined ? [] : [{ status: transport.status }]))
   }
   return new LlmError(error instanceof Error ? error.message : String(error), 'TRANSPORT', { cause: error })
+}
+
+/** 429 上游原话提取：优先 Google 错误 JSON 的 error.message，否则原文；脱敏有界。 */
+function rateLimitDetail(body: string): string {
+  let text = body.trim()
+  try {
+    const parsed = JSON.parse(text) as unknown
+    if (isRecord(parsed) && isRecord(parsed.error) && typeof parsed.error.message === 'string') text = parsed.error.message
+  } catch { /* 非 JSON  body：用原文 */ }
+  return redactSensitiveText(text.slice(0, 300))
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

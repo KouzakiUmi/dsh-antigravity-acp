@@ -88,6 +88,7 @@ ELECTRON_RUN_AS_NODE=1 "$DSH_NODE_EXECUTABLE" scripts/check-desktop-compat.cjs
 | 额度快照 | 用桌面包内 Cordis 拉取真实 Google 额度，获得 3 个分组；新开隔离 Host，在上游不可调用的条件下重读同一快照，分组与时间戳一致。自动回归覆盖独立定时、手动合并、读取不等待刷新、换账户隔离与过期标记。2026-11-26 真实代理快照核实上游已合并为 2 组（Gemini Models / Claude and GPT models），客户端动态遍历无硬编码组数，旧独立 Argon 组并入 Gemini 展示 |
 | 退役模型与额度药丸（0.1.51） | 系统 Node 24：`tests/model-retirement.test.ts` 锁定退役表（家族键归一、档位 ID 命中、日期与迁移字段）；`tests/model-settings.test.ts` 覆盖默认关闭与显式启用优先；client/host 两表家族与日期一致性、「即将下线」徽章与开关默认态由 `tests/client-loader.test.ts` 锁定；药丸短周期在上排序（weekly/5h 逆序夹具）与 `useLayoutEffect` fixed 定位、空组不再渲染均有回归。真实上游拉取与 GUI 弹层位置未实机验收 |
 | prompt 字节预算与裁剪可观测（#16） | 系统 Node 24：`tests/history-notices.test.ts` 锁定事件日志有界与最新在前；`tests/settings-schema.test.ts` 覆盖 `promptByteBudget` 默认值、越界拒绝与非 volatile；`tests/acp-adapter.test.ts` 在 FakeAcpAgent 下验证配置预算传入 prompt 组装、超限裁剪触发 `onHistoryNotice` 且提示块与实际字节不超预算；`tests/quota-remote.test.ts` 验证裁剪事件只随 read 附带、不写入快照存储；真实 React renderer 验证药丸警示、详情文案与 10 分钟窗口过期不提示。真实长会话 GUI 裁剪提示未实机验收 |
+| 代理 429 诊断（#14） | 系统 Node 24：`tests/proxy-adapter.test.ts` 覆盖 HTTP 429 配额耗尽分支附带 JSON `error.message`（脱敏、保留重置时间）、普通限流分支既有口径、流内限流事件附带上游原话并脱敏。真实账户 429 复现未执行（探针期间观测到 ACP 线配额耗尽文案 `reached your current quota`，已纳入耗尽识别） |
 | 工具 / runtime | 假 ACP / MCP、乱序工具结果、池所有权、续轮变更、取消、写入阻塞和回收 |
 | Claude 历史工具批次 | 桌面 Core `0.2.2-rc.5` + 真实 Sonnet 5.5 `medium`：并行两个工具只回填一个后续发消息，已安装 0.1.42 上游 HTTP 400 / `PROTOCOL_DRIFT`；候选用同一历史正常完成（HTTP 200），两个结果都缺失时也正常完成；当前批次未收齐时在本地返回 `INVALID_ARGS`，不派发 |
 | 图片 | 附件引用校验、图片内容映射与跨 worker 能力；代理模式 inlineData 准入、12MB 预算与 offload 协商、附件缺席降级；未调用真实视觉模型 |
