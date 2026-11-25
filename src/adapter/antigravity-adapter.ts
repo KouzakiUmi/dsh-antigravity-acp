@@ -652,7 +652,8 @@ export class AntigravityAcpAdapter extends LlmAdapter {
    * 家族折叠（2026-10-16 用户指示）：官方把思考强度编码进模型 id
    * （`claude-opus-5-5-{low,medium,high}`），但模型选择只出家族一行，强度由
    * 思考强度菜单路由（见 #applyModelSelection）。会话观测目录与官方 CLI 清单
-   * 一并折叠，同 id 去重；被排除的家族（gpt-oss-120b 临近下架）不出现。
+   * 一并折叠，同 id 去重；临近下线的家族仍保留在折叠结果里，由退役表
+   * （adapter/model-retirement.ts）经可见性层默认关闭，用户可显式重新启用。
    */
   override async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
     const folded = await this.#foldCatalog(_provider)

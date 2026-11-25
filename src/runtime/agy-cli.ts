@@ -118,12 +118,6 @@ export const AGY_REASONING_EFFORT_NAMES: Record<AgyReasoningEffort, string> = {
  */
 export const DEFAULT_AGY_REASONING_EFFORT: AgyReasoningEffort = 'medium'
 
-/**
- * 用户明确排除的模型家族（2026-10-16 指示：gpt-oss-120b 临近下架，不进选择器）。
- * 按家族排除：`gpt-oss-120b` 与其全部档位变体一并不出现。
- */
-export const AGY_MODEL_EXCLUDED_FAMILIES: ReadonlySet<string> = new Set(['gpt-oss-120b'])
-
 /** 识别 id 的思考强度后缀；识别不出返回 undefined。 */
 export function tierForModelId(id: string): AgyModelTier | undefined {
   const match = /-(low|medium|high|xhigh)$/.exec(id)
@@ -147,7 +141,8 @@ function stripTierLabel(name: string): string {
  * 模型选择只出**家族**（`claude-opus-5-5` 一行），思考强度由 DSH 的思考强度
  * 菜单选择后自动路由到对应档位模型（`claude-opus-5-5-high`）——2026-10-16
  * 用户指示「不要把思考强度单独放进模型，而是做一个路由」。
- * 被排除的家族（gpt-oss-120b）整组不出现。
+ * 本函数只做观测折叠，不做隐藏：临近下线的家族（见 adapter/model-retirement.ts）
+ * 仍保留在折叠结果里，由可见性层默认关闭，用户可显式重新启用。
  */
 export function foldAgyModelFamilies(
   rows: readonly { id: string; name: string; description?: string }[],
@@ -156,7 +151,6 @@ export function foldAgyModelFamilies(
   for (const row of rows) {
     const tier = tierForModelId(row.id)
     const familyId = modelFamilyId(row.id)
-    if (AGY_MODEL_EXCLUDED_FAMILIES.has(familyId)) continue
     const entry = families.get(familyId) ?? {
       id: familyId,
       name: stripTierLabel(row.name),

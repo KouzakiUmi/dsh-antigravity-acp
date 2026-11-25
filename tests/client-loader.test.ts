@@ -109,6 +109,14 @@ function loadRegistrations(options: QuotaStubOptions = {}): Map<string, SlotRegi
         else effectCleanups.push(cleanup)
       }
     },
+    // 测试环境无真实绘制阶段，layout effect 与普通 effect 同口径执行。
+    useLayoutEffect: (fn: () => void | (() => void)) => {
+      const cleanup = fn()
+      if (typeof cleanup === 'function') {
+        if (options.immediateUnmount) cleanup()
+        else effectCleanups.push(cleanup)
+      }
+    },
     useSyncExternalStore: (_subscribe: unknown, getSnapshot: () => unknown) => getSnapshot(),
     useId: () => 'test',
     useMemo: <T,>(fn: () => T) => fn(),
@@ -262,7 +270,8 @@ describe('browser client module', () => {
     // 普通配置（并发/二进制/超时）不是即时字段，宿主拒绝在本卡片写入，改为指引块。
     expect(text).toContain('普通配置（并发 / 二进制 / 超时）')
     expect(text).toContain('maxConcurrentSessions')
-    expect(elements(tree).filter((item) => item.type === 'details')).toHaveLength(3)
+    // 带 aria-label 的 details 是高级页三个折叠组；模型行 details 无 aria-label，不计入。
+    expect(elements(tree).filter((item) => item.type === 'details' && item.props['aria-label'])).toHaveLength(3)
   })
 
   it('目录冷启动超过 60 秒时客户端继续等待 Host，而不是提前报超时', async () => {
@@ -525,6 +534,7 @@ describe('额度药丸（conversation.input.right）', () => {
     expect(entries.get('antigravity-quota')!.row.inject!('session')).not.toHaveProperty('control')
   })
 
+  // 上游额度池已合并为两个分组；保留三组建模用于验证旧独立 Argon 组并入 Gemini 展示。
   const completeQuota = { status: 'ok', groups: [
     { name: 'Gemini Models', buckets: [{ window: '5h', remainingPct: 82 }, { window: 'weekly', remainingPct: 71 }] },
     { name: 'Claude and GPT models', buckets: [{ window: '5h', remainingPct: 43 }] },
@@ -534,17 +544,24 @@ describe('额度药丸（conversation.input.right）', () => {
   it('药丸只显示选中模型的迷你条与简短状态；展开完整额度组和余额', () => {
     const props = { store: { ...modelStore('antigravity-acp'), getSnapshot: () => ({ current: { provider: 'antigravity-acp', model: 'gemini-4-argon-high' } }) } }
     const closed = loadRegistrations({ quotaSnapshot: completeQuota }).get('antigravity-quota')!.component(props)
-    expect(texts(closed)).toEqual(['偏少'])
+    // 并入 Gemini 共享组后余量充足，不再显示「偏少」短状态，只保留迷你条。
+    expect(texts(closed)).toEqual([])
+    // 池合并后 Argon 模型并入 Gemini 组：5h 与 weekly 两个窗口，短周期在上。
     const bars = elements(closed).filter((item) => item.props.role === 'progressbar')
-    expect(bars).toHaveLength(1)
-    expect(bars[0]?.props['aria-valuenow']).toBe(12)
+    expect(bars).toHaveLength(2)
+    expect(bars[0]?.props['aria-valuenow']).toBe(82)
+    expect(bars[1]?.props['aria-valuenow']).toBe(71)
     const opened = loadRegistrations({ quotaSnapshot: completeQuota, stateOverrides: { 2: true } }).get('antigravity-quota')!.component(props)
     const text = texts(opened).join(' ')
-    for (const label of ['Gemini', 'Claude / GPT', 'Gemini 4 Argon', 'AI Credits', '未提供']) expect(text).toContain(label)
+    for (const label of ['Gemini', 'Claude / GPT', 'AI Credits', '未提供']) expect(text).toContain(label)
+    // 旧结构里的独立 Argon 组不再单独成 section。
+    expect(text).not.toContain('Gemini 4 Argon额度')
     expect(elements(opened).filter((item) => item.props.role === 'dialog')).toHaveLength(1)
+    // 药丸按钮迷你条 2 条 + 弹层内 Gemini 组 2 条、Claude/GPT 组 1 条；旧独立 Argon 组不重复渲染。
     const openBars = elements(opened).filter((item) => item.props.role === 'progressbar')
     expect(openBars).toHaveLength(5)
-    expect(openBars.slice(1).every((item) => (item.props.style as { height?: string }).height === '4px')).toBe(true)
+    // 前两条是按钮迷你条（5px），其余为弹层进度条（4px）。
+    expect(openBars.slice(2).every((item) => (item.props.style as { height?: string }).height === '4px')).toBe(true)
     const gemini = elements(opened).find((item) => item.props['aria-label'] === 'Gemini额度')!
     expect(gemini.props.style).toMatchObject({ padding: '9px 0' })
     expect(elements(gemini).some((item) => (item.props.style as { gridTemplateColumns?: string } | undefined)?.gridTemplateColumns === 'repeat(auto-fit, minmax(120px, 1fr))')).toBe(true)
@@ -604,12 +621,14 @@ describe('额度药丸（conversation.input.right）', () => {
     expect(switched).toContain('10%')
     expect(switched).not.toContain('90%')
     model = 'gemini-4-argon'
-    expect(pillLabel(pill(props))).toContain('2%')
+    // 池合并后 Argon 模型看 Gemini 组；旧独立 Argon 组（2%）不再单独匹配。
+    expect(pillLabel(pill(props))).toContain('90%')
+    expect(pillLabel(pill(props))).not.toContain('2%')
     model = 'server-default'
     expect(pillLabel(pill(props))).toContain('额度未匹配')
   })
 
-  it('官方未单列 Argon 额度时使用 Gemini 共享组，独立组存在时优先使用', () => {
+  it('额度池合并后 Argon 模型始终使用 Gemini 组，旧独立 Argon 组并入展示', () => {
     const quotaSnapshot = { status: 'ok', groups: [
       { name: 'Gemini Models', buckets: [{ window: '5h', remainingPct: 82 }] },
       { name: 'Claude and GPT models', buckets: [{ window: '5h', remainingPct: 43 }] },
@@ -618,9 +637,10 @@ describe('额度药丸（conversation.input.right）', () => {
     const shared = loadRegistrations({ quotaSnapshot }).get('antigravity-quota')!.component({ store })
     expect(pillLabel(shared)).toContain('82%')
     expect(pillLabel(shared)).not.toContain('额度未知')
-    const separate = loadRegistrations({ quotaSnapshot: { ...quotaSnapshot, groups: [...quotaSnapshot.groups, { name: 'Gemini 4 Argon', buckets: [{ window: 'weekly', remainingPct: 12 }] }] } }).get('antigravity-quota')!.component({ store })
-    expect(pillLabel(separate)).toContain('12%')
-    expect(pillLabel(separate)).not.toContain('82%')
+    // 上游若仍按旧结构返回独立 Argon 组，并入 Gemini 组而不是单独成组。
+    const legacy = loadRegistrations({ quotaSnapshot: { ...quotaSnapshot, groups: [...quotaSnapshot.groups, { name: 'Gemini 4 Argon', buckets: [{ window: 'weekly', remainingPct: 12 }] }] } }).get('antigravity-quota')!.component({ store })
+    expect(pillLabel(legacy)).toContain('82%')
+    expect(pillLabel(legacy)).not.toContain('43%')
   })
 
   it('额度百分比缺失不能显示为零额度', () => {
@@ -630,6 +650,23 @@ describe('额度药丸（conversation.input.right）', () => {
     const label = pillLabel(pill({ store, readQuota: async () => quotaSnapshot }))
     expect(label).toContain('额度未知')
     expect(label).not.toContain('0%')
+  })
+
+  it('额度窗口按短周期在上排序：上游 weekly 在前时药丸与详情都先显示 5 小时', () => {
+    const quotaSnapshot = { status: 'ok', groups: [{
+      name: 'Gemini Models',
+      buckets: [
+        { name: 'Weekly Limit Remaining', window: 'weekly', remainingPct: 68 },
+        { name: 'Five Hour Limit Remaining', window: '5h', remainingPct: 51 },
+      ],
+    }] }
+    const pill = loadRegistrations({ stateOverrides: { 2: true }, quotaSnapshot }).get('antigravity-quota')!.component
+    const store = { subscribe: () => () => {}, getSnapshot: () => ({ current: { provider: 'antigravity-acp', model: 'gemini-flash' } }) }
+    const label = pillLabel(pill({ store, readQuota: async () => quotaSnapshot }))
+    const shortIndex = label.indexOf('5 小时')
+    const weeklyIndex = label.indexOf('每周')
+    expect(shortIndex).toBeGreaterThanOrEqual(0)
+    expect(weeklyIndex).toBeGreaterThan(shortIndex)
   })
 
   it('注册在模型选择器左侧的槽位，带稳定 id 与 order', () => {
@@ -791,5 +828,43 @@ describe('额度药丸：remote 客户端挂载', () => {
       (deps) => deps.includes('slots') && deps.includes('modelDirectories'),
     )
     expect(registersPillWithoutRemote).toBe(true)
+  })
+})
+
+describe('退役模型表：client 内置表与 host 单一规则源一致', () => {
+  it('client bundle 内的退役家族与日期和 host MODEL_RETIREMENTS 完全相同', async () => {
+    const { MODEL_RETIREMENTS: hostTable } = await import('../src/adapter/model-retirement.js')
+    const source = buildClientSource()
+    // 正则依赖 client.js 中字面量的 4 空格缩进；改表结构时同步本断言（client 无法直接导出常量）。
+    const match = source.match(/const MODEL_RETIREMENTS = (\[[\s\S]*?\n    \])/)
+    expect(match).not.toBeNull()
+    // 截取的是纯对象字面量，隔离求值，不接触组件作用域。
+    const clientTable = (new Function(`return ${match![1]}`)()) as Array<{
+      familyId: string
+      name: string
+      retireAt: string
+      migration?: string
+    }>
+    // 规则源核心字段（家族与下线日期）必须逐字一致；migration 两侧用途不同：
+    // host 是可路由家族 ID，client 是徽章显示名。
+    expect(clientTable.map(({ familyId, retireAt }) => ({ familyId, retireAt })))
+      .toEqual(hostTable.map(({ familyId, retireAt }) => ({ familyId, retireAt })))
+    expect(clientTable.every((entry) => entry.name.length > 0)).toBe(true)
+    // 迁移目标是可路由的活跃家族 ID（不在退役表内），gpt-oss 无替代。
+    expect(hostTable.find((entry) => entry.familyId === 'gemini-4-argon')?.migrationFamily).toBe('gemini-4-hydrogen')
+    expect(hostTable.find((entry) => entry.familyId === 'gemini-3.8-flash')?.migrationFamily).toBe('gemini-4-hydrogen')
+    expect(hostTable.find((entry) => entry.familyId === 'gpt-oss-120b')?.migrationFamily).toBeUndefined()
+  })
+
+  it('退役模型行带「即将下线/已下线」徽章，默认开关为关闭', () => {
+    // 徽章文案依赖墙钟（RetirementBadge 按 retireAt 当天 23:59:59 判定）：
+    // 2026-11-30 之后 Argon / 3.8 Flash 会翻转为「已下线」，届时更新这两条断言。
+    const tree = loadCard()({ remote: {} })
+    const text = texts(tree).join(' ')
+    expect(text).toContain('即将下线 11-30')
+    // gpt-oss 的下线日已过，徽章展示已下线。
+    expect(text).toContain('已下线 11-18')
+    const argonSwitch = elements(tree).find((item) => item.props.name === 'model-enabled-gemini-4-argon')
+    expect(argonSwitch?.props.checked).toBe(false)
   })
 })

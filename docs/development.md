@@ -67,7 +67,7 @@ ELECTRON_RUN_AS_NODE=1 "$DSH_NODE_EXECUTABLE" scripts/check-desktop-compat.cjs
 
 ## 本次验证矩阵
 
-0.1.35 本地检查日期：**2026-11-03**；0.1.36（额度取数解耦、设置页紧凑布局与隔离修复）复检日期：**2026-11-04**（Asia/Hong_Kong）；0.1.37（AI Credits 未开启时隐藏、删除代理积分说明、保存栏面板化样式）复检日期：**2026-11-04**（Asia/Hong_Kong）；0.1.38（无档位模型的元数据、模式总线回切、设置卡片只编辑即时字段、会话选模按会话判定、一次性请求不再占死 worker、账户刷新与资源回收修复）复检日期：**2026-11-12**（Asia/Hong_Kong）；开发契约基准升到 Core `0.2.2-rc.1` / Cordis `4.1.0` 与转发型请求 `purpose` 放宽的适配复检日期：**2026-11-13**（Asia/Hong_Kong）；peer 范围补 `0.2.2` prerelease 界标、契约基准升到 `0.2.2-rc.3` 与 `LlmError` 自定义码改走 `fromFailure` 的适配复检日期：**2026-11-16**（Asia/Hong_Kong）；0.1.46（客户端 i18n、`cloakSensitiveWords` 移除、Host 字典补齐与会话容量修复）复检日期：**2026-11-20**（Asia/Hong_Kong）；0.1.47（Linux 解压守卫阈值修复、默认 ACP server 升 1.5.2）复检日期：**2026-11-22**（Asia/Hong_Kong）；0.1.48（posix 辅助程序执行位、`session/new` 失败诊断）复检日期：**2026-11-22**（Asia/Hong_Kong）；0.1.50（编排模式 planner → executor、设置页编排分组、目录合成条目；PR #15 合并、executor 两选一 Hydrogen / Sonnet 5.5）复检日期：**2026-11-25**（Asia/Hong_Kong）。
+0.1.35 本地检查日期：**2026-11-03**；0.1.36（额度取数解耦、设置页紧凑布局与隔离修复）复检日期：**2026-11-04**（Asia/Hong_Kong）；0.1.37（AI Credits 未开启时隐藏、删除代理积分说明、保存栏面板化样式）复检日期：**2026-11-04**（Asia/Hong_Kong）；0.1.38（无档位模型的元数据、模式总线回切、设置卡片只编辑即时字段、会话选模按会话判定、一次性请求不再占死 worker、账户刷新与资源回收修复）复检日期：**2026-11-12**（Asia/Hong_Kong）；开发契约基准升到 Core `0.2.2-rc.1` / Cordis `4.1.0` 与转发型请求 `purpose` 放宽的适配复检日期：**2026-11-13**（Asia/Hong_Kong）；peer 范围补 `0.2.2` prerelease 界标、契约基准升到 `0.2.2-rc.3` 与 `LlmError` 自定义码改走 `fromFailure` 的适配复检日期：**2026-11-16**（Asia/Hong_Kong）；0.1.46（客户端 i18n、`cloakSensitiveWords` 移除、Host 字典补齐与会话容量修复）复检日期：**2026-11-20**（Asia/Hong_Kong）；0.1.47（Linux 解压守卫阈值修复、默认 ACP server 升 1.5.2）复检日期：**2026-11-22**（Asia/Hong_Kong）；0.1.48（posix 辅助程序执行位、`session/new` 失败诊断）复检日期：**2026-11-22**（Asia/Hong_Kong）；0.1.50（编排模式 planner → executor、设置页编排分组、目录合成条目；PR #15 合并、executor 两选一 Hydrogen / Sonnet 5.5）复检日期：**2026-11-25**（Asia/Hong_Kong）；0.1.51（退役模型默认隐藏、额度池合并适配、药丸排序与弹层定位修复）复检日期：**2026-11-26**（Asia/Hong_Kong）。
 
 | 验证项 | 状态与范围 |
 |---|---|
@@ -85,7 +85,8 @@ ELECTRON_RUN_AS_NODE=1 "$DSH_NODE_EXECUTABLE" scripts/check-desktop-compat.cjs
 | 图片和上下文端到端 | 真实目录 HTTP 200，Hydrogen / Neon 八档均返回 `supportsImages: true`、`maxTokens: 1048576`、`maxOutputTokens: 262144`。用桌面 Core `0.2.2-rc.5` 和本地附件服务向 Neon `medium` 发送生成的纯蓝 PNG，上游正确识别并返回 HTTP 200；Core 收到窗口 1,048,576、输入 1,144、输出 2、思考 109、总量 1,255。设置服务输出容量和输出上限；自动回归另覆盖混合档位和无附件服务 |
 | 官方 CLI 容量来源 | 本机 `agy models` 实测 23 行、每行只有两列（ID、名称）；ACP 模型容量来自会话 `usage_update.size`，`used` 与单次计费 token 分开 |
 | 代理思考摘要 | 同一 Hydrogen `medium` 线模型的真实对照：两次 HTTP 200；原请求收到正文和签名但无摘要，仅添加 `includeThoughts: true` 后收到 1,135 字符摘要。Neon `medium` 经 DSH NEXT 2.0.24-next 所带 Core `0.2.2-rc.5`，真实生成输出 2,177 字符摘要及 reasoning 块，正常结束 |
-| 额度快照 | 用桌面包内 Cordis 拉取真实 Google 额度，获得 3 个分组；新开隔离 Host，在上游不可调用的条件下重读同一快照，分组与时间戳一致。自动回归覆盖独立定时、手动合并、读取不等待刷新、换账户隔离与过期标记 |
+| 额度快照 | 用桌面包内 Cordis 拉取真实 Google 额度，获得 3 个分组；新开隔离 Host，在上游不可调用的条件下重读同一快照，分组与时间戳一致。自动回归覆盖独立定时、手动合并、读取不等待刷新、换账户隔离与过期标记。2026-11-26 真实代理快照核实上游已合并为 2 组（Gemini Models / Claude and GPT models），客户端动态遍历无硬编码组数，旧独立 Argon 组并入 Gemini 展示 |
+| 退役模型与额度药丸（0.1.51） | 系统 Node 24：`tests/model-retirement.test.ts` 锁定退役表（家族键归一、档位 ID 命中、日期与迁移字段）；`tests/model-settings.test.ts` 覆盖默认关闭与显式启用优先；client/host 两表家族与日期一致性、「即将下线」徽章与开关默认态由 `tests/client-loader.test.ts` 锁定；药丸短周期在上排序（weekly/5h 逆序夹具）与 `useLayoutEffect` fixed 定位、空组不再渲染均有回归。真实上游拉取与 GUI 弹层位置未实机验收 |
 | 工具 / runtime | 假 ACP / MCP、乱序工具结果、池所有权、续轮变更、取消、写入阻塞和回收 |
 | Claude 历史工具批次 | 桌面 Core `0.2.2-rc.5` + 真实 Sonnet 5.5 `medium`：并行两个工具只回填一个后续发消息，已安装 0.1.42 上游 HTTP 400 / `PROTOCOL_DRIFT`；候选用同一历史正常完成（HTTP 200），两个结果都缺失时也正常完成；当前批次未收齐时在本地返回 `INVALID_ARGS`，不派发 |
 | 图片 | 附件引用校验、图片内容映射与跨 worker 能力；代理模式 inlineData 准入、12MB 预算与 offload 协商、附件缺席降级；未调用真实视觉模型 |

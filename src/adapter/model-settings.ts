@@ -7,12 +7,15 @@
  *   接受，未登记 ID 不会被这里静默改写成别的模型。
  * - 停用是「不列入选择器」，不是删除目录条目：已知模型的显示名、上下文容量与
  *   路由仍保留，避免重新启用时退回裸 ID。
+ * - 官方公告即将下线的家族（见 model-retirement.ts）在用户未显式配置时默认
+ *   停用；一旦 modelOverrides 出现该家族的显式记录，以用户配置为准。
  * - 默认档位只决定**未显式选择**思考强度时的路由结果；DSH 思考强度菜单的选择
  *   始终优先。
  *
  * 本模块只有纯函数，无 IO。
  */
 import type { ModelOverride } from '../settings.js'
+import { isRetiringModel } from './model-retirement.js'
 
 /** Read-only capacity shown in model settings; never submitted as an override. */
 export interface ModelCapacity {
@@ -64,7 +67,10 @@ export function normalizeModelSettings(input: unknown): Map<string, ModelSetting
 
 /** 该模型的显示设置；未配置时返回启用且不带覆盖项。 */
 export function modelSettingFor(settings: ReadonlyMap<string, ModelSetting>, id: string): ModelSetting {
-  return settings.get(id) ?? { enabled: true }
+  const stored = settings.get(id)
+  if (stored) return stored
+  // 未显式配置时，官方公告即将下线的家族默认关闭；用户仍可在设置页手动打开。
+  return { enabled: !isRetiringModel(id) }
 }
 
 /** 是否列入 DSH 模型选择器。 */

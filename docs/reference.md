@@ -62,7 +62,7 @@ dsh plugin --profile web add ./dsh-bundle-antigravity-host-0.1.24.tgz
 - 设置页的模型列表支持搜索和启停筛选，可设置默认思考档位，并按需展开显示名与官方模型 ID 映射。停用不删除目录条目；映射或默认档位变化会使已有 ACP 会话受控重建，避免继续沿用旧官方路由。映射目标由官方 agent 判定是否接受，未登记 ID 不会被静默改写。
 - 映射优先于家族 + 档位路由；没有映射时才按「显式选择 → 该模型默认档位 → 官方默认档位」决定最终模型。默认档位未被官方声明时退回官方默认，不指向不存在的选项。
 - 旧 `server-default` 路由仍兼容：默认沿用上游模型，配置了映射时才写入映射目标；不再新增占位选择项。
-- 官方将思考档位编码进 ID 时，选择器折叠为模型家族；DSH 思考强度低 / 中 / 高路由至 `-low` / `-medium` / `-high`。缺档取最近档位，未指定通常使用 `medium`；显式钉住档位 ID 时尊重该 ID。`gpt-oss-120b` 家族不列入选择器。目录里没有任何档位变体的家族 id **不声明**思考强度菜单（省略 `reasoning` 字段）：宿主把 `efforts: []` 判为非法元数据（`INVALID_MODEL_REASONING`）并使该模型不可用，空数组不等于「没有档位」。
+- 官方将思考档位编码进 ID 时，选择器折叠为模型家族；DSH 思考强度低 / 中 / 高路由至 `-low` / `-medium` / `-high`。缺档取最近档位，未指定通常使用 `medium`；显式钉住档位 ID 时尊重该 ID。官方公告即将下线的家族（见 `src/adapter/model-retirement.ts`）在未显式配置时默认不列入选择器，设置页保留条目与「即将下线」徽章，手动启用后恢复显示。目录里没有任何档位变体的家族 id **不声明**思考强度菜单（省略 `reasoning` 字段）：宿主把 `efforts: []` 判为非法元数据（`INVALID_MODEL_REASONING`）并使该模型不可用，空数组不等于「没有档位」。
 - `antigravity-orchestrator` 是唯一由插件合成的条目：只有配置的 planner 与 executor 都已在当前目录可见时追加，代理侧与 ACP 侧同名。它不是观测到的上游模型；依赖缺失时不出现，直接请求它会得到可读错误（代理侧 `INVALID_MODEL`，ACP 侧 `AGY_INVALID_MODEL`）。官方 `gemini-pro-orchestrator-*` 条目保持原样，仍由官方 agent 自己编排。
 - 上下文容量不填猜测值。收到官方 `usage_update.size` 后才记录到模型上下文并缓存；首次观测前未知。
 - 模型、容量与图片能力在 worker 间同步；不因增加 worker 就虚构新模型权益。

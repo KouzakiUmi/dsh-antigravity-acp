@@ -704,6 +704,8 @@ describe('模型目录来自 ACP 会话配置', () => {
 
   it('ACP 目录已知时，CLI 清单只补已知家族的档位，不新增 ACP 不提供的型号', async () => {
     const harness = createHarness({
+      // Argon 已列入退役表默认关闭，这里显式启用以聚焦本用例的档位补全断言。
+      modelOverrides: { 'gemini-4-argon': { enabled: true } },
       loadCachedCatalog: async () => [{ id: 'gemini-4-argon', name: 'Gemini 4 Argon' }],
       loadCliCatalog: async () => [
         { id: 'gemini-4-argon-low', name: 'Gemini 4 Argon (Low)' },
@@ -729,7 +731,7 @@ describe('模型目录来自 ACP 会话配置', () => {
     expect(explainUnavailableModel(other, 'x')).toBe(other)
   })
 
-  it('listModels 折叠成家族（Opus 5.5 / Sonnet 5.5 / Argon），不把思考强度放进模型', async () => {
+  it('listModels 折叠成家族（Opus 5.5 / Sonnet 5.5），不把思考强度放进模型；退役家族默认关闭', async () => {
     // 尚无 ACP 目录（冷启动、无磁盘缓存）时，CLI 清单整份兜底。
     const harness = createHarness({
       loadCliCatalog: async () => [
@@ -745,13 +747,26 @@ describe('模型目录来自 ACP 会话配置', () => {
     const ids = models.map((model) => model.id)
     expect(ids).not.toContain(AGY_PLACEHOLDER_MODEL_ID)
     expect(ids).toContain('claude-opus-5-5')
-    expect(ids).toContain('gemini-4-argon')
     expect(ids).toContain('claude-sonnet-5-5')
-    // 选择器里不出现档位化 id，也不出现临近下架的 gpt-oss-120b。
+    // 选择器里不出现档位化 id；临近下线的 Argon / gpt-oss 默认关闭。
     expect(ids.some((id) => /-(low|medium|high)$/.test(id))).toBe(false)
     expect(ids.some((id) => id.includes('gpt-oss'))).toBe(false)
+    expect(ids).not.toContain('gemini-4-argon')
     expect(models.find((model) => model.id === 'gemini-3-flash')?.name).toBe('Gemini 3 Flash')
     expect(models.find((model) => model.id === 'claude-opus-5-5')?.name).toBe('Claude Opus 5.5')
+  })
+
+  it('退役家族在 modelOverrides 显式启用后重新进入选择器，用户选择优先于默认关闭', async () => {
+    const harness = createHarness({
+      modelOverrides: { 'gemini-4-argon': { enabled: true }, 'gpt-oss-120b': { enabled: true } },
+      loadCliCatalog: async () => [
+        { id: 'gemini-4-argon-medium', name: 'Gemini 4 Argon (Medium)' },
+        { id: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' },
+      ],
+    })
+    const ids = (await harness.adapter.listModels(AGY_PROVIDER_ID)).map((model) => model.id)
+    expect(ids).toContain('gemini-4-argon')
+    expect(ids).toContain('gpt-oss-120b')
   })
 
   it('CLI 清单取数失败时目录主体不受影响', async () => {

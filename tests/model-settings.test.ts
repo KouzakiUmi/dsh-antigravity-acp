@@ -20,11 +20,25 @@ describe('模型目录用户设置', () => {
     }
   })
 
-  it('未配置的模型默认启用，停用项不列入选择器但设置仍可读', () => {
+  it('未配置的普通模型默认启用，停用项不列入选择器但设置仍可读', () => {
     const settings = normalizeModelSettings({ hidden: { enabled: false, name: '隐藏' } })
     expect(modelVisible(settings, 'unknown-model')).toBe(true)
     expect(modelVisible(settings, 'hidden')).toBe(false)
     expect(modelSettingFor(settings, 'hidden')).toMatchObject({ enabled: false, name: '隐藏' })
+  })
+
+  it('退役家族在未显式配置时默认隐藏，显式启用后以用户配置为准', () => {
+    const empty = normalizeModelSettings(undefined)
+    // 家族 ID 与带 antigravity- 前缀、档位后缀的 ID 同样命中。
+    expect(modelVisible(empty, 'gemini-4-argon')).toBe(false)
+    expect(modelVisible(empty, 'antigravity-gemini-3.8-flash-high')).toBe(false)
+    expect(modelVisible(empty, 'gpt-oss-120b-medium')).toBe(false)
+    // 非退役模型不受影响。
+    expect(modelVisible(empty, 'gemini-4-hydrogen')).toBe(true)
+    const reenabled = normalizeModelSettings({ 'gemini-4-argon': { enabled: true } })
+    expect(modelVisible(reenabled, 'gemini-4-argon')).toBe(true)
+    const explicitlyHidden = normalizeModelSettings({ 'gemini-4-argon': { enabled: false } })
+    expect(modelVisible(explicitlyHidden, 'gemini-4-argon')).toBe(false)
   })
 
   it('列表套用显示名覆盖并跳过停用项，不新增条目', () => {

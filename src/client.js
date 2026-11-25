@@ -77,11 +77,34 @@ window.__ModuleLoader__.load({
     const EFFORT_IDS = new Set(EFFORT_OPTIONS.map((entry) => entry.value).filter(Boolean))
     const MODALITY_LABELS = { text: msg('文本'), image: msg('图片'), audio: msg('音频'), video: msg('视频'), file: msg('文件') }
 
-    /** 只保留有意义的字段：启用是默认值，空串等于未设置。 */
-    function canonicalOverride(row) {
+    /**
+     * 官方公告即将下线的模型家族，须与 src/adapter/model-retirement.ts 保持一致
+     * （一致性由 tests/client-loader.test.ts 锁定）。client 不能 import TS，内置同份表。
+     */
+    const MODEL_RETIREMENTS = [
+      { familyId: 'gemini-4-argon', name: 'Gemini 4 Argon', retireAt: '2026-11-30', migration: 'Gemini 4 Hydrogen' },
+      { familyId: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', retireAt: '2026-11-30', migration: 'Gemini 4 Hydrogen' },
+      { familyId: 'gpt-oss-120b', name: 'GPT-OSS 120B', retireAt: '2026-11-18' },
+    ]
+    const RETIREMENT_BY_FAMILY = new Map(MODEL_RETIREMENTS.map((entry) => [entry.familyId, entry]))
+    function retirementFamilyKey(id) {
+      return String(id ?? '').trim().replace(/^antigravity-/, '').replace(/-(?:low|medium|high|xhigh|minimal)$/, '')
+    }
+    function retirementForModel(id) {
+      return RETIREMENT_BY_FAMILY.get(retirementFamilyKey(id))
+    }
+    /** 生效启用态：显式配置优先；未配置时退役家族默认关闭。 */
+    function effectiveEnabled(overrides, id) {
+      const stored = overrideFor(overrides, id).enabled
+      return stored !== undefined ? stored : !retirementForModel(id)
+    }
+
+    /** 只保留有意义的字段：启用是默认值，空串等于未设置；退役家族的显式启用需要落盘。 */
+    function canonicalOverride(id, row) {
       const source = row && typeof row === 'object' ? row : {}
       const result = {}
       if (source.enabled === false) result.enabled = false
+      else if (source.enabled === true && retirementForModel(id)) result.enabled = true
       if (EFFORT_IDS.has(source.effort)) result.effort = source.effort
       const name = typeof source.name === 'string' ? source.name.trim() : ''
       if (name) result.name = name
@@ -94,7 +117,7 @@ window.__ModuleLoader__.load({
       const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
       const result = {}
       for (const key of Object.keys(source).sort()) {
-        const row = canonicalOverride(source[key])
+        const row = canonicalOverride(key, source[key])
         if (Object.keys(row).length > 0) result[key] = row
       }
       return result
@@ -135,7 +158,7 @@ window.__ModuleLoader__.load({
     }
     const ORCHESTRATOR_FIELDS = {
       enabled: { key: 'orchestratorEnabled', checkbox: true, label: msg('启用编排'), hint: msg('关闭后不生成编排模型条目，也不执行规划编排。') },
-      plannerModel: { key: 'orchestratorPlannerModel', options: ORCHESTRATOR_PLANNER_OPTIONS, label: msg('规划模型（Planner）'), hint: msg('从预设规划模型中选择（默认 Claude Opus 5.5）。') },
+      plannerModel: { key: 'orchestratorPlannerModel', options: ORCHESTRATOR_PLANNER_OPTIONS, label: msg('规划模型（Planner）'), hint: msg('从预设规划模型中选择（默认 Claude Opus 5.5）；Gemini 4 Argon 将于 11-30 下线。') },
       plannerEffort: { key: 'orchestratorPlannerEffort', options: ORCHESTRATOR_EFFORT_OPTIONS, label: msg('规划思考档位'), hint: msg('规划阶段使用的思考档位（low / medium / high）。') },
       executorModel: { key: 'orchestratorExecutorModel', options: ORCHESTRATOR_EXECUTOR_OPTIONS, label: msg('执行模型（Executor）'), hint: msg('从预设执行模型中选择（默认 Gemini 4 Hydrogen）；仅当前账户目录可见时生效。') },
       executorEffort: { key: 'orchestratorExecutorEffort', options: ORCHESTRATOR_EFFORT_OPTIONS, label: msg('执行思考档位'), hint: msg('执行阶段使用的思考档位（low / medium / high）。') },
@@ -182,10 +205,29 @@ window.__ModuleLoader__.load({
     function isOrchestratorDraftValid(value) {
       return Boolean(value && typeof value === 'object' && isValidOrchestratorMaxPlans(value.maxPlansPerTurn))
     }
-    /** 目录条目 + 已配置但当前目录没有的 ID，都要能在此编辑。 */
-    function modelRows(models, overrides) {
-      const rows = models.map(({ id, name, inputModalities, contextWindow, maxOutputTokens }) => ({ id, name, inputModalities, contextWindow, maxOutputTokens, inCatalog: true }))
+    /**
+     * 目录条目 + 已配置但当前目录没有的 ID + 退役表内置家族，都要能在此编辑。
+     * proxyMode 必须由调用方按当前链路显式传入：不能用目录里是否出现 antigravity-
+     * 前缀来猜（ACP 模式的编排合成条目同样带该前缀，会导致补行写错 ID 风格）。
+     */
+    function modelRows(models, overrides, proxyMode = false) {
+      const rows = models.map(({ id, name, inputModalities, contextWindow, maxOutputTokens }) => {
+        const retiring = retirementForModel(id)
+        return { id, name, inputModalities, contextWindow, maxOutputTokens, inCatalog: true, ...(retiring ? { retiring } : {}) }
+      })
       const known = new Set(rows.map((row) => row.id))
+      // 按家族去重：同一退役家族只要已有任意档位/前缀的观测行在场，就不再补行，
+      // 避免 gpt-oss（真实键 antigravity-gpt-oss-120b-medium）出现重复死行。
+      const presentFamilies = new Set(rows.map((row) => retirementFamilyKey(row.id)))
+      for (const retiring of MODEL_RETIREMENTS) {
+        if (presentFamilies.has(retiring.familyId)) continue
+        // ACP 目录键是裸家族 id；代理目录键带 antigravity- 前缀。
+        const id = proxyMode ? `antigravity-${retiring.familyId}` : retiring.familyId
+        if (!known.has(id)) {
+          rows.push({ id, name: retiring.name, inCatalog: false, retiring })
+          known.add(id)
+        }
+      }
       for (const id of Object.keys(canonicalOverrides(overrides))) {
         if (!known.has(id)) rows.push({ id, name: id, inCatalog: false })
       }
@@ -364,8 +406,21 @@ window.__ModuleLoader__.load({
     }
 
     /** 紧凑列表行；完整 ID、输入能力、改名和映射集中在单条详情里。 */
+    function RetirementBadge({ retiring }) {
+      const monthDay = retiring.retireAt.slice(5)
+      const retired = Date.parse(`${retiring.retireAt}T23:59:59`) < Date.now()
+      const title = retiring.migration
+        ? t('官方将于 {date} 下线，建议改用 {migration}', { date: retiring.retireAt, migration: retiring.migration })
+        : t('官方将于 {date} 下线', { date: retiring.retireAt })
+      return h('span', {
+        title,
+        'aria-label': title,
+        style: { flex: '0 0 auto', padding: '1px 7px', borderRadius: '99px', fontSize: '10.5px', fontWeight: 600, color: '#b45309', background: 'rgba(234,179,8,.16)', border: '1px solid rgba(234,179,8,.35)', whiteSpace: 'nowrap' },
+      }, retired ? t('已下线 {date}', { date: monthDay }) : t('即将下线 {date}', { date: monthDay }))
+    }
     function ModelOverrideRow({ row, override, disabled, onEdit }) {
-      const enabled = override.enabled !== false
+      const retiring = row.retiring ?? retirementForModel(row.id)
+      const enabled = override.enabled !== undefined ? override.enabled : !retiring
       const inputId = 'agy-model-' + row.id.replace(/[^\w.-]/g, '_')
       const labelStyle = { fontSize: '11.5px', opacity: .66 }
       const inputStyle = { ...ACTION, width: '100%', minWidth: 0, minHeight: '32px', boxSizing: 'border-box', background: 'transparent', cursor: disabled ? 'not-allowed' : 'text' }
@@ -374,7 +429,9 @@ window.__ModuleLoader__.load({
       return h('div', { role: 'listitem', style: { padding: '10px 14px', borderTop: '1px solid var(--agy-line)', opacity: enabled ? 1 : .54 } },
         h('div', { style: { display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto auto', alignItems: 'center', gap: '10px' } },
           h('label', { htmlFor: toggleId, title: displayName, style: { minWidth: 0, cursor: disabled ? 'default' : 'pointer' } },
-            h('div', { title: displayName, style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: '13px', fontWeight: 560 } }, displayName),
+            h('div', { title: displayName, style: { display: 'flex', alignItems: 'center', gap: '7px', overflow: 'hidden' } },
+              h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: '13px', fontWeight: 560 } }, displayName),
+              retiring ? h(RetirementBadge, { retiring }) : null),
             h('div', { style: { fontSize: '11px', opacity: .55, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, row.id)),
           h('label', { htmlFor: inputId + '-effort', style: { display: 'flex', alignItems: 'center', gap: '5px', fontSize: '11.5px' } },
             h('span', { style: { opacity: .62 } }, t('思考')),
@@ -417,12 +474,12 @@ window.__ModuleLoader__.load({
       if (rows.length === 0) {
         return h('p', { role: 'status', style: { margin: 0, fontSize: '12px', lineHeight: 1.5, opacity: .6 } }, t('暂无模型。请先连接当前账户，再刷新目录。'))
       }
-      const hidden = rows.filter((row) => overrideFor(overrides, row.id).enabled === false).length
+      const hidden = rows.filter((row) => !effectiveEnabled(overrides, row.id)).length
       const keyword = query.trim().toLowerCase()
       const visible = rows.filter((row) => {
+        if (filter === 'enabled' && !effectiveEnabled(overrides, row.id)) return false
+        if (filter === 'hidden' && effectiveEnabled(overrides, row.id)) return false
         const override = overrideFor(overrides, row.id)
-        if (filter === 'enabled' && override.enabled === false) return false
-        if (filter === 'hidden' && override.enabled !== false) return false
         return !keyword || (row.name + ' ' + row.id + ' ' + (override.name ?? '')).toLowerCase().includes(keyword)
       })
       const setVisible = (enabled) => { for (const row of visible) onEdit(row.id, { enabled }) }
@@ -641,7 +698,7 @@ window.__ModuleLoader__.load({
       const editOverride = React.useCallback((id, patch) => {
         if (savingRef.current) return
         const current = overrideFor(draftRef.current[OVERRIDES_KEY], id)
-        const merged = canonicalOverride({ ...current, ...patch })
+        const merged = canonicalOverride(id, { ...current, ...patch })
         const overrides = canonicalOverrides(draftRef.current[OVERRIDES_KEY])
         if (Object.keys(merged).length === 0) delete overrides[id]
         else overrides[id] = merged
@@ -820,7 +877,7 @@ window.__ModuleLoader__.load({
       }, [reload, remote])
 
       // 目录条目 + 已配置但目录里暂时没有的 ID：正在编辑的映射不能因为目录刷新而消失。
-      const rows = modelRows(models, draft[OVERRIDES_KEY])
+      const rows = modelRows(models, draft[OVERRIDES_KEY], effectiveProxyMode)
       const editingDisabled = loading || saving || !view || !writable
       const connectionSettingsDirty = dirtyKeys.some(key => key === 'proxyUrl' || key === 'proxyBypass')
       const discardDraft = () => {
@@ -948,25 +1005,32 @@ window.__ModuleLoader__.load({
     const SUMMARY = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', cursor: 'pointer', listStyle: 'none' }
     const ACTION = { padding: '4px 12px', minHeight: '30px', borderRadius: '8px', border: '1px solid color-mix(in srgb, currentColor 20%, transparent)', background: 'transparent', color: 'inherit', font: 'inherit', fontSize: '12.5px', fontWeight: 500, cursor: 'pointer' }
     const PRIMARY = { ...ACTION, background: '#3b82f6', border: '1px solid #3b82f6', color: '#fff', fontWeight: 500 }
-    const GROUPS = [{ key: 'gemini', name: 'Gemini' }, { key: 'claude', name: 'Claude / GPT' }, { key: 'argon', name: 'Gemini 4 Argon' }]
+    // 上游额度池已合并为 Gemini / Claude·GPT 两组；不再预建 Argon 空组，
+    // 未匹配名称的分组仍由 quotaGroups 的 other-* 兜底展示。
+    const GROUPS = [{ key: 'gemini', name: 'Gemini' }, { key: 'claude', name: 'Claude / GPT' }]
     function groupKey(name) {
       const text = String(name ?? '').toLowerCase()
-      if (/\bargon\b/.test(text)) return 'argon'
+      // 额度池合并后无独立 Argon 组：上游若仍按旧结构返回，并入 Gemini 展示。
+      if (/\bargon\b/.test(text)) return 'gemini'
       if (/\bgemini\b/.test(text)) return 'gemini'
       if (/\b(claude|gpt)\b/.test(text)) return 'claude'
       return undefined
     }
     function modelGroup(model) {
       const id = String(model ?? '').toLowerCase().replace(/^antigravity-/, '')
-      if (/^gemini-/.test(id) && /(?:^|-)argon(?:-|$)/.test(id)) return 'argon'
+      // 额度池合并后无独立 Argon 组，Argon 型号与其他 Gemini 共用 Gemini 组。
       if (/^gemini-/.test(id)) return 'gemini'
       if (/^(claude|gpt)-/.test(id)) return 'claude'
       return undefined
     }
     function quotaGroups(data) {
       const groups = Array.isArray(data?.groups) ? data.groups : []
-      return GROUPS.map((entry) => ({ ...entry, buckets: groups.filter((g) => groupKey(g.name) === entry.key).flatMap((g) => g.buckets ?? []) }))
-        .concat(groups.filter((g) => !groupKey(g.name)).map((g, i) => ({ ...g, key: 'other-' + i })))
+      // 池合并后同一 key 只取首个匹配组：同 key 的后续组被静默并入首个（取舍：
+      // 上游已合并为两组，重复 key 只可能是旧结构残留；未识别组名仍由 other-* 兜底）。
+      return GROUPS.map((entry) => {
+        const matched = groups.find((g) => groupKey(g.name) === entry.key)
+        return { ...entry, buckets: matched?.buckets ?? [] }
+      }).concat(groups.filter((g) => !groupKey(g.name)).map((g, i) => ({ ...g, key: 'other-' + i })))
     }
     function percentage(bucket) {
       return Number.isFinite(bucket?.remainingPct) ? Math.max(0, Math.min(100, bucket.remainingPct)) : undefined
@@ -981,6 +1045,11 @@ window.__ModuleLoader__.load({
     }
     function windowName(bucket) {
       return t(({ '5h': '5 小时', weekly: '每周', '7d': '每周' })[bucket.window] ?? bucket.window ?? bucket.name ?? '额度窗口')
+    }
+    /** 额度窗口短周期在上：5h → 每周 → 未知窗口兜底置后；不修改原数组。 */
+    const WINDOW_ORDER = { '5h': 1, daily: 2, weekly: 3, '7d': 3 }
+    function orderedBuckets(buckets) {
+      return [...buckets].sort((a, b) => (WINDOW_ORDER[a?.window] ?? 99) - (WINDOW_ORDER[b?.window] ?? 99))
     }
     function resetCountdown(value) {
       const seconds = Math.ceil((Date.parse(value) - Date.now()) / 1000)
@@ -1092,7 +1161,7 @@ window.__ModuleLoader__.load({
           h('div', { style: { display: 'flex', alignItems: 'center', gap: '7px', marginBottom: '7px' } },
             h('strong', { style: { fontSize: '12px' } }, group.name),
             group.key === modelGroup(model) ? h('span', { style: { fontSize: '10px', padding: '1px 6px', borderRadius: '99px', color: '#22c55e', background: 'rgba(34,197,94,.12)', fontWeight: 560 } }, t('当前模型')) : null),
-          group.buckets.length ? h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', gap: '8px' } }, ...group.buckets.map((bucket, index) => {
+          group.buckets.length ? h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', gap: '8px' } }, ...orderedBuckets(group.buckets).map((bucket, index) => {
             const pct = percentage(bucket)
             return h('div', { key: index, style: CARD },
               h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: '6px', marginBottom: '4px' } },
@@ -1151,7 +1220,7 @@ window.__ModuleLoader__.load({
         return () => { active = false; clearInterval(timer) }
       }, [isProxy, proxyControl, readQuota])
       React.useEffect(() => { setExpanded(false) }, [enabled])
-      React.useEffect(() => {
+      React.useLayoutEffect(() => {
         if (!expanded) { setPosition(null); return undefined }
         const reposition = () => {
           if (!button.current?.getBoundingClientRect) return
@@ -1180,11 +1249,8 @@ window.__ModuleLoader__.load({
       if (!enabled) return null
       const groups = quotaGroups(quota.data)
       const family = modelGroup(quota.data?.routeModel ?? model)
-      // 官方 /usage 可能只报告 Gemini 共享额度；只有真实 Argon 分组存在时，
-      // 才把 Argon 型号绑定到独立组，不能命中一个预建的空组而误报未知。
-      const group = groups.find((g) => g.key === family && (family !== 'argon' || g.buckets.length > 0))
-        ?? (family === 'argon' ? groups.find((g) => g.key === 'gemini') : undefined)
-      const buckets = group?.buckets ?? []
+      const group = groups.find((g) => g.key === family)
+      const buckets = orderedBuckets(group?.buckets ?? [])
       const pillStatus = quotaPillStatus(quota.data, buckets)
       const miniBuckets = buckets.slice(0, 5)
       const miniHeight = miniBuckets.length <= 1 ? 6 : miniBuckets.length === 2 ? 5 : miniBuckets.length === 3 ? 4 : miniBuckets.length === 4 ? 3 : 2
@@ -1197,7 +1263,10 @@ window.__ModuleLoader__.load({
           miniBuckets.length ? h('span', { style: { display: 'grid', gap: miniBuckets.length <= 2 ? '3px' : '2px', opacity: quota.data?.stale ? .5 : 1 } }, ...miniBuckets.map((b, i) => h('span', { key: i }, remainingBar(b, true, quota.data?.stale, t('{name} {window}剩余额度', { name: group.name, window: windowName(b) }), miniHeight))))
             : h('span', { 'aria-hidden': true, style: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: '16px', height: '16px', borderRadius: '50%', background: pillStatus.color, color: '#fff', fontSize: '11px' } }, pillStatus.icon),
           pillStatus.short ? h('span', null, pillStatus.short) : null),
-        expanded ? h('div', { className: 'antigravity-quota-popover', role: 'dialog', 'aria-label': t('Antigravity 额度详情'), style: { position: 'absolute', bottom: 'calc(100% + 6px)', right: 0, zIndex: 50, width: 'min(340px, calc(100vw - 24px))', maxHeight: 'min(70vh, calc(100vh - 72px))', overflowY: 'auto', boxSizing: 'border-box', overflowWrap: 'anywhere', padding: '14px', borderRadius: '14px', background: 'var(--dsh-surface, var(--dsw-alias-bg-layer-1, Canvas))', color: 'var(--dsh-text, var(--dsw-alias-label-primary, CanvasText))', border: '1px solid rgba(128,128,128,.28)', boxShadow: '0 12px 32px rgba(0,0,0,.28)', font: '12px/1.5 sans-serif', ...position } },
+        expanded ? h('div', { className: 'antigravity-quota-popover', role: 'dialog', 'aria-label': t('Antigravity 额度详情'), style: { zIndex: 50, width: 'min(340px, calc(100vw - 24px))', maxHeight: 'min(70vh, calc(100vh - 72px))', overflowY: 'auto', boxSizing: 'border-box', overflowWrap: 'anywhere', padding: '14px', borderRadius: '14px', background: 'var(--dsh-surface, var(--dsw-alias-bg-layer-1, Canvas))', color: 'var(--dsh-text, var(--dsw-alias-label-primary, CanvasText))', border: '1px solid rgba(128,128,128,.28)', boxShadow: '0 12px 32px rgba(0,0,0,.28)', font: '12px/1.5 sans-serif',
+          // 坐标全部由 useLayoutEffect 的 fixed 定位给出；首帧未算好时放屏外，
+          // 不再用相对药丸的 absolute/right:0，避免贴左边缘时弹出层超出视口。
+          ...(position ?? { position: 'fixed', left: -9999, top: 0 }) } },
           QuotaDetails({ ...quota, model, source: state?.current?.provider, onClose: () => { setExpanded(false); button.current?.focus?.() } })) : null)
     }
 

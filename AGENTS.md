@@ -32,6 +32,7 @@ npm 包名 `dsh-bundle-antigravity-host`、provider ID `antigravity-acp` / `anti
 - **模型目录只观测，不自造**：ACP 模式目录来自会话 `configOptions` 与官方 CLI 只读清单；代理模式由 [`model-catalog.ts`](src/proxy/model-catalog.ts) 将支持的模型与当前账户的可用项取交集，排除上游停用项。审计快照之外的 Hydrogen 和 Neon 只按已观测档位派发，不借用其他家族的容量和能力。用户设置（`modelOverrides`）只作用于已存在的条目。唯一例外是受约束的合成条目 `antigravity-orchestrator`：只有配置的 planner 与 executor 都已在当前目录可见时才出现，它是插件编排入口而不是观测到的上游模型，条件不满足时不出现在选择器里。
 - **编排由插件自己驱动**：`antigravity-orchestrator` 的 planner 与 executor 选择、计划解析、交回判定都在插件内（[`src/orchestrator/`](src/orchestrator/)），两模式行为一致。代理链路是两次独立上游请求（planner 用独立会话存储，不写 `ContinuationState`）；ACP 链路是独立 planner 会话 + 同会话切模型执行。官方 `gemini-pro-orchestrator-*` 条目保持原样，透传给官方 agent 自己编排。
 - **停用 ≠ 删除**：停用只是不列入选择器，已知模型的显示名、上下文容量与路由仍保留，重新启用不会退回裸 ID。
+- **退役模型默认关闭但可显式启用**：官方公告即将下线的家族集中登记在 [`model-retirement.ts`](src/adapter/model-retirement.ts)（单一规则源），未显式配置时默认不进选择器，ACP 与代理两链路同口径；目录观测、家族折叠与路由不删除，设置页保留条目与「即将下线」徽章，`modelOverrides` 显式 `enabled: true` 优先于默认关闭。client 内置同份表用于徽章，两侧一致性由测试锁定。
 - **映射优先于家族路由**：`target` 原样写入 `session/set_config_option`，由官方 agent 判定是否接受；未登记 ID 不被静默改写。没有映射时才走「显式选择 → 该模型默认档位 → 官方默认档位」。
 - **默认档位必须存在**：配置的档位若未被官方声明，退回官方默认档位，不指向不存在的选项。
 - **整份 map 作为一个字段**：`modelOverrides` 参与草稿脏值与冲突判断，规范化后比较，避免键序或写回默认值被误判为未保存修改；提交时只发改动过的顶层字段。

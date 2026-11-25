@@ -4,6 +4,13 @@
 
 记录源码与发布内容，不将本地构建、npm 发布和本机升级混为同一状态。日期采用 Asia/Hong_Kong。更早历史见 [Git 提交记录](https://github.com/KouzakiUmi/dsh-antigravity-acp/commits/main/)。
 
+## 0.1.51 · 2026-11-26
+
+- **官方下线模型默认隐藏**：按官方 Antigravity 模型菜单与文档的退役标注，新增集中退役表（`src/adapter/model-retirement.ts`），Gemini 4 Argon 与 Gemini 3.8 Flash（2026-11-30 下线，建议改用 Gemini 4 Hydrogen）、GPT-OSS 120B（2026-11-18 下线）在用户未显式配置时默认不进入模型选择器，ACP 与代理两条链路同口径。目录观测、家族折叠与路由仍保留，设置页模型列表保留这些条目并按日期显示「即将下线 / 已下线」徽章与迁移建议，打开开关即可重新启用；用户的显式启用配置优先于默认关闭，补行 ID 严格按当前链路（ACP 裸家族 ID / 代理带前缀 ID）生成并按家族去重。原先对 GPT-OSS 120B 的硬排除改为同一套默认关闭机制。
+- **适配额度池合并**：上游套餐额度已合并为 Gemini 与 Claude/GPT 两个分组，药丸与额度详情按上游返回动态渲染，移除预建的独立 Argon 空组；旧结构若仍返回独立 Argon 组，并入 Gemini 组展示，不重复计数。
+- **修复额度药丸**：迷你余量条按短周期在上排序（5 小时 → 每周），与官方窗口顺序一致；展开弹窗改为 `useLayoutEffect` 在绘制前完成 fixed 定位，贴左边缘时不再先以绝对定位冲出视口被挡住一半。
+- **编排设置标注**：planner 下拉的 Gemini 4 Argon 选项旁注明 11-30 下线。
+
 ## 0.1.50 · 2026-11-25
 
 - **新增编排模式（`antigravity-orchestrator`）**：planner → executor 两段式生成，两条链路行为一致。**组合可配置**：planner 三选一（Gemini 4 Neon / Gemini 4 Argon / Claude Opus 5.5，默认 Opus 5.5），executor 两选一（Gemini 4 Hydrogen / Claude Sonnet 5.5，默认 Hydrogen，对齐官方 Antigravity 编排设置）；两个角色各带思考档位（默认 medium），可选档位按目标模型收敛。planner 产出一份带步骤、每步验证方式与交回条件的计划，executor 只执行不重规划，命中交回条件后下一轮重新规划。代理链路是两次独立上游请求（planner 不写会话续轮状态，档位编码在 wire 模型后缀里）；ACP 链路在不挂 MCP 桥的独立 planner 会话里运行官方 `mode=plan`，再回 chat 会话切模型执行，切角色时显式带档位以免继承上一角色。计划默认只注入上下文，`showPlan` 打开时以文本块显示；每回合最多 `maxPlansPerTurn` 次规划，planner 失败或超时降级为单模型执行。该条目只有在 planner 与配置的 executor 都已在当前目录可见时才出现。设置页新增「编排」分组（planner / executor 两个模型下拉、两个档位、规划预算、计划显示）。

@@ -8,7 +8,6 @@ import {
   agyCliCandidates,
   AgyCliError,
   AGY_CLI_TIMEOUT_MS,
-  AGY_MODEL_EXCLUDED_FAMILIES,
   cliEnv,
   fetchAgyModels,
   fetchAgyUsage,
@@ -233,20 +232,21 @@ describe('家族折叠与思考强度路由', () => {
       'gemini-3.8-flash',
       'claude-opus-5-5',
       'claude-sonnet-5-5',
+      'gpt-oss-120b',
     ])
     expect(models.map((m) => m.name)).toEqual([
       'Gemini 4 Argon',
       'Gemini 3.8 Flash',
       'Claude Opus 5.5',
       'Claude Sonnet 5.5',
+      'GPT-OSS 120B',
     ])
   })
 
-  it('gpt-oss-120b 整族排除（临近下架，用户指示不进选择器）', () => {
-    expect(AGY_MODEL_EXCLUDED_FAMILIES.has('gpt-oss-120b')).toBe(true)
+  it('临近下线家族仍保留在折叠结果：隐藏由退役表与可见性层负责，折叠不丢观测', () => {
     const { models, tiers } = foldAgyModelFamilies(RAW)
-    expect(models.some((m) => m.id.includes('gpt-oss'))).toBe(false)
-    expect(tiers.has('gpt-oss-120b')).toBe(false)
+    expect(models.some((m) => m.id === 'gpt-oss-120b')).toBe(true)
+    expect(tiers.get('gpt-oss-120b')).toEqual(new Set(['medium']))
   })
 
   it('记录各家族支持的档位', () => {

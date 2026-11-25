@@ -508,10 +508,12 @@ describe('settings card with real React state and effects', () => {
   it('全部模型被隐藏时提示 provider 会从选择器消失，重新启用后提示消失', async () => {
     const service = transport(document({ modelOverrides: { 'gemini-3-pro': { enabled: false }, 'claude-sonnet-5-5': { enabled: false } } }))
     const { renderer } = await mount(service.remote, controlWith())
+    // 两个观测模型显式隐藏 + 三个退役家族默认隐藏，整页模型全部隐藏时出现提示。
     expect(renderedText(renderer)).toContain('全部隐藏后')
+    expect(renderedText(renderer)).toContain('全部 5')
     await act(async () => { modelControl(renderer, 'enabled', 'gemini-3-pro').props.onChange({ target: { checked: true } }) })
     expect(renderedText(renderer)).not.toContain('全部隐藏后')
-    expect(renderedText(renderer)).toContain('已隐藏 1')
+    expect(renderedText(renderer)).toContain('已隐藏 4')
   })
 
   it('已经保存但当前目录没有的模型 ID 仍可编辑，并标注不在目录', async () => {
@@ -519,7 +521,51 @@ describe('settings card with real React state and effects', () => {
     const { renderer } = await mount(service.remote, controlWith())
     expect(modelControl(renderer, 'target', 'retired-model').props.value).toBe('retired-model-high')
     expect(renderedText(renderer)).toContain('不在当前目录')
-    expect(renderedText(renderer)).toContain('全部 3')
+    // 两个观测模型 + 三个退役表内置家族 + 一个已保存但不在目录的 ID = 6 行。
+    expect(renderedText(renderer)).toContain('全部 6')
+    // 退役家族默认隐藏，观测模型与已保存 ID 默认启用。
+    expect(renderedText(renderer)).toContain('已隐藏 3')
+  })
+
+  it('ACP 模式即使目录含带前缀的编排合成条目，退役补行仍用裸家族 ID', async () => {
+    // antigravity-orchestrator 带 antigravity- 前缀但不代表代理链路；
+    // 补行若按前缀猜测会写出 host 永远查不中的 override 键。
+    const models = {
+      status: 'ok' as const,
+      models: [
+        { id: 'antigravity-orchestrator', name: 'Orchestrator' },
+        { id: 'gemini-4-hydrogen', name: 'Gemini 4 Hydrogen' },
+      ],
+    }
+    const service = transport()
+    const control = vi.fn(async (method: string) => method === 'account'
+      ? { state: 'idle', message: 'ready' }
+      : models)
+    const { renderer } = await mount(service.remote, control)
+    // 裸 ID 补行存在且可切换；带前缀的错误补行不存在。
+    expect(renderer.root.findAllByProps({ name: 'model-enabled-gemini-4-argon' })).toHaveLength(1)
+    expect(renderer.root.findAllByProps({ name: 'model-enabled-antigravity-gemini-4-argon' })).toHaveLength(0)
+    // 切换裸 ID 补行后，提交的 override 键与 host 侧 modelSettingFor 直查键一致。
+    await act(async () => { modelControl(renderer, 'enabled', 'gemini-4-argon').props.onChange({ target: { checked: true } }) })
+    await act(async () => { await button(renderer, '保存').props.onClick() })
+    expect(service.mutate).toHaveBeenCalledWith('llm-antigravity-acp', [
+      expect.objectContaining({ path: ['modelOverrides'], value: { 'gemini-4-argon': { enabled: true } } }),
+    ], expect.anything())
+  })
+
+  it('代理模式观测到带档位后缀的 gpt-oss 时不补重复行，退役徽章挂在观测行上', async () => {
+    const models = {
+      status: 'ok' as const,
+      models: [{ id: 'antigravity-gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' }],
+    }
+    const control = vi.fn(async (method: string) => method === 'account'
+      ? { state: 'idle', message: 'ready', generationMode: { requested: 'proxy', active: 'proxy', proxyRouterReady: true } }
+      : models)
+    const { renderer } = await mount(transport(document({ proxyMode: true })).remote, control)
+    // 真实观测行只有一个开关；不会再补一个 antigravity-gpt-oss-120b 死行。
+    expect(renderer.root.findAllByProps({ name: 'model-enabled-antigravity-gpt-oss-120b-medium' })).toHaveLength(1)
+    expect(renderer.root.findAllByProps({ name: 'model-enabled-antigravity-gpt-oss-120b' })).toHaveLength(0)
+    expect(renderedText(renderer)).toContain('已下线 11-18')
   })
 
   it('模型可搜索并按启停筛选，折叠的高级映射仍可编辑', async () => {
@@ -644,7 +690,10 @@ describe('settings card with real React state and effects', () => {
       return revision === 1 ? { status: 'ok', models: [] } : catalog()
     })
     const { renderer, intervals } = await mount(service.remote, control)
-    expect(renderedText(renderer)).toContain('暂无模型')
+    // 空目录仍有退役表内置家族补行（默认关闭并带下线徽章），不显示空列表提示。
+    expect(renderedText(renderer)).not.toContain('暂无模型')
+    expect(renderedText(renderer)).toContain('即将下线 11-30')
+    expect(renderedText(renderer)).toContain('全部 3')
     revision = 2
     await act(async () => { for (const timer of intervals.values()) if (timer.delay === 2000) timer.callback() })
     expect(modelControl(renderer, 'target', 'gemini-3-pro').props.value).toBe('')

@@ -309,6 +309,8 @@ describe('代理模型设置与调用准备', () => {
       'gemini-3.8-flash-medium': { upstreamMetadata: 'x'.repeat(metadataBytes) },
     } }))
     const instance = new AntigravityProxyAdapter({
+      // 3.8 Flash 已列入退役表默认关闭，显式启用以聚焦本用例的响应预算断言。
+      readSettings: () => ({ modelOverrides: { [model]: { enabled: true } } }),
       credential: { credential: async () => ({ accessToken: 'fixture', source: 'login', updatedAt: 'x' }) },
       transport: { request },
     })
@@ -362,6 +364,8 @@ describe('代理模型设置与调用准备', () => {
     let account = 'a'
     const request = vi.fn(async () => new Response('unavailable', { status: 503 }))
     const instance = new AntigravityProxyAdapter({
+      // 3.8 Flash 已列入退役表默认关闭，显式启用以聚焦本用例的缓存回退断言。
+      readSettings: () => ({ modelOverrides: { [model]: { enabled: true } } }),
       credential: { credential: async () => ({ accessToken: `synthetic-${account}`, email: `${account}@example.invalid`, source: 'login', updatedAt: 'x' }) },
       transport: { request },
     })

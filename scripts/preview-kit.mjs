@@ -6,7 +6,6 @@ const source = buildClientSource()
 const quota = { status: 'ok', updatedAt: '2026-10-22T03:00:00+08:00', plan: '示例套餐', groups: [
   { name: 'Gemini Models', buckets: [{ window: '5h', remainingPct: 86, resetTime: new Date(Date.now() + 2 * 3600_000).toISOString() }, { window: 'weekly', remainingPct: 72 }] },
   { name: 'Claude and GPT models', buckets: [{ window: '5h', remainingPct: 42 }, { window: 'weekly', remainingPct: 24 }] },
-  { name: 'Gemini 4 Argon', buckets: [{ window: '5h', remainingPct: 8 }, { window: 'weekly', remainingPct: 31 }] },
 ], credits: { status: 'ok', remainingCredits: 1234, planName: '示例套餐', updatedAt: '2026-10-22T03:00:00+08:00' } }
 let plugin
 // 客户端样式在浏览器里由 ctx.effect 注入 document.head；离线夹具没有 DOM，
@@ -27,7 +26,7 @@ let states = {}
 const React = {
   createElement: (type, props, ...children) => typeof type === 'function' ? type({ ...(props ?? {}), children: children.flat() }) : ({ type, props: props ?? {}, children: children.flat() }),
   useState: (initial) => [index in states ? states[index++] : (index++, initial), () => {}],
-  useRef: (value) => ({ current: value }), useCallback: (fn) => fn, useEffect() {}, useId: () => 'preview',
+  useRef: (value) => ({ current: value }), useCallback: (fn) => fn, useEffect() {}, useLayoutEffect() {}, useId: () => 'preview',
   useSyncExternalStore: (_subscribe, getSnapshot) => getSnapshot(),
 }
 const components = new Map()
