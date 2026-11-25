@@ -1104,6 +1104,38 @@ describe('StreamChunk 序列映射', () => {
     expect(models.find((model) => model.id === 'gemini-3-pro')).toMatchObject({ contextWindow: 131_072, contextWindowSource: 'audited' })
   })
 
+  it('跨家族映射的观测不泄漏给未映射档位（Codex 审查 P2）', async () => {
+    const ossOptions: SessionConfigOption[] = [{
+      id: 'model',
+      type: 'select',
+      name: 'Model',
+      category: 'model',
+      currentValue: 'gpt-oss-120b-medium',
+      options: [{ value: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B' }],
+    }]
+    const harness = createHarness({
+      configOptions: ossOptions,
+      readSettings: () => ({ modelOverrides: { 'gpt-oss-120b': { target: 'gemini-4-neon-medium' } } }),
+      reuseSessions: false,
+    })
+    const streaming = collect(harness.adapter.stream(baseOptions({ model: 'gpt-oss-120b' })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    await harness.agent.notify('session/update', {
+      sessionId: SESSION_1,
+      update: { sessionUpdate: 'usage_update', used: 10, size: 1_048_576 },
+    })
+    await harness.agent.notify('session/update', {
+      sessionId: SESSION_1,
+      update: { sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: '好' } },
+    })
+    await harness.agent.reply('session/prompt', { stopReason: 'end_turn' })
+    await streaming
+    // 映射路由本身命中观测（该观测描述映射目标 neon）。
+    expect((await harness.adapter.resolveModel(AGY_PROVIDER_ID, 'gpt-oss-120b')).context).toEqual({ contextWindow: 1_048_576 })
+    // 未映射的固定档位不继承跨家族观测，用自身审计值 131072。
+    expect((await harness.adapter.resolveModel(AGY_PROVIDER_ID, 'gpt-oss-120b-medium')).context).toEqual({ contextWindow: 131_072 })
+  })
+
   it('家族折叠下实测容量按家族 id 落盘，且 resolveModel 用家族显示名', async () => {
     // 目录条目是官方档位 id，而 DSH 路由键是折叠后的家族 id：两者不同名。
     const tiered: SessionConfigOption[] = [{

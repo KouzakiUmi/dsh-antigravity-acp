@@ -752,16 +752,25 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   }
 
   /**
-   * 实测容量查找：精确路由键 → 映射目标 → 各自的家族键，全部未命中才返回
-   * undefined。家族路由的观测记在家族键上，固定档位 ID 的请求也要能命中；
-   * 映射目标才是实际上游模型，其观测与家族键同样优先于审计值。
+   * 实测容量查找：精确路由键 → 映射目标（及其家族键）→ 本路由的家族键。
+   * 家族键回退仅在该家族路由**没有跨家族映射**时生效：跨家族映射下家族键
+   * 上的观测描述的是映射目标，不是未映射的固定档位（Codex 审查 P2）。
    */
   #observedContextWindow(model: string, target: string | undefined): number | undefined {
-    const candidates = [model, target, modelFamilyId(model), target === undefined ? undefined : modelFamilyId(target)]
-    for (const key of candidates) {
-      if (key === undefined) continue
-      const size = this.#contextWindows.get(key)
-      if (size !== undefined) return size
+    const exact = this.#contextWindows.get(model)
+    if (exact !== undefined) return exact
+    if (target !== undefined) {
+      const byTarget = this.#contextWindows.get(target) ?? this.#contextWindows.get(modelFamilyId(target))
+      if (byTarget !== undefined) return byTarget
+    }
+    const family = modelFamilyId(model)
+    if (family !== model) {
+      const familyTarget = modelSettingFor(this.#modelSettingsSnapshot(), family).target
+      const crossMapped = familyTarget !== undefined && modelFamilyId(familyTarget) !== family
+      if (!crossMapped) {
+        const byFamily = this.#contextWindows.get(family)
+        if (byFamily !== undefined) return byFamily
+      }
     }
     return undefined
   }
