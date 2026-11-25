@@ -21,6 +21,7 @@
 | `authTimeoutMs` | `300000` | 交互式 `authenticate` 等待上限（毫秒），独立于普通请求超时。 |
 | `promptTimeoutMs` | `1800000` | 单个 `session/prompt` 上限（毫秒）；工具 park 不表示上游 prompt 已结束。 |
 | `promptByteBudget` | `176000` | 单次 ACP prompt 的 UTF-8 字节预算（16000–191000）。上游硬上限 192001 字节，超限时从最旧历史整条裁剪，保留固定块与最近对话；裁剪事实写入宿主日志并在额度药丸警示（最近 10 分钟）。按字节而非 token 计量，中文等多字节字符占用更多预算。压缩请求同样受此预算约束。 |
+| `toolCatalogByteBudget` | `55000` | MCP 工具目录 JSON 字节预算（0–60000）。官方 agent 对超约 60KB 的工具目录会丢弃工具（实测 100KB 丢 4 个）；超预算时从最长描述裁剪以保全部工具可见，名称与参数不变，裁剪写入宿主日志。0 禁用裁剪。 |
 | `bridgeParkSettleMs` | `50` | 并发 MCP 工具调用聚合窗口（毫秒）；不是工具执行超时。 |
 | `modelOverrides` | `{}` | 按模型 ID 的目录设置，键是 DSH 选择器里的模型 ID：`enabled`（默认 `true`）决定是否出现在选择器，`effort` 是该模型未选思考强度时的默认档位，`name` 覆盖显示名，`target` 把该 ID 映射到官方模型 ID。只作用于目录中已存在的条目，不新增自造模型。官方公告即将下线的家族在未配置时默认 `enabled: false`，在此显式设为 `true` 可重新启用。 |
 | `orchestrator` | `{}` | 编排模式（`antigravity-orchestrator`）配置，整份对象字段：`enabled`（默认 `true`）、`plannerModel`（三选一：`gemini-4-neon` / `gemini-4-argon` / `claude-opus-5-5`，默认后者）、`plannerEffort`（默认 `medium`）、`executorModel`（两选一：`gemini-4-hydrogen` / `claude-sonnet-5-5`，默认前者）、`executorEffort`（默认 `medium`）、`maxPlansPerTurn`（默认 `2`，范围 1–4）、`plannerTimeoutMs`（显式设置才生效；代理侧默认 20000，ACP 侧未设置时用 120000）、`showPlan`（默认 `false`）。档位按目标模型的实际可选集合收敛（Opus / Sonnet 只有 low/medium/high，Hydrogen 另有 xhigh），非法值退回 medium 或默认模型。只有 planner 与配置的 executor 都已在当前目录可见时，`antigravity-orchestrator` 才会出现在选择器里。 |
@@ -103,7 +104,7 @@ ACP 官方 agent 在同一会话内会保留上下文（2026-10-23 真机验证�
 
 设置页字段通过宿主的即时配置引用保存：模型显示开关、显示名与映射随保存更新选择器，会话与进程偏好在下一轮聊天、预热或目录发现时读取，不打断正在输出或等待工具的回合。自动预热开关在下次启用插件时读取。代理和 CLI 路径用于后续请求及新启动的官方进程；已有 ACP 进程保留原启动环境，切换其出口仍需重新加载插件。
 
-并发、二进制（`binaryPath` / `autoDownload` / `acpVersion` / `extraArgs`）与各段超时、预算（`requestTimeoutMs` / `handshakeTimeoutMs` / `authTimeoutMs` / `promptTimeoutMs` / `promptByteBudget` / `bridgeParkSettleMs` / `maxConcurrentSessions` / `queueTimeoutMs`）是**普通配置**：宿主只把即时（volatile）字段投影进设置文档，也会拒绝用 `mutate` 写这些路径。因此设置卡片不把它们做成输入框，只列出字段名作为指引；请在插件的普通配置编辑器里修改，保存后由宿主重载生效。
+并发、二进制（`binaryPath` / `autoDownload` / `acpVersion` / `extraArgs`）与各段超时、预算（`requestTimeoutMs` / `handshakeTimeoutMs` / `authTimeoutMs` / `promptTimeoutMs` / `promptByteBudget` / `toolCatalogByteBudget` / `bridgeParkSettleMs` / `maxConcurrentSessions` / `queueTimeoutMs`）是**普通配置**：宿主只把即时（volatile）字段投影进设置文档，也会拒绝用 `mutate` 写这些路径。因此设置卡片不把它们做成输入框，只列出字段名作为指引；请在插件的普通配置编辑器里修改，保存后由宿主重载生效。
 
 工具回合尚未结束时保存偏好，其有效续轮以及不兼容续轮触发的 ACP prompt 重建仍沿用原回合快照；新值可能延至后续空闲新轮生效，不通过保存设置中断当前工具执行。
 

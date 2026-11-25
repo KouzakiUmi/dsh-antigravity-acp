@@ -19,6 +19,7 @@ import type {
   RequestMessage,
   StreamChunk,
   TokenUsage,
+  ToolSchema,
 } from '@deepseek-ai/dsh-llm'
 import type { AdapterPreparedCall, AdapterRequestOptions, AdapterRequestOwner } from './request-options.js'
 import type { AnyRequest, McpServer as AcpMcpServer, PromptResponse, SessionConfigOption, SessionNotification, Usage } from '@agentclientprotocol/sdk'
@@ -40,6 +41,7 @@ import { acpOrchestratorFamily, findModeSelector, findModelSelector, findThought
 import type { ModelSelector } from './model-catalog.js'
 import { applyModelSettings, modelDisplayName, modelSettingFor, normalizeModelSettings, resolveModelTarget } from './model-settings.js'
 import type { ModelSetting } from './model-settings.js'
+import { fitToolCatalogBudget } from './tool-catalog.js'
 import { buildPromptDeltaWithImages, buildPromptWithImages, buildToolResultContent } from './image-content.js'
 import type { ImageReader } from './image-content.js'
 import { ACP_PROMPT_BYTE_BUDGET } from './prompt-transcript.js'
@@ -117,6 +119,8 @@ export interface AntigravityAcpAdapterOptions {
   promptTimeoutMs?: number
   /** 单次 prompt 的 UTF-8 字节预算；缺省用 ACP_PROMPT_BYTE_BUDGET。 */
   promptByteBudget?: number
+  /** MCP 工具目录 JSON 字节预算；超限时裁剪最长描述。0 禁用。 */
+  toolCatalogByteBudget?: number
   /** 并发 MCP park 的聚合窗口（毫秒）。 */
   parkSettleMs?: number
   /** session/new 使用的工作目录；缺省为进程 cwd。 */
@@ -172,7 +176,7 @@ export interface AntigravityAcpAdapterOptions {
   /** 编排模式配置（`antigravity-orchestrator`）。 */
   orchestrator?: OrchestratorConfig
   /** Capture live preferences only between ACP turns, never during tool continuation. */
-  readSettings?: () => Pick<AntigravityAcpAdapterOptions, 'modelOverrides' | 'reuseSessions' | 'resumeSessions' | 'keepProcessAfterCancel' | 'cancelGraceMs' | 'idleRecycleMs' | 'sessionStore' | 'orchestrator' | 'promptByteBudget'>
+  readSettings?: () => Pick<AntigravityAcpAdapterOptions, 'modelOverrides' | 'reuseSessions' | 'resumeSessions' | 'keepProcessAfterCancel' | 'cancelGraceMs' | 'idleRecycleMs' | 'sessionStore' | 'orchestrator' | 'promptByteBudget' | 'toolCatalogByteBudget'>
   /** 历史被字节预算裁剪时的事件回调（issue #16）；宿主据此向 UI 暴露裁剪事实。 */
   onHistoryNotice?: (info: HistoryTruncationInfo) => void
   /** 独立 adapter 的兼容读取回调；连接池必须改用共享 sessionStore。 */
@@ -244,6 +248,11 @@ interface ReusedSession {
 
 const DEFAULT_PROMPT_TIMEOUT_MS = 30 * 60_000
 const DEFAULT_PARK_SETTLE_MS = 50
+/**
+ * MCP 工具目录 JSON 字节预算默认值。官方 agent 约 60KB 开始丢工具
+ * （issue #18 探针：60KB 全可见、100KB 丢 4 个），留安全余量取 55KB。
+ */
+const DEFAULT_TOOL_CATALOG_BYTE_BUDGET = 55_000
 const ACP_DEFAULT_PLANNER_TIMEOUT_MS = 120_000
 
 interface PlannerSessionEntry {
@@ -295,6 +304,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   readonly #registerBridgeTeardown: AntigravityAcpAdapterOptions['registerBridgeTeardown']
   readonly #promptTimeoutMs: number
   #promptByteBudget: number
+  #toolCatalogByteBudget: number
   readonly #parkSettleMs: number
   readonly #cwd: string
   /** 用户模型设置的只读快照；每次读取设置时整体替换。 */
@@ -404,6 +414,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     this.#registerBridgeTeardown = options.registerBridgeTeardown
     this.#promptTimeoutMs = options.promptTimeoutMs ?? DEFAULT_PROMPT_TIMEOUT_MS
     this.#promptByteBudget = options.promptByteBudget ?? ACP_PROMPT_BYTE_BUDGET
+    this.#toolCatalogByteBudget = options.toolCatalogByteBudget ?? DEFAULT_TOOL_CATALOG_BYTE_BUDGET
     this.#parkSettleMs = options.parkSettleMs ?? DEFAULT_PARK_SETTLE_MS
     this.#cwd = options.cwd ?? process.cwd()
     this.#modelSettings = normalizeModelSettings(options.modelOverrides)
@@ -552,6 +563,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     this.#cancelGraceMs = Math.max(0, settings.cancelGraceMs ?? 30_000)
     this.#idleRecycleMs = Math.max(0, settings.idleRecycleMs ?? 300_000)
     this.#promptByteBudget = settings.promptByteBudget ?? ACP_PROMPT_BYTE_BUDGET
+    this.#toolCatalogByteBudget = settings.toolCatalogByteBudget ?? DEFAULT_TOOL_CATALOG_BYTE_BUDGET
     if (this.#sessionStore !== settings.sessionStore) this.#sessionStore?.release(this.#sessionOwner)
     this.#sessionStore = settings.sessionStore
   }
@@ -629,6 +641,20 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         this.#onHistoryNotice?.(info)
       },
     }
+  }
+
+  /**
+   * 工具目录预算收敛（issue #18）：官方 agent 对超约 60KB 的工具目录会丢弃
+   * 工具，插件侧先把描述总量裁进预算，保全部工具可见；名称与参数不变。
+   */
+  #fitTools(tools: readonly ToolSchema[]): readonly ToolSchema[] {
+    const fitted = fitToolCatalogBudget(tools, this.#toolCatalogByteBudget)
+    if (fitted.truncated.length > 0) {
+      this.#log?.warn(
+        `antigravity-acp: 工具目录超出字节预算 ${this.#toolCatalogByteBudget}，已裁剪 ${fitted.truncated.length} 个工具的描述（${fitted.truncated.map((entry) => entry.name).join('、')}）；名称与参数不变`,
+      )
+    }
+    return fitted.tools
   }
 
   #inputModalities(): readonly ('text' | 'image')[] | undefined {
@@ -1041,7 +1067,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     const tools = options.tools ?? []
     let mcpServers: AcpMcpServer[] = []
     if (tools.length > 0) {
-      this.#bridge.beginRound(tools, key)
+      this.#bridge.beginRound(this.#fitTools(tools), key)
       if (!this.#bridge.listening) await this.#bridge.start()
       mcpServers = this.#bridge.acpRegistration()
     }
@@ -1783,7 +1809,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       let mcpServers: AcpMcpServer[] = []
       // 复用会话时无工具的一次性请求（标题、压缩）不接管桥：轮换 token 会让同一
       // worker 上仍在复用的 ACP 会话失去工具连接。关闭复用时恢复旧的每轮清桥。
-      if (tools.length > 0 || !this.#reuseSessions) this.#bridge.beginRound(tools, owner)
+      if (tools.length > 0 || !this.#reuseSessions) this.#bridge.beginRound(this.#fitTools(tools), owner)
       if (tools.length > 0) {
         if (!this.#bridge.listening) await this.#bridge.start()
         check()
@@ -2026,7 +2052,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   }
 
   async *#runContinuation(turn: PromptTurn, options: AdapterRequestOptions, tail: readonly RequestMessage[]): AsyncGenerator<StreamChunk> {
-    this.#bridge.publishTools(options.tools ?? [])
+    this.#bridge.publishTools(this.#fitTools(options.tools ?? []))
     if (turn.terminated) {
       // 终止的回合不会再有生产者。必须**先于 resume()** 判定：resume 会把
       // producerDone 复位，之后 drainTurn 会因无人生产而永久挂起。
