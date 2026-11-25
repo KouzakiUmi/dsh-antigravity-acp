@@ -755,22 +755,28 @@ export class AntigravityAcpAdapter extends LlmAdapter {
    * 实测容量查找：精确路由键 → 映射目标（及其家族键）→ 本路由的家族键。
    * 家族键回退仅在该家族路由**没有跨家族映射**时生效：跨家族映射下家族键
    * 上的观测描述的是映射目标，不是未映射的固定档位（Codex 审查 P2）。
+   * 映射目标的家族键同样受此守卫：链式映射（A→B、B→C）下 B 家族键的观测
+   * 描述 C，而 A 路由实际发送字面 B 档位，不递归套用 B 的映射。
    */
   #observedContextWindow(model: string, target: string | undefined): number | undefined {
     const exact = this.#contextWindows.get(model)
     if (exact !== undefined) return exact
+    const settings = this.#modelSettingsSnapshot()
+    const crossMapped = (family: string): boolean => {
+      const familyTarget = modelSettingFor(settings, family).target
+      return familyTarget !== undefined && modelFamilyId(familyTarget) !== family
+    }
     if (target !== undefined) {
-      const byTarget = this.#contextWindows.get(target) ?? this.#contextWindows.get(modelFamilyId(target))
-      if (byTarget !== undefined) return byTarget
+      const targetFamily = modelFamilyId(target)
+      if (!crossMapped(targetFamily)) {
+        const byTarget = this.#contextWindows.get(target) ?? this.#contextWindows.get(targetFamily)
+        if (byTarget !== undefined) return byTarget
+      }
     }
     const family = modelFamilyId(model)
-    if (family !== model) {
-      const familyTarget = modelSettingFor(this.#modelSettingsSnapshot(), family).target
-      const crossMapped = familyTarget !== undefined && modelFamilyId(familyTarget) !== family
-      if (!crossMapped) {
-        const byFamily = this.#contextWindows.get(family)
-        if (byFamily !== undefined) return byFamily
-      }
+    if (family !== model && !crossMapped(family)) {
+      const byFamily = this.#contextWindows.get(family)
+      if (byFamily !== undefined) return byFamily
     }
     return undefined
   }

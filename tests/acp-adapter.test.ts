@@ -1136,6 +1136,20 @@ describe('StreamChunk 序列映射', () => {
     expect((await harness.adapter.resolveModel(AGY_PROVIDER_ID, 'gpt-oss-120b-medium')).context).toEqual({ contextWindow: 131_072 })
   })
 
+  it('链式映射下目标家族的观测不跨上游复用（Codex 审查 P2-2）', async () => {
+    // gpt-oss-120b → gemini-4-neon-medium；claude-opus-5-5 → gpt-oss-120b-medium。
+    // GPT 家族键上的观测描述 neon；Claude 路由实际发送字面 GPT 档位（映射不递归），
+    // 不得经目标家族键继承该观测，用 GPT 档位审计值 131072。
+    const harness = createHarness({
+      readSettings: () => ({ modelOverrides: {
+        'gpt-oss-120b': { target: 'gemini-4-neon-medium' },
+        'claude-opus-5-5': { target: 'gpt-oss-120b-medium' },
+      } }),
+      loadCachedCatalog: async () => [{ id: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B', contextWindow: 1_048_576 }],
+    })
+    expect((await harness.adapter.resolveModel(AGY_PROVIDER_ID, 'claude-opus-5-5')).context).toEqual({ contextWindow: 131_072 })
+  })
+
   it('家族折叠下实测容量按家族 id 落盘，且 resolveModel 用家族显示名', async () => {
     // 目录条目是官方档位 id，而 DSH 路由键是折叠后的家族 id：两者不同名。
     const tiered: SessionConfigOption[] = [{
