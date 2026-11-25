@@ -42,6 +42,8 @@ import { applyModelSettings, modelDisplayName, modelSettingFor, normalizeModelSe
 import type { ModelSetting } from './model-settings.js'
 import { buildPromptDeltaWithImages, buildPromptWithImages, buildToolResultContent } from './image-content.js'
 import type { ImageReader } from './image-content.js'
+import { ACP_PROMPT_BYTE_BUDGET } from './prompt-transcript.js'
+import type { HistoryTruncationInfo } from '../runtime/history-notices.js'
 import { AGY_TURN_ERROR, mapUsage, PromptTurn } from './prompt-turn.js'
 import type { AcpLifecycle } from '../runtime/lifecycle.js'
 import { ContinuationState } from './continuation-state.js'
@@ -113,6 +115,8 @@ export interface AntigravityAcpAdapterOptions {
   registerBridgeTeardown: (teardown: () => Promise<void>) => void
   /** session/prompt 等待上限（毫秒）。 */
   promptTimeoutMs?: number
+  /** 单次 prompt 的 UTF-8 字节预算；缺省用 ACP_PROMPT_BYTE_BUDGET。 */
+  promptByteBudget?: number
   /** 并发 MCP park 的聚合窗口（毫秒）。 */
   parkSettleMs?: number
   /** session/new 使用的工作目录；缺省为进程 cwd。 */
@@ -168,7 +172,9 @@ export interface AntigravityAcpAdapterOptions {
   /** 编排模式配置（`antigravity-orchestrator`）。 */
   orchestrator?: OrchestratorConfig
   /** Capture live preferences only between ACP turns, never during tool continuation. */
-  readSettings?: () => Pick<AntigravityAcpAdapterOptions, 'modelOverrides' | 'reuseSessions' | 'resumeSessions' | 'keepProcessAfterCancel' | 'cancelGraceMs' | 'idleRecycleMs' | 'sessionStore' | 'orchestrator'>
+  readSettings?: () => Pick<AntigravityAcpAdapterOptions, 'modelOverrides' | 'reuseSessions' | 'resumeSessions' | 'keepProcessAfterCancel' | 'cancelGraceMs' | 'idleRecycleMs' | 'sessionStore' | 'orchestrator' | 'promptByteBudget'>
+  /** 历史被字节预算裁剪时的事件回调（issue #16）；宿主据此向 UI 暴露裁剪事实。 */
+  onHistoryNotice?: (info: HistoryTruncationInfo) => void
   /** 独立 adapter 的兼容读取回调；连接池必须改用共享 sessionStore。 */
   loadSessionMap?: () => Promise<Record<string, SessionMapEntry>>
   /** 保存 ACP 会话映射；失败由实现方吞掉。 */
@@ -288,6 +294,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   #unrecycledLink: AgentLink | undefined
   readonly #registerBridgeTeardown: AntigravityAcpAdapterOptions['registerBridgeTeardown']
   readonly #promptTimeoutMs: number
+  #promptByteBudget: number
   readonly #parkSettleMs: number
   readonly #cwd: string
   /** 用户模型设置的只读快照；每次读取设置时整体替换。 */
@@ -304,6 +311,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   readonly #loadCliCatalog?: AntigravityAcpAdapterOptions['loadCliCatalog']
   readonly #log?: AdapterLog
   readonly #onMetadataChanged?: AntigravityAcpAdapterOptions['onMetadataChanged']
+  readonly #onHistoryNotice?: AntigravityAcpAdapterOptions['onHistoryNotice']
   #reuseSessions: boolean
   #resumeSessions: boolean
   #sessionStore?: SessionMapStore
@@ -395,6 +403,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     this.#recycleLink = options.recycleLink
     this.#registerBridgeTeardown = options.registerBridgeTeardown
     this.#promptTimeoutMs = options.promptTimeoutMs ?? DEFAULT_PROMPT_TIMEOUT_MS
+    this.#promptByteBudget = options.promptByteBudget ?? ACP_PROMPT_BYTE_BUDGET
     this.#parkSettleMs = options.parkSettleMs ?? DEFAULT_PARK_SETTLE_MS
     this.#cwd = options.cwd ?? process.cwd()
     this.#modelSettings = normalizeModelSettings(options.modelOverrides)
@@ -405,6 +414,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     this.#loadCliCatalog = options.loadCliCatalog
     this.#log = options.log
     this.#onMetadataChanged = options.onMetadataChanged
+    this.#onHistoryNotice = options.onHistoryNotice
     this.#reuseSessions = options.reuseSessions ?? true
     this.#resumeSessions = options.resumeSessions ?? false
     this.#sessionStore = options.sessionStore ?? (options.loadSessionMap && options.saveSessionMap
@@ -541,6 +551,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     this.#keepProcessAfterCancel = settings.keepProcessAfterCancel ?? false
     this.#cancelGraceMs = Math.max(0, settings.cancelGraceMs ?? 30_000)
     this.#idleRecycleMs = Math.max(0, settings.idleRecycleMs ?? 300_000)
+    this.#promptByteBudget = settings.promptByteBudget ?? ACP_PROMPT_BYTE_BUDGET
     if (this.#sessionStore !== settings.sessionStore) this.#sessionStore?.release(this.#sessionOwner)
     this.#sessionStore = settings.sessionStore
   }
@@ -610,10 +621,13 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       readImage: this.#readImage,
       supported: this.#imageSupported === true && (this.#canReadImages?.() ?? true),
       signal,
-      onHistoryTruncated: (info: { omittedCount: number; omittedBytes: number; totalBytes: number }) =>
+      maxPromptBytes: this.#promptByteBudget,
+      onHistoryTruncated: (info: { omittedCount: number; omittedBytes: number; totalBytes: number }) => {
         this.#log?.warn(
           `antigravity-acp: 全量重放超出单次 prompt 字节预算，已自动裁剪最早的 ${info.omittedCount} 条历史消息（约 ${Math.ceil(info.omittedBytes / 1024)} KB），保留最近上下文与当前请求（最终 ${info.totalBytes} 字节）`,
-        ),
+        )
+        this.#onHistoryNotice?.(info)
+      },
     }
   }
 

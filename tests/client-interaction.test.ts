@@ -183,6 +183,27 @@ describe('quota pill with real React state and effects', () => {
     expect(renderer.root.findByProps({ role: 'progressbar' }).props['aria-valuenow']).toBe(42)
   })
 
+  it('近期历史裁剪在药丸警示并可在详情查看，过期事件不提示（issue #16）', async () => {
+    const fresh = { at: new Date().toISOString(), omittedCount: 3, omittedBytes: 90_000, totalBytes: 170_000 }
+    const renderer = await mountPill(async () => ({
+      status: 'ok', groups: [{ name: 'Gemini', buckets: [{ window: '5h', remainingPct: 82 }] }],
+      historyNotices: [fresh],
+    }))
+    expect(renderer.root.findByProps({ 'aria-haspopup': 'dialog' }).props['aria-label']).toContain('历史已裁剪')
+    await act(async () => { await renderer.root.findByProps({ 'aria-haspopup': 'dialog' }).props.onClick() })
+    expect(renderedText(renderer)).toContain('省略 3 条消息')
+    expect(renderedText(renderer)).toContain('DSH 上下文条不反映被裁剪部分')
+  })
+
+  it('超过展示窗口的裁剪事件不再警示（issue #16）', async () => {
+    const stale = { at: new Date(Date.now() - 60 * 60_000).toISOString(), omittedCount: 3, omittedBytes: 90_000, totalBytes: 170_000 }
+    const renderer = await mountPill(async () => ({
+      status: 'ok', groups: [{ name: 'Gemini', buckets: [{ window: '5h', remainingPct: 82 }] }],
+      historyNotices: [stale],
+    }))
+    expect(renderer.root.findByProps({ 'aria-haspopup': 'dialog' }).props['aria-label']).not.toContain('历史已裁剪')
+  })
+
   it('失败信封转成可读错误，不把异常抛出组件', async () => {
     const renderer = await mountPill(async () => ({ ok: false, error: { message: 'remote denied' } }))
     expect(renderer.root.findByProps({ 'aria-haspopup': 'dialog' }).props['aria-label']).toContain('额度读取失败')

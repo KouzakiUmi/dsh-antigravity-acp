@@ -6,7 +6,9 @@ const source = buildClientSource()
 const quota = { status: 'ok', updatedAt: '2026-10-22T03:00:00+08:00', plan: '示例套餐', groups: [
   { name: 'Gemini Models', buckets: [{ window: '5h', remainingPct: 86, resetTime: new Date(Date.now() + 2 * 3600_000).toISOString() }, { window: 'weekly', remainingPct: 72 }] },
   { name: 'Claude and GPT models', buckets: [{ window: '5h', remainingPct: 42 }, { window: 'weekly', remainingPct: 24 }] },
-], credits: { status: 'ok', remainingCredits: 1234, planName: '示例套餐', updatedAt: '2026-10-22T03:00:00+08:00' } }
+], credits: { status: 'ok', remainingCredits: 1234, planName: '示例套餐', updatedAt: '2026-10-22T03:00:00+08:00' },
+  // 历史裁剪警示示例（issue #16）：动态时间保证落在 10 分钟展示窗口内。
+  historyNotices: [{ at: new Date().toISOString(), omittedCount: 4, omittedBytes: 96_000, totalBytes: 172_000 }] }
 let plugin
 // 客户端样式在浏览器里由 ctx.effect 注入 document.head；离线夹具没有 DOM，
 // 这里给一个最小 document 桩，捕获同一份样式串供静态预览页复用。

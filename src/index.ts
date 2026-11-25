@@ -43,6 +43,7 @@ import { describeLowIntegrity, isLowIntegrityTarget } from './runtime/integrity.
 import { describeAuthWait, redactSensitiveText } from './runtime/redact.js'
 import { readCachedCatalog, writeCachedCatalog } from './runtime/catalog-cache.js'
 import { createFileSessionMapStore } from './runtime/session-map.js'
+import { HistoryNoticeLog } from './runtime/history-notices.js'
 import { agyCliCandidates, createSubprocessCliRun, fetchAgyModels } from './runtime/agy-cli.js'
 import { AgYQuotaService, registerAgYQuotaRemote } from './quota/quota-remote.js'
 import { SettingsControl } from './quota/control.js'
@@ -568,6 +569,8 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
   const sessionStore = createFileSessionMapStore(cacheDir,
     () => ctx.logger?.warn?.('antigravity-acp: 会话映射不可用或由另一 Host 占用，跨进程恢复已降级；不影响本地聊天'),
   )
+  // 历史裁剪事件（issue #16）：内存有界日志，经额度 read 附带给药丸展示。
+  const historyNotices = new HistoryNoticeLog()
   const workers: AntigravityAcpAdapter[] = []
   let metadata: AdapterMetadata | undefined
   // Serialize startup/credential preparation, not inference. This avoids competing OAuth imports.
@@ -593,9 +596,11 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
         active.bridgeTeardown = teardown
       },
       promptTimeoutMs: config.promptTimeoutMs,
+      promptByteBudget: config.promptByteBudget,
       parkSettleMs: config.bridgeParkSettleMs,
       modelOverrides: config.modelOverrides,
       readSettings: () => ({ ...config, sessionStore: config.resumeSessions ? sessionStore : undefined }),
+      onHistoryNotice: (info) => historyNotices.push(info),
       // ACP 会话复用：同一条 DSH 对话的后续回合只发增量；重启恢复默认关闭。
       reuseSessions: config.reuseSessions,
       resumeSessions: config.resumeSessions,
@@ -746,6 +751,7 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
     proxyIdentity: () => proxyAccount.quotaIdentity(),
     snapshotDirectory: cacheDir,
     background: true,
+    historyNotices: () => historyNotices.list(),
     onScopeChange: (tick) => {
       const offMode = modeBus.subscribe(tick)
       const offAccount = proxyAccount.subscribe(() => { if (modeBus.current()) tick() })

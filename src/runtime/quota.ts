@@ -27,6 +27,7 @@ import {
   buildAntigravityHarnessBootstrapHeaders,
 } from '@cortexkit/antigravity-auth-core'
 import { redactSensitiveText } from './redact.js'
+import type { HistoryTruncationNotice } from './history-notices.js'
 import { resolveInstallRoot, versionCachePaths, DEFAULT_ACP_SERVER_VERSION } from './binary.js'
 import { agyCliCandidates } from './agy-cli.js'
 
@@ -112,6 +113,11 @@ export interface QuotaSnapshot {
   routeModel?: string
   credits?: CreditsSnapshot
   error?: { code: QuotaErrorCode; message: string }
+  /**
+   * 最近的历史裁剪事件（issue #16）：read 时附带的内存态，供药丸警示；
+   * 不写入快照存储，也不参与 stale 回退。
+   */
+  historyNotices?: readonly HistoryTruncationNotice[]
 }
 
 /** 登录态文件里我们只认这几项，其余（id_token 等）一律不读不用。 */
