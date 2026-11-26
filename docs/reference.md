@@ -130,7 +130,7 @@ ACP fs / terminal 与未知原生权限请求始终拒绝并记录，但不因�
 - 取消登录也覆盖回调后的 token 交换；退出时使旧刷新失效并清除副本，本次插件生命周期内保持退出，用户显式连接后才恢复自动取凭据。
 - 页面区分检查登录态、等待浏览器、完成登录；取消也覆盖授权前的凭据换发与项目请求。失败显示授权、项目或保存的具体原因。授权链接过期或遗失时取消后重连；端口占用时先结束占用端口的旧授权流程。
 - 线身份：User-Agent 为 `antigravity/cli/<version> (aidev_client; os_type=…; arch=…; cl=…; auth_method=consumer)`（取自 `@cortexkit/antigravity-auth-core` 3.0.14 的审计实现），头顺序 Host → User-Agent → (Transfer-Encoding|Content-Length) → Authorization → Content-Type → Accept-Encoding；`:streamGenerateContent` 固定 chunked。端点白名单仅 Cloud Code Assist 的 `streamGenerateContent` / `generateContent` / `fetchAvailableModels` / `loadCodeAssist` / `retrieveUserQuotaSummary` 与 `oauth2.googleapis.com/token`。
-- 与参考实现（dsh-tool-antigravity）的差异：不携带 DSH 归属第二头（归属 User-Agent 与 agy 伪装互斥，代理模式是用户显式开启的功能）；SOCKS 代理在代理模式明确报错而非静默直连；单账户，429 不轮转。
+- 与参考实现（dsh-tool-antigravity）的差异：不携带 DSH 归属第二头（归属 User-Agent 与 agy 伪装互斥，代理模式是用户显式开启的功能）；SOCKS 代理在代理模式明确报错而非静默直连；单账户，429 不轮转、不自动重试。429 错误（HTTP 与流内事件）附带上游原话（脱敏、最多 300 字符），配额耗尽时的重置时间等诊断信息随错误可见；ACP 登录与代理账户是不同额度池，一侧有额度不代表另一侧可用。
 - 图片输入：宿主附件服务在场时经 `readImageRequest` 有界投影（单图 4MP / 1MB）转 `inlineData`；整请求 12MB 内联预算，超预算报 `IMAGE_OFFLOAD_REQUIRED` 并按最旧优先协商 offload；已 offload 的图片投影为占位文本。附件服务缺席时报 `UNSUPPORTED_MODALITY`。输出含图片的型号（图像生成类）不在代理路由内；上游对文本模型返回媒体输出按协议漂移拒绝。
 - 工具调用：同一响应中的多个完整 `functionCall` 分别交给 DSH，即使上游省略调用 ID 也保持独立；同一 ID 的字符串参数分片继续组装为一条调用。工具响应即使附带 `STOP` 也进入工具续轮。文本与思考块的后到签名随历史回放保留，模型映射或档位改变后不误用旧签名；未收到完成标记就断开会报告传输错误。
 - Claude 续聊会保留中断前已经取得的工具结果。历史批次缺失的结果会标记为「未取得结果，工具可能已执行」，插件不会重跑该工具。当前批次若仍缺结果，先提示检查该批次的执行状态。
@@ -214,6 +214,7 @@ onefile 临时展开使用用户级根目录内独立的 `runtime/instance-*`，
 | 工具参数非流式 | ACP 桥在工具被调用后才拿到完整参数，界面里工具调用一次性出现。 | 协议没有增量参数通道，暂无。 |
 | 标题 / 压缩走当前 provider | DSH 用当前模型生成标题、做压缩，各自新建一次 ACP 会话（约 3–20 秒、消耗额度）。 | 标题超时已收紧到 90 秒、压缩 10 分钟；可在 DSH 侧关闭自动标题或改用更便宜的 provider。 |
 | 单次 prompt 字节上限 | agy 对单次 `session/prompt` 有 192001 字节硬上限；全量重放超预算（默认 176000，`promptByteBudget` 可配）时从最旧历史整条裁剪。裁剪写进 prompt 内提示块、宿主日志，并在额度药丸显示警示与详情（最近 10 分钟）；DSH 上下文条不反映被裁部分。压缩请求同受此限，被裁掉的历史无法靠压缩找回。 | 大目录引用首轮即超限时，精简引用范围或拆分任务；按字节计量，中文内容占用更多预算。 |
+| 工具目录超约 60KB 被官方丢工具 | 实测（官方 1.5.2，`scripts/probe-tool-budget.mjs`）：目录 JSON 60KB 时 24 个工具全可见，100KB 时丢 4 个 12KB 描述的工具；丢弃发生在官方 agent / 上游侧，插件桥全量交付。插件默认按 `toolCatalogByteBudget`（55000）把描述总量裁进预算，保全部工具可见；名称与参数不变，被裁描述带 `…[description truncated]` 标记并写宿主日志。 | 工具描述被裁后模型可按需试探；需要完整描述时调高预算（上限 60000）或减少同时启用的工具；设 0 禁用裁剪（恢复官方丢弃行为）。 |
 | `temperature` / `stop` 不生效 | ACP v1 没有对应会话通道；插件记录警告并忽略，不再整单失败。 | 需要采样控制时使用官方 agent 自身的会话配置。 |
 | 上下文去重 | 相同 producer 的未变化快照/目录/指令与已见召回材料不重复发送；新内容、变化和状态回滚仍发送。 | 不再整类跳过注入；未知来源保守发送。需要每轮全量重放可关闭 `reuseSessions`。 |
 | 取消后默认回收进程 | `session/cancel` 只是通知；默认安全优先，下一轮冷启动（热启动约 10 秒、冷启动可达 50 秒）。 | 开启 `keepProcessAfterCancel`，用 `cancelGraceMs` 等确认、`idleRecycleMs` 限制空闲保留。 |

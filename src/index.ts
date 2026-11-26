@@ -597,6 +597,7 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
       },
       promptTimeoutMs: config.promptTimeoutMs,
       promptByteBudget: config.promptByteBudget,
+      toolCatalogByteBudget: config.toolCatalogByteBudget,
       parkSettleMs: config.bridgeParkSettleMs,
       modelOverrides: config.modelOverrides,
       readSettings: () => ({ ...config, sessionStore: config.resumeSessions ? sessionStore : undefined }),

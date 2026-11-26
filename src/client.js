@@ -59,6 +59,7 @@ window.__ModuleLoader__.load({
       msg('浏览器登录超时（authTimeoutMs）'),
       msg('单轮生成超时（promptTimeoutMs）'),
       msg('单次 prompt 字节预算（promptByteBudget）'),
+      msg('工具目录字节预算（toolCatalogByteBudget）'),
       msg('工具调用聚合窗口（bridgeParkSettleMs）'),
       msg('ACP Server 路径（binaryPath）'),
       msg('自动下载 ACP Server（autoDownload）'),
