@@ -4,7 +4,7 @@
 
 记录源码与发布内容，不将本地构建、npm 发布和本机升级混为同一状态。日期采用 Asia/Hong_Kong。更早历史见 [Git 提交记录](https://github.com/KouzakiUmi/dsh-antigravity-acp/commits/main/)。
 
-## 未发布
+## 0.1.52 · 2026-11-26
 
 - **修复额度药丸弹窗锚定（0.1.51 回归）**：0.1.51 把展开弹窗改为 `fixed` ＋ 视口坐标钳位，但宿主 GUI 内存在 transform 祖先时 `fixed` 的包含块不是视口，且视口钳位会把弹窗推离药丸、伸进右侧对话区被面板边缘裁剪，实际表现为弹窗必然被遮挡。改回 `position:absolute` 锚在药丸自身（`position:relative` 容器）：默认右缘对齐向左展开，仅当右对齐越过视口左缘且左对齐溢出更小时翻转 `left:0`；上下方向仍按可用空间选边并限制 `maxHeight`。`data-dsh-go-island` 面板形态的 `position:static` 覆盖不受影响。真实 React 渲染测试（注入按钮几何）锁定 absolute 锚定、翻转与上下选边三类行为。
 - **修复 #23：macOS 上 agy ≥1.5.17 登录态迁入钥匙串后 ACP 卡「等待登录」**（致谢 issue 报告者）：三处修复。① 凭据导入链扩展为「CLI 登录文件 → macOS 钥匙串（`security find-generic-password -s gemini -a antigravity -w`，解 `go-keyring-base64:` 前缀）→ 旧版 `~/.gemini/oauth_creds.json` 平铺形态」，全部只读、惰性读取（既有凭据可用时不碰任何 CLI 来源），钥匙串仅 darwin 且经宿主受管子进程读取（[`cli-login.ts`](../src/runtime/cli-login.ts)）；换发失败时依次改用各候选重试，额度取数与快照身份（`cliQuotaIdentity`）同链兜底。② 官方 server 启动环境注入 `AGY_ACP_FORCE_FILE_STORAGE=1`：官方 1.5.2 在 macOS 探测到钥匙串可用就把它当 primary backend 而无视插件写好的 `acp_token.json`，强制文件后端与插件凭据准备机制自洽，不碰钥匙串、无 ACL 弹窗。③ 首个 `session/new` 改用 `handshakeTimeoutMs` 档（默认 120 秒）：issue 实测官方 1.5.2 冷启动到 `session/new` 返回约 36 秒，超过普通请求默认 30 秒；建过会话后回到普通档，调用方显式 `timeoutMs` 始终优先。`acpVersion` 默认仍为 1.5.2（issue 评论证实升级 server 不解决卡死）。钥匙串路径经注入依赖的单元测试覆盖，macOS 实机未验证。

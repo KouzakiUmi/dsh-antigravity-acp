@@ -49,7 +49,7 @@ dsh plugin --profile web add dsh-bundle-antigravity-host
 `web` 是示例 Profile，请替换为实际目标。**DSH NEXT Desktop 使用目标桌面壳提供的 DSH Desktop CLI**；不要用独立 npm 公共 CLI 管理保留的 `desktop` Profile。[安装与更新说明](docs/reference.md#安装与更新)
 
 1. **安装并启用**：按部署方式重载或重启，让 Host 与 Client 一起生效；只刷新页面不保证 Host 已升级。
-2. **打开「设置 → Antigravity ACP」**：需要代理时先配置并保存，再点击 **连接 / 登录 ACP**。插件优先复用已有 ACP 登录态，或导入本机已登录的官方 CLI 登录态；必要时才进入官方浏览器授权。成功建会话后读取模型目录，不需要先发送聊天。
+2. **打开「设置 → Antigravity ACP」**：需要代理时先配置并保存，再点击 **连接 / 登录 ACP**。插件优先复用已有 ACP 登录态，或导入本机已登录的官方 CLI 登录态（含 agy ≥1.5.17 在 macOS 钥匙串中的登录态，只读取出）；必要时才进入官方浏览器授权。成功建会话后读取模型目录，不需要先发送聊天。
 3. **选择模型，开始对话**：提供商名称为 **Antigravity (ACP)**，路由 ID 为 `antigravity-acp`。模型选择器左侧出现紧凑额度药丸；预热入口位于设置页，工具调用继续走 DSH 的校验、审批与执行。
 
 使用代理模式时，启用插件页的 `antigravity-proxy-router` 组件，在设置页「运行模式」勾选并保存，再点击「连接代理账户 → 打开 Google 授权页」。**无需安装 agy CLI**，在运行 DSH 的同一台电脑上授权，账户和已有项目检测通过后自动读取模型，选择 **Antigravity（代理模式）** 的模型开始对话。组件未就绪时页面说明原因，ACP 仍保持停用；代理模式不会自动预热或启动官方进程。
@@ -118,7 +118,7 @@ flowchart LR
 | 边界 | 当前行为 |
 |---|---|
 | 工具与权限 | AGY 内置工具、ACP fs / terminal 关闭；只允许已识别的私有桥请求进入 DSH，`allow_once` 不等于绕过 DSH 审批。协议约束**不是 OS 沙箱**。 |
-| 登录材料 | 插件可能读取 CLI 登录文件，并为官方 ACP 写入 / 更新本机凭据文件；这些文件不是加密凭据库，Windows 访问保护依赖目录 ACL。 |
+| 登录材料 | 插件可能读取 CLI 登录文件与 macOS 钥匙串条目（均只读），并为官方 ACP 写入 / 更新本机凭据文件；这些文件不是加密凭据库，Windows 访问保护依赖目录 ACL。 |
 | 官方程序 | 按需从 `https://dl.google.com` 下载，拒绝重定向并检查 ZIP 路径；官方未提供校验和，不宣称签名验证通过。默认 server 版本为 **1.5.2**，不跟随 registry 自动升级。 |
 | 模型参数 | `reasoningEffort` 映射官方档位；`maxTokens` 忽略；显式 `temperature` / `stop` 记录警告并忽略，值不生效。 |
 | 数据可信度 | 缓存、失败、缺字段和未知分别标记；额度与余额是上游快照数据，不是计费数据。 |
@@ -132,7 +132,7 @@ flowchart LR
 | DSH Core peer 范围 | `>=0.2.0-rc.1 <0.2.1-0 \|\| >=0.2.1-0 <0.3.0-0 \|\| >=0.2.2-0 <0.3.0-0`，适用于所声明的三个 `dsh-*` peer；npm 与 DSH 分别检查准入 |
 | 开发契约基准 | `dsh-llm` / `dsh-subprocess` / `dsh-typert-protocol` / `dsh-attachment` **0.2.2-rc.3**，Cordis **4.1.0**（与实机内嵌版本一致，类型检查在该基准下运行） |
 | 上游协议 | ACP **v1**；SDK **1.4.0** 与默认 server **1.5.2** 是两个独立版本 |
-| 当前源码本地验证 | 0.1.48（契约基准 `0.2.2-rc.3` / Cordis `4.1.0`）：类型检查、48 个文件 / 870 项测试（Windows 上 1 项 POSIX 权限位测试跳过）与构建通过；桌面契约用 2.0.24-next / Core `0.2.2-rc.5` 真实组件复检（路由互斥、Typert 注册与清理、自定义错误码）；另有无 CLI 的真实本地 OAuth 回调闭环及既有离线 Chrome 36 项布局检查 |
+| 当前源码本地验证 | 0.1.52（契约基准 `0.2.2-rc.3` / Cordis `4.1.0`）：类型检查、57 个文件 / 984 项测试（Windows 上 1 项 POSIX 权限位测试跳过）与构建通过；macOS 钥匙串登录态兜底经注入依赖的单元测试覆盖，macOS 实机未验证；桌面契约用 2.0.24-next / Core `0.2.2-rc.5` 真实组件复检（路由互斥、Typert 注册与清理、自定义错误码）；另有无 CLI 的真实本地 OAuth 回调闭环及既有离线 Chrome 36 项布局检查 |
 | 实机运行时核对 | 2026-11-16 复核实机分发包（`app.asar`）内嵌 **dsh-llm / dsh-subprocess / dsh-typert-protocol / dsh-attachment 0.2.2-rc.3，cordis 4.1.0**；此前 2026-11-12 在 0.2.2-rc.1 逐项核对的导出（`LlmAdapter` 方法集、`registerAdapter().replace([])`、`LlmError`、品牌类型构造函数、`settings.describe/mutate`、`attachments` 服务名、Typert 远程注册形状、客户端 `__ModuleLoader__.load` / `$mount` / `settings.section`）在 rc.3 类型层复核通过——`LlmError` constructor 自 rc.3 起只接受 `BuiltinLlmFailureCode`，本包自定义码改经 `LlmError.fromFailure` 原样抛出；未在 0.2.2-rc.3 上跑真实生成 |
 | 桌面契约核对 | DSH NEXT **2.0.23-next**（Core **0.2.2-rc.3**，Cordis **4.1.0**）：使用分发包的真实组件在独立进程验证 peer 范围、ACP / 代理路由互斥切换、Typert 贡献注册与卸载清理、自定义错误码及其状态和原因。未加载桌面 Profile |
 | 尚未覆盖 | 0.1.39 安装后的 Desktop GUI、真实 Google 授权、真实上游生成与图片识别、非 Windows 实机 |
