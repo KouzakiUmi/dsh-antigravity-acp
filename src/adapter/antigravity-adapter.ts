@@ -41,6 +41,7 @@ import { acpOrchestratorFamily, findModeSelector, findModelSelector, findThought
 import type { ModelSelector } from './model-catalog.js'
 import { applyModelSettings, modelDisplayName, modelSettingFor, normalizeModelSettings, resolveModelTarget } from './model-settings.js'
 import type { ModelSetting } from './model-settings.js'
+import { auditedAcpContextWindow } from './model-capacity.js'
 import { fitToolCatalogBudget } from './tool-catalog.js'
 import { buildPromptDeltaWithImages, buildPromptWithImages, buildToolResultContent } from './image-content.js'
 import type { ImageReader } from './image-content.js'
@@ -699,13 +700,13 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     const folded = await this.#foldCatalog(_provider)
     const orch = this.#orchestratorSettingsSnapshot()
     const observedFamilies = await this.#observedAcpFamilies(_provider)
-    const orchContextWindow = this.#orchestratorContextWindow(orch)
+    const orchContext = this.#orchestratorContextWindow(orch)
     const orchModel = synthesizeAcpOrchestratorModel({
       provider: _provider,
       settings: orch,
       observedFamilies,
       ...(this.#inputModalities() === undefined ? {} : { inputModalities: this.#inputModalities() }),
-      ...(orchContextWindow === undefined ? {} : { contextWindow: orchContextWindow }),
+      ...(orchContext === undefined ? {} : { contextWindow: orchContext.contextWindow }),
     })
     const candidates = orchModel === undefined
       ? folded.models
@@ -720,9 +721,17 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     const models = applyModelSettings(this.#modelSettingsSnapshot(), visible)
     return [
       ...models.map((model) => {
+        // 实测容量优先；未实测时用审计参考值（issue #17），来源随目录行下发，
+        // 设置页据此区分「上游容量」与「审计参考」。配置了官方 ID 映射时，
+        // 容量按映射目标取值（映射优先于家族路由，AGENTS.md 契约）。
+        const mappedTarget = model.id === ORCHESTRATOR_MODEL_ID ? undefined : modelSettingFor(this.#modelSettingsSnapshot(), model.id).target
+        const observedWindow = model.id === ORCHESTRATOR_MODEL_ID ? undefined : this.#observedContextWindow(model.id, mappedTarget)
         const contextWindow = model.id === ORCHESTRATOR_MODEL_ID
-          ? orchContextWindow
-          : this.#contextWindows.get(model.id)
+          ? orchContext?.contextWindow
+          : observedWindow ?? auditedAcpContextWindow(mappedTarget ?? model.id)
+        const contextWindowSource = model.id === ORCHESTRATOR_MODEL_ID
+          ? orchContext?.source
+          : contextWindow === undefined ? undefined : observedWindow !== undefined ? 'observed' : 'audited'
         return {
           provider: _provider,
           id: model.id,
@@ -730,6 +739,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
           ...(model.description === undefined ? {} : { description: model.description }),
           ...(this.#inputModalities() === undefined ? {} : { inputModalities: this.#inputModalities() }),
           ...(contextWindow === undefined ? {} : { contextWindow }),
+          ...(contextWindowSource === undefined ? {} : { contextWindowSource }),
         }
       }),
     ]
@@ -750,11 +760,51 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     return new Set(folded.models.map((model) => model.id))
   }
 
-  #orchestratorContextWindow(orch: OrchestratorSettings): number | undefined {
-    const plannerWindow = this.#contextWindows.get(acpOrchestratorFamily(orch.plannerModel))
-    const executorWindow = this.#contextWindows.get(acpOrchestratorFamily(orch.executorModel))
+  /** 编排容量取 planner / executor 的较小值；实测优先，未实测用审计参考（issue #17）。 */
+  #orchestratorContextWindow(orch: OrchestratorSettings): { contextWindow: number; source: 'observed' | 'audited' } | undefined {
+    const plannerFamily = acpOrchestratorFamily(orch.plannerModel)
+    const executorFamily = acpOrchestratorFamily(orch.executorModel)
+    // planner 会话直接写家族档位、不经用户映射；executor 走常规路由，映射优先。
+    const executorTarget = modelSettingFor(this.#modelSettingsSnapshot(), executorFamily).target
+    const plannerObserved = this.#observedContextWindow(plannerFamily, undefined)
+    const executorObserved = this.#observedContextWindow(executorFamily, executorTarget)
+    const plannerWindow = plannerObserved ?? auditedAcpContextWindow(plannerFamily)
+    const executorWindow = executorObserved ?? auditedAcpContextWindow(executorTarget ?? executorFamily)
     if (plannerWindow === undefined || executorWindow === undefined) return undefined
-    return Math.min(plannerWindow, executorWindow)
+    return {
+      contextWindow: Math.min(plannerWindow, executorWindow),
+      source: plannerObserved !== undefined && executorObserved !== undefined ? 'observed' : 'audited',
+    }
+  }
+
+  /**
+   * 实测容量查找：精确路由键 → 映射目标（及其家族键）→ 本路由的家族键。
+   * 家族键回退仅在该家族路由**没有跨家族映射**时生效：跨家族映射下家族键
+   * 上的观测描述的是映射目标，不是未映射的固定档位（Codex 审查 P2）。
+   * 映射目标的家族键同样受此守卫：链式映射（A→B、B→C）下 B 家族键的观测
+   * 描述 C，而 A 路由实际发送字面 B 档位，不递归套用 B 的映射。
+   */
+  #observedContextWindow(model: string, target: string | undefined): number | undefined {
+    const exact = this.#contextWindows.get(model)
+    if (exact !== undefined) return exact
+    const settings = this.#modelSettingsSnapshot()
+    const crossMapped = (family: string): boolean => {
+      const familyTarget = modelSettingFor(settings, family).target
+      return familyTarget !== undefined && modelFamilyId(familyTarget) !== family
+    }
+    if (target !== undefined) {
+      const targetFamily = modelFamilyId(target)
+      if (!crossMapped(targetFamily)) {
+        const byTarget = this.#contextWindows.get(target) ?? this.#contextWindows.get(targetFamily)
+        if (byTarget !== undefined) return byTarget
+      }
+    }
+    const family = modelFamilyId(model)
+    if (family !== model && !crossMapped(family)) {
+      const byFamily = this.#contextWindows.get(family)
+      if (byFamily !== undefined) return byFamily
+    }
+    return undefined
   }
 
   /**
@@ -868,13 +918,13 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       const orch = this.#orchestratorSettingsSnapshot()
       const observedFamilies = await withAbort(this.#observedAcpFamilies(provider), signal)
       throwIfAborted(signal)
-      const contextWindow = this.#orchestratorContextWindow(orch)
+      const orchContext = this.#orchestratorContextWindow(orch)
       const synthesized = synthesizeAcpOrchestratorModel({
         provider,
         settings: orch,
         observedFamilies,
         ...(this.#inputModalities() === undefined ? {} : { inputModalities: this.#inputModalities() }),
-        ...(contextWindow === undefined ? {} : { contextWindow }),
+        ...(orchContext === undefined ? {} : { contextWindow: orchContext.contextWindow }),
       })
       if (synthesized === undefined) {
         throw llmError('编排模式的 planner/executor 模型不在当前目录', AGY_ADAPTER_ERROR.INVALID_ORCHESTRATOR_MODEL)
@@ -896,7 +946,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         id: ORCHESTRATOR_MODEL_ID,
         name: displayName,
         ...(this.#inputModalities() === undefined ? {} : { inputModalities: this.#inputModalities() }),
-        ...(contextWindow === undefined ? {} : { context: { contextWindow } }),
+        ...(orchContext === undefined ? {} : { context: { contextWindow: orchContext.contextWindow } }),
         reasoning: {
           efforts: exposedEfforts.map((effort) => ({
             id: ReasoningEffortId(effort),
@@ -916,9 +966,13 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     // 显示名覆盖对已知与未知路由键都生效：用户在设置页改了名字，选择器与
     // 会话标题都要一致，不能只在 listModels 里生效。
     const displayName = modelDisplayName(this.#modelSettingsSnapshot(), model, known?.name ?? model)
-    // 上下文容量只在**实测**过（usage_update.size）或缓存过时才声明；官方目录
-    // 不报告容量，绝不填猜测值。缺省时不带 context，压缩引擎按未知处理。
-    const contextWindow = this.#contextWindows.get(model)
+    // 上下文容量：实测（usage_update.size / 磁盘缓存）优先，按路由键 / 映射目标 /
+    // 家族键查找；未实测时用审计参考值（model-capacity.ts），且按映射目标取值——
+    // 映射才是实际上游模型（AGENTS.md 映射优先契约）。宿主压缩引擎对无容量路由
+    // 在模型切换 / 溢出恢复时直接报错（issue #17）；未知家族仍省略 context，
+    // 绝不填猜测值。
+    const mappedTarget = modelSettingFor(this.#modelSettingsSnapshot(), model).target
+    const contextWindow = this.#observedContextWindow(model, mappedTarget) ?? auditedAcpContextWindow(mappedTarget ?? model)
     // 没有档位变体的模型必须省略 reasoning（宿主拒绝空 efforts）。
     const reasoning = this.#reasoningInfo(model, tiers)
     return {
@@ -2248,11 +2302,21 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   /** 把当前目录（含实测上下文容量）落盘；写失败不影响功能。 */
   #persistCatalog(): void {
     if (!this.#saveCatalog || this.#catalog.length === 0) return
+    const settings = this.#modelSettingsSnapshot()
+    // 家族级守卫与运行时查找（#observedContextWindow）同口径：家族键上的
+    // 观测由家族路由写入、描述的是映射目标；档位自身没有观测时，只要其家族
+    // 有跨家族映射，就不能用家族键兜底（issue #17 Codex 审查 F1）。
+    const familyCrossMapped = (family: string): boolean => {
+      const familyTarget = modelSettingFor(settings, family).target
+      return familyTarget !== undefined && modelFamilyId(familyTarget) !== family
+    }
     const payload = this.#catalog.map((model) => {
       // `usage_update` 归属的是 DSH 路由键（家族 id），而目录条目是 ACP 的档位
-      // id；按家族 id 兜底查询，否则折叠目录永远落盘不到 contextWindow。
+      // id；对**没有跨家族映射**的档位，按家族 id 兜底查询，否则折叠目录永远落盘
+      // 不到 contextWindow。
+      const family = modelFamilyId(model.id)
       const contextWindow = this.#contextWindows.get(model.id)
-        ?? this.#contextWindows.get(modelFamilyId(model.id))
+        ?? (familyCrossMapped(family) ? undefined : this.#contextWindows.get(family))
       return {
         id: model.id,
         name: model.name,

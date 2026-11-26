@@ -78,10 +78,11 @@ export class SettingsControl {
     try {
       const models = await this.options.models(force)
       if (source !== this.options.modelSource?.()) return this.models(force)
-      this.rows = models.map(({ id, name, inputModalities, contextWindow, maxOutputTokens }) => ({ id, name,
+      this.rows = models.map(({ id, name, inputModalities, contextWindow, maxOutputTokens, contextWindowSource }) => ({ id, name,
         ...(inputModalities ? { inputModalities } : {}),
         ...(contextWindow === undefined ? {} : { contextWindow }),
         ...(maxOutputTokens === undefined ? {} : { maxOutputTokens }),
+        ...(contextWindowSource === undefined ? {} : { contextWindowSource }),
       }))
       return { status: 'ok', models: this.rows }
     } catch (error) {

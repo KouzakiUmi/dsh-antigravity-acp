@@ -526,6 +526,18 @@ describe('settings card with real React state and effects', () => {
     expect(service.mutate).not.toHaveBeenCalled()
   })
 
+  it('审计参考容量在设置页标注来源，不与实测容量混淆（issue #17）', async () => {
+    const service = transport(document())
+    const models = catalog()
+    const control = controlWith({ ...models, models: models.models.map((row, i) => i === 0
+      ? { ...row, contextWindow: 1048576, contextWindowSource: 'audited' } : row) })
+    const { renderer } = await mount(service.remote, control)
+    const text = renderedText(renderer)
+    expect(text).toContain('审计参考，实测后更新')
+    expect(text).not.toContain('（上游容量）')
+    expect(service.mutate).not.toHaveBeenCalled()
+  })
+
   it('全部模型被隐藏时提示 provider 会从选择器消失，重新启用后提示消失', async () => {
     const service = transport(document({ modelOverrides: { 'gemini-3-pro': { enabled: false }, 'claude-sonnet-5-5': { enabled: false } } }))
     const { renderer } = await mount(service.remote, controlWith())

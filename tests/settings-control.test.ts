@@ -44,6 +44,22 @@ describe('设置页账户与目录控制', () => {
     await control.dispose()
   })
 
+  it('模型容量来源随目录行透传，供设置页区分实测与审计参考（issue #17）', async () => {
+    const control = new SettingsControl({
+      connect: async () => {},
+      models: async () => [
+        { id: 'gemini-4-neon', name: 'Gemini 4 Neon', contextWindow: 1_048_576, contextWindowSource: 'audited' as const },
+        { id: 'gemini-4-argon', name: 'Gemini 4 Argon', contextWindow: 1_000_000, contextWindowSource: 'observed' as const },
+        { id: 'unknown-model', name: 'Unknown' },
+      ],
+    })
+    const rows = (await control.models()).models
+    expect(rows[0]).toMatchObject({ contextWindow: 1_048_576, contextWindowSource: 'audited' })
+    expect(rows[1]).toMatchObject({ contextWindow: 1_000_000, contextWindowSource: 'observed' })
+    expect(rows[2]).not.toHaveProperty('contextWindowSource')
+    await control.dispose()
+  })
+
   it('预热调用共享连接入口，状态读取可带实时快照且不会重新启动', async () => {
     const gate = deferred()
     const warmup = vi.fn(async () => gate.promise)
