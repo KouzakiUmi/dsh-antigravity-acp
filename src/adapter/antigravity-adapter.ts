@@ -2276,11 +2276,21 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   /** 把当前目录（含实测上下文容量）落盘；写失败不影响功能。 */
   #persistCatalog(): void {
     if (!this.#saveCatalog || this.#catalog.length === 0) return
+    const settings = this.#modelSettingsSnapshot()
+    // 家族级守卫与运行时查找（#observedContextWindow）同口径：家族键上的
+    // 观测由家族路由写入、描述的是映射目标；档位自身没有观测时，只要其家族
+    // 有跨家族映射，就不能用家族键兜底（issue #17 Codex 审查 F1）。
+    const familyCrossMapped = (family: string): boolean => {
+      const familyTarget = modelSettingFor(settings, family).target
+      return familyTarget !== undefined && modelFamilyId(familyTarget) !== family
+    }
     const payload = this.#catalog.map((model) => {
       // `usage_update` 归属的是 DSH 路由键（家族 id），而目录条目是 ACP 的档位
-      // id；按家族 id 兜底查询，否则折叠目录永远落盘不到 contextWindow。
+      // id；对**没有跨家族映射**的档位，按家族 id 兜底查询，否则折叠目录永远落盘
+      // 不到 contextWindow。
+      const family = modelFamilyId(model.id)
       const contextWindow = this.#contextWindows.get(model.id)
-        ?? this.#contextWindows.get(modelFamilyId(model.id))
+        ?? (familyCrossMapped(family) ? undefined : this.#contextWindows.get(family))
       return {
         id: model.id,
         name: model.name,

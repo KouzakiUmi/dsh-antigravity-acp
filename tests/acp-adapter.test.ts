@@ -100,8 +100,8 @@ function createHarness(
     holdRecycle?: Promise<void>
     holdRecycleAttempts?: number[]
     onRecycleAttempt?: (count: number) => void
-    loadCachedCatalog?: () => Promise<{ id: string; name: string; description?: string }[] | undefined>
-    saveCatalog?: (models: readonly { id: string; name: string; description?: string }[]) => Promise<void> | void
+    loadCachedCatalog?: () => Promise<{ id: string; name: string; description?: string; contextWindow?: number }[] | undefined>
+    saveCatalog?: (models: readonly { id: string; name: string; description?: string; contextWindow?: number }[]) => Promise<void> | void
     loadCliCatalog?: () => Promise<readonly { id: string; name: string }[]>
     readImage?: ImageReader
     canReadImages?: () => boolean
@@ -3183,5 +3183,52 @@ describe('ACP 会话复用与跨进程恢复', () => {
     await waitForRequest(harness.agent, 'session/new')
     await replyWithText(harness, '重建回答')
     expect(visibleText(await streaming)).toBe('重建回答')
+  })
+
+  it('跨家族映射的观测不泄漏给未映射档位（save→load 往返，Codex 审查 F1）', async () => {
+    const tiered: SessionConfigOption[] = [{
+      id: 'model',
+      type: 'select',
+      name: 'Model',
+      category: 'model',
+      currentValue: 'gpt-oss-120b-medium',
+      options: [{ value: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B' }],
+    }]
+    // 每次落盘都是整份目录快照；重启只读最后一份。
+    let latestPayload: Array<{ id: string; contextWindow?: number }> = []
+    const harness = createHarness({
+      configOptions: tiered,
+      readSettings: () => ({ modelOverrides: { 'gpt-oss-120b': { target: 'gemini-4-neon-medium' } } }),
+      saveCatalog: (models) => { latestPayload = models.map((m) => ({ ...m })) },
+      reuseSessions: false,
+    })
+    // 第一轮：实测 neon 的观测（通过 gpt-oss-120b 路由触发），但 gpt-oss-120b-medium 是未映射档位。
+    const streaming = collect(harness.adapter.stream(baseOptions({ model: 'gpt-oss-120b' })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    await harness.agent.notify('session/update', {
+      sessionId: SESSION_1,
+      update: { sessionUpdate: 'usage_update', used: 10, size: 1_048_576 },
+    })
+    await harness.agent.notify('session/update', {
+      sessionId: SESSION_1,
+      update: { sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: '好' } },
+    })
+    await harness.agent.reply('session/prompt', { stopReason: 'end_turn' })
+    await streaming
+    // usage_update 只写 DSH 路由键 gpt-oss-120b（家族键）；目录行是档位 id
+    // gpt-oss-120b-medium。该档位所属家族有跨家族映射（→ neon），落盘不得用
+    // 家族键兜底，否则重启后未映射档位继承 neon 的观测（F1）。
+    expect(latestPayload.map((row) => row.id)).toEqual(['gpt-oss-120b-medium'])
+    const mediumRow = latestPayload.find((row) => row.id === 'gpt-oss-120b-medium')
+    expect(mediumRow?.contextWindow).toBeUndefined()
+    // 第二轮模拟重启：重新创建 adapter 并 loadCachedCatalog。
+    const secondHarness = createHarness({
+      configOptions: tiered,
+      readSettings: () => ({ modelOverrides: { 'gpt-oss-120b': { target: 'gemini-4-neon-medium' } } }),
+      loadCachedCatalog: async () => latestPayload.map((m) => ({ id: m.id, name: 'GPT-OSS 120B', ...(m.contextWindow ? { contextWindow: m.contextWindow } : {}) })),
+      reuseSessions: false,
+    })
+    // 读取缓存后，gpt-oss-120b-medium 应仍用审计值 131072，而不是 neon 的 1048576。
+    expect((await secondHarness.adapter.resolveModel(AGY_PROVIDER_ID, 'gpt-oss-120b-medium')).context).toEqual({ contextWindow: 131_072 })
   })
 })
