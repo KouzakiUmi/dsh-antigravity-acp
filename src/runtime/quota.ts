@@ -156,6 +156,11 @@ export interface QuotaDeps {
   tokenUrl?: string
   /** 单次 HTTP 请求上限（毫秒）；缺省 {@link QUOTA_HTTP_TIMEOUT_MS}。 */
   httpTimeoutMs?: number
+  /**
+   * macOS 钥匙串只读兜底（issue #23，agy 1.5.17 起 CLI 登录态的落点）：
+   * 登录文件都不可用时才调用。由宿主接线（quota-remote）注入；测试注入替身。
+   */
+  readKeychainToken?: () => Promise<QuotaTokenState | undefined>
 }
 
 function defaultReadFile(path: string): Promise<string> {
@@ -489,10 +494,20 @@ async function fetchQuotaSnapshotUncached(deps: QuotaDeps): Promise<QuotaSnapsho
         break
       }
     }
+    if (!state && deps.readKeychainToken) {
+      // 文件来源全部缺席：macOS 上 agy 1.5.17 起登录态在钥匙串里（issue #23）。
+      try {
+        const candidate = await deps.readKeychainToken()
+        if (candidate && (candidate.accessToken || candidate.refreshToken)) {
+          state = candidate
+          readable = true
+        }
+      } catch { /* 钥匙串不可读时按既有 token-missing 降级 */ }
+    }
     if (!state) {
       return readable
         ? failure(stamp(), 'token-missing', 'Antigravity 登录态里没有可用 token，请先在 Antigravity 登录')
-        : failure(stamp(), 'token-missing', '读不到官方 CLI 或 ACP 登录态（antigravity-oauth-token / acp_token.json）')
+        : failure(stamp(), 'token-missing', '读不到官方 CLI 或 ACP 登录态（antigravity-oauth-token / acp_token.json / macOS 钥匙串）')
     }
     if (!isTokenUsable(state, now())) {
       const client = embeddedClient ?? await resolveOAuthClient(deps)

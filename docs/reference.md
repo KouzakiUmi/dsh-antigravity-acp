@@ -113,9 +113,11 @@ ACP fs / terminal 与未知原生权限请求始终拒绝并记录，但不因�
 
 插件在 ACP 模式使用本机官方 ACP 的当前登录态；设置页没有保存多个 Google 账号或按会话选账号的入口。
 
-优先复用本机已有 ACP 凭据。需要导入时，只读 `~/.gemini/antigravity-cli/antigravity-oauth-token`，换发后写入官方 ACP 使用的 `~/.gemini/antigravity-acp/acp_token.json`，并在 `settings.json` 缺少认证方式时合并 `auth.type = oauth-personal`。保留既有设置与用户指定的其它认证方式，不覆盖无法解析的设置文件。
+优先复用本机已有 ACP 凭据。需要导入时，按顺序只读官方 CLI 登录态：`~/.gemini/antigravity-cli/antigravity-oauth-token` → macOS 钥匙串（agy 1.5.17 起在 macOS 的落点，`service=gemini, account=antigravity`，值带 `go-keyring-base64:` 前缀，经 `security find-generic-password` 只读取出）→ 旧版 Gemini CLI 的 `~/.gemini/oauth_creds.json` 平铺形态。换发后写入官方 ACP 使用的 `~/.gemini/antigravity-acp/acp_token.json`，并在 `settings.json` 缺少认证方式时合并 `auth.type = oauth-personal`。既有 refresh_token 换发失败（如被吊销）时依次改用上述候选重试。保留既有设置与用户指定的其它认证方式，不覆盖无法解析的设置文件。
 
-这意味着插件**可能读写本机认证材料**，不是“完全不碰凭据”。CLI 源文件不由插件改写；有可用登录态时跳过浏览器授权。没有可用登录态且本次允许交互时才退回官方 OAuth。预热与非交互目录刷新不会暗中弹登录页。CLI 登录不会由 ACP 登录反向补齐。
+官方 ACP server（1.5.2）在 macOS 上探测到钥匙串可用时会把钥匙串当 primary 凭据后端、忽略 `acp_token.json`；插件启动它时注入 `AGY_ACP_FORCE_FILE_STORAGE=1` 强制文件后端，凭据始终经 `acp_token.json` 生效，钥匙串条目不被读取或改写。首个 `session/new` 使用 `handshakeTimeoutMs` 档（官方冷启动收尾实测可达约 36 秒，超过普通请求默认 30 秒），建过会话后回到 `requestTimeoutMs` 档。
+
+这意味着插件**可能读写本机认证材料**，不是“完全不碰凭据”。CLI 源文件与钥匙串条目只读；有可用登录态时跳过浏览器授权。没有可用登录态且本次允许交互时才退回官方 OAuth。预热与非交互目录刷新不会暗中弹登录页。CLI 登录不会由 ACP 登录反向补齐。
 
 凭据文件使用临时文件与重命名写入，POSIX 请求 `0600`；Windows 依赖目录 ACL，不宣称文件加密或仅靠 mode 就完成隔离。OAuth client 元数据来自显式环境变量或本机官方分发物，这是兼容性取数路径，不保证官方内部格式永远稳定。
 
@@ -164,7 +166,7 @@ ACP 目录发现沿用排队、握手与会话请求各阶段的超时，不再�
 
 `agyQuota.read` 只读快照，不等待在途刷新；`agyQuota.refresh` 与宿主定时拉取合并同一账户的在途操作。每种模式最多保存一份快照，只有身份匹配才恢复磁盘数据。CLI 额度 / 余额命令各有 45 秒超时，HTTP 回退的换发与 Cloud Code Assist 请求各有 20 秒超时。套餐额度与 Credits 分别保留有效值、更新时间与错误；查询失败保留同账户的旧值，上游明确无余额信息时撤下旧余额。Credits 校验成功状态、命令与非负安全整数金额；真实零显示 0，缺字段显示未知。不请求购买、不自动开启 `useG1Credits`。
 
-HTTP 额度回退只读 CLI 登录材料，换发 access token 仅留内存，不写回 CLI 文件。所有 CLI 进程经宿主受管通道启动。日志与错误对 OAuth URL、Bearer、代理密码和结构化 token 脱敏，不回显正文或工具参数值。
+HTTP 额度回退按「CLI 登录文件 → `acp_token.json` → macOS 钥匙串」只读登录材料（钥匙串仅 darwin 且文件来源全部缺席时尝试），换发 access token 仅留内存，不写回 CLI 文件或钥匙串。快照身份（`cliQuotaIdentity`）与取数用同一条来源链。所有 CLI 进程（含 `security` 钥匙串读取）经宿主受管通道启动。日志与错误对 OAuth URL、Bearer、代理密码和结构化 token 脱敏，不回显正文或工具参数值。
 
 **历史实测，不是 0.1.24 GUI 验收：** 2026-10-16 本机 CLI `/usage` 返回三个组的 weekly / 5h 窗口；同账户 HTTP 回退曾返回产品授权 403。2026-10-22 既有 CLI `/credits` 记录为成功、零模型回合 / 零用量。当前任务未重跑这些在线调用；不能保证所有旧 CLI 支持相同 JSON 形态。
 

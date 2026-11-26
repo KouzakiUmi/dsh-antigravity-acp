@@ -27,6 +27,7 @@ const ACP_DIR = join(HOME, '.gemini', 'antigravity-acp')
 const TOKEN_PATH = join(ACP_DIR, ACP_TOKEN_FILENAME)
 const SETTINGS_PATH = join(ACP_DIR, ACP_SETTINGS_FILENAME)
 const CLI_TOKEN_PATH = join(HOME, '.gemini', 'antigravity-cli', 'antigravity-oauth-token')
+const LEGACY_TOKEN_PATH = join(HOME, '.gemini', 'oauth_creds.json')
 
 const CLIENT: OAuthClientMeta = { clientId: '1234-abc.apps.googleusercontent.com', clientSecret: 'GOCSPX-secret' }
 const REFRESHED: QuotaTokenState = {
@@ -162,7 +163,7 @@ describe('ensureAcpCredentials', () => {
     expect(seen?.refreshToken).toBe('1//refresh-token')
   })
 
-  it('既有 token 仍新鲜时什么都不写（幂等，避免每次启动都打网络）', async () => {
+  it('既有 token 仍新鲜时什么都不写、也不读钥匙串（幂等，避免每次启动都打网络）', async () => {
     const fs = createFs({
       [TOKEN_PATH]: JSON.stringify(EXISTING_DOC),
       [SETTINGS_PATH]: JSON.stringify({ auth: { type: ACP_AUTH_TYPE } }),
@@ -171,6 +172,9 @@ describe('ensureAcpCredentials', () => {
       makeDeps(fs, {
         refresh: async () => {
           throw new Error('不该被调用')
+        },
+        readKeychainToken: async () => {
+          throw new Error('不该被读取')
         },
       }),
     )
@@ -274,5 +278,93 @@ describe('ensureAcpCredentials', () => {
     expect(result.note ?? '').not.toContain('ya29.')
     expect(result.note ?? '').not.toContain(EXISTING_DOC.refresh_token)
     expect(result.note).toContain('***')
+  })
+})
+
+describe('ensureAcpCredentials：macOS 钥匙串与旧版文件兜底（issue #23）', () => {
+  const KEYCHAIN_STATE: QuotaTokenState = {
+    accessToken: 'ya29.keychain-stale',
+    refreshToken: '1//from-keychain',
+    expiry: '2026-10-16T10:00:00.000Z',
+  }
+
+  it('CLI 文件缺失时用钥匙串登录态换发并落盘 acp_token.json', async () => {
+    const fs = createFs()
+    const result = await ensureAcpCredentials(makeDeps(fs, {
+      readKeychainToken: async () => KEYCHAIN_STATE,
+      refresh: async (state) => ({ ...REFRESHED, refreshToken: state.refreshToken }),
+    }))
+    expect(result).toMatchObject({ ready: true, status: 'imported', authType: ACP_AUTH_TYPE })
+    expect(JSON.parse(fs.files.get(TOKEN_PATH)!)).toMatchObject({ refresh_token: '1//from-keychain', token: 'ya29.fresh-access-token' })
+    // 兜底来源全部只读：不写 CLI 文件，也不写旧版文件。
+    expect(fs.writes).not.toContain(CLI_TOKEN_PATH)
+    expect(fs.writes).not.toContain(LEGACY_TOKEN_PATH)
+  })
+
+  it('CLI 文件存在但缺 refresh_token 时仍兜底钥匙串（文件优先只认可用登录态）', async () => {
+    const fs = createFs({ [CLI_TOKEN_PATH]: JSON.stringify({ token: { access_token: 'ya29.no-refresh' } }) })
+    const result = await ensureAcpCredentials(makeDeps(fs, {
+      readKeychainToken: async () => KEYCHAIN_STATE,
+      refresh: async (state) => ({ ...REFRESHED, refreshToken: state.refreshToken }),
+    }))
+    expect(result).toMatchObject({ ready: true, status: 'imported' })
+    expect(JSON.parse(fs.files.get(TOKEN_PATH)!)).toMatchObject({ refresh_token: '1//from-keychain' })
+  })
+
+  it('文件与钥匙串 refresh_token 都换发失败时，按候选链依次尝试且报失败原因', async () => {
+    const fs = createFs({ [TOKEN_PATH]: JSON.stringify(EXISTING_DOC), [CLI_TOKEN_PATH]: JSON.stringify({ token: { refresh_token: '1//from-cli' } }) })
+    const tried: string[] = []
+    const result = await ensureAcpCredentials(makeDeps(fs, {
+      readKeychainToken: async () => KEYCHAIN_STATE,
+      refresh: async (state) => {
+        tried.push(state.refreshToken!)
+        throw new Error('invalid_grant')
+      },
+    }))
+    // 磁盘上还有既有可用凭据：按既有降级语义仍就绪，但失败原因保留。
+    expect(result).toMatchObject({ ready: true, status: 'existing' })
+    expect(result.note).toContain('invalid_grant')
+    expect(tried).toEqual(['1//refresh-token', '1//from-cli', '1//from-keychain'])
+  })
+
+  it('既有 refresh_token 被吊销时改用钥匙串当前登录态（agy 续期只更新钥匙串）', async () => {
+    const fs = createFs({ [TOKEN_PATH]: JSON.stringify(EXISTING_DOC) })
+    const result = await ensureAcpCredentials(makeDeps(fs, {
+      readKeychainToken: async () => KEYCHAIN_STATE,
+      refresh: async (state) => {
+        if (state.refreshToken === '1//from-keychain') return { ...REFRESHED, refreshToken: '1//from-keychain' }
+        throw new Error('invalid_grant')
+      },
+    }))
+    expect(result).toMatchObject({ ready: true, status: 'imported' })
+    expect(JSON.parse(fs.files.get(TOKEN_PATH)!)).toMatchObject({ refresh_token: '1//from-keychain' })
+  })
+
+  it('钥匙串缺席时兜底旧 Gemini CLI 平铺文件（expiry_date 换算成 ISO）', async () => {
+    const fs = createFs({ [LEGACY_TOKEN_PATH]: JSON.stringify({ access_token: 'ya29.legacy', refresh_token: '1//legacy', expiry_date: 1760600000000 }) })
+    const seen: QuotaTokenState[] = []
+    const result = await ensureAcpCredentials(makeDeps(fs, {
+      refresh: async (state) => { seen.push(state); return { ...REFRESHED, refreshToken: state.refreshToken } },
+    }))
+    expect(result).toMatchObject({ ready: true, status: 'imported' })
+    expect(seen[0]!.refreshToken).toBe('1//legacy')
+    expect(Date.parse(seen[0]!.expiry!)).toBe(1760600000000)
+    expect(fs.writes).not.toContain(LEGACY_TOKEN_PATH)
+  })
+
+  it('全部来源缺席时保持降级文案并列出钥匙串', async () => {
+    const fs = createFs()
+    const result = await ensureAcpCredentials(makeDeps(fs, { readKeychainToken: async () => undefined }))
+    expect(result).toMatchObject({ ready: false, status: 'unavailable' })
+    expect(result.note).toContain('钥匙串')
+    expect(fs.files.has(TOKEN_PATH)).toBe(false)
+  })
+
+  it('钥匙串读取抛错不外泄，按来源缺席降级', async () => {
+    const fs = createFs()
+    const result = await ensureAcpCredentials(makeDeps(fs, {
+      readKeychainToken: async () => { throw new Error('keychain denied') },
+    }))
+    expect(result).toMatchObject({ ready: false, status: 'unavailable' })
   })
 })

@@ -208,6 +208,8 @@ export class AgentLink {
   #pumpPromise?: Promise<void>
   #initialized = false
   #initializeResponse?: InitializeResponse
+  /** 本链路是否已成功建过会话；首个 session/new 走握手档超时（见 newSession）。 */
+  #sessionCreated = false
   #boundSessionId: string | undefined
   /** 出站单例 writer：并发 #write 复用同一个 writer，避免重复 getWriter 撞锁。 */
   #writer?: WritableStreamDefaultWriter<AnyMessage>
@@ -555,10 +557,15 @@ export class AgentLink {
     }
     let response: NewSessionResponse
     try {
-      response = await this.request<NewSessionResponse>('session/new', request, options)
+      // 首个 session/new 承担官方进程的冷启动收尾（Python 解压后的 loadCodeAssist、
+      // 配额刷新，实测 1.5.2 约 36 秒，issue #23），默认 30s 会把正常启动判死；
+      // 与 initialize 同走握手档超时。调用方显式给的 timeoutMs（如 planner 预算）优先。
+      const timeoutMs = options?.timeoutMs ?? (this.#sessionCreated ? undefined : this.#handshakeTimeoutMs)
+      response = await this.request<NewSessionResponse>('session/new', request, { ...options, ...(timeoutMs === undefined ? {} : { timeoutMs }) })
     } catch (error) {
       throw this.#withDiagnostics(error, options?.signal)
     }
+    this.#sessionCreated = true
     this.#boundSessionId = response.sessionId
     return response
   }
@@ -731,6 +738,11 @@ export function officialAgentEnv(options: {
     TEMP: options.tmpDir,
     TMP: options.tmpDir,
     TMPDIR: options.tmpDir,
+    // 官方 server（1.5.2）在 macOS 上探测到钥匙串可用就把它当 primary backend，
+    // 只读 `gemini/antigravity-acp` 条目而无视本插件写好的 acp_token.json，
+    // 缺条目时拉起浏览器登录并把 session/new 挂死（issue #23）。强制文件后端
+    // 与插件的凭据准备机制自洽：不碰钥匙串、无 ACL 弹窗、每次预热刷新即生效。
+    AGY_ACP_FORCE_FILE_STORAGE: '1',
   }
   const forward = [
     'USERPROFILE',
