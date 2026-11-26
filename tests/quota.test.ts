@@ -391,6 +391,50 @@ describe('fetchQuotaSnapshot 链路', () => {
     expect(calls).toHaveLength(0)
   })
 
+  it('登录文件都缺席时用 macOS 钥匙串登录态取数（issue #23）', async () => {
+    const reads: string[] = []
+    const { fetchImpl, calls } = fakeFetch(quotaRoutes())
+    const snapshot = await fetchQuotaSnapshot({}, {
+      homedir: () => '/home/test',
+      readFileImpl: async (path: string) => { reads.push(path); throw new Error('ENOENT') },
+      readKeychainToken: async () => ({ accessToken: ACCESS_TOKEN, refreshToken: REFRESH_TOKEN, expiry: '2099-01-01T00:00:00Z' }),
+      fetchImpl,
+      env: {},
+      binaryPaths: [],
+      now: () => Date.parse('2026-10-16T00:00:00Z'),
+    })
+    expect(snapshot.status).toBe('ok')
+    expect(at(calls, 0).authorization).toBe(`Bearer ${ACCESS_TOKEN}`)
+    // 文件来源仍先尝试（文件优先，钥匙串只兜底）。
+    expect(reads.some((path) => path.endsWith('antigravity-oauth-token'))).toBe(true)
+  })
+
+  it('文件可用时不读钥匙串；钥匙串抛错按既有 token-missing 降级', async () => {
+    const file = memoryTokenFile({ token: { access_token: ACCESS_TOKEN, refresh_token: REFRESH_TOKEN, expiry: '2099-01-01T00:00:00Z' } })
+    const { fetchImpl } = fakeFetch(quotaRoutes())
+    const ok = await fetchQuotaSnapshot({}, {
+      ...file.deps,
+      fetchImpl,
+      env: {},
+      binaryPaths: [],
+      now: () => Date.parse('2026-10-16T00:00:00Z'),
+      readKeychainToken: async () => { throw new Error('不该被读取') },
+    })
+    expect(ok.status).toBe('ok')
+    const missing = memoryTokenFile({})
+    missing.deps.readFileImpl = async () => { throw new Error('ENOENT') }
+    const failed = await fetchQuotaSnapshot({}, {
+      ...missing.deps,
+      fetchImpl,
+      binaryPaths: [],
+      readKeychainToken: async () => { throw new Error('keychain denied') },
+    })
+    expect(failed.status).toBe('error')
+    expect(failed.error?.code).toBe('token-missing')
+    expect(failed.error?.message).toContain('钥匙串')
+    expect(failed.error?.message).not.toContain('keychain denied')
+  })
+
   it('过期且拿不到 OAuth client 元数据时报 refresh-unavailable（不编造 client）', async () => {
     const file = memoryTokenFile({ token: { ...validTokenFile, expiry: '2026-10-01T00:00:00Z' } })
     const { fetchImpl, calls } = fakeFetch(quotaRoutes())

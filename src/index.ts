@@ -39,6 +39,7 @@ import { createLiveProxiedFetch, createProxiedFetch } from './runtime/proxied-fe
 import type { ResolvedProxy } from './runtime/proxy-env.js'
 import { ensureAcpCredentials } from './runtime/credentials.js'
 import type { AcpCredentialResult } from './runtime/credentials.js'
+import { readCliKeychainToken } from './runtime/cli-login.js'
 import { describeLowIntegrity, isLowIntegrityTarget } from './runtime/integrity.js'
 import { describeAuthWait, redactSensitiveText } from './runtime/redact.js'
 import { readCachedCatalog, writeCachedCatalog } from './runtime/catalog-cache.js'
@@ -304,7 +305,7 @@ async function startAcpRuntime(
     // 传入 acpVersion：OAuth client 元数据要从对应版本的缓存二进制里提取。
     active.lifecycle?.startupPhase('credentials')
     const credentials = await (deps.ensureCredentials
-      ?? (() => ensureAcpCredentials({ acpVersion: config.acpVersion, cliPath: config.agyCliPath, fetchImpl: pluginFetch })))()
+      ?? (() => ensureAcpCredentials({ acpVersion: config.acpVersion, cliPath: config.agyCliPath, fetchImpl: pluginFetch, subprocess })))()
     startupSignal.throwIfAborted()
     if (!credentials.ready && deps.allowInteractiveAuth === false) {
       throw llmError('未找到可用的 ACP 登录态，请先使用“连接 / 登录 ACP”，然后再预热', 'AGY_AUTH_REQUIRED')
@@ -739,10 +740,15 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
   // 仅当设置显式开启 cliQuotaEnabled 时才 spawn `agy -p /usage` 与 `/credits`
   // （AI Credits 只能这样读）。取数只读，凭据不写回、不进日志。
   registerAgYQuotaRemote(ctx)
+  // macOS 钥匙串兜底（issue #23）：agy 1.5.17 起 CLI 登录态不再落文件，HTTP 回退
+  // 路径与快照身份都要能读到它。只在 darwin 上注入；读取经 ctx.subprocess，只读。
+  const readKeychainToken = process.platform === 'darwin'
+    ? () => readCliKeychainToken(ctx.subprocess)
+    : undefined
   ctx.plugin(AgYQuotaService, {
     control,
     // HTTP 回退路径要从对应版本的缓存二进制里提取 OAuth client 元数据。
-    deps: { cacheDir, acpVersion, cliPath: config.agyCliPath, fetchImpl: pluginFetch },
+    deps: { cacheDir, acpVersion, cliPath: config.agyCliPath, fetchImpl: pluginFetch, ...(readKeychainToken ? { readKeychainToken } : {}) },
     cliQuotaEnabled: () => config.cliQuotaEnabled === true,
     resolveCli: () => { const cliPath = findCli(); return cliPath ? { run: cliRun, cliPath } : undefined },
     // 额度取数跟随当前生成模式：代理模式用代理账户 + agy 线传输。

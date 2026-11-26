@@ -10,8 +10,10 @@ export const quotaIdentity = (...parts: string[]): string => createHash('sha256'
 const MAX_SNAPSHOT_BYTES = 512 * 1024
 
 /**
- * Identifies the credential the quota fetch will use (CLI token, else ACP token)
- * without refreshing it or persisting a token.
+ * Identifies the credential the quota fetch will use (CLI token, else ACP token,
+ * else the macOS keychain entry) without refreshing it or persisting a token.
+ * The order mirrors fetchQuotaSnapshot's source chain so identity and fetch
+ * never disagree about which account a snapshot belongs to (issue #23).
  */
 export async function cliQuotaIdentity(deps: QuotaDeps): Promise<string | undefined> {
   for (const subpath of QUOTA_TOKEN_SUBPATHS) {
@@ -22,6 +24,13 @@ export async function cliQuotaIdentity(deps: QuotaDeps): Promise<string | undefi
       const token = state.refreshToken ?? state.accessToken
       if (token) return quotaIdentity(token)
     } catch { /* try the next credential file */ }
+  }
+  if (deps.readKeychainToken) {
+    try {
+      const state = await deps.readKeychainToken()
+      const token = state?.refreshToken ?? state?.accessToken
+      if (token) return quotaIdentity(token)
+    } catch { /* keychain unavailable: no identifiable credential */ }
   }
   return undefined
 }

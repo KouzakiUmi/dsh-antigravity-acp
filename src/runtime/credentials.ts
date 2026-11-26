@@ -5,8 +5,10 @@
  *
  * 官方 server 自带的登录方式是浏览器 OAuth（ACP `authenticate` + 本机回调）。
  * 用户明确要求「不要拉起登录界面」，改用**已在本机登录过的官方 CLI 凭据**导入：
- * CLI 的登录态在 `~/.gemini/antigravity-cli/antigravity-oauth-token`（本模块只读，
- * 永不改写），换发一颗 access token 后落成 ACP server 认的 `acp_token.json`。
+ * CLI 的登录态在 `~/.gemini/antigravity-cli/antigravity-oauth-token`；agy 1.5.17
+ * 起 macOS 上迁进钥匙串（`gemini`/`antigravity`，issue #23），另有旧 Gemini CLI
+ * 的 `~/.gemini/oauth_creds.json` 平铺形态兜底。三个来源都**只读，永不改写**，
+ * 换发一颗 access token 后落成 ACP server 认的 `acp_token.json`。
  * 同时写好 `settings.json` 的 `auth.type = oauth-personal`，server 启动时即从该文件
  * 推断认证方式（实测日志：`Selected auth method 'oauth-personal' inferred from
  * settings.json`），**无需再发 `authenticate` 请求**——该请求在没有交互式浏览器时
@@ -20,7 +22,7 @@
  *
  * ## 红线
  *
- * - CLI 凭据文件**只读**，绝不写回；
+ * - CLI 凭据文件与 macOS 钥匙串**只读**，绝不写回；
  * - token 全文不进日志、不进错误消息；
  * - 不硬编码任何账号/项目标识：`project_id` 只从既有文件继承或由注入的解析器取得。
  */
@@ -28,14 +30,18 @@ import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { homedir as osHomedir } from 'node:os'
 import { join } from 'node:path'
+import type { SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import { parseTokenState, refreshAccessToken, resolveOAuthClient } from './quota.js'
 import type { OAuthClientMeta, QuotaTokenState } from './quota.js'
+import { parseLegacyGeminiToken, readCliKeychainToken } from './cli-login.js'
 import { redactSensitiveText } from './redact.js'
 
 /** 凭据目录（相对 home）。 */
 export const ACP_HOME_SUBPATH = ['.gemini', 'antigravity-acp'] as const
 /** CLI 登录态文件（只读来源）。 */
 export const CLI_TOKEN_SUBPATH = ['.gemini', 'antigravity-cli', 'antigravity-oauth-token'] as const
+/** 旧 Gemini CLI 登录态文件（平铺 access_token/refresh_token/expiry_date；只读兜底）。 */
+export const LEGACY_GEMINI_TOKEN_SUBPATH = ['.gemini', 'oauth_creds.json'] as const
 export const ACP_TOKEN_FILENAME = 'acp_token.json'
 export const ACP_SETTINGS_FILENAME = 'settings.json'
 export const ACP_TOKEN_URI = 'https://oauth2.googleapis.com/token'
@@ -163,6 +169,15 @@ export interface AcpCredentialDeps {
   resolveProjectId?: (accessToken: string) => Promise<string | undefined>
   /** 换发所用的 fetch（插件代理在 index.ts 装好）；缺省为全局 fetch。 */
   fetchImpl?: typeof fetch
+  /**
+   * macOS 钥匙串只读兜底（issue #23）：文件导入源缺 refresh_token 时启用。
+   * 缺省仅在 darwin 且注入 subprocess 时用 `security` 读取；测试注入替身。
+   */
+  readKeychainToken?: () => Promise<QuotaTokenState | undefined>
+  /** 宿主子进程服务；用于钥匙串读取（本模块不 import child_process）。 */
+  subprocess?: SubprocessRuntime
+  /** 平台判定（测试注入）；缺省 process.platform。 */
+  platform?: NodeJS.Platform
   readFileImpl?: (path: string) => Promise<string>
   writeFileImpl?: (path: string, data: string) => Promise<void>
   mkdirImpl?: (path: string) => Promise<void>
@@ -267,6 +282,48 @@ export async function ensureAcpCredentials(deps: AcpCredentialDeps = {}): Promis
   const tokenPath = join(acpDir, ACP_TOKEN_FILENAME)
   const settingsPath = join(acpDir, ACP_SETTINGS_FILENAME)
   const cliTokenPath = join(home, ...CLI_TOKEN_SUBPATH)
+  const legacyTokenPath = join(home, ...LEGACY_GEMINI_TOKEN_SUBPATH)
+  const platform = deps.platform ?? process.platform
+  /*
+   * 官方 CLI 登录态候选链（全部只读）：登录文件 → macOS 钥匙串（agy 1.5.17 起
+   * 的落点，issue #23）→ 旧 Gemini CLI 平铺文件。惰性读取：既有 acp_token.json
+   * 可用时不碰任何 CLI 来源；钥匙串仅 darwin 且能执行 `security` 时尝试。
+   */
+  let keychainReader = deps.readKeychainToken
+  if (!keychainReader && platform === 'darwin' && deps.subprocess) {
+    const subprocess = deps.subprocess
+    keychainReader = () => readCliKeychainToken(subprocess)
+  }
+  const readKeychain = keychainReader
+  /*
+   * 按序惰性产出候选并缓存：前序来源已给出可用 refresh_token 时，不再读后续
+   * 来源——CLI 文件命中就不 spawn `security` 读钥匙串；换发失败回退重走链时
+   * 复用缓存，同一次准备内每个来源至多读一次。
+   */
+  const candidateCache: QuotaTokenState[] = []
+  const cliCandidateSources: Array<() => Promise<QuotaTokenState>> = [
+    async () => parseTokenState(await readJsonOrUndefined(cliTokenPath, read)),
+    ...(readKeychain
+      ? [async () => {
+          try {
+            return (await readKeychain()) ?? {}
+          } catch {
+            return {}
+          }
+        }]
+      : []),
+    async () => parseLegacyGeminiToken(await readJsonOrUndefined(legacyTokenPath, read)),
+  ]
+  async function* cliCandidates(): AsyncGenerator<QuotaTokenState> {
+    for (let index = 0; index < cliCandidateSources.length; index += 1) {
+      let candidate = candidateCache[index]
+      if (candidate === undefined) {
+        candidate = await cliCandidateSources[index]!()
+        candidateCache[index] = candidate
+      }
+      yield candidate
+    }
+  }
 
   const existingRaw = await readJsonOrUndefined(tokenPath, read)
   const existing = readAcpCredentialState(existingRaw)
@@ -333,22 +390,27 @@ export async function ensureAcpCredentials(deps: AcpCredentialDeps = {}): Promis
     return { ...base, ready: true, status: 'existing', settingsWritten }
   }
 
-  // 需要换发：refresh_token 来源依次为既有文件 → CLI 登录态。
+  // 需要换发：refresh_token 来源依次为既有文件 → 官方 CLI 登录态候选链。
   let source: AcpCredentialStatus = existing.usable ? 'refreshed' : 'imported'
   let state = existing.state
   if (!state.refreshToken) {
-    const cliRaw = await readJsonOrUndefined(cliTokenPath, read)
-    const cliState = parseTokenState(cliRaw)
-    if (!cliState.refreshToken) {
+    let imported: QuotaTokenState | undefined
+    for await (const candidate of cliCandidates()) {
+      if (candidate.refreshToken) {
+        imported = candidate
+        break
+      }
+    }
+    if (!imported) {
       return {
         ...base,
         ready: false,
         status: 'unavailable',
         settingsWritten,
-        note: '未找到可导入的官方登录态（CLI 登录文件不存在或无 refresh_token）',
+        note: '未找到可导入的官方登录态（CLI 登录文件、macOS 钥匙串与旧版 oauth_creds.json 均无 refresh_token）',
       }
     }
-    state = cliState
+    state = imported
     source = 'imported'
   }
 
@@ -372,8 +434,8 @@ export async function ensureAcpCredentials(deps: AcpCredentialDeps = {}): Promis
   }
 
   // 换发候选链：既有 refresh_token 优先；失败（常见于被撤销 / invalid_grant）时
-  // 改用官方 CLI 当前的登录态再试一次——CLI 重新登录后它是新的，不该因为
-  // acp_token.json 里留着一颗作废的旧 token 就判成不可用。
+  // 依次改用官方 CLI 当前登录态候选（文件 → 钥匙串 → 旧版文件）再试——CLI 重新
+  // 登录后它是新的，不该因为 acp_token.json 里留着一颗作废的旧 token 就判成不可用。
   const doRefresh = (candidate: QuotaTokenState, meta: OAuthClientMeta): Promise<QuotaTokenState> =>
     deps.refresh ? deps.refresh(candidate, meta) : refreshWithDefaults(candidate, meta, env, deps.fetchImpl)
   let refreshed: QuotaTokenState | undefined
@@ -382,11 +444,12 @@ export async function ensureAcpCredentials(deps: AcpCredentialDeps = {}): Promis
     refreshed = await doRefresh(state, client)
   } catch (error) {
     refreshError = error
-    const cliState = parseTokenState(await readJsonOrUndefined(cliTokenPath, read))
-    if (cliState.refreshToken && cliState.refreshToken !== state.refreshToken) {
+    for await (const candidate of cliCandidates()) {
+      if (!candidate.refreshToken || candidate.refreshToken === state.refreshToken) continue
       try {
-        refreshed = await doRefresh(cliState, client)
+        refreshed = await doRefresh(candidate, client)
         source = 'imported'
+        break
       } catch (fallbackError) {
         refreshError = fallbackError
       }

@@ -175,6 +175,71 @@ describe('AgentLink 超时与取消', () => {
     await link.close()
   })
 
+  it('首个 session/new 走握手档超时：官方冷启动收尾超过普通请求预算也不判死（issue #23）', async () => {
+    vi.useFakeTimers()
+    const pair = fakePair()
+    pumpAgent(pair, async (message, reply) => {
+      if (message.method === 'initialize') {
+        await reply({ jsonrpc: '2.0', id: message.id!, result: { protocolVersion: 1 } })
+      } else if (message.method === 'session/new') {
+        // 模拟官方 1.5.2 冷启动到 session/new 返回约 36 秒。
+        await new Promise((resolve) => setTimeout(resolve, 36_000))
+        await reply({ jsonrpc: '2.0', id: message.id!, result: { sessionId: 'cold-start-session' } })
+      }
+    })
+    const link = new AgentLink({ stream: pair.stream, requestTimeoutMs: 5_000, handshakeTimeoutMs: 60_000 })
+    link.start()
+    await link.initialize()
+    const pending = link.newSession({ cwd: '/tmp', mcpServers: [] })
+    await vi.advanceTimersByTimeAsync(36_000)
+    expect((await pending).sessionId).toBe('cold-start-session')
+    await link.close()
+  })
+
+  it('建过会话后，后续 session/new 回到普通请求档超时', async () => {
+    vi.useFakeTimers()
+    const pair = fakePair()
+    pumpAgent(pair, async (message, reply) => {
+      if (message.method === 'initialize') {
+        await reply({ jsonrpc: '2.0', id: message.id!, result: { protocolVersion: 1 } })
+      } else if (message.method === 'session/new') {
+        const params = message.params as { cwd?: string } | undefined
+        // 首个会话立刻回；后续会话装聋，靠超时判定用的是哪一档。
+        if (params?.cwd === '/first') {
+          await reply({ jsonrpc: '2.0', id: message.id!, result: { sessionId: 'first-session' } })
+        }
+      }
+    })
+    const link = new AgentLink({ stream: pair.stream, requestTimeoutMs: 1_000, handshakeTimeoutMs: 60_000 })
+    link.start()
+    await link.initialize()
+    expect((await link.newSession({ cwd: '/first', mcpServers: [] })).sessionId).toBe('first-session')
+    const later = link.newSession({ cwd: '/later', mcpServers: [] })
+    const laterRejected = expect(later).rejects.toMatchObject({ code: AGY_LINK_ERROR.REQUEST_TIMEOUT })
+    await vi.advanceTimersByTimeAsync(1_000)
+    await laterRejected
+    await link.close()
+  })
+
+  it('首个 session/new 显式 timeoutMs 优先于握手档（planner/压缩预算语义）', async () => {
+    vi.useFakeTimers()
+    const pair = fakePair()
+    pumpAgent(pair, async (message, reply) => {
+      if (message.method === 'initialize') {
+        await reply({ jsonrpc: '2.0', id: message.id!, result: { protocolVersion: 1 } })
+      }
+      // session/new 装聋：靠超时时刻判定实际生效的档位。
+    })
+    const link = new AgentLink({ stream: pair.stream, requestTimeoutMs: 5_000, handshakeTimeoutMs: 60_000 })
+    link.start()
+    await link.initialize()
+    const pending = link.newSession({ cwd: '/tmp', mcpServers: [] }, { timeoutMs: 500 })
+    const rejected = expect(pending).rejects.toMatchObject({ code: AGY_LINK_ERROR.REQUEST_TIMEOUT })
+    await vi.advanceTimersByTimeAsync(500)
+    await rejected
+    await link.close()
+  })
+
   it('authenticate 走独立的 authTimeoutMs，不被普通请求超时掐断', async () => {
     const pair = fakePair()
     pumpAgent(pair, async (message, reply) => {
@@ -603,6 +668,14 @@ describe('launchAcpAgent', () => {
   it('officialAgentEnv 未配置代理时不注入任何 *_PROXY 变量', () => {
     const env = officialAgentEnv({ binaryDir: 'D:\\bin', tmpDir: 'D:\\tmp\\agy', parent: {} })
     expect(Object.keys(env).filter((key) => key.toLowerCase().includes('proxy'))).toEqual([])
+  })
+
+  it('officialAgentEnv 强制官方 server 走文件凭据后端（macOS 钥匙串会遮蔽 acp_token.json，issue #23）', () => {
+    const env = officialAgentEnv({ binaryDir: 'D:\\bin', tmpDir: 'D:\\tmp\\agy', parent: {} })
+    expect(env.AGY_ACP_FORCE_FILE_STORAGE).toBe('1')
+    // 即便父环境试图关掉，也保持强制文件后端：凭据准备只写 acp_token.json。
+    const overridden = officialAgentEnv({ binaryDir: 'D:\\bin', tmpDir: 'D:\\tmp\\agy', parent: { AGY_ACP_FORCE_FILE_STORAGE: '0' } })
+    expect(overridden.AGY_ACP_FORCE_FILE_STORAGE).toBe('1')
   })
 
   it('officialAgentEnv 把代理写入大小写两套变量，loopback 始终绕过', () => {

@@ -16,8 +16,8 @@
 | `autoDownload` | `true` | 无本地覆盖和有效缓存时从官方域名下载。 |
 | `extraArgs` | `[]` | 额外启动参数；不要传入会改变协议、工具隔离或认证边界的参数并假定仍兼容。 |
 | `acpVersion` | `"1.5.2"` | 自动下载与缓存目标版本；不是 ACP wire protocol 版本。更换版本需重新验证厂商扩展与发行布局。 |
-| `requestTimeoutMs` | `30000` | 普通 ACP 请求超时（毫秒），覆盖 stdin 写入与响应等待。 |
-| `handshakeTimeoutMs` | `120000` | ACP `initialize` 握手上限（毫秒）。官方 PyInstaller 进程冷启动实测约 52 秒、热启动约 10 秒，旧默认 15 秒会使冷启动登录超时。 |
+| `requestTimeoutMs` | `30000` | 普通 ACP 请求超时（毫秒），覆盖 stdin 写入与响应等待。首个 `session/new` 除外——它走 `handshakeTimeoutMs` 档（见下）。 |
+| `handshakeTimeoutMs` | `120000` | ACP `initialize` 握手与首个 `session/new` 的上限（毫秒）。官方 PyInstaller 进程冷启动实测约 52 秒、热启动约 10 秒，旧默认 15 秒会使冷启动登录超时；官方 1.5.2 冷启动到 `session/new` 返回实测约 36 秒（#23），超过普通请求默认 30 秒，故首个建会话同用此档。建过会话后 `session/new` 回到 `requestTimeoutMs`；调用方显式 `timeoutMs`（如标题、压缩、planner）始终优先。 |
 | `authTimeoutMs` | `300000` | 交互式 `authenticate` 等待上限（毫秒），独立于普通请求超时。 |
 | `promptTimeoutMs` | `1800000` | 单个 `session/prompt` 上限（毫秒）；工具 park 不表示上游 prompt 已结束。 |
 | `promptByteBudget` | `176000` | 单次 ACP prompt 的 UTF-8 字节预算（16000–191000）。上游硬上限 192001 字节，超限时从最旧历史整条裁剪，保留固定块与最近对话；裁剪事实写入宿主日志并在额度药丸警示（最近 10 分钟）。按字节而非 token 计量，中文等多字节字符占用更多预算。压缩请求同样受此预算约束。 |
