@@ -221,6 +221,25 @@ describe('AgentLink 超时与取消', () => {
     await link.close()
   })
 
+  it('首个 session/new 显式 timeoutMs 优先于握手档（planner/压缩预算语义）', async () => {
+    vi.useFakeTimers()
+    const pair = fakePair()
+    pumpAgent(pair, async (message, reply) => {
+      if (message.method === 'initialize') {
+        await reply({ jsonrpc: '2.0', id: message.id!, result: { protocolVersion: 1 } })
+      }
+      // session/new 装聋：靠超时时刻判定实际生效的档位。
+    })
+    const link = new AgentLink({ stream: pair.stream, requestTimeoutMs: 5_000, handshakeTimeoutMs: 60_000 })
+    link.start()
+    await link.initialize()
+    const pending = link.newSession({ cwd: '/tmp', mcpServers: [] }, { timeoutMs: 500 })
+    const rejected = expect(pending).rejects.toMatchObject({ code: AGY_LINK_ERROR.REQUEST_TIMEOUT })
+    await vi.advanceTimersByTimeAsync(500)
+    await rejected
+    await link.close()
+  })
+
   it('authenticate 走独立的 authTimeoutMs，不被普通请求超时掐断', async () => {
     const pair = fakePair()
     pumpAgent(pair, async (message, reply) => {

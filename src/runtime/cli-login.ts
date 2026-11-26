@@ -46,7 +46,10 @@ export function parseKeychainTokenDocument(raw: string): unknown {
 export function parseLegacyGeminiToken(raw: unknown): QuotaTokenState {
   const state = parseTokenState(raw)
   if (!state.expiry && isRecord(raw) && typeof raw.expiry_date === 'number' && Number.isFinite(raw.expiry_date)) {
-    state.expiry = new Date(raw.expiry_date).toISOString()
+    // 有限数值仍可能超出 Date 有效范围（如误写纳秒时间戳）；越界时跳过 expiry，
+    // 不让 toISOString 的 RangeError 穿破 ensureAcpCredentials 的永不抛错契约。
+    const date = new Date(raw.expiry_date)
+    if (!Number.isNaN(date.getTime())) state.expiry = date.toISOString()
   }
   return state
 }
@@ -72,7 +75,11 @@ export async function readCliKeychainToken(subprocess: SubprocessRuntime): Promi
     const exit = await handle.done.catch(() => undefined)
     if (!exit || exit.exitCode !== 0) return undefined
     const raw = handle.collected.stdout?.readFrom(0).text ?? ''
-    return parseTokenState(parseKeychainTokenDocument(raw))
+    const doc = parseKeychainTokenDocument(raw)
+    if (doc === undefined) return undefined
+    const state = parseTokenState(doc)
+    // 解析成功但没有任何 token 字段时按「无条目」降级，返回值与 JSDoc 一致。
+    return state.accessToken || state.refreshToken ? state : undefined
   } catch {
     return undefined
   }

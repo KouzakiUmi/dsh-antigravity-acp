@@ -71,6 +71,13 @@ describe('parseLegacyGeminiToken', () => {
     expect(parseLegacyGeminiToken(null)).toEqual({ accessToken: undefined, refreshToken: undefined, expiry: undefined })
     expect(parseLegacyGeminiToken({ expiry_date: Number.NaN }).expiry).toBeUndefined()
   })
+
+  it('expiry_date 为有限但超出 Date 范围的数值时跳过 expiry，不抛 RangeError', () => {
+    // 误写纳秒级时间戳等损坏值：Number.isFinite 为真但 Date 无效。
+    expect(() => parseLegacyGeminiToken({ refresh_token: 'R', expiry_date: 1e20 })).not.toThrow()
+    expect(parseLegacyGeminiToken({ refresh_token: 'R', expiry_date: 1e20 }))
+      .toEqual({ accessToken: undefined, refreshToken: 'R', expiry: undefined })
+  })
 })
 
 describe('readCliKeychainToken', () => {
@@ -92,7 +99,8 @@ describe('readCliKeychainToken', () => {
 
   it('spawn 失败或值不可解析时降级为 undefined，不抛穿', async () => {
     expect(await readCliKeychainToken(fakeSecurity({ spawnThrows: true }).runtime)).toBeUndefined()
-    expect(await readCliKeychainToken(fakeSecurity({ stdout: 'garbage' }).runtime))
-      .toEqual({ accessToken: undefined, refreshToken: undefined, expiry: undefined })
+    expect(await readCliKeychainToken(fakeSecurity({ stdout: 'garbage' }).runtime)).toBeUndefined()
+    // 合法 JSON 但没有任何 token 字段：同样按无条目降级。
+    expect(await readCliKeychainToken(fakeSecurity({ stdout: '{"other":1}' }).runtime)).toBeUndefined()
   })
 })

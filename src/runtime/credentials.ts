@@ -295,17 +295,34 @@ export async function ensureAcpCredentials(deps: AcpCredentialDeps = {}): Promis
     keychainReader = () => readCliKeychainToken(subprocess)
   }
   const readKeychain = keychainReader
-  const readCliCandidates = async (): Promise<QuotaTokenState[]> => {
-    const candidates: QuotaTokenState[] = [parseTokenState(await readJsonOrUndefined(cliTokenPath, read))]
-    if (readKeychain) {
-      try {
-        candidates.push((await readKeychain()) ?? {})
-      } catch {
-        candidates.push({})
+  /*
+   * 按序惰性产出候选并缓存：前序来源已给出可用 refresh_token 时，不再读后续
+   * 来源——CLI 文件命中就不 spawn `security` 读钥匙串；换发失败回退重走链时
+   * 复用缓存，同一次准备内每个来源至多读一次。
+   */
+  const candidateCache: QuotaTokenState[] = []
+  const cliCandidateSources: Array<() => Promise<QuotaTokenState>> = [
+    async () => parseTokenState(await readJsonOrUndefined(cliTokenPath, read)),
+    ...(readKeychain
+      ? [async () => {
+          try {
+            return (await readKeychain()) ?? {}
+          } catch {
+            return {}
+          }
+        }]
+      : []),
+    async () => parseLegacyGeminiToken(await readJsonOrUndefined(legacyTokenPath, read)),
+  ]
+  async function* cliCandidates(): AsyncGenerator<QuotaTokenState> {
+    for (let index = 0; index < cliCandidateSources.length; index += 1) {
+      let candidate = candidateCache[index]
+      if (candidate === undefined) {
+        candidate = await cliCandidateSources[index]!()
+        candidateCache[index] = candidate
       }
+      yield candidate
     }
-    candidates.push(parseLegacyGeminiToken(await readJsonOrUndefined(legacyTokenPath, read)))
-    return candidates
   }
 
   const existingRaw = await readJsonOrUndefined(tokenPath, read)
@@ -377,7 +394,13 @@ export async function ensureAcpCredentials(deps: AcpCredentialDeps = {}): Promis
   let source: AcpCredentialStatus = existing.usable ? 'refreshed' : 'imported'
   let state = existing.state
   if (!state.refreshToken) {
-    const imported = (await readCliCandidates()).find((candidate) => Boolean(candidate.refreshToken))
+    let imported: QuotaTokenState | undefined
+    for await (const candidate of cliCandidates()) {
+      if (candidate.refreshToken) {
+        imported = candidate
+        break
+      }
+    }
     if (!imported) {
       return {
         ...base,
@@ -421,7 +444,7 @@ export async function ensureAcpCredentials(deps: AcpCredentialDeps = {}): Promis
     refreshed = await doRefresh(state, client)
   } catch (error) {
     refreshError = error
-    for (const candidate of await readCliCandidates()) {
+    for await (const candidate of cliCandidates()) {
       if (!candidate.refreshToken || candidate.refreshToken === state.refreshToken) continue
       try {
         refreshed = await doRefresh(candidate, client)

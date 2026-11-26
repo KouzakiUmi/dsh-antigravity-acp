@@ -367,4 +367,30 @@ describe('ensureAcpCredentials：macOS 钥匙串与旧版文件兜底（issue #2
     }))
     expect(result).toMatchObject({ ready: false, status: 'unavailable' })
   })
+
+  it('CLI 文件命中 refresh_token 时不读钥匙串（按序惰性，不多 spawn security）', async () => {
+    const fs = createFs({ [CLI_TOKEN_PATH]: JSON.stringify({ token: { refresh_token: '1//from-cli' } }) })
+    let keychainReads = 0
+    const result = await ensureAcpCredentials(makeDeps(fs, {
+      readKeychainToken: async () => { keychainReads += 1; return KEYCHAIN_STATE },
+      refresh: async (state) => ({ ...REFRESHED, refreshToken: state.refreshToken }),
+    }))
+    expect(result).toMatchObject({ ready: true, status: 'imported' })
+    expect(JSON.parse(fs.files.get(TOKEN_PATH)!)).toMatchObject({ refresh_token: '1//from-cli' })
+    expect(keychainReads).toBe(0)
+  })
+
+  it('换发失败回退重走候选链时复用缓存，钥匙串至多读一次', async () => {
+    const fs = createFs({ [TOKEN_PATH]: JSON.stringify(EXISTING_DOC) })
+    let keychainReads = 0
+    const result = await ensureAcpCredentials(makeDeps(fs, {
+      readKeychainToken: async () => { keychainReads += 1; return KEYCHAIN_STATE },
+      refresh: async (state) => {
+        if (state.refreshToken === '1//from-keychain') return { ...REFRESHED, refreshToken: '1//from-keychain' }
+        throw new Error('invalid_grant')
+      },
+    }))
+    expect(result).toMatchObject({ ready: true, status: 'imported' })
+    expect(keychainReads).toBe(1)
+  })
 })
