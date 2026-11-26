@@ -20,6 +20,7 @@ function deferred<T>() {
 const renderers: ReactTestRenderer[] = []
 afterEach(async () => {
   await act(async () => { for (const renderer of renderers.splice(0)) renderer.unmount() })
+  vi.useRealTimers()
 })
 
 /** Real React hooks and rerenders; only the DSH loader/transport and browser timers are substituted. */
@@ -39,6 +40,8 @@ function loadCard(quotaRead?: () => Promise<unknown>) {
     setInterval: (callback: () => void, delay: number) => { intervals.set(++timerId, { callback, delay }); return timerId },
     clearInterval: (id: number) => intervals.delete(id),
     setTimeout, clearTimeout,
+    // 沿用测试进程的 Date：vi.setSystemTime 才能固定 client 的退役判定（vm 上下文默认有自己的内建 Date）。
+    Date,
   })
   const slots = {
     inject: (_name: string, callback: () => void) => { callback(); return () => {} },
@@ -431,7 +434,7 @@ describe('settings card with real React state and effects', () => {
     const control = vi.fn(async (method: string) => method === 'account'
       ? { state: 'idle', message: 'ready' }
       : snapshot.phase === 'signed-in'
-        ? { status: 'ok', models: [{ id: 'antigravity-gemini-3.8-flash', name: 'Gemini Flash' }] }
+        ? { status: 'ok', models: [{ id: 'antigravity-gemini-4-neon', name: 'Gemini Neon' }] }
         : { status: 'error', models: [], message: '代理账户尚未连接' })
     const { renderer, intervals } = await mount(service.remote, control, proxyControl)
     await act(async () => { await button(renderer, '连接代理账户').props.onClick() })
@@ -440,11 +443,11 @@ describe('settings card with real React state and effects', () => {
     snapshot = { phase: 'signed-in', message: '代理账户已就绪', revision: 2 }
     await act(async () => { for (const timer of intervals.values()) if (timer.delay === 3000) timer.callback() })
     expect(control.mock.calls.filter(([method]) => method === 'models').length).toBeGreaterThan(pulls)
-    expect(renderedText(renderer)).toContain('Gemini Flash')
+    expect(renderedText(renderer)).toContain('Gemini Neon')
     expect(renderedText(renderer)).not.toContain('等待浏览器授权')
     expect(renderer.root.findAllByType('a')).toHaveLength(0)
     await act(async () => { await button(renderer, '退出登录').props.onClick() })
-    expect(renderedText(renderer)).not.toContain('Gemini Flash')
+    expect(renderedText(renderer)).not.toContain('Gemini Neon')
     expect(renderedText(renderer)).toContain('代理账户尚未连接')
   })
 
@@ -492,6 +495,8 @@ describe('settings card with real React state and effects', () => {
   ] })
   const controlWith = (models: unknown = catalog(), account: Record<string, unknown> = { state: 'idle', message: 'ready' }) =>
     vi.fn(async (method: string) => method === 'account' ? account : models)
+  /** 退役判定的固定时钟：GPT-OSS 120B（11-18）已过下线日，Argon / 3.8 Flash（11-30）尚未。 */
+  const NOW = new Date(2026, 10, 26, 12, 0, 0)
 
   it('设置卡片只提交即时字段，普通配置以重载指引呈现', async () => {
     const liveKeys: readonly string[] = [...LIVE_SETTING_KEYS]
@@ -590,28 +595,31 @@ describe('settings card with real React state and effects', () => {
   })
 
   it('全部模型被隐藏时提示 provider 会从选择器消失，重新启用后提示消失', async () => {
+    vi.setSystemTime(NOW)
     const service = transport(document({ modelOverrides: { 'gemini-3-pro': { enabled: false }, 'claude-sonnet-5-5': { enabled: false } } }))
     const { renderer } = await mount(service.remote, controlWith())
-    // 两个观测模型显式隐藏 + 三个退役家族默认隐藏，整页模型全部隐藏时出现提示。
+    // 两个观测模型显式隐藏 + 两个尚未下线的退役家族默认隐藏（GPT-OSS 120B 已过下线日，不补行）。
     expect(renderedText(renderer)).toContain('全部隐藏后')
-    expect(renderedText(renderer)).toContain('全部 5')
+    expect(renderedText(renderer)).toContain('全部 4')
     await act(async () => { modelControl(renderer, 'enabled', 'gemini-3-pro').props.onChange({ target: { checked: true } }) })
     expect(renderedText(renderer)).not.toContain('全部隐藏后')
-    expect(renderedText(renderer)).toContain('已隐藏 4')
+    expect(renderedText(renderer)).toContain('已隐藏 3')
   })
 
   it('已经保存但当前目录没有的模型 ID 仍可编辑，并标注不在目录', async () => {
+    vi.setSystemTime(NOW)
     const service = transport(document({ modelOverrides: { 'retired-model': { target: 'retired-model-high' } } }))
     const { renderer } = await mount(service.remote, controlWith())
     expect(modelControl(renderer, 'target', 'retired-model').props.value).toBe('retired-model-high')
     expect(renderedText(renderer)).toContain('不在当前目录')
-    // 两个观测模型 + 三个退役表内置家族 + 一个已保存但不在目录的 ID = 6 行。
-    expect(renderedText(renderer)).toContain('全部 6')
+    // 两个观测模型 + 两个尚未下线的退役表内置家族 + 一个已保存但不在目录的 ID = 5 行。
+    expect(renderedText(renderer)).toContain('全部 5')
     // 退役家族默认隐藏，观测模型与已保存 ID 默认启用。
-    expect(renderedText(renderer)).toContain('已隐藏 3')
+    expect(renderedText(renderer)).toContain('已隐藏 2')
   })
 
   it('ACP 模式即使目录含带前缀的编排合成条目，退役补行仍用裸家族 ID', async () => {
+    vi.setSystemTime(NOW)
     // antigravity-orchestrator 带 antigravity- 前缀但不代表代理链路；
     // 补行若按前缀猜测会写出 host 永远查不中的 override 键。
     const models = {
@@ -637,19 +645,352 @@ describe('settings card with real React state and effects', () => {
     ], expect.anything())
   })
 
-  it('代理模式观测到带档位后缀的 gpt-oss 时不补重复行，退役徽章挂在观测行上', async () => {
+  it('代理模式观测到带档位后缀的退役中家族时不补重复行，退役徽章挂在观测行上', async () => {
+    vi.setSystemTime(NOW)
     const models = {
       status: 'ok' as const,
-      models: [{ id: 'antigravity-gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' }],
+      models: [{ id: 'antigravity-gemini-3.8-flash-medium', name: 'Gemini 3.8 Flash (Medium)' }],
     }
     const control = vi.fn(async (method: string) => method === 'account'
       ? { state: 'idle', message: 'ready', generationMode: { requested: 'proxy', active: 'proxy', proxyRouterReady: true } }
       : models)
     const { renderer } = await mount(transport(document({ proxyMode: true })).remote, control)
-    // 真实观测行只有一个开关；不会再补一个 antigravity-gpt-oss-120b 死行。
-    expect(renderer.root.findAllByProps({ name: 'model-enabled-antigravity-gpt-oss-120b-medium' })).toHaveLength(1)
+    // 真实观测行只有一个开关；不会再补一个 antigravity-gemini-3.8-flash 死行。
+    expect(renderer.root.findAllByProps({ name: 'model-enabled-antigravity-gemini-3.8-flash-medium' })).toHaveLength(1)
+    expect(renderer.root.findAllByProps({ name: 'model-enabled-antigravity-gemini-3.8-flash' })).toHaveLength(0)
+    expect(renderedText(renderer)).toContain('即将下线 11-30')
+  })
+
+  it('官方下线日已过的家族移出模型列表：观测行、补行与残留配置键都不显示', async () => {
+    vi.setSystemTime(NOW)
+    // 上游菜单仍列出 GPT-OSS 120B（代理目录的真实键带档位后缀）；残留配置键是代理链路的家族键。
+    const models = {
+      status: 'ok' as const,
+      models: [
+        { id: 'antigravity-gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' },
+        { id: 'antigravity-gemini-4-hydrogen', name: 'Gemini 4 Hydrogen' },
+      ],
+    }
+    const control = vi.fn(async (method: string) => method === 'account'
+      ? { state: 'idle', message: 'ready', generationMode: { requested: 'proxy', active: 'proxy', proxyRouterReady: true } }
+      : models)
+    const service = transport(document({ proxyMode: true, modelOverrides: { 'antigravity-gpt-oss-120b': { enabled: true } } }))
+    const { renderer } = await mount(service.remote, control)
+    expect(renderer.root.findAllByProps({ name: 'model-enabled-antigravity-gpt-oss-120b-medium' })).toHaveLength(0)
+    expect(renderer.root.findAllByProps({ name: 'model-enabled-gpt-oss-120b' })).toHaveLength(0)
     expect(renderer.root.findAllByProps({ name: 'model-enabled-antigravity-gpt-oss-120b' })).toHaveLength(0)
-    expect(renderedText(renderer)).toContain('已下线 11-18')
+    expect(modelControl(renderer, 'enabled', 'antigravity-gemini-4-hydrogen')).toBeDefined()
+    expect(renderedText(renderer)).not.toContain('已下线')
+    // 一个未退役观测行 + 两个尚未下线的补行。
+    expect(renderedText(renderer)).toContain('全部 3')
+  })
+
+  it('下线日过后条目按同一判定移出列表', async () => {
+    // 11-30 的次日，按本地日历日构造。
+    vi.setSystemTime(new Date(2026, 11, 1, 0, 0, 0, 0))
+    const { renderer } = await mount(transport().remote, controlWith())
+    expect(renderer.root.findAllByProps({ name: 'model-enabled-gemini-4-argon' })).toHaveLength(0)
+    expect(renderer.root.findAllByProps({ name: 'model-enabled-gemini-3.8-flash' })).toHaveLength(0)
+    expect(renderedText(renderer)).not.toContain('即将下线')
+    expect(modelControl(renderer, 'enabled', 'gemini-3-pro')).toBeDefined()
+  })
+
+  it('已过下线日家族的配置键随草稿保存删除，并说明未保存项的来源', async () => {
+    vi.setSystemTime(NOW)
+    const service = transport(document({ modelOverrides: { 'antigravity-gpt-oss-120b-medium': { enabled: true, target: 'x' }, 'gemini-3-pro': { effort: 'high' } } }))
+    const { renderer } = await mount(service.remote, controlWith())
+    expect(renderedText(renderer)).toContain('GPT-OSS 120B 已过官方下线日，不再列入模型列表；保存后移除其模型设置。')
+    expect(renderedText(renderer)).toContain('1 项未保存')
+    expect(service.mutate).not.toHaveBeenCalled()
+    await act(async () => { await button(renderer, '保存').props.onClick() })
+    expect(service.mutate).toHaveBeenCalledWith('llm-antigravity-acp', [
+      { op: 'set', path: ['modelOverrides'], value: { 'gemini-3-pro': { effort: 'high' } } },
+    ], expect.anything())
+  })
+
+  it('撤销放弃对已过下线日家族配置键的删除，条目仍不显示', async () => {
+    vi.setSystemTime(NOW)
+    const service = transport(document({ modelOverrides: { 'gpt-oss-120b': { enabled: true } } }))
+    const { renderer } = await mount(service.remote, controlWith())
+    expect(renderedText(renderer)).toContain('1 项未保存')
+    await act(async () => { await button(renderer, '撤销').props.onClick() })
+    expect(renderedText(renderer)).not.toContain('项未保存')
+    expect(renderedText(renderer)).not.toContain('已过官方下线日')
+    expect(renderer.root.findAllByProps({ name: 'model-enabled-gpt-oss-120b' })).toHaveLength(0)
+    expect(button(renderer, '保存').props.disabled).toBe(true)
+    // 撤销后同 namespace 的通知（内容未变）不把清理重新排入。
+    await act(async () => { service.notify() })
+    expect(renderedText(renderer)).not.toContain('项未保存')
+    // 此后切成只读也不残留待保存项。
+    service.set(document({ modelOverrides: { 'gpt-oss-120b': { enabled: true } } }, 2, false))
+    await act(async () => { service.notify() })
+    expect(renderedText(renderer)).toContain('只读设置')
+    expect(renderedText(renderer)).not.toContain('项未保存')
+    expect(service.mutate).not.toHaveBeenCalled()
+  })
+
+  it('清理保存不覆盖外部更新，也不删除另一链路或仅默认值的键', async () => {
+    vi.setSystemTime(NOW)
+    const initial = { modelOverrides: { 'gpt-oss-120b': { enabled: true }, 'gemini-3-pro': { effort: 'low' }, 'antigravity-unknown': { enabled: true } } }
+    const service = transport(document(initial, 1))
+    const { renderer } = await mount(service.remote, controlWith())
+    expect(renderedText(renderer)).toContain('1 项未保存')
+    // 外部（同 revision 推进）改了裸键的值，并新增了一个代理链路的键。
+    const external = { modelOverrides: { ...initial.modelOverrides, 'gemini-3-pro': { effort: 'high' }, 'antigravity-known': { target: 'keep-me' } } }
+    service.set(document(external, 2))
+    await act(async () => { service.notify() })
+    expect(renderedText(renderer)).toContain('GPT-OSS 120B 已过官方下线日')
+    await act(async () => { await button(renderer, '保存').props.onClick() })
+    expect(service.mutate).toHaveBeenCalledTimes(1)
+    const [namespace, ops, revision] = service.mutate.mock.calls[0] as unknown as [string, Array<{ path: string[]; value: unknown }>, number]
+    expect(namespace).toBe('llm-antigravity-acp')
+    expect(revision).toBe(2)
+    expect(ops).toEqual([{ op: 'set', path: ['modelOverrides'], value: {
+      'gemini-3-pro': { effort: 'high' },
+      'antigravity-unknown': { enabled: true },
+      'antigravity-known': { target: 'keep-me' },
+    } }])
+  })
+
+  it('保存成功回读后不再标脏，清理说明随之消失', async () => {
+    vi.setSystemTime(NOW)
+    const service = transport(document({ modelOverrides: { 'gpt-oss-120b': { enabled: true }, 'gemini-3-pro': { effort: 'high' } } }, 1))
+    // 保存桩写回远端文档并推进 revision，模拟真实宿主。
+    const saved = { modelOverrides: { 'gpt-oss-120b': { enabled: true }, 'gemini-3-pro': { effort: 'high' } } }
+    service.mutate.mockImplementation(async (_ns, ops, revision) => {
+      expect(revision).toBe(1)
+      saved.modelOverrides = (ops[0] as { value: typeof saved.modelOverrides }).value
+      service.change(document(saved, 2))
+      return { ok: true, value: undefined }
+    })
+    const { renderer } = await mount(service.remote, controlWith())
+    await act(async () => { await button(renderer, '保存').props.onClick() })
+    expect(service.mutate).toHaveBeenCalledTimes(1)
+    expect(renderedText(renderer)).not.toContain('项未保存')
+    expect(renderedText(renderer)).not.toContain('已过官方下线日')
+    expect(button(renderer, '保存').props.disabled).toBe(true)
+    expect(modelControl(renderer, 'enabled', 'gemini-3-pro').props.checked).toBe(true)
+  })
+
+  it('撤销清理后编辑其它模型，保存不删除已退役键', async () => {
+    vi.setSystemTime(NOW)
+    const service = transport(document({ modelOverrides: { 'gpt-oss-120b': { enabled: true }, 'gemini-3-pro': { effort: 'low' } } }))
+    const { renderer } = await mount(service.remote, controlWith())
+    await act(async () => { await button(renderer, '撤销').props.onClick() })
+    await act(async () => { modelControl(renderer, 'effort', 'gemini-3-pro').props.onChange({ target: { value: 'high' } }) })
+    expect(renderedText(renderer)).not.toContain('已过官方下线日')
+    await act(async () => { await button(renderer, '保存').props.onClick() })
+    expect(service.mutate).toHaveBeenCalledWith('llm-antigravity-acp', [
+      { op: 'set', path: ['modelOverrides'], value: { 'gpt-oss-120b': { enabled: true }, 'gemini-3-pro': { effort: 'high' } } },
+    ], expect.anything())
+  })
+
+  it('未编辑时设置直接转只读，不残留自动排入的未保存项', async () => {
+    vi.setSystemTime(NOW)
+    const service = transport(document({ modelOverrides: { 'gpt-oss-120b': { enabled: true } } }))
+    const { renderer } = await mount(service.remote, controlWith())
+    expect(renderedText(renderer)).toContain('1 项未保存')
+    service.set(document({ modelOverrides: { 'gpt-oss-120b': { enabled: true } } }, 2, false))
+    await act(async () => { service.notify() })
+    expect(renderedText(renderer)).toContain('只读设置')
+    expect(renderedText(renderer)).not.toContain('项未保存')
+  })
+
+  it('外部更新后，未触及的模型在界面上跟随服务端最新值', async () => {
+    vi.setSystemTime(NOW)
+    const service = transport(document({ modelOverrides: { 'gemini-3-pro': { effort: 'low' }, 'claude-sonnet-5-5': { effort: 'high' } } }))
+    const { renderer } = await mount(service.remote, controlWith())
+    expect(modelControl(renderer, 'effort', 'gemini-3-pro').props.value).toBe('low')
+    // 用户只改了 Sonnet：这个键算触及过。
+    await act(async () => { modelControl(renderer, 'effort', 'claude-sonnet-5-5').props.onChange({ target: { value: 'low' } }) })
+    service.set(document({ modelOverrides: { 'gemini-3-pro': { effort: 'high' }, 'claude-sonnet-5-5': { effort: 'medium' } } }, 2))
+    await act(async () => { service.notify() })
+    // 未触及的键跟随服务端最新值。
+    expect(modelControl(renderer, 'effort', 'gemini-3-pro').props.value).toBe('high')
+    // 用户触及过的键保留草稿，不被外部更新覆盖。
+    expect(modelControl(renderer, 'effort', 'claude-sonnet-5-5').props.value).toBe('low')
+    expect(renderedText(renderer)).toContain('1 项未保存')
+    await act(async () => { await button(renderer, '保存').props.onClick() })
+    expect(service.mutate).toHaveBeenCalledWith('llm-antigravity-acp', [
+      { op: 'set', path: ['modelOverrides'], value: { 'gemini-3-pro': { effort: 'high' }, 'claude-sonnet-5-5': { effort: 'low' } } },
+    ], expect.anything())
+  })
+
+  it('改回原值的模型不再算触及，保存跟随服务端最新值', async () => {
+    vi.setSystemTime(NOW)
+    const service = transport(document({ modelOverrides: { 'gemini-3-pro': { effort: 'low' }, 'claude-sonnet-5-5': { effort: 'high' } } }))
+    const { renderer } = await mount(service.remote, controlWith())
+    await act(async () => { modelControl(renderer, 'effort', 'gemini-3-pro').props.onChange({ target: { value: 'high' } }) })
+    await act(async () => { modelControl(renderer, 'effort', 'gemini-3-pro').props.onChange({ target: { value: 'low' } }) })
+    expect(renderedText(renderer)).not.toContain('项未保存')
+    await act(async () => { modelControl(renderer, 'effort', 'claude-sonnet-5-5').props.onChange({ target: { value: 'low' } }) })
+    service.set(document({ modelOverrides: { 'gemini-3-pro': { effort: 'high' }, 'claude-sonnet-5-5': { effort: 'high' } } }, 2))
+    await act(async () => { service.notify() })
+    await act(async () => { await button(renderer, '保存').props.onClick() })
+    expect(service.mutate).toHaveBeenCalledWith('llm-antigravity-acp', [
+      { op: 'set', path: ['modelOverrides'], value: { 'gemini-3-pro': { effort: 'high' }, 'claude-sonnet-5-5': { effort: 'low' } } },
+    ], expect.anything())
+  })
+
+  it('只有默认值的已配置 ID 也列出，编辑其它模型后不消失', async () => {
+    vi.setSystemTime(NOW)
+    const service = transport(document({ modelOverrides: { 'claude-opus-5-5': { enabled: true }, 'unknown-model': {} } }))
+    const { renderer } = await mount(service.remote, controlWith())
+    expect(modelControl(renderer, 'enabled', 'claude-opus-5-5').props['aria-label']).toBe('Claude Opus 5.5')
+    expect(modelControl(renderer, 'enabled', 'unknown-model')).toBeDefined()
+    await act(async () => { modelControl(renderer, 'effort', 'gemini-3-pro').props.onChange({ target: { value: 'low' } }) })
+    expect(modelControl(renderer, 'enabled', 'claude-opus-5-5')).toBeDefined()
+    expect(renderedText(renderer)).toContain('1 项未保存')
+    await act(async () => { await button(renderer, '保存').props.onClick() })
+    expect(service.mutate).toHaveBeenCalledWith('llm-antigravity-acp', [
+      { op: 'set', path: ['modelOverrides'], value: { 'claude-opus-5-5': { enabled: true }, 'unknown-model': {}, 'gemini-3-pro': { effort: 'low' } } },
+    ], expect.anything())
+  })
+
+  it('对仅默认值的行做无效的「全部启用」，该行不消失也不产生未保存项', async () => {
+    vi.setSystemTime(NOW)
+    const service = transport(document({ modelOverrides: { 'gemini-4-hydrogen': { enabled: true } } }))
+    const { renderer } = await mount(service.remote, controlWith())
+    expect(modelControl(renderer, 'enabled', 'gemini-4-hydrogen').props.checked).toBe(true)
+    await act(async () => { renderer.root.findByProps({ 'aria-label': '搜索模型' }).props.onChange({ target: { value: 'hydrogen' } }) })
+    await act(async () => { await button(renderer, '全部启用').props.onClick() })
+    expect(modelControl(renderer, 'enabled', 'gemini-4-hydrogen')).toBeDefined()
+    expect(renderedText(renderer)).not.toContain('项未保存')
+    expect(button(renderer, '保存').props.disabled).toBe(true)
+    expect(service.mutate).not.toHaveBeenCalled()
+  })
+
+  it('普通模型改回原值不冲掉待保存的退役清理', async () => {
+    vi.setSystemTime(NOW)
+    const service = transport(document({ modelOverrides: { 'gpt-oss-120b': {}, 'gemini-3-pro': { effort: 'low' } } }))
+    const { renderer } = await mount(service.remote, controlWith())
+    expect(renderedText(renderer)).toContain('1 项未保存')
+    await act(async () => { modelControl(renderer, 'effort', 'gemini-3-pro').props.onChange({ target: { value: 'high' } }) })
+    await act(async () => { modelControl(renderer, 'effort', 'gemini-3-pro').props.onChange({ target: { value: 'low' } }) })
+    expect(renderedText(renderer)).toContain('GPT-OSS 120B 已过官方下线日')
+    expect(renderedText(renderer)).toContain('1 项未保存')
+    await act(async () => { await button(renderer, '保存').props.onClick() })
+    expect(service.mutate).toHaveBeenCalledWith('llm-antigravity-acp', [
+      { op: 'set', path: ['modelOverrides'], value: { 'gemini-3-pro': { effort: 'low' } } },
+    ], expect.anything())
+  })
+
+  it('显式清空的删除意图保留到远端键消失，外部把该记录改成默认值也不放弃', async () => {
+    vi.setSystemTime(NOW)
+    const service = transport(document({ modelOverrides: { 'gemini-3-pro': { effort: 'high', name: '旧名' } } }))
+    const { renderer } = await mount(service.remote, controlWith())
+    await act(async () => { modelControl(renderer, 'effort', 'gemini-3-pro').props.onChange({ target: { value: '' } }) })
+    await act(async () => { modelControl(renderer, 'name', 'gemini-3-pro').props.onChange({ target: { value: '' } }) })
+    expect(renderedText(renderer)).toContain('1 项未保存')
+    service.set(document({ modelOverrides: { 'gemini-3-pro': { enabled: true } } }, 2))
+    await act(async () => { service.notify() })
+    expect(renderedText(renderer)).toContain('1 项未保存')
+    await act(async () => { await button(renderer, '保存').props.onClick() })
+    expect(service.mutate).toHaveBeenCalledWith('llm-antigravity-acp', [
+      { op: 'set', path: ['modelOverrides'], value: {} },
+    ], expect.anything())
+  })
+
+  it('删除意图在远端键消失后完成，之后外部重建同名键不再被删除', async () => {
+    vi.setSystemTime(NOW)
+    const service = transport(document({ modelOverrides: { 'gemini-3-pro': { name: '旧名' }, 'claude-sonnet-5-5': { effort: 'low' } } }))
+    const { renderer } = await mount(service.remote, controlWith())
+    await act(async () => { modelControl(renderer, 'name', 'gemini-3-pro').props.onChange({ target: { value: '' } }) })
+    expect(renderedText(renderer)).toContain('1 项未保存')
+    // 外部先删掉了 A：删除意图完成，界面转干净。
+    service.set(document({ modelOverrides: { 'claude-sonnet-5-5': { effort: 'low' } } }, 2))
+    await act(async () => { service.notify() })
+    expect(renderedText(renderer)).not.toContain('项未保存')
+    // 用户编辑 B；外部又把 A 重建（新名称）。
+    await act(async () => { modelControl(renderer, 'effort', 'claude-sonnet-5-5').props.onChange({ target: { value: 'high' } }) })
+    service.set(document({ modelOverrides: { 'gemini-3-pro': { name: '新名' }, 'claude-sonnet-5-5': { effort: 'low' } } }, 3))
+    await act(async () => { service.notify() })
+    await act(async () => { await button(renderer, '保存').props.onClick() })
+    expect(service.mutate).toHaveBeenCalledWith('llm-antigravity-acp', [
+      { op: 'set', path: ['modelOverrides'], value: { 'gemini-3-pro': { name: '新名' }, 'claude-sonnet-5-5': { effort: 'high' } } },
+    ], 3)
+  })
+
+  it('退役边界按本地日历日：下线日当天最后一刻未退役，次日零点起退役', async () => {
+    // GPT-OSS 120B 的下线日是 11-18；用本地时间构造，不依赖进程时区。
+    vi.setSystemTime(new Date(2026, 10, 18, 23, 59, 59, 500))
+    const before = await mount(transport().remote, controlWith())
+    expect(renderedText(before.renderer)).toContain('即将下线 11-18')
+    expect(before.renderer.root.findAllByProps({ name: 'model-enabled-gpt-oss-120b' })).toHaveLength(1)
+    await act(async () => { before.renderer.unmount() })
+    vi.setSystemTime(new Date(2026, 10, 19, 0, 0, 0, 0))
+    const after = await mount(transport().remote, controlWith())
+    expect(after.renderer.root.findAllByProps({ name: 'model-enabled-gpt-oss-120b' })).toHaveLength(0)
+    expect(renderedText(after.renderer)).not.toContain('GPT-OSS 120B')
+  })
+
+  it('只读设置下不产生待保存的删除，已过下线日家族的条目仍不显示', async () => {
+    vi.setSystemTime(NOW)
+    const service = transport(document({ modelOverrides: { 'gpt-oss-120b': { enabled: true } } }, 1, false))
+    const { renderer } = await mount(service.remote, controlWith())
+    expect(renderedText(renderer)).toContain('只读设置')
+    expect(renderedText(renderer)).not.toContain('项未保存')
+    expect(renderer.root.findAllByProps({ name: 'model-enabled-gpt-oss-120b' })).toHaveLength(0)
+  })
+
+  it('已配置但不在当前目录的已知家族用内置名显示，未知 ID 仍显示原始 ID', async () => {
+    vi.setSystemTime(NOW)
+    // ACP 模式：退役表家族名用带档位后缀的 ACP 键验证（家族键本身已由退役表补行占据）。
+    const service = transport(document({ modelOverrides: {
+      'gemini-3.8-flash-medium': { effort: 'high' },
+      'antigravity-orchestrator': { target: 'gemini-4-hydrogen' },
+      'gemini-4-neon': { enabled: false },
+      'claude-sonnet-5-5-high': { effort: 'low' },
+      'unknown-model': { effort: 'low' },
+    } }))
+    const { renderer } = await mount(service.remote, controlWith())
+    expect(modelControl(renderer, 'enabled', 'gemini-3.8-flash-medium').props['aria-label']).toBe('Gemini 3.8 Flash')
+    expect(modelControl(renderer, 'enabled', 'antigravity-orchestrator').props['aria-label']).toBe('Orchestrator（插件编排）')
+    expect(modelControl(renderer, 'enabled', 'gemini-4-neon').props['aria-label']).toBe('Gemini 4 Neon')
+    expect(modelControl(renderer, 'enabled', 'claude-sonnet-5-5-high').props['aria-label']).toBe('Claude Sonnet 5.5')
+    expect(modelControl(renderer, 'enabled', 'unknown-model').props['aria-label']).toBe('unknown-model')
+  })
+
+  it('ACP 模式不补代理链路的已配置 ID，配置键随保存原样保留', async () => {
+    vi.setSystemTime(NOW)
+    // 代理目录键带 antigravity- 前缀，ACP 目录键是裸 ID：切到 ACP 后这些键不再混进列表。
+    const service = transport(document({ modelOverrides: {
+      'antigravity-gemini-3.8-flash': { enabled: true },
+      'antigravity-gemini-4-hydrogen': { effort: 'high' },
+      'gemini-4-neon': { enabled: false },
+    } }))
+    const { renderer } = await mount(service.remote, controlWith())
+    expect(renderer.root.findAllByProps({ name: 'model-enabled-antigravity-gemini-3.8-flash' })).toHaveLength(0)
+    expect(renderer.root.findAllByProps({ name: 'model-enabled-antigravity-gemini-4-hydrogen' })).toHaveLength(0)
+    expect(modelControl(renderer, 'enabled', 'gemini-4-neon').props['aria-label']).toBe('Gemini 4 Neon')
+    expect(renderedText(renderer)).not.toContain('项未保存')
+    // 不补行不等于删除：保存其它改动时，代理链路的键随整份 modelOverrides 原样提交。
+    await act(async () => { modelControl(renderer, 'enabled', 'gemini-4-neon').props.onChange({ target: { checked: true } }) })
+    await act(async () => { await button(renderer, '保存').props.onClick() })
+    expect(service.mutate).toHaveBeenCalledWith('llm-antigravity-acp', [
+      { op: 'set', path: ['modelOverrides'], value: {
+        'antigravity-gemini-3.8-flash': { enabled: true },
+        'antigravity-gemini-4-hydrogen': { effort: 'high' },
+      } },
+    ], expect.anything())
+  })
+
+  it('代理模式不补 ACP 链路的已配置 ID，编排合成条目两条链路同名', async () => {
+    vi.setSystemTime(NOW)
+    const control = vi.fn(async (method: string) => method === 'account'
+      ? { state: 'idle', message: 'ready', generationMode: { requested: 'proxy', active: 'proxy', proxyRouterReady: true } }
+      : { status: 'ok', models: [] })
+    const service = transport(document({ proxyMode: true, modelOverrides: {
+      'gemini-4-neon': { effort: 'high' },
+      'claude-sonnet-5-5': { enabled: false },
+      'antigravity-gemini-4-hydrogen': { effort: 'low' },
+      'antigravity-orchestrator': { target: 'x' },
+    } }))
+    const { renderer } = await mount(service.remote, control)
+    expect(renderer.root.findAllByProps({ name: 'model-enabled-gemini-4-neon' })).toHaveLength(0)
+    expect(renderer.root.findAllByProps({ name: 'model-enabled-claude-sonnet-5-5' })).toHaveLength(0)
+    expect(modelControl(renderer, 'enabled', 'antigravity-gemini-4-hydrogen').props['aria-label']).toBe('Gemini 4 Hydrogen')
+    expect(modelControl(renderer, 'enabled', 'antigravity-orchestrator').props['aria-label']).toBe('Orchestrator（插件编排）')
   })
 
   it('模型可搜索并按启停筛选，折叠的高级映射仍可编辑', async () => {
@@ -766,6 +1107,7 @@ describe('settings card with real React state and effects', () => {
   })
 
   it('目录变化时刷新逐模型列表，手动列目录也能读到新条目', async () => {
+    vi.setSystemTime(NOW)
     const service = transport()
     let revision = 1
     const control = vi.fn(async (method: string, request?: { force?: boolean }) => {
@@ -774,10 +1116,10 @@ describe('settings card with real React state and effects', () => {
       return revision === 1 ? { status: 'ok', models: [] } : catalog()
     })
     const { renderer, intervals } = await mount(service.remote, control)
-    // 空目录仍有退役表内置家族补行（默认关闭并带下线徽章），不显示空列表提示。
+    // 空目录仍有尚未下线的退役表内置家族补行（默认关闭并带下线徽章），不显示空列表提示。
     expect(renderedText(renderer)).not.toContain('暂无模型')
     expect(renderedText(renderer)).toContain('即将下线 11-30')
-    expect(renderedText(renderer)).toContain('全部 3')
+    expect(renderedText(renderer)).toContain('全部 2')
     revision = 2
     await act(async () => { for (const timer of intervals.values()) if (timer.delay === 2000) timer.callback() })
     expect(modelControl(renderer, 'target', 'gemini-3-pro').props.value).toBe('')

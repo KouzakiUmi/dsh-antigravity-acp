@@ -1,5 +1,6 @@
 /** 界面文案的英文字典：键是 client.js 里的中文原文（t / msg 的参数）。 */
 const EN_UI = {
+  'Orchestrator（插件编排）': 'Orchestrator (plugin)',
   '使用代理模式': 'Use proxy mode',
   '直连上游；需启用代理路由并连接代理账户。': 'Connects to the upstream directly; requires the proxy router and a connected proxy account.',
   '使用 agy CLI 补充额度': 'Use agy CLI for extra quota',
@@ -267,6 +268,7 @@ const EN_UI = {
   '已下线 {date}': 'Retired {date}',
   '官方将于 {date} 下线': 'Officially retires on {date}',
   '官方将于 {date} 下线，建议改用 {migration}': 'Officially retires on {date}; consider switching to {migration}',
+  '{names} 已过官方下线日，不再列入模型列表；保存后移除其模型设置。': '{names} passed its official retirement date and is no longer listed; saving removes its model settings.',
   '规划思考档位': 'Planner thinking level',
   '规划阶段使用的思考档位（low / medium / high）。': 'Thinking level used during planning (low / medium / high).',
   '执行模型（Executor）': 'Executor model',

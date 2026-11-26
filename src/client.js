@@ -95,6 +95,20 @@ window.__ModuleLoader__.load({
     function retirementForModel(id) {
       return RETIREMENT_BY_FAMILY.get(retirementFamilyKey(id))
     }
+    /**
+     * 官方下线日（本地日历日）当天结束后即为已退役：徽章文案与「已退役家族移出列表、
+     * 随保存清理配置键」共用这一个判定。
+     */
+    function isRetired(retiring) {
+      const endOfDay = new Date(`${retiring.retireAt}T00:00:00`)
+      endOfDay.setDate(endOfDay.getDate() + 1)
+      return endOfDay.getTime() <= Date.now()
+    }
+    /** 该 ID（家族或档位 ID）是否属于已过官方下线日的家族。 */
+    function isRetiredModel(id) {
+      const retiring = retirementForModel(id)
+      return retiring !== undefined && isRetired(retiring)
+    }
     /** 生效启用态：显式配置优先；未配置时退役家族默认关闭。 */
     function effectiveEnabled(overrides, id) {
       const stored = overrideFor(overrides, id).enabled
@@ -127,6 +141,57 @@ window.__ModuleLoader__.load({
     function sameOverrides(a, b) {
       return JSON.stringify(canonicalOverrides(a)) === JSON.stringify(canonicalOverrides(b))
     }
+    /** 已退役家族的键名；非对象输入返回空数组。 */
+    function retiredOverrideKeys(overrides) {
+      if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides)) return []
+      return Object.keys(overrides).filter(isRetiredModel)
+    }
+    /** 服务端 modelOverrides 的原始对象形态；非对象输入视为空表。 */
+    function rawOverrides(value) {
+      return value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+    }
+    /**
+     * 合成 modelOverrides：以与当前修订号同源的服务端原始值为底；cleanup 为真时删掉已退役
+     * 家族的键，为假（用户已撤销清理）时原样保留。只有**用户触及过**的键以草稿为准
+     * （草稿里没有即用户清空，删除该键），且不会把已退役键写回。未触及的键（含另一链路、
+     * 含仅默认值的记录、含外部新增的键）逐字保留服务端值。
+     */
+    function mergeOverrides(latest, draft, touched, cleanup) {
+      const value = { ...rawOverrides(latest) }
+      const edited = rawOverrides(draft)
+      for (const id of retiredOverrideKeys(value)) {
+        if (cleanup) delete value[id]
+      }
+      for (const id of touched ?? []) {
+        if (isRetiredModel(id)) continue
+        if (id in edited) value[id] = edited[id]
+        else delete value[id]
+      }
+      return value
+    }
+    /**
+     * modelOverrides 是否有未保存改动：基线里有而草稿里没有的键算改动（显式清空与
+     * 退役清理），用户触及过且值仍不同的键也算；不看键序与写法差异。
+     * 传入的基线决定退役清理是否算改动：编辑路径传原始基线（清理待办要保留），
+     * 重读路径传已去掉退役键的基线（清理的脏值由调用方单独标记）。
+     */
+    function overridesChanged(draft, baselineClean, touched) {
+      const edited = rawOverrides(draft)
+      const base = rawOverrides(baselineClean)
+      for (const id of Object.keys(base)) if (!(id in edited)) return true
+      for (const id of touched ?? []) {
+        if (!sameOverrides({ [id]: edited[id] }, { [id]: base[id] })) return true
+      }
+      return false
+    }
+    /** 待保存的清理涉及的家族名：基线里有、草稿里没有的已退役键。 */
+    function retiredCleanupNames(latest, draft) {
+      const names = new Set()
+      for (const id of retiredOverrideKeys(latest)) {
+        if (!(id in rawOverrides(draft))) names.add(retirementForModel(id).name)
+      }
+      return [...names]
+    }
     function overrideFor(overrides, id) {
       const row = overrides && typeof overrides === 'object' ? overrides[id] : undefined
       return row && typeof row === 'object' ? row : {}
@@ -147,6 +212,33 @@ window.__ModuleLoader__.load({
       { value: 'claude-sonnet-5-5', label: 'Claude Sonnet 5.5' },
     ]
     const ORCHESTRATOR_EXECUTOR_IDS = new Set(ORCHESTRATOR_EXECUTOR_OPTIONS.map((entry) => entry.value))
+    /**
+     * 插件合成的编排条目，须与 src/orchestrator/types.ts 的同名常量一致
+     * （一致性由 tests/client-loader.test.ts 锁定）。client 不能 import TS，内置同值。
+     */
+    const ORCHESTRATOR_MODEL_ID = 'antigravity-orchestrator'
+    const ORCHESTRATOR_MODEL_NAME = 'Orchestrator（插件编排）'
+    /**
+     * 已知家族的内置显示名：只给「已配置但不在当前目录」的补行兜底，
+     * 目录条目始终用目录自带的名字。表由退役表与编排预设选项派生，不另抄一份。
+     */
+    const KNOWN_FAMILY_NAMES = new Map([
+      ...MODEL_RETIREMENTS.map((entry) => [entry.familyId, entry.name]),
+      ...ORCHESTRATOR_PLANNER_OPTIONS.map((entry) => [entry.value, entry.label]),
+      ...ORCHESTRATOR_EXECUTOR_OPTIONS.map((entry) => [entry.value, entry.label]),
+    ])
+    function fallbackModelName(id) {
+      return KNOWN_FAMILY_NAMES.get(retirementFamilyKey(id)) ?? (id === ORCHESTRATOR_MODEL_ID ? t(ORCHESTRATOR_MODEL_NAME) : id)
+    }
+    /**
+     * 已配置但不在当前目录的 ID 是否属于当前链路：代理目录键一律带 antigravity- 前缀
+     * （auth-core 定义与 live Gemini 家族），ACP 目录键是裸 ID；编排合成条目两条链路同名，
+     * 不按前缀判断。另一链路的键留在配置里，切回时照常出现。
+     */
+    function belongsToMode(id, proxyMode) {
+      if (id === ORCHESTRATOR_MODEL_ID) return true
+      return id.startsWith('antigravity-') === proxyMode
+    }
     const ORCHESTRATOR_EFFORT_OPTIONS = EFFORT_OPTIONS.filter((entry) => Boolean(entry.value))
     const ORCHESTRATOR_DEFAULTS = {
       enabled: true,
@@ -211,9 +303,12 @@ window.__ModuleLoader__.load({
      * 目录条目 + 已配置但当前目录没有的 ID + 退役表内置家族，都要能在此编辑。
      * proxyMode 必须由调用方按当前链路显式传入：不能用目录里是否出现 antigravity-
      * 前缀来猜（ACP 模式的编排合成条目同样带该前缀，会导致补行写错 ID 风格）。
+     * 官方下线日已过的家族不在此列：观测行、补行与残留配置键一律跳过，配置键由
+     * reload 从草稿移出、随保存删除。不属于当前链路的已配置 ID 也不补行
+     * （见 belongsToMode），配置键原样保留。
      */
     function modelRows(models, overrides, proxyMode = false) {
-      const rows = models.map(({ id, name, inputModalities, contextWindow, maxOutputTokens, contextWindowSource }) => {
+      const rows = models.filter(({ id }) => !isRetiredModel(id)).map(({ id, name, inputModalities, contextWindow, maxOutputTokens, contextWindowSource }) => {
         const retiring = retirementForModel(id)
         return { id, name, inputModalities, contextWindow, maxOutputTokens, contextWindowSource, inCatalog: true, ...(retiring ? { retiring } : {}) }
       })
@@ -222,7 +317,7 @@ window.__ModuleLoader__.load({
       // 避免 gpt-oss（真实键 antigravity-gpt-oss-120b-medium）出现重复死行。
       const presentFamilies = new Set(rows.map((row) => retirementFamilyKey(row.id)))
       for (const retiring of MODEL_RETIREMENTS) {
-        if (presentFamilies.has(retiring.familyId)) continue
+        if (isRetired(retiring) || presentFamilies.has(retiring.familyId)) continue
         // ACP 目录键是裸家族 id；代理目录键带 antigravity- 前缀。
         const id = proxyMode ? `antigravity-${retiring.familyId}` : retiring.familyId
         if (!known.has(id)) {
@@ -230,8 +325,11 @@ window.__ModuleLoader__.load({
           known.add(id)
         }
       }
-      for (const id of Object.keys(canonicalOverrides(overrides))) {
-        if (!known.has(id)) rows.push({ id, name: id, inCatalog: false })
+      // 按服务端原始值列键：只有默认值（如 enabled: true）的已配置 ID 也要能在此编辑。
+      for (const id of Object.keys(rawOverrides(overrides))) {
+        // 另一链路的键（代理带 antigravity- 前缀 / ACP 裸 ID）不补行，切回该链路时再出现。
+        if (known.has(id) || isRetiredModel(id) || !belongsToMode(id, proxyMode)) continue
+        rows.push({ id, name: fallbackModelName(id), inCatalog: false })
       }
       return rows
     }
@@ -410,7 +508,7 @@ window.__ModuleLoader__.load({
     /** 紧凑列表行；完整 ID、输入能力、改名和映射集中在单条详情里。 */
     function RetirementBadge({ retiring }) {
       const monthDay = retiring.retireAt.slice(5)
-      const retired = Date.parse(`${retiring.retireAt}T23:59:59`) < Date.now()
+      const retired = isRetired(retiring)
       const title = retiring.migration
         ? t('官方将于 {date} 下线，建议改用 {migration}', { date: retiring.retireAt, migration: retiring.migration })
         : t('官方将于 {date} 下线', { date: retiring.retireAt })
@@ -703,14 +801,34 @@ window.__ModuleLoader__.load({
         if (savingRef.current) return
         const current = overrideFor(draftRef.current[OVERRIDES_KEY], id)
         const merged = canonicalOverride(id, { ...current, ...patch })
-        const overrides = canonicalOverrides(draftRef.current[OVERRIDES_KEY])
-        if (Object.keys(merged).length === 0) delete overrides[id]
-        else overrides[id] = merged
-        const value = overrides
+        // 其它记录保持原样（含仅默认值的记录），只规范化被编辑的这一条。
+        const overrides = { ...rawOverrides(draftRef.current[OVERRIDES_KEY]) }
+        const base = rawOverrides(baseline.current[OVERRIDES_KEY])
+        const touched = (dirty.current.touchedIds ??= new Set())
+        if (sameOverrides({ [id]: merged }, { [id]: base[id] })) {
+          // 改回基线值：不算触及，草稿恢复该行的原始值（含仅默认值的记录）。
+          if (id in base) overrides[id] = base[id]
+          else delete overrides[id]
+          touched.delete(id)
+        } else if (Object.keys(merged).length === 0) {
+          // 显式清空 = 删除该键：基线里有才构成删除意图。
+          delete overrides[id]
+          if (id in base) touched.add(id)
+          else touched.delete(id)
+        } else {
+          overrides[id] = merged
+          touched.add(id)
+        }
+        // 保存值由 mergeOverrides 从基线合成；这里同步草稿以驱动列表与脏值。
+        const cleanup = dirty.current.retiredDiscarded !== true
+        const value = mergeOverrides(base, overrides, touched, cleanup)
+        dirty.current.retiredAuto = touched.size === 0
         const next = { ...draftRef.current, [OVERRIDES_KEY]: value }
         draftRef.current = next
-        if (sameOverrides(value, baseline.current[OVERRIDES_KEY])) dirty.current.delete(OVERRIDES_KEY)
-        else dirty.current.add(OVERRIDES_KEY)
+        // 脏值 = 有净改动的键，或有「基线里有、草稿里没有」的键（显式清空与退役清理）；
+        // 对照未清理的原始基线，清理掉的退役键才算待删。
+        if (overridesChanged(value, base, touched)) dirty.current.add(OVERRIDES_KEY)
+        else dirty.current.delete(OVERRIDES_KEY)
         setDirtyKeys([...dirty.current])
         setConflicts((previous) => previous.filter((field) => field !== OVERRIDES_KEY))
         setDraft(next)
@@ -766,29 +884,57 @@ window.__ModuleLoader__.load({
             : field.lines ? (Array.isArray(current[field.key]) ? current[field.key].join('\n') : current[field.key] ?? '')
               : current[field.key] ?? field.defaultValue ?? '']))
           // 整份 map 作为一个字段参与脏值比较；规范化后再比，避免键序或
-          // 「显式写回默认值」被误判为未保存修改。
-          server[OVERRIDES_KEY] = canonicalOverrides(current[OVERRIDES_KEY])
+          // 「显式写回默认值」被误判为未保存修改。基线保留服务端原始值（含已退役
+          // 家族的键），保存时以它为底，只删已退役键、保留其余键。
+          const latest = rawOverrides(current[OVERRIDES_KEY])
+          // 清理是否生效：设置可写、服务端确有已退役键，且用户没有撤销过。撤销后已退役键
+          // 只是不出现在列表里，草稿与保存都原样保留，直到服务端不再含这些键。
+          const cleanup = settings?.writable === true && retiredOverrideKeys(latest).length > 0 && dirty.current.retiredDiscarded !== true
+          const withoutRetired = cleanup ? { ...latest } : latest
+          if (cleanup) for (const id of retiredOverrideKeys(withoutRetired)) delete withoutRetired[id]
           server[ORCHESTRATOR_KEY] = orchestratorDraftFrom(current[ORCHESTRATOR_KEY])
           const changed = []
-          const next = { ...server }
+          const next = { ...server, [OVERRIDES_KEY]: withoutRetired }
           for (const key of dirty.current) {
+            // 外部更新后未触及的键跟随服务端最新值，用户触及过的键保留草稿。
+            const draftValue = key === OVERRIDES_KEY
+              ? mergeOverrides(latest, draftRef.current[key], dirty.current.touchedIds, cleanup)
+              : draftRef.current[key]
             const same = key === OVERRIDES_KEY
-              ? sameOverrides(draftRef.current[key], server[key])
+              ? !overridesChanged(draftValue, withoutRetired, dirty.current.touchedIds)
               : key === ORCHESTRATOR_KEY
-                ? isOrchestratorDraftValid(draftRef.current[key]) && sameOrchestrator(draftRef.current[key], server[key])
-                : draftRef.current[key] === server[key]
+                ? isOrchestratorDraftValid(draftValue) && sameOrchestrator(draftValue, server[key])
+                : draftValue === server[key]
             if (same) dirty.current.delete(key)
             else {
-              next[key] = draftRef.current[key]
+              next[key] = draftValue
+              // 冲突判定看服务端相对旧基线是否变过。
               const beforeSame = key === OVERRIDES_KEY
-                ? sameOverrides(baseline.current[key], server[key])
+                ? sameOverrides(baseline.current[key], withoutRetired)
                 : key === ORCHESTRATOR_KEY
                   ? sameOrchestrator(baseline.current[key], server[key])
                   : baseline.current[key] === server[key]
               if (!beforeSame) changed.push(key)
             }
           }
-          baseline.current = server
+          baseline.current = { ...server, [OVERRIDES_KEY]: latest }
+          // 触及过的键在草稿与服务端「存在性一致且值一致」时不再算触及：远端键已删除
+          // （两边都没有）即删除意图完成；草稿里没有而服务端有的是待删除，保留。
+          for (const id of dirty.current.touchedIds ?? []) {
+            const inDraft = Object.hasOwn(next[OVERRIDES_KEY], id)
+            const inBase = Object.hasOwn(withoutRetired, id)
+            if (inDraft === inBase && (!inDraft || sameOverrides({ [id]: next[OVERRIDES_KEY][id] }, { [id]: withoutRetired[id] }))) dirty.current.touchedIds.delete(id)
+          }
+          // 清理把 modelOverrides 标为未保存项：用户点保存才真正删除。清理是自动排入的，
+          // 用户没有编辑时，设置转只读或用户撤销后要把它从脏值里撤掉。
+          if (cleanup) {
+            dirty.current.add(OVERRIDES_KEY)
+            dirty.current.retiredAuto = dirty.current.touchedIds === undefined || dirty.current.touchedIds.size === 0
+          } else {
+            if (dirty.current.retiredAuto === true) dirty.current.delete(OVERRIDES_KEY)
+            dirty.current.retiredAuto = false
+            if (retiredOverrideKeys(latest).length === 0) dirty.current.retiredDiscarded = false
+          }
           draftRef.current = next
           setDraft(next)
           setDirtyKeys([...dirty.current])
@@ -830,6 +976,7 @@ window.__ModuleLoader__.load({
             const field = FIELDS.find((entry) => entry.key === key)
             const value = key === ORCHESTRATOR_KEY
               ? canonicalOrchestrator(draftRef.current[key])
+              : key === OVERRIDES_KEY ? mergeOverrides(baseline.current[key], draftRef.current[key], dirty.current.touchedIds, dirty.current.retiredDiscarded !== true)
               : field?.lines ? String(draftRef.current[key] ?? '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean) : draftRef.current[key]
             return { op: 'set', path: [key], value }
           })
@@ -841,9 +988,13 @@ window.__ModuleLoader__.load({
             const field = FIELDS.find((entry) => entry.key === key)
             const currentValue = key === ORCHESTRATOR_KEY
               ? canonicalOrchestrator(draftRef.current[key])
+              // modelOverrides 的写回值含基线保留的键，以同一函数重算后再比。
+              : key === OVERRIDES_KEY ? mergeOverrides(baseline.current[key], draftRef.current[key], dirty.current.touchedIds, dirty.current.retiredDiscarded !== true)
               : field?.lines ? String(draftRef.current[key] ?? '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean) : draftRef.current[key]
             if (JSON.stringify(currentValue) === JSON.stringify(operation.value)) dirty.current.delete(key)
           }
+          // 已提交的键不再视为用户触及，之后的保存只认新的编辑。
+          dirty.current.touchedIds = new Set()
           setDirtyKeys([...dirty.current])
           setConflicts([])
           setStatus({ kind: 'ok', text: ops.some((operation) => operation.path[0] === 'proxyMode')
@@ -887,6 +1038,10 @@ window.__ModuleLoader__.load({
       const discardDraft = () => {
         if (savingRef.current) return
         dirty.current.clear()
+        dirty.current.touchedIds = new Set()
+        // 撤销同时放弃已退役键的清理：草稿回到基线原始值（已退役键仍在，只是不列入
+        // 列表），之后的编辑与保存都不删除它们，直到服务端不再含这些键。
+        dirty.current.retiredDiscarded = retiredOverrideKeys(baseline.current[OVERRIDES_KEY]).length > 0
         draftRef.current = { ...baseline.current }
         setDraft(draftRef.current)
         setDirtyKeys([])
@@ -965,6 +1120,12 @@ window.__ModuleLoader__.load({
             h(SectionHeading, { title: t('模型'),
               action: h('button', { type: 'button', title: t('刷新模型目录'), 'aria-label': t('刷新模型目录'), 'aria-busy': modelBusy || undefined, style: { ...ACTION, minHeight: '26px', padding: '3px 10px', flex: '0 0 auto', whiteSpace: 'nowrap' }, disabled: modelBusy || !props.control, onClick: () => pullModels(true) }, t(modelBusy ? '正在刷新…' : '刷新')) }),
             h(ModelOverrideList, { rows, overrides: draft[OVERRIDES_KEY], disabled: editingDisabled, onEdit: editOverride }),
+            // 清理说明从当前待删键派生：基线里有、草稿里没有的已退役键。
+            (() => {
+              const names = dirtyKeys.includes(OVERRIDES_KEY) ? retiredCleanupNames(baseline.current[OVERRIDES_KEY], draft[OVERRIDES_KEY]) : []
+              return names.length === 0 ? null
+                : h('p', { role: 'status', style: { margin: 0, fontSize: '11.5px', lineHeight: 1.5, color: '#946200' } }, t('{names} 已过官方下线日，不再列入模型列表；保存后移除其模型设置。', { names: names.join(t('、')) }))
+            })(),
             modelMessage ? h('p', { role: 'status', style: { fontSize: '11.5px', lineHeight: 1.5, opacity: .66, margin: '6px 0 0', overflowWrap: 'anywhere' } }, t(modelMessage)) : null)),
 
         h('div', { id: 'agy-settings-page-quota', role: 'tabpanel', style: pageStyle('quota') },

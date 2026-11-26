@@ -26,6 +26,7 @@ interface SlotRegistration {
 let lastStateCalls: unknown[] = []
 const effectCleanups: Array<() => void> = []
 afterEach(() => { for (const cleanup of effectCleanups.splice(0)) cleanup() })
+afterEach(() => { vi.useRealTimers() })
 
 /** 最近一次 `loadRegistrations` 期间，各处 `ctx.inject([...])` 声明的依赖列表。 */
 let lastInjectDeps: string[][] = []
@@ -70,6 +71,8 @@ function loadRegistrations(options: QuotaStubOptions = {}): Map<string, SlotRegi
     clearInterval,
     setTimeout,
     clearTimeout,
+    // 沿用测试进程的 Date：vi.setSystemTime 才能固定 client 的退役判定（vm 上下文默认有自己的内建 Date）。
+    Date,
     document: {
       documentElement: { clientWidth: 375 },
       addEventListener: (type: string, fn: (event: { key?: string; target?: unknown }) => void) => options.listeners?.set(type, fn),
@@ -876,15 +879,31 @@ describe('退役模型表：client 内置表与 host 单一规则源一致', () 
     expect(hostTable.find((entry) => entry.familyId === 'gpt-oss-120b')?.migrationFamily).toBeUndefined()
   })
 
-  it('退役模型行带「即将下线/已下线」徽章，默认开关为关闭', () => {
-    // 徽章文案依赖墙钟（RetirementBadge 按 retireAt 当天 23:59:59 判定）：
-    // 2026-11-30 之后 Argon / 3.8 Flash 会翻转为「已下线」，届时更新这两条断言。
+  it('尚未下线的退役模型行带「即将下线」徽章且默认关闭；已过下线日的家族不补行', () => {
+    // 退役判定按本地日历日：下线日次日零点起才算已退役。固定在 GPT-OSS 120B
+    // （11-18）已过下线日、Argon / 3.8 Flash（11-30）尚未，断言不随真实日期漂移。
+    vi.setSystemTime(new Date(2026, 10, 26, 12, 0, 0))
     const tree = loadCard()({ remote: {} })
     const text = texts(tree).join(' ')
     expect(text).toContain('即将下线 11-30')
-    // gpt-oss 的下线日已过，徽章展示已下线。
-    expect(text).toContain('已下线 11-18')
+    // gpt-oss 的下线日已过：不再补行，列表里没有它的名字与徽章。
+    expect(text).not.toContain('GPT-OSS 120B')
+    expect(text).not.toContain('已下线')
     const argonSwitch = elements(tree).find((item) => item.props.name === 'model-enabled-gemini-4-argon')
     expect(argonSwitch?.props.checked).toBe(false)
+  })
+})
+
+describe('编排合成条目常量：client 内置值与 host 单一规则源一致', () => {
+  it('client 内置的 ORCHESTRATOR_MODEL_ID / NAME 与 src/orchestrator/types.ts 完全相同', async () => {
+    const host = await import('../src/orchestrator/types.js')
+    const source = buildClientSource()
+    const literal = (name: string): string => {
+      const match = source.match(new RegExp(`const ${name} = ('(?:[^'\\\\]|\\\\.)*')`))
+      expect(match, `client.js 缺少常量 ${name}`).not.toBeNull()
+      return (new Function(`return ${match![1]}`)()) as string
+    }
+    expect(literal('ORCHESTRATOR_MODEL_ID')).toBe(host.ORCHESTRATOR_MODEL_ID)
+    expect(literal('ORCHESTRATOR_MODEL_NAME')).toBe(host.ORCHESTRATOR_MODEL_NAME)
   })
 })

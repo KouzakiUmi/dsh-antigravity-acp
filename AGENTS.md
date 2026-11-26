@@ -32,7 +32,8 @@ npm 包名 `dsh-bundle-antigravity-host`、provider ID `antigravity-acp` / `anti
 - **模型目录只观测，不自造**：ACP 模式目录来自会话 `configOptions` 与官方 CLI 只读清单；代理模式由 [`model-catalog.ts`](src/proxy/model-catalog.ts) 将支持的模型与当前账户的可用项取交集，排除上游停用项。审计快照之外的 Hydrogen 和 Neon 只按已观测档位派发，不借用其他家族的容量和能力。用户设置（`modelOverrides`）只作用于已存在的条目。唯一例外是受约束的合成条目 `antigravity-orchestrator`：只有配置的 planner 与 executor 都已在当前目录可见时才出现，它是插件编排入口而不是观测到的上游模型，条件不满足时不出现在选择器里。
 - **编排由插件自己驱动**：`antigravity-orchestrator` 的 planner 与 executor 选择、计划解析、交回判定都在插件内（[`src/orchestrator/`](src/orchestrator/)），两模式行为一致。代理链路是两次独立上游请求（planner 用独立会话存储，不写 `ContinuationState`）；ACP 链路是独立 planner 会话 + 同会话切模型执行。官方 `gemini-pro-orchestrator-*` 条目保持原样，透传给官方 agent 自己编排。
 - **停用 ≠ 删除**：停用只是不列入选择器，已知模型的显示名、上下文容量与路由仍保留，重新启用不会退回裸 ID。
-- **退役模型默认关闭但可显式启用**：官方公告即将下线的家族集中登记在 [`model-retirement.ts`](src/adapter/model-retirement.ts)（单一规则源），未显式配置时默认不进选择器，ACP 与代理两链路同口径；目录观测、家族折叠与路由不删除，设置页保留条目与「即将下线」徽章，`modelOverrides` 显式 `enabled: true` 优先于默认关闭。client 内置同份表用于徽章，两侧一致性由测试锁定。
+- **退役模型默认关闭但可显式启用**：官方公告即将下线的家族集中登记在 [`model-retirement.ts`](src/adapter/model-retirement.ts)（单一规则源），未显式配置时默认不进选择器，ACP 与代理两链路同口径；目录观测、家族折叠与路由不删除，下线日之前设置页保留条目与「即将下线」徽章，`modelOverrides` 显式 `enabled: true` 优先于默认关闭。client 内置同份表用于徽章，两侧一致性由测试锁定。官方下线日（本地日历日）已过后，设置页把该家族的观测行、补行与残留配置键一律移出列表，残留键移出草稿并显示为未保存项、随保存删除（只读设置下保留原样）；判定与徽章共用 client 内的同一个函数。保存时 `modelOverrides` 以与当前修订号同源的服务端原始值为底：只删已退役键，只有用户改过且相对基线仍有净改动的键（`editOverride` 记在 `dirty.current.touchedIds`，改回原值即移除）以草稿为准；脏值由「仍有净改动或有待删键」判定（`overridesChanged`），显式清空的删除意图保留到远端键消失，未触及的键逐字保留，避免覆盖外部更新或误删另一链路的键；清理说明从待删键派生，撤销后不随刷新重新排入（`dirty.current.retiredDiscarded`）。不在当前目录的已知家族补行用内置名（由退役表与编排预设派生；client 内置 `ORCHESTRATOR_MODEL_ID` / `NAME` 与 [`types.ts`](src/orchestrator/types.ts) 的一致性由测试锁定），目录条目始终沿用目录自带的名字。
+- **已配置的模型 ID 按链路过滤**：`modelOverrides` 由两条链路共用，代理目录键一律带 `antigravity-` 前缀（auth-core 定义与 live Gemini 家族），ACP 目录键是裸 ID，合成条目 `antigravity-orchestrator` 两边同名。设置页只给当前链路的「已配置但不在目录」的 ID 补行，另一链路的键留在配置里、切回时再出现；判定在 client 的 `belongsToMode`，与退役补行的键写法约定同源。
 - **映射优先于家族路由**：`target` 原样写入 `session/set_config_option`，由官方 agent 判定是否接受；未登记 ID 不被静默改写。没有映射时才走「显式选择 → 该模型默认档位 → 官方默认档位」。
 - **默认档位必须存在**：配置的档位若未被官方声明，退回官方默认档位，不指向不存在的选项。
 - **整份 map 作为一个字段**：`modelOverrides` 参与草稿脏值与冲突判断，规范化后比较，避免键序或写回默认值被误判为未保存修改；提交时只发改动过的顶层字段。
@@ -68,5 +69,6 @@ npm 包名 `dsh-bundle-antigravity-host`、provider ID `antigravity-acp` / `anti
 - 代理模式的线身份、传输、凭据、payload 与路由分别在 [`src/proxy/`](src/proxy/) 下独立模块；模式总线（`mode-bus.ts`）是互斥语义的唯一实现处。
 - 客户端 [`src/client.js`](src/client.js) 不得导入 Node 原生模块；`remote.settings` / `remote.llm` 必须逐个声明注入。一个包只注册一次 Host Typert contribution、只执行一次客户端 `$mount`，合并 `agyQuota` 与 `agyProxyAccount` 描述符；宿主拒绝重复 package-face / Remote package 身份。
 - 行为改动后同步更新 `docs/changelog.md`、`docs/configuration.md`、`docs/reference.md` 与 `docs/development.md` 的验证矩阵，并核对 `scripts/preview-kit.mjs` 的离线预览夹具。
+- client 用例涉及退役判定（官方下线日与本地日历日比较）时用 `vi.setSystemTime` 固定时钟，时间用本地构造（`new Date(2026, 10, 26, 12)`）而非带偏移的 ISO 字符串，使断言在任意进程时区下成立；`afterEach` 以 `vi.useRealTimers()` 恢复：client 在 vm 上下文里执行，默认有自己的内建 `Date`，两个 client 测试加载器已把测试进程的 `Date` 传入上下文。`scripts/preview-kit.mjs` 按序号硬编码 hook 状态，卡片组件内新增或调整 hook 顺序会使离线预览错位，改动后重新生成预览核对。
 - 验证入口：`npm run typecheck`、`npm test`、`npm run build`（`npm run check` 顺序执行三者）。
 - 待决事项：无。
