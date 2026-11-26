@@ -6,12 +6,9 @@
 
 ## 未发布
 
-<<<<<<< HEAD
-- **修复 #17：上下文容量未观测导致宿主压缩引擎报错**：宿主 `dsh-compaction-basic` 对没有 context 容量的路由在模型切换 / 溢出恢复路径直接抛错，而 ACP 容量只来自 `usage_update.size` 实测，首次观测前（或官方进程不报告 size 时）所有模型都无容量。新增 [`model-capacity.ts`](../src/adapter/model-capacity.ts) 审计参考回退：auth-core 原生模型快照覆盖的家族取其 maxTokens；快照未覆盖的 Neon / Hydrogen 用登记的上游实测记录（2026-11-19 真实账户目录八档均 maxTokens=1048576）。实测值永远优先，审计值不落盘、不参与目录观测，未知家族仍省略容量。`resolveModel`、`listModels` 与编排合成容量同口径；目录行新增 `contextWindowSource`（observed / audited），设置页据此显示「上游容量」或「审计参考，实测后更新」。
-=======
+- **修复 #17：上下文容量未观测导致宿主压缩引擎报错**：宿主 `dsh-compaction-basic` 对没有 context 容量的路由在模型切换 / 溢出恢复路径直接抛错，而 ACP 容量只来自 `usage_update.size` 实测，首次观测前（或官方进程不报告 size 时）所有模型都无容量。新增 [`model-capacity.ts`](../src/adapter/model-capacity.ts) 审计参考回退：auth-core 原生模型快照覆盖的家族取其 maxTokens；快照未覆盖的 Neon / Hydrogen 用登记的上游实测记录（2026-11-19 真实账户目录八档均 maxTokens=1048576）。实测值永远优先，审计值不落盘、不参与目录观测，未知家族仍省略容量。`resolveModel`、`listModels` 与编排合成容量同口径；目录行新增 `contextWindowSource`（observed / audited），设置页据此显示「上游容量」或「审计参考，实测后更新」。跨家族映射家族的实测容量描述的是映射目标，不落盘到该家族的档位缓存行；重启后该家族路由按映射目标的审计值取容量。
 - **修复 #18：工具目录超约 60KB 被官方 agent 丢弃**：真实探针（官方 1.5.2 + 本机登录态，`scripts/probe-tool-budget.mjs`）确认目录 JSON 60KB 时 24 个合成工具全可见、100KB 时丢 4 个 12KB 描述的工具，丢弃发生在官方 agent / 上游侧（插件桥全量交付、无分页）。新增 `src/adapter/tool-catalog.ts` 预算收敛：目录 JSON 超 `toolCatalogByteBudget`（普通配置，0–60000，默认 55000，0 禁用）时从最长描述迭代裁剪至落入预算，名称与参数 schema 不变，被裁描述带 `…[description truncated]` 标记；裁剪写宿主日志。三处工具发布点（新会话、恢复会话、续轮）同口径。
 - **修复 #14：代理模式 429 诊断增强**：配额耗尽分支此前丢弃上游原话，用户只看到泛化的「稍后重试」。现在 HTTP 429 两个分支（配额耗尽 / 普通限流）与流内限流事件都附带上游原话（优先 Google 错误 JSON 的 `error.message`，脱敏、最多 300 字符），配额重置时间等关键诊断随错误可见；耗尽识别补充 `reached your current quota` 形态。文档注明 ACP 登录与代理账户是不同额度池、429 不自动重试。
->>>>>>> origin/main
 - **修复 #16：prompt 字节预算裁剪可观测、预算可配置**：全量重放超出单次 prompt 字节预算时，裁剪事实除宿主日志外新增内存事件日志（有界 20 条，不落盘），经额度 `read` 结果附带给浏览器端；额度药丸在最近 10 分钟内出现裁剪时显示黄色警示点与标题提示，展开详情列出近期裁剪记录（最多 5 条）的时间、省略条数与字节量，并说明 DSH 上下文条不反映被裁部分。新增普通配置 `promptByteBudget`（16000–191000，默认 176000），经设置快照传入 prompt 组装与断言；设置卡片指引块列出该字段。文档注明按 UTF-8 字节计量（中文占用更多预算）与压缩请求同受此限。
 
 ## 0.1.51 · 2026-11-26

@@ -3277,4 +3277,63 @@ describe('ACP 会话复用与跨进程恢复', () => {
     // 读取缓存后，gpt-oss-120b-medium 应仍用审计值 131072，而不是 neon 的 1048576。
     expect((await secondHarness.adapter.resolveModel(AGY_PROVIDER_ID, 'gpt-oss-120b-medium')).context).toEqual({ contextWindow: 131_072 })
   })
+
+  it('链式映射下中间家族的观测同样不落盘（save 方向，DeepSeek 审查 P3-3）', async () => {
+    // A→B、B→C：claude-opus-5-5 → gpt-oss-120b-medium → gemini-4-neon-medium。
+    // 经 claude 路由的观测写在 claude 家族键（描述字面 GPT 档位）；经 gpt-oss
+    // 路由的观测写在 gpt-oss 家族键（描述 neon）。两个家族的档位行都不得兜底。
+    const tiered: SessionConfigOption[] = [{
+      id: 'model',
+      type: 'select',
+      name: 'Model',
+      category: 'model',
+      currentValue: 'gpt-oss-120b-medium',
+      options: [
+        { value: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B' },
+        { value: 'claude-opus-5-5-medium', name: 'Claude Opus 5.5' },
+      ],
+    }]
+    let latestPayload: Array<{ id: string; contextWindow?: number }> = []
+    const harness = createHarness({
+      configOptions: tiered,
+      readSettings: () => ({ modelOverrides: {
+        'gpt-oss-120b': { target: 'gemini-4-neon-medium' },
+        'claude-opus-5-5': { target: 'gpt-oss-120b-medium' },
+      } }),
+      saveCatalog: (models) => { latestPayload = models.map((m) => ({ ...m })) },
+      reuseSessions: false,
+    })
+    // 经中间家族 gpt-oss-120b 路由触发观测（其映射目标 neon，家族键描述 neon）。
+    const streaming = collect(harness.adapter.stream(baseOptions({ model: 'gpt-oss-120b' })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    await harness.agent.notify('session/update', {
+      sessionId: SESSION_1,
+      update: { sessionUpdate: 'usage_update', used: 10, size: 1_048_576 },
+    })
+    await harness.agent.notify('session/update', {
+      sessionId: SESSION_1,
+      update: { sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: '好' } },
+    })
+    await harness.agent.reply('session/prompt', { stopReason: 'end_turn' })
+    await streaming
+    const gptRow = latestPayload.find((row) => row.id === 'gpt-oss-120b-medium')
+    expect(gptRow?.contextWindow).toBeUndefined()
+    // 再经上游 claude 路由触发一次观测（claude 家族键描述字面 GPT 档位）。
+    const second = collect(harness.adapter.stream(baseOptions({ model: 'claude-opus-5-5' })))
+    await waitForRequest(harness.agent, 'session/prompt', 2)
+    await harness.agent.notify('session/update', {
+      sessionId: SESSION_1,
+      update: { sessionUpdate: 'usage_update', used: 12, size: 200_000 },
+    })
+    await harness.agent.notify('session/update', {
+      sessionId: SESSION_1,
+      update: { sessionUpdate: 'agent_message_chunk', messageId: 'm2', content: { type: 'text', text: '好' } },
+    })
+    await harness.agent.reply('session/prompt', { stopReason: 'end_turn' }, 1)
+    await second
+    // 守卫按家族分别求值：claude 行不继承 claude 家族键（描述 GPT），
+    // gpt 行不继承 gpt 家族键（描述 neon），两行都没有 contextWindow。
+    expect(latestPayload.map((row) => row.id).sort()).toEqual(['claude-opus-5-5-medium', 'gpt-oss-120b-medium'])
+    for (const row of latestPayload) expect(row.contextWindow).toBeUndefined()
+  })
 })
