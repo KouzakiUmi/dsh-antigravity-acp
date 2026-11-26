@@ -1078,6 +1078,52 @@ describe('StreamChunk 序列映射', () => {
   })
 })
 
+describe('工具目录字节预算（issue #18）', () => {
+  it('超预算工具描述在发布到 MCP 桥前裁剪，名称参数不变并留痕', async () => {
+    const warnings: string[] = []
+    const harness = createHarness({
+      readSettings: () => ({ toolCatalogByteBudget: 2_000 }),
+      log: { info: () => {}, warn: (message) => { warnings.push(message) } },
+    })
+    const bigTools: ToolSchema[] = [
+      { name: 'big_tool', description: 'x'.repeat(8_000), parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } },
+      ...TOOLS,
+    ]
+    const streaming = collect(harness.adapter.stream(baseOptions({ tools: bigTools })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    const published = harness.adapter.bridge.toolSchemas()
+    const big = published.find((tool) => tool.name === 'big_tool')!
+    expect(Buffer.byteLength(big.description, 'utf8')).toBeLessThan(8_000)
+    expect(big.description).toContain('[description truncated]')
+    expect(big.parameters).toEqual(bigTools[0]!.parameters)
+    expect(Buffer.byteLength(JSON.stringify(published), 'utf8')).toBeLessThanOrEqual(2_000)
+    expect(warnings.some((message) => message.includes('工具目录超出字节预算'))).toBe(true)
+    await harness.agent.notify('session/update', {
+      sessionId: SESSION_1,
+      update: { sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: '好' } },
+    })
+    await harness.agent.reply('session/prompt', { stopReason: 'end_turn' })
+    await streaming
+  })
+
+  it('预算内工具原样发布，不产生裁剪告警', async () => {
+    const warnings: string[] = []
+    const harness = createHarness({
+      log: { info: () => {}, warn: (message) => { warnings.push(message) } },
+    })
+    const streaming = collect(harness.adapter.stream(baseOptions({ tools: TOOLS })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    expect(harness.adapter.bridge.toolSchemas()).toEqual(TOOLS)
+    expect(warnings.some((message) => message.includes('工具目录超出字节预算'))).toBe(false)
+    await harness.agent.notify('session/update', {
+      sessionId: SESSION_1,
+      update: { sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: '好' } },
+    })
+    await harness.agent.reply('session/prompt', { stopReason: 'end_turn' })
+    await streaming
+  })
+})
+
 describe('不支持的请求项', () => {
   const cases: Array<[string, Partial<AdapterRequestOptions>]> = [
     ['temperature', { temperature: 0.5 }],

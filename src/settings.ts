@@ -51,6 +51,11 @@ export interface AntigravityHostConfig {
    * 超限时从最旧历史整条裁剪；中文等多字节字符按实际字节计。
    */
   promptByteBudget?: number
+  /**
+   * MCP 工具目录 JSON 字节预算（默认 55,000）。官方 agent 对超约 60KB 的目录
+   * 会丢弃工具；超预算时从最长描述裁剪以保全部工具可见。0 禁用裁剪。
+   */
+  toolCatalogByteBudget?: number
   /** 并发 MCP tools/call 的聚合窗口（毫秒），决定同一轮携带多少 tool-call block。 */
   bridgeParkSettleMs?: number
   /**
@@ -205,6 +210,7 @@ export const Config = Schema.object({
   authTimeoutMs: Schema.natural().default(300_000).description('authenticate（需人工在浏览器完成 OAuth 授权）的等待上限（毫秒）'),
   promptTimeoutMs: Schema.natural().default(1_800_000).description('单轮 session/prompt 的等待上限（毫秒）'),
   promptByteBudget: Schema.natural().min(16_000).max(191_000).default(176_000).description('单次 ACP prompt 的 UTF-8 字节预算（16000–191000）；超限时先裁剪最旧历史并在药丸提示。上游硬上限 192001 字节，中文等多字节字符按实际字节计'),
+  toolCatalogByteBudget: Schema.natural().max(60_000).default(55_000).description('MCP 工具目录 JSON 字节预算（0–60000，默认 55000）；官方 agent 对超约 60KB 的目录会丢弃工具，超预算时从最长描述裁剪以保全部工具可见，名称与参数不变。0 禁用裁剪'),
   bridgeParkSettleMs: Schema.natural().default(50).description('并发 MCP tools/call 的聚合窗口（毫秒）'),
   modelOverrides: Schema.dict(ModelOverrideSchema).default({}).volatile().description('按模型 ID 的目录设置（是否显示、默认思考档位、显示名、官方模型 ID 映射）；只作用于目录中已存在的模型') as Schema<
     Record<string, ModelOverride>,

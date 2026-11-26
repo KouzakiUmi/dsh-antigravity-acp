@@ -28,6 +28,7 @@ const EN_UI = {
   '浏览器登录超时（authTimeoutMs）': 'Browser login timeout (authTimeoutMs)',
   '单轮生成超时（promptTimeoutMs）': 'Per-turn generation timeout (promptTimeoutMs)',
   '单次 prompt 字节预算（promptByteBudget）': 'Per-prompt byte budget (promptByteBudget)',
+  '工具目录字节预算（toolCatalogByteBudget）': 'Tool catalog byte budget (toolCatalogByteBudget)',
   '工具调用聚合窗口（bridgeParkSettleMs）': 'Tool-call aggregation window (bridgeParkSettleMs)',
   'ACP Server 路径（binaryPath）': 'ACP Server path (binaryPath)',
   '自动下载 ACP Server（autoDownload）': 'Auto-download ACP Server (autoDownload)',
