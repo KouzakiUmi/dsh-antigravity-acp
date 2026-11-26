@@ -146,6 +146,14 @@ describe('代理模式流式工具与签名', () => {
     expect(chunks.at(-1)).toMatchObject({ type: 'finish', reason: { kind: 'error', failure: { code: 'RATE_LIMIT', status: 429 } } })
   })
 
+  it('SSE 限流事件附带上游原话并脱敏（issue #14）', async () => {
+    const chunks = await collect(adapter([{ error: { code: 429, status: 'RESOURCE_EXHAUSTED', message: 'Resource has been exhausted. Reset in 30s. Bearer abcdefgh12345678' } }]).stream(options))
+    const failure = (chunks.at(-1) as { reason: { failure: { message: string } } }).reason.failure
+    expect(failure.message).toContain('Resource has been exhausted')
+    expect(failure.message).toContain('Reset in 30s')
+    expect(failure.message).not.toContain('abcdefgh12345678')
+  })
+
   it('HTTP 429 区分配额耗尽与普通限流文案，并脱敏上游原话', async () => {
     const respond = (body: string) => new AntigravityProxyAdapter({
       credential: { credential: async () => ({ accessToken: 'synthetic', source: 'login', updatedAt: 'x' }) },
@@ -154,6 +162,13 @@ describe('代理模式流式工具与签名', () => {
     await expect(collect(respond('Resource has been exhausted for this project').stream(options))).rejects.toMatchObject({
       code: 'RATE_LIMIT', failure: { status: 429 }, message: expect.stringContaining('配额或容量已耗尽'),
     })
+    // 配额耗尽分支同样附带上游原话（JSON error.message 优先），重置时间等诊断不丢。
+    const jsonBody = JSON.stringify({ error: { code: 429, message: 'Resource has been exhausted. Retry in 45s. Bearer abcdefgh12345678', status: 'RESOURCE_EXHAUSTED' } })
+    const exhaustedJson = await collect(respond(jsonBody).stream(options)).catch((error: unknown) => error)
+    expect(exhaustedJson).toMatchObject({ code: 'RATE_LIMIT', failure: { status: 429 } })
+    expect((exhaustedJson as Error).message).toContain('配额或容量已耗尽')
+    expect((exhaustedJson as Error).message).toContain('Retry in 45s')
+    expect((exhaustedJson as Error).message).not.toContain('abcdefgh12345678')
     await expect(collect(respond('You have exhausted your capacity for today').stream(options))).rejects.toMatchObject({
       code: 'RATE_LIMIT', message: expect.stringContaining('配额或容量已耗尽'),
     })
