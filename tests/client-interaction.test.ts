@@ -99,6 +99,27 @@ async function mountPill(readQuota: unknown) {
   return renderer
 }
 
+/** 带真实几何的药丸挂载：按钮 ref 注入 getBoundingClientRect，驱动 useLayoutEffect 定位。
+ *  快照必须是稳定引用：useSyncExternalStore 每次返回新对象会触发无限重渲染。 */
+async function mountPillWithRect(rect: { left: number; right: number; top: number; bottom: number }) {
+  const { Pill } = loadCard()
+  const snapshot = { current: { provider: 'antigravity-acp', model: 'gemini-flash' } }
+  const store = { subscribe: () => () => {}, getSnapshot: () => snapshot }
+  const readQuota = async () => ({ status: 'ok', groups: [{ name: 'Gemini', buckets: [{ window: '5h', remainingPct: 95 }] }] })
+  let renderer!: ReactTestRenderer
+  await act(async () => {
+    renderer = create(React.createElement(Pill, { store, readQuota }), {
+      createNodeMock: (element) =>
+        element.type === 'button' && (element.props as Record<string, unknown>)['aria-haspopup'] === 'dialog'
+          ? { getBoundingClientRect: () => rect, focus: () => {} }
+          : null,
+    })
+  })
+  renderers.push(renderer)
+  await act(async () => { await renderer.root.findByProps({ 'aria-haspopup': 'dialog' }).props.onClick() })
+  return renderer
+}
+
 function button(renderer: ReactTestRenderer, label: string): ReactTestInstance {
   return renderer.root.findAllByType('button').find((node) => node.children.join('') === label || node.props['aria-label'] === label)!
 }
@@ -209,6 +230,36 @@ describe('quota pill with real React state and effects', () => {
     expect(renderer.root.findByProps({ 'aria-haspopup': 'dialog' }).props['aria-label']).toContain('额度读取失败')
     await act(async () => { await renderer.root.findByProps({ 'aria-haspopup': 'dialog' }).props.onClick() })
     expect(renderedText(renderer)).toContain('remote denied')
+  })
+
+  it('展开的弹层 absolute 锚在药丸上：右缘对齐、向上展开，不做视口坐标钳位（0.1.51 遮挡回归）', async () => {
+    // loadCard 视口 1200×800；按钮位于底部输入栏（top 744）。右对齐左端 660 ≥ 12 无溢出。
+    const renderer = await mountPillWithRect({ left: 900, right: 1000, top: 744, bottom: 770 })
+    const popover = renderer.root.findByProps({ role: 'dialog' })
+    expect(popover.props.style).toMatchObject({
+      position: 'absolute', right: 0, left: 'auto',
+      bottom: 'calc(100% + 8px)', top: 'auto', width: 340,
+    })
+    // 关闭后重开不叠加坐标状态，仍是同一锚定。
+    await act(async () => { await renderer.root.findByProps({ 'aria-haspopup': 'dialog' }).props.onClick() })
+    expect(renderer.root.findAllByProps({ role: 'dialog' })).toHaveLength(0)
+    await act(async () => { await renderer.root.findByProps({ 'aria-haspopup': 'dialog' }).props.onClick() })
+    expect(renderer.root.findByProps({ role: 'dialog' }).props.style).toMatchObject({ position: 'absolute', right: 0 })
+  })
+
+  it('右缘对齐越过视口左缘且左对齐更放得下时翻转 left:0', async () => {
+    // 按钮 left:10 right:110：右对齐左端 -230（溢出 242），左对齐右端 350（无溢出）→ left:0。
+    const renderer = await mountPillWithRect({ left: 10, right: 110, top: 744, bottom: 770 })
+    expect(renderer.root.findByProps({ role: 'dialog' }).props.style).toMatchObject({
+      position: 'absolute', left: 0, right: 'auto', bottom: 'calc(100% + 8px)',
+    })
+  })
+
+  it('顶部药丸下方空间更宽裕时向下展开', async () => {
+    const renderer = await mountPillWithRect({ left: 900, right: 1000, top: 30, bottom: 56 })
+    expect(renderer.root.findByProps({ role: 'dialog' }).props.style).toMatchObject({
+      position: 'absolute', right: 0, top: 'calc(100% + 8px)', bottom: 'auto',
+    })
   })
 
   it('刷新异常保留成功快照并标缓存，后续成功清除缓存标记', async () => {

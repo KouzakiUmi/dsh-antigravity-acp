@@ -587,12 +587,32 @@ describe('额度药丸（conversation.input.right）', () => {
     expect(listeners.size).toBe(0)
   })
 
-  it('窄屏靠左的药丸展开时把弹层夹在视口内', () => {
+  it('窄屏靠左的药丸：右缘对齐出界更多时翻转 left:0，向上展开', () => {
+    // 右缘 75：右对齐溢出 277；左对齐（left=-25+340=315 < 363）不溢出 → left:0。
     const pill = loadRegistrations({ stateOverrides: { 2: true }, refStateBindings: { 4: 3 }, refOverrides: {
-      5: { getBoundingClientRect: () => ({ right: 75, top: 760, bottom: 786 }) },
+      5: { getBoundingClientRect: () => ({ left: -25, right: 75, top: 760, bottom: 786 }) },
     } }).get('antigravity-quota')!.component
     pill({ store: modelStore('antigravity-acp') })
-    expect(lastStateCalls).toContainEqual(expect.objectContaining({ position: 'fixed', left: 12, width: 340, bottom: 92 }))
+    expect(lastStateCalls).toContainEqual(expect.objectContaining({ position: 'absolute', left: 0, right: 'auto', width: 340, bottom: 'calc(100% + 8px)' }))
+  })
+
+  it('视口内的药丸保持 absolute 右缘对齐锚点，不做视口钳位（0.1.51 遮挡回归）', () => {
+    // 右缘 260：右对齐左端 -80 虽为负，仍比左对齐（260+... 右端 500 出界 137）更贴近
+    // 视口 → 保持 right:0 锚定，不换算 fixed 坐标、不推离锚点。
+    const pill = loadRegistrations({ stateOverrides: { 2: true }, refStateBindings: { 4: 3 }, refOverrides: {
+      5: { getBoundingClientRect: () => ({ left: 160, right: 260, top: 760, bottom: 786 }) },
+    } }).get('antigravity-quota')!.component
+    pill({ store: modelStore('antigravity-acp') })
+    expect(lastStateCalls).toContainEqual(expect.objectContaining({ position: 'absolute', right: 0, left: 'auto', width: 340, bottom: 'calc(100% + 8px)' }))
+  })
+
+  it('贴右缘的药丸右对齐无溢出；顶部空间不足且下方更宽裕才向下', () => {
+    // 右缘 375：右对齐左端 35 ≥ 12 无溢出 → right:0；above=12 < below=788 → 向下。
+    const pill = loadRegistrations({ stateOverrides: { 2: true }, refStateBindings: { 4: 3 }, refOverrides: {
+      5: { getBoundingClientRect: () => ({ left: 315, right: 375, top: 32, bottom: 56 }) },
+    } }).get('antigravity-quota')!.component
+    pill({ store: modelStore('antigravity-acp') })
+    expect(lastStateCalls).toContainEqual(expect.objectContaining({ position: 'absolute', right: 0, width: 340, bottom: 'auto', top: 'calc(100% + 8px)' }))
   })
 
   it('挂载后立即卸载不接收迟到的额度响应', async () => {

@@ -1257,11 +1257,18 @@ window.__ModuleLoader__.load({
           const width = Math.min(340, viewport - 24)
           const above = rect.top - 20
           const below = height - rect.bottom - 20
-          setPosition({ position: 'fixed', right: 'auto', width,
-            left: Math.max(12, Math.min(rect.right - width, viewport - width - 12)),
+          // 弹层用 absolute 锚在药丸自身（right:0 右缘对齐，向输入区左侧展开），不换算
+          // 视口坐标：0.1.51 改成 fixed + 12px 视口钳位后，窄面板里的药丸被整体推离锚点、
+          // 悬到宿主面板外被裁掉（本版回归）。只有右缘对齐真的越过视口左缘、且左缘对齐
+          // 更放得下时才翻转成 left:0；两种对齐都出界时选溢出更小的一侧。
+          const overflowRightAlign = Math.max(0, 12 - (rect.right - width))
+          const overflowLeftAlign = Math.max(0, rect.left + width - (viewport - 12))
+          const alignLeft = overflowLeftAlign < overflowRightAlign
+          setPosition({ position: 'absolute', width,
+            ...(alignLeft ? { left: 0, right: 'auto' } : { right: 0, left: 'auto' }),
             ...(above >= Math.min(480, below)
-              ? { bottom: height - rect.top + 8, maxHeight: Math.max(32, above) }
-              : { bottom: 'auto', top: rect.bottom + 8, maxHeight: Math.max(32, below) }),
+              ? { bottom: 'calc(100% + 8px)', top: 'auto', maxHeight: Math.max(32, above) }
+              : { top: 'calc(100% + 8px)', bottom: 'auto', maxHeight: Math.max(32, below) }),
           })
         }
         reposition()
@@ -1294,8 +1301,8 @@ window.__ModuleLoader__.load({
           notices.length ? h('span', { 'aria-hidden': true, style: { width: '8px', height: '8px', borderRadius: '50%', background: '#eab308', flexShrink: 0 } }) : null,
           pillStatus.short ? h('span', null, pillStatus.short) : null),
         expanded ? h('div', { className: 'antigravity-quota-popover', role: 'dialog', 'aria-label': t('Antigravity 额度详情'), style: { zIndex: 50, width: 'min(340px, calc(100vw - 24px))', maxHeight: 'min(70vh, calc(100vh - 72px))', overflowY: 'auto', boxSizing: 'border-box', overflowWrap: 'anywhere', padding: '14px', borderRadius: '14px', background: 'var(--dsh-surface, var(--dsw-alias-bg-layer-1, Canvas))', color: 'var(--dsh-text, var(--dsw-alias-label-primary, CanvasText))', border: '1px solid rgba(128,128,128,.28)', boxShadow: '0 12px 32px rgba(0,0,0,.28)', font: '12px/1.5 sans-serif',
-          // 坐标全部由 useLayoutEffect 的 fixed 定位给出；首帧未算好时放屏外，
-          // 不再用相对药丸的 absolute/right:0，避免贴左边缘时弹出层超出视口。
+          // 坐标由 useLayoutEffect 给出：absolute 锚在药丸上，右缘对齐向左展开，
+          // 左缘出界时翻转 left:0。首帧未算好时放屏外，避免闪现在错误位置。
           ...(position ?? { position: 'fixed', left: -9999, top: 0 }) } },
           QuotaDetails({ ...quota, model, source: state?.current?.provider, onClose: () => { setExpanded(false); button.current?.focus?.() } })) : null)
     }
