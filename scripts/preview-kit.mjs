@@ -24,6 +24,7 @@ const documentStub = {
 }
 runInNewContext(source, { window: { __ModuleLoader__: { load(value) { plugin = value } } }, document: documentStub })
 let index = 0
+let previewId = 0
 let states = {}
 const usagePreview = { status: 'ok', pacificDay: '2026-10-22', minuteTruncated: false,
   minute: { requests: 3, inputTokens: 2560, reportedRequests: 2 },
@@ -46,7 +47,7 @@ const React = {
     try { return type({ ...(props ?? {}), children: children.flat() }) } finally { [localStates, localIndex] = saved }
   },
   useState: (initial) => [localStates ? localStates[localIndex++] ?? initial : index in states ? states[index++] : (index++, initial), () => {}],
-  useRef: (value) => ({ current: value?.control === previewAistudioControl ? previewAistudioScope : value }), useCallback: (fn) => fn, useEffect() {}, useLayoutEffect() {}, useId: () => 'preview',
+  useRef: (value) => ({ current: value?.control === previewAistudioControl ? previewAistudioScope : value }), useCallback: (fn) => fn, useEffect() {}, useLayoutEffect() {}, useId: () => 'preview-' + ++previewId,
   useSyncExternalStore: (_subscribe, getSnapshot) => getSnapshot(),
 }
 const components = new Map()
@@ -57,7 +58,7 @@ const ctx = {
 }
 plugin.factory(() => React).apply(ctx)
 const escape = (value) => String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;')
-const booleanAttributes = new Set(['disabled', 'checked', 'selected', 'multiple', 'readOnly', 'required'])
+const booleanAttributes = new Set(['disabled', 'checked', 'selected', 'multiple', 'readOnly', 'required', 'hidden'])
 const unitlessStyles = new Set(['opacity', 'zIndex', 'fontWeight', 'lineHeight', 'flex', 'flexGrow', 'flexShrink', 'order'])
 function html(node) {
   if (node === undefined || node === null || typeof node === 'boolean') return ''
@@ -65,18 +66,19 @@ function html(node) {
   const { type, props, children } = node
   let attrs = ''
   for (const [key, value] of Object.entries(props)) {
-    if (value === undefined || value === null || key === 'ref' || key === 'key' || key.startsWith('on')) continue
+    if (value === undefined || value === null || key === 'ref' || key === 'key' || key.startsWith('on') || (type === 'textarea' && key === 'value')) continue
     if (key === 'style') {
       attrs += ' style="' + escape(Object.entries(value).map(([k, v]) => k.replace(/[A-Z]/g, (c) => '-' + c.toLowerCase()) + ':' + (typeof v === 'number' && v !== 0 && !unitlessStyles.has(k) ? v + 'px' : v)).join(';')) + '"'
     } else if (booleanAttributes.has(key)) { if (value) attrs += ' ' + key.toLowerCase(); }
-    else attrs += ' ' + key + '="' + escape(value) + '"'
+    else attrs += ' ' + (key === 'className' ? 'class' : key === 'htmlFor' ? 'for' : key) + '="' + escape(value) + '"'
   }
-  const content = type === 'select' ? children.map((child) => child?.type === 'option' && child.props.value === props.value ? { ...child, props: { ...child.props, selected: true } } : child) : children
+  const content = type === 'select' ? children.map((child) => child?.type === 'option' && child.props.value === props.value ? { ...child, props: { ...child.props, selected: true } } : child)
+    : type === 'textarea' && props.value !== undefined ? [props.value] : children
   return '<' + type + attrs + '>' + content.map(html).join('') + '</' + type + '>'
 }
 function render(id, values, props) { index = 0; states = values; return html(components.get(id)(props)) }
-function pill(model, open = false) {
-  return render('antigravity-quota', { 0: quota, 2: open },
+function pill(model, open = false, snapshot = quota) {
+  return render('antigravity-quota', { 0: snapshot, 2: open, 3: open ? { position: 'absolute', right: 0, bottom: 'calc(100% + 8px)' } : null },
     { store: { subscribe() {}, getSnapshot: () => ({ current: { provider: 'antigravity-acp', model } }) } })
 }
 const models = [{ id: 'gemini-3.8-flash', name: 'Gemini Flash', inputModalities: ['text', 'image'] }, { id: 'claude-sonnet-5-5', name: 'Claude Sonnet', inputModalities: ['text'] }, { id: 'gemini-4-argon', name: 'Gemini 4 Argon', inputModalities: ['text', 'image'] }]
@@ -127,6 +129,10 @@ const aistudioSettings = render('antigravity-acp', {
 const vertexSettings = render('antigravity-acp', {
   0: { state: 'idle' }, 1: models, 4: { revision: 1 }, 5: true, 8: false, 9: true, 14: 'vertex',
   6: { vertexEnabled: true, vertexProject: 'example-project', vertexLocation: 'global',
-    vertexModels: 'gemini-4-hydrogen\ngemini-4-neon', modelOverrides: { 'vertex-ai-gemini-4-neon': { enabled: false } } },
+    vertexModels: 'gemini-2.5-flash\ngemini-4-hydrogen\ngemini-4-neon', modelOverrides: { 'vertex-ai-gemini-4-neon': { enabled: false } } },
 }, { remote: {}, control() {}, readVertexModels: async () => ({ status: 'ok', ids: ['gemini-4-hydrogen', 'gemini-4-neon'] }) })
-export { quota, models, aistudioModels, settings, proxySettings, proxyLoginSettings, aistudioSettings, vertexSettings, pill, render, escape, injectedStyles }
+const narrowQuota = { ...quota, plan: 'PreviewEnterprisePlanWithAnUnusuallyLongName', groups: [
+  { name: 'Gemini Models', buckets: [{ window: '5h', remainingPct: 86 }, { window: 'weekly', remainingPct: 72 }] },
+  { name: 'CustomQuotaGroupWithoutBreakableSpaces', buckets: [{ window: 'LongQuotaWindowWithoutBreakableSpaces', remainingPct: 65 }] },
+] }
+export { quota, narrowQuota, models, aistudioModels, settings, proxySettings, proxyLoginSettings, aistudioSettings, vertexSettings, pill, render, escape, injectedStyles }

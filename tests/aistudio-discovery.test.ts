@@ -36,9 +36,9 @@ describe('AI Studio 模型发现', () => {
     expect(page.models.map(model => model.wireModel)).toEqual(['gemini-3-pro-preview'])
   })
 
-  it('缺 displayName 回退线模型名，缺容量省略字段', () => {
+  it('缺 displayName 时格式化线模型名，缺容量省略字段', () => {
     const page = parseAistudioModels({ models: [{ name: 'models/gemini-2.0-flash', supportedGenerationMethods: ['generateContent'] }] })
-    expect(page.models[0]!).toMatchObject({ wireModel: 'gemini-2.0-flash', name: 'gemini-2.0-flash' })
+    expect(page.models[0]!).toMatchObject({ wireModel: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash' })
     expect(page.models[0]!.contextWindow).toBeUndefined()
     expect(page.models[0]!.maxOutputTokens).toBeUndefined()
   })
@@ -55,6 +55,16 @@ describe('AI Studio 模型发现', () => {
     expect(page.models).toHaveLength(1)
     expect(parseAistudioModels(null).models).toEqual([])
     expect(parseAistudioModels({ models: 'nope' }).models).toEqual([])
+  })
+
+  it('允许带图片输入的文本模型，剔除明确无文本输出的模型', () => {
+    const methods = ['generateContent']
+    const page = parseAistudioModels({ models: [
+      { name: 'models/gemini-4-fixture', supportedGenerationMethods: methods, inputModalities: ['IMAGE', 'TEXT'], outputModalities: ['TEXT'] },
+      { name: 'models/gemini-4-special', supportedGenerationMethods: methods, outputModalities: ['IMAGE'] },
+    ] })
+    expect(page.models.map(row => row.wireModel)).toEqual(['gemini-4-fixture'])
+    expect(page.nonChatIds).toEqual(['gemini-4-special'])
   })
 
   it('保留 nextPageToken 供翻页', () => {
@@ -75,6 +85,8 @@ describe('AI Studio 端点与 ID 约定', () => {
     expect(aistudioDefaultEnabled('aistudio-gemini-4-argon')).toBe(true)
     expect(aistudioDefaultEnabled('aistudio-gemini-4.5-flash')).toBe(true)
     expect(aistudioDefaultEnabled('gemini-4-hydrogen')).toBe(true)
+    expect(aistudioDefaultEnabled('gemini-4-live')).toBe(false)
+    expect(aistudioDefaultEnabled('aistudio-gemini-5-pro')).toBe(false)
     expect(aistudioDefaultEnabled('aistudio-gemini-3.8-flash')).toBe(false)
     expect(aistudioDefaultEnabled('aistudio-gemini-2.5-flash')).toBe(false)
     expect(aistudioDefaultEnabled('aistudio-gemini-1.5-pro')).toBe(false)

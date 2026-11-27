@@ -1,6 +1,6 @@
 {
   "name": "dsh-bundle-antigravity-host",
-  "version": "0.1.55",
+  "version": "0.1.56",
   "description": "Google Antigravity ACP, AI Studio, Vertex AI, and optional Colab tools for DeepSeek Harness.",
   "displayName": "Antigravity ACP",
   "keywords": [

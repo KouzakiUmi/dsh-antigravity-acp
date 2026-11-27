@@ -1,4 +1,5 @@
 import { llmError } from '../runtime/llm-error.js'
+import { isNonChatModel } from '../adapter/model-catalog-policy.js'
 
 export const VERTEX_PROVIDER_ID = 'vertex-ai'
 export const VERTEX_MODEL_PREFIX = `${VERTEX_PROVIDER_ID}-`
@@ -16,7 +17,7 @@ export function isVertexLocation(location: string): boolean {
 }
 
 export function isVertexPublisherModel(model: string): boolean {
-  return /^gemini-[a-z0-9](?:[a-z0-9.-]{0,119}[a-z0-9])?$/u.test(model)
+  return /^gemini-[a-z0-9](?:[a-z0-9.-]{0,119}[a-z0-9])?$/u.test(model) && !isNonChatModel(model)
 }
 
 export function validVertexScope(scope: VertexScope): boolean {

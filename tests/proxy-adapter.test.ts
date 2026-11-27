@@ -304,6 +304,22 @@ describe('代理凭据取消', () => {
 })
 
 describe('代理模型设置与调用准备', () => {
+  it('设置目录保留旧版，选择器不默认启用；非对话映射不影响其他模型', async () => {
+    const neon = 'antigravity-gemini-4-neon'
+    const request = vi.fn(async () => Response.json({ models: {
+      'gemini-3.8-flash-medium': {}, 'gemini-4-neon-medium': {}, 'gemini-3.1-flash-image': {}, 'claude-opus-5-5-medium': {},
+    } }))
+    const instance = new AntigravityProxyAdapter({
+      credential: { credential: async () => ({ accessToken: 'fixture', source: 'login', updatedAt: 'x' }) }, transport: { request },
+      readSettings: () => ({ modelOverrides: { [neon]: { target: 'gemini-4-tts' } } }),
+    })
+    expect((await instance.discoverModels()).map(row => row.id)).toEqual(expect.arrayContaining([model, 'antigravity-claude-opus-5-5']))
+    expect((await instance.listModels(PROXY_PROVIDER_ID)).map(row => row.id)).toEqual(['antigravity-claude-opus-5-5'])
+    await expect(instance.prepareCall(PROXY_PROVIDER_ID, neon)).rejects.toMatchObject({ code: 'INVALID_MODEL' })
+    await expect(instance.prepareCall(PROXY_PROVIDER_ID, 'antigravity-gemini-3.1-flash-image')).rejects.toMatchObject({ code: 'INVALID_MODEL' })
+    expect(request).toHaveBeenCalledOnce()
+  })
+
   it('经 DSH Core 保留混合档位家族的图片，再按实际路由校验', async () => {
     const image = { attachmentId: 'test-image', mediaType: 'image/png', width: 1, height: 1, bytes: 3 } as ImageAttachmentRef
     const reader: ProxyAttachmentReader = { readImage: vi.fn(), readImageRequest: vi.fn(async () => ({ data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' })) }
@@ -395,7 +411,7 @@ describe('代理模型设置与调用准备', () => {
         'claude-opus-5-5-low': { disabled: true, modelName: 'claude-opus-5-5-high' },
       } }) : new Response(`data: ${JSON.stringify(event([{ text: 'ok' }], 'STOP'))}\n\n`))
     const instance = new AntigravityProxyAdapter({
-      readSettings: () => ({ modelOverrides: { [model]: { effort: 'high' } } }),
+      readSettings: () => ({ modelOverrides: { [model]: { enabled: true, effort: 'high' } } }),
       credential: { credential: async () => ({ accessToken: 'fixture', source: 'login', updatedAt: 'x' }) },
       transport: { request },
     })

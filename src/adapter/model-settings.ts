@@ -7,8 +7,7 @@
  *   接受，未登记 ID 不会被这里静默改写成别的模型。
  * - 停用是「不列入选择器」，不是删除目录条目：已知模型的显示名、上下文容量与
  *   路由仍保留，避免重新启用时退回裸 ID。
- * - 官方公告即将下线的家族（见 model-retirement.ts）在用户未显式配置时默认
- *   停用；一旦 modelOverrides 出现该家族的显式记录，以用户配置为准。
+ * - 旧版和已公告退役的家族默认关闭；只有显式布尔开关覆盖所在路由的默认值。
  * - 默认档位只决定**未显式选择**思考强度时的路由结果；DSH 思考强度菜单的选择
  *   始终优先。
  *
@@ -16,6 +15,11 @@
  */
 import type { ModelOverride } from '../settings.js'
 import { isRetiringModel } from './model-retirement.js'
+import { catalogDisplayName, defaultChatModelEnabled } from './model-catalog-policy.js'
+
+function defaultEnabledFor(id: string): boolean {
+  return defaultChatModelEnabled(id) && !isRetiringModel(id)
+}
 
 /** Read-only capacity shown in model settings; never submitted as an override. */
 export interface ModelCapacity {
@@ -57,8 +61,8 @@ export function normalizeModelSettings(input: unknown, defaultEnabled?: (id: str
     const record = row as ModelOverride
     const name = text(record.name)
     const target = text(record.target)
-    // 显式 enabled 优先；缺省时交给链路默认谓词（AI Studio 按代际），无谓词保持启用。
-    const enabled = record.enabled !== undefined ? record.enabled !== false : (defaultEnabled ? defaultEnabled(id) : true)
+    // 仅显式布尔值覆盖目录默认。改名和映射不会顺带启用旧版。
+    const enabled = typeof record.enabled === 'boolean' ? record.enabled : (defaultEnabled ?? defaultEnabledFor)(id)
     settings.set(id, {
       enabled,
       ...(isEffort(record.effort) ? { effort: record.effort } : {}),
@@ -69,12 +73,12 @@ export function normalizeModelSettings(input: unknown, defaultEnabled?: (id: str
   return settings
 }
 
-/** 该模型的显示设置；未配置时返回启用且不带覆盖项。 */
+/** 未配置的模型继承所在路由的默认状态，不生成覆盖项。 */
 export function modelSettingFor(settings: ReadonlyMap<string, ModelSetting>, id: string, defaultEnabled?: (id: string) => boolean): ModelSetting {
   const stored = settings.get(id)
   if (stored) return stored
   // 未显式配置时，官方公告即将下线的家族默认关闭；用户仍可在设置页手动打开。
-  return { enabled: defaultEnabled ? defaultEnabled(id) : !isRetiringModel(id) }
+  return { enabled: (defaultEnabled ?? defaultEnabledFor)(id) }
 }
 
 /** 是否列入 DSH 模型选择器。 */
@@ -87,7 +91,7 @@ export function modelVisible(settings: ReadonlyMap<string, ModelSetting>, id: st
  */
 export function modelDisplayName(settings: ReadonlyMap<string, ModelSetting>, id: string, fallback: string): string {
   const name = modelSettingFor(settings, id).name
-  return name === undefined ? fallback : name
+  return name ?? catalogDisplayName(id, fallback)
 }
 
 /**
@@ -125,12 +129,13 @@ export interface CatalogRow {
 export function applyModelSettings(
   settings: ReadonlyMap<string, ModelSetting>,
   rows: readonly CatalogRow[],
+  includeDisabled = false,
 ): CatalogRow[] {
   const result: CatalogRow[] = []
   for (const row of rows) {
     const setting = modelSettingFor(settings, row.id)
-    if (!setting.enabled) continue
-    result.push(setting.name === undefined ? row : { ...row, name: setting.name })
+    if (!includeDisabled && !setting.enabled) continue
+    result.push({ ...row, name: setting.name ?? catalogDisplayName(row.id, row.name) })
   }
   return result
 }

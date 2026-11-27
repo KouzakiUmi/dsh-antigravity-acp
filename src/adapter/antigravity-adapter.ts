@@ -22,6 +22,7 @@ import type {
   ToolSchema,
 } from '@deepseek-ai/dsh-llm'
 import type { AcpRequestOptions, AdapterPreparedCall, AdapterRequestOptions, AdapterRequestOwner } from './request-options.js'
+import { isNonChatModel } from './model-catalog-policy.js'
 import type { AnyRequest, McpServer as AcpMcpServer, PromptResponse, SessionConfigOption, SessionNotification, Usage } from '@agentclientprotocol/sdk'
 import { AgentLinkError } from '../protocol/agent-link.js'
 import type { AgentLink, AgentLinkHandlers } from '../protocol/agent-link.js'
@@ -591,7 +592,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       throwIfAborted(signal)
       if (!findModelSelector(session.configOptions)) throw llmError('ACP 会话未提供模型目录', AGY_ADAPTER_ERROR.NO_MODEL_SELECTOR)
       this.observeSessionConfigOptions(session.configOptions)
-      return await this.listModels(AGY_PROVIDER_ID)
+      return await this.listSettingsModels(AGY_PROVIDER_ID)
     } catch (error) {
       if (link) this.#scheduleRecycle(link)
       throw error
@@ -697,6 +698,15 @@ export class AntigravityAcpAdapter extends LlmAdapter {
    * （adapter/model-retirement.ts）经可见性层默认关闭，用户可显式重新启用。
    */
   override async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+    return this.#listCatalog(_provider, false)
+  }
+
+  /** Settings can enable any observed chat model, including those off by default. */
+  async listSettingsModels(provider: string): Promise<readonly LlmModelInfo[]> {
+    return this.#listCatalog(provider, true)
+  }
+
+  async #listCatalog(_provider: string, includeDisabled: boolean): Promise<readonly LlmModelInfo[]> {
     const folded = await this.#foldCatalog(_provider)
     const orch = this.#orchestratorSettingsSnapshot()
     const observedFamilies = await this.#observedAcpFamilies(_provider)
@@ -718,7 +728,8 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     const visible = offered === undefined
       ? candidates
       : candidates.filter((model) => model.id === ORCHESTRATOR_MODEL_ID || offered.has(model.id))
-    const models = applyModelSettings(this.#modelSettingsSnapshot(), visible)
+    const settings = this.#modelSettingsSnapshot()
+    const models = applyModelSettings(settings, includeDisabled ? visible : visible.filter(({ id }) => !isNonChatModel(modelSettingFor(settings, id).target ?? id)), includeDisabled)
     return [
       ...models.map((model) => {
         // 实测容量优先；未实测时用审计参考值（issue #17），来源随目录行下发，
@@ -822,12 +833,13 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     // 磁盘缓存来自 ACP 原始档位观测，优先于其它 worker 的 CLI 家族兜底。
     const cached = this.#catalog.length > 0 ? this.#catalog : await this.#cachedModels(provider)
     const source = cached.length > 0 ? cached : [...this.#fallbackCatalog]
-    const observed = source.filter((model) => model.id !== AGY_PLACEHOLDER_MODEL_ID)
+    const observed = source.filter((model) => model.id !== AGY_PLACEHOLDER_MODEL_ID && !isNonChatModel(model.id))
     // ACP 目录（会话观测或其磁盘缓存）是当前认证方式下的权威清单：官方 server
     // 对清单外的型号直接拒绝 set_config_option（实测 oauth-personal 下 Claude 报
     // 「not available for the current authentication method」）。此时 CLI 清单仍
     // 参与档位表（路由不变），但选择器只列 ACP 提供的家族；尚无 ACP 目录时整份兜底。
-    const offered = observed.length > 0 && cached.length > 0 ? new Set(observed.map((model) => modelFamilyId(model.id))) : undefined
+    const offered = cached.some(model => model.id !== AGY_PLACEHOLDER_MODEL_ID)
+      ? new Set(observed.map(model => modelFamilyId(model.id))) : undefined
     const cliRows = await this.#cliRawRows()
     const folded = foldAgyModelFamilies([
       ...observed
@@ -910,6 +922,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
    * 真正的能力拒绝发生在 ACP 会话侧（模型不存在时 agent 自行报错）。
    */
   override async resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+    assertChatModel(model, modelSettingFor(this.#modelSettingsSnapshot(), model).target)
     // 显示名与档位不能只依赖此前是否有人列过目录；跨 worker 导入目录后
     // 也要走同一份折叠结果。这里仅读缓存，不启动 ACP 连接。
     const folded = await withAbort(this.#foldCatalog(provider), signal)
@@ -1040,6 +1053,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   #leadingEmittedBlock: ContentBlock | undefined
 
   override async *stream(options: AcpRequestOptions): AsyncIterable<StreamChunk> {
+    assertChatModel(options.model)
     // temperature / stop 在 ACP v1 没有会话通道：不因它们拒绝整个请求（否则宿主里
     // 任何携带这两个字段的流程都会整单失败），只明确告知「值不生效」。
     const unsupported = unsupportedOptions(options)
@@ -2391,6 +2405,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
             : family
       },
     })
+    assertChatModel(model, requested)
     const selector = this.#modelSelector
     if (!selector) {
       throw llmError(
@@ -2460,6 +2475,10 @@ export function explainUnavailableModel(error: unknown, model: string): unknown 
     `${error.message}（官方 ACP 当前登录方式不提供 ${model}，请在模型选择里换用 ACP 目录内的型号，或改用代理模式）`,
     { cause: error, ...(error.jsonRpc === undefined ? {} : { jsonRpc: error.jsonRpc }) },
   )
+}
+
+function assertChatModel(model: string, target = model): void {
+  if (isNonChatModel(model) || isNonChatModel(target)) throw llmError('ACP 文本路由不支持此模型或映射目标', 'INVALID_MODEL')
 }
 
 function throwIfAborted(signal?: AbortSignal): void {

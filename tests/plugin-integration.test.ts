@@ -76,6 +76,7 @@ vi.mock('../src/adapter/antigravity-adapter.js', () => ({
       return { provider, id, name: 'Example', inputModalities: this.options.canReadImages?.() ? ['text', 'image'] : ['text'] }
     }
     async listModels(provider: string) { return [await this.resolveModel(provider, 'example')] }
+    async listSettingsModels(provider: string) { return this.listModels(provider) }
     prepareCall = vi.fn(async (provider: string, model: string) => ({
       model: await this.resolveModel(provider, model), stream: (options: AdapterRequestOptions) => this.stream(options),
     }))
@@ -278,7 +279,7 @@ describe('apply wiring with real pool and SettingsControl', () => {
       if (!isVolatile(before) || !isVolatile(after)) throw new Error('Expected live setting')
       updateVolatile(before, after)
     }
-    expect(external.workers[0]!.options.readSettings?.()).toMatchObject({ modelOverrides: { after: { enabled: true, effort: 'high' } }, reuseSessions: false })
+    expect(external.workers[0]!.options.readSettings?.()).toMatchObject({ modelOverrides: { after: { effort: 'high' } }, reuseSessions: false })
     const beforeRevision = instance.control().account().runtime!.modelCatalogRevision!
     instance.updateSettings([['modelOverrides']])
     expect(instance.control().account().runtime!.modelCatalogRevision).toBe(beforeRevision + 1)

@@ -36,7 +36,7 @@ import { buildAistudioPayload } from './payload.js'
 import { parseAistudioModels } from './discovery.js'
 import type { AistudioModel } from './discovery.js'
 import { createAistudioReplayState } from './replay.js'
-import { AISTUDIO_PROVIDER_ID, aistudioCatalogId, aistudioDefaultEnabled, aistudioModelsUrl, aistudioStreamUrl, aistudioWireModel } from './endpoints.js'
+import { AISTUDIO_PROVIDER_ID, aistudioCatalogId, aistudioDefaultEnabled, aistudioModelsUrl, aistudioStreamUrl, aistudioWireModel, isAistudioChatModel } from './endpoints.js'
 import { inspectAistudioEvent, readAistudioError, redactAistudioError } from './response-observation.js'
 import { AistudioUsageStore } from './usage.js'
 import type { AistudioUsageResult } from './usage.js'
@@ -67,6 +67,7 @@ export interface AistudioAdapterOptions {
 
 export class AistudioAdapter extends LlmAdapter {
   private catalog: Map<string, AistudioModel> | undefined
+  private nonChatIds = new Set<string>()
   private catalogExpiresAt = 0
   private catalogDigest: string | undefined
   private catalogVersion = 0
@@ -101,6 +102,7 @@ export class AistudioAdapter extends LlmAdapter {
   invalidateModelCatalog(): void {
     this.catalogVersion += 1
     this.catalog = undefined
+    this.nonChatIds.clear()
     this.catalogExpiresAt = 0
   }
 
@@ -193,17 +195,22 @@ export class AistudioAdapter extends LlmAdapter {
   }
 
   private wireModel(model: string, settings: Map<string, ModelSetting>): string {
+    const selected = aistudioWireModel(model)
+    const original = selected.startsWith('models/') ? selected.slice('models/'.length) : selected
+    if (!isAistudioChatModel(original)) throw llmError('AI Studio 仅支持文本对话模型', 'INVALID_MODEL')
     const setting = modelSettingFor(settings, model, aistudioDefaultEnabled)
-    const wire = setting.target !== undefined ? setting.target : aistudioWireModel(model)
+    const wire = setting.target ?? original
     const canonical = wire.startsWith('models/') ? wire.slice('models/'.length) : wire
-    if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,255}$/u.test(canonical)) throw llmError('AI Studio 模型映射无效', 'INVALID_MODEL')
+    if (!isAistudioChatModel(canonical)) throw llmError('AI Studio 模型映射必须是文本对话模型', 'INVALID_MODEL')
     return canonical
   }
 
   private resolveInCatalog(model: string, settings: Map<string, ModelSetting>, catalog: Map<string, AistudioModel>): LlmResolvedModelInfo {
     const entry = catalog.get(model)
     if (entry === undefined) throw llmError('该模型不在 AI Studio 当前目录内', 'INVALID_MODEL')
-    const capacity = catalog.get(aistudioCatalogId(this.wireModel(model, settings)))
+    const wire = this.wireModel(model, settings)
+    if (this.nonChatIds.has(entry.wireModel) || this.nonChatIds.has(wire)) throw llmError('AI Studio 目录显示该映射不支持文本生成', 'INVALID_MODEL')
+    const capacity = catalog.get(aistudioCatalogId(wire))
     return {
       provider: AISTUDIO_PROVIDER_ID,
       id: model,
@@ -218,6 +225,7 @@ export class AistudioAdapter extends LlmAdapter {
     return [...catalog.values()].flatMap(entry => {
       let wire: string
       try { wire = this.wireModel(entry.catalogId, settings) } catch { return [] }
+      if (this.nonChatIds.has(entry.wireModel) || this.nonChatIds.has(wire)) return []
       const capacity = catalog.get(aistudioCatalogId(wire))
       return [{
         provider: AISTUDIO_PROVIDER_ID,
@@ -288,6 +296,7 @@ export class AistudioAdapter extends LlmAdapter {
     check()
     if (!force && this.catalogDigest === digest && this.catalog !== undefined && Date.now() < this.catalogExpiresAt) return this.catalog
     const models = new Map<string, AistudioModel>()
+    const nonChatIds = new Set<string>()
     let pageToken: string | undefined
     let pages = 0
     do {
@@ -309,6 +318,7 @@ export class AistudioAdapter extends LlmAdapter {
       }
       check()
       const page = parseAistudioModels(raw)
+      for (const id of page.nonChatIds ?? []) nonChatIds.add(id)
       for (const model of page.models) {
         if (models.size >= MAX_CATALOG_MODELS) break
         models.set(model.catalogId, model)
@@ -318,6 +328,7 @@ export class AistudioAdapter extends LlmAdapter {
     } while (pageToken !== undefined && pages < MAX_CATALOG_PAGES && models.size < MAX_CATALOG_MODELS)
     check()
     this.catalog = models
+    this.nonChatIds = nonChatIds
     this.catalogDigest = digest
     this.catalogExpiresAt = Date.now() + CATALOG_TTL_MS
     return models
@@ -332,6 +343,10 @@ export class AistudioAdapter extends LlmAdapter {
     }
     const { key, digest, epoch } = auth
     if (epoch !== this.credentialEpoch || (prepared !== undefined && (prepared.epoch !== epoch || prepared.digest !== digest))) { yield finishChunk('aborted', 'CANCELLED'); return }
+    const selected = aistudioWireModel(options.model).replace(/^models\//u, '')
+    if (this.nonChatIds.has(wireModel) || this.nonChatIds.has(selected)) {
+      throw llmError('AI Studio 目录显示该模型不支持文本生成', 'INVALID_MODEL')
+    }
     const signal = AbortSignal.any([this.credentialAbort.signal, ...(options.signal === undefined ? [] : [options.signal])])
     const header = new AbortController()
     const payload = buildAistudioPayload(options, wireModel)

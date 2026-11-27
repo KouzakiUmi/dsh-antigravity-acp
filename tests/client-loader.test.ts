@@ -567,7 +567,7 @@ describe('额度药丸（conversation.input.right）', () => {
     expect(openBars.slice(2).every((item) => (item.props.style as { height?: string }).height === '4px')).toBe(true)
     const gemini = elements(opened).find((item) => item.props['aria-label'] === 'Gemini额度')!
     expect(gemini.props.style).toMatchObject({ padding: '9px 0' })
-    expect(elements(gemini).some((item) => (item.props.style as { gridTemplateColumns?: string } | undefined)?.gridTemplateColumns === 'repeat(auto-fit, minmax(120px, 1fr))')).toBe(true)
+    expect(elements(gemini).some((item) => (item.props.style as { gridTemplateColumns?: string } | undefined)?.gridTemplateColumns === 'repeat(auto-fit, minmax(min(120px, 100%), 1fr))')).toBe(true)
   })
 
   it('未知自定义模型不借用其它模型额度；缓存状态与禁用窗口有明确语义', () => {
@@ -582,7 +582,7 @@ describe('额度药丸（conversation.input.right）', () => {
     const listeners = new Map<string, (event: { key?: string; target?: unknown }) => void>()
     const pill = loadRegistrations({ quotaSnapshot: completeQuota, stateOverrides: { 2: true }, listeners }).get('antigravity-quota')!.component
     pill({ store: modelStore('antigravity-acp') })
-    listeners.get('keydown')?.({ key: 'Escape' })
+    expect(listeners.has('keydown')).toBe(false) // Escape is handled inside the popover, not globally.
     expect(lastStateCalls.at(-1)).toBe(false)
     listeners.get('pointerdown')?.({ target: {} })
     expect(lastStateCalls.at(-1)).toBe(false)
@@ -591,22 +591,21 @@ describe('额度药丸（conversation.input.right）', () => {
   })
 
   it('窄屏靠左的药丸：右缘对齐出界更多时翻转 left:0，向上展开', () => {
-    // 右缘 75：右对齐溢出 277；左对齐（left=-25+340=315 < 363）不溢出 → left:0。
+    // 右对齐出界；左对齐 12+340=352 ≤ 375 → 保留 left:0。
     const pill = loadRegistrations({ stateOverrides: { 2: true }, refStateBindings: { 4: 3 }, refOverrides: {
-      5: { getBoundingClientRect: () => ({ left: -25, right: 75, top: 760, bottom: 786 }) },
+      5: { getBoundingClientRect: () => ({ left: 12, right: 112, top: 760, bottom: 786 }) },
     } }).get('antigravity-quota')!.component
     pill({ store: modelStore('antigravity-acp') })
     expect(lastStateCalls).toContainEqual(expect.objectContaining({ position: 'absolute', left: 0, right: 'auto', width: 340, bottom: 'calc(100% + 8px)' }))
   })
 
-  it('视口内的药丸保持 absolute 右缘对齐锚点，不做视口钳位（0.1.51 遮挡回归）', () => {
-    // 右缘 260：右对齐左端 -80 虽为负，仍比左对齐（260+... 右端 500 出界 137）更贴近
-    // 视口 → 保持 right:0 锚定，不换算 fixed 坐标、不推离锚点。
+  it('两种对齐都出界时相对药丸平移，仍保持 absolute 锚定', () => {
+    // 右对齐左端 -80，左对齐右端 500，平移到视口左右边距以内。
     const pill = loadRegistrations({ stateOverrides: { 2: true }, refStateBindings: { 4: 3 }, refOverrides: {
       5: { getBoundingClientRect: () => ({ left: 160, right: 260, top: 760, bottom: 786 }) },
     } }).get('antigravity-quota')!.component
     pill({ store: modelStore('antigravity-acp') })
-    expect(lastStateCalls).toContainEqual(expect.objectContaining({ position: 'absolute', right: 0, left: 'auto', width: 340, bottom: 'calc(100% + 8px)' }))
+    expect(lastStateCalls).toContainEqual(expect.objectContaining({ position: 'absolute', right: 'auto', left: -148, width: 340, bottom: 'calc(100% + 8px)' }))
   })
 
   it('贴右缘的药丸右对齐无溢出；顶部空间不足且下方更宽裕才向下', () => {
@@ -932,14 +931,13 @@ describe('编排合成条目常量：client 内置值与 host 单一规则源一
   })
 })
 
-describe('AI Studio 默认启用口径：client 内置函数与 host 单一规则源一致', () => {
-  it('client aistudioDefaultEnabled 与 host endpoints.aistudioDefaultEnabled 逐 ID 同结论', async () => {
-    const { aistudioDefaultEnabled: hostFn } = await import('../src/aistudio/endpoints.js')
+describe('浏览器 bundle 注入共享模型策略', () => {
+  it('AI Studio 与 Vertex 年代默认结果与 Host 同源', async () => {
+    const { defaultChatModelEnabled: hostFn } = await import('../src/adapter/model-catalog-policy.js')
     const source = buildClientSource()
-    // 正则依赖 client.js 中函数的 4 空格缩进；改函数结构时同步本断言。
-    const match = source.match(/function aistudioDefaultEnabled\(id\) \{([\s\S]*?)\n    \}/)
-    expect(match, 'client.js 缺少函数 aistudioDefaultEnabled').not.toBeNull()
-    const clientFn = new Function('id', match![1]!) as (id: string) => boolean
+    const shared = source.slice(source.indexOf('function bareModelId('), source.indexOf('/** ACP / 代理额外应用'))
+    expect(shared).toContain('function defaultChatModelEnabled')
+    const clientFn = new Function('id', `${shared}\nreturn defaultChatModelEnabled(id)`) as (id: string) => boolean
     const ids = [
       'aistudio-gemini-4-argon', 'aistudio-gemini-4.5-flash', 'gemini-4-hydrogen',
       'aistudio-gemini-3.8-flash', 'aistudio-gemini-3-pro', 'aistudio-gemini-2.5-flash',

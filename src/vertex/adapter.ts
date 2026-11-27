@@ -10,7 +10,7 @@ import { ProxyConfigError } from '../runtime/proxy-env.js'
 import { listConfiguredVertexModels } from './catalog.js'
 import { discoverVertexModels } from './discovery.js'
 import { resolveVertexScope } from './environment.js'
-import { isVertexPublisherModel, validVertexScope, vertexStreamUrl, VERTEX_LABEL, VERTEX_PROVIDER_ID } from './endpoints.js'
+import { validVertexScope, vertexStreamUrl, VERTEX_LABEL, VERTEX_PROVIDER_ID } from './endpoints.js'
 import type { VertexTarget } from './endpoints.js'
 import { vertexReplayBlocks, vertexReplayState } from './replay.js'
 import type { VertexSettingsBus } from './settings-bus.js'
@@ -55,7 +55,7 @@ export class VertexAdapter extends LlmAdapter {
     this.providerInfo(provider)
     const { settings } = this.options
     if (this.disposed || !settings.enabled() || !validVertexScope(this.scope())) return []
-    return this.catalog().filter(entry => entry.enabled && isVertexPublisherModel(entry.upstreamId))
+    return this.catalog().filter(entry => entry.enabled)
   }
 
   /** Explicit refresh only; Model Garden candidates never auto-register in the model selector. */
@@ -112,7 +112,7 @@ export class VertexAdapter extends LlmAdapter {
     this.providerInfo(provider)
     const { scope, generation } = this.activeScope()
     const entry = this.catalog().find(item => item.id === id)
-    if (entry === undefined || !isVertexPublisherModel(entry.upstreamId)) throw llmError('Vertex AI 模型未配置或 Google publisher 模型 ID 无效', 'INVALID_MODEL')
+    if (entry === undefined) throw llmError('Vertex AI 模型未配置或映射的文本对话模型 ID 无效', 'INVALID_MODEL')
     const model: LlmResolvedModelInfo = {
       provider, id, name: entry.name, inputModalities: ['text'],
       ...(entry.contextWindow === undefined ? {} : { context: { contextWindow: entry.contextWindow } }),

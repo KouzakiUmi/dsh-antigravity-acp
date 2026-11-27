@@ -54,6 +54,7 @@ import { PROXY_RESPONSE_HEADER_TIMEOUT_MS, PROXY_IDLE_TIMEOUT_MS, PROXY_TOTAL_TI
 import type { ProxyCredential } from './account-store.js'
 import type { AntigravityHostConfig } from '../settings.js'
 import { modelDisplayName, modelSettingFor, modelVisible, normalizeModelSettings, resolveModelTarget } from '../adapter/model-settings.js'
+import { isNonChatModel } from '../adapter/model-catalog-policy.js'
 import type { ModelCapacity, ModelSetting } from '../adapter/model-settings.js'
 import { llmError } from '../runtime/llm-error.js'
 import {
@@ -73,6 +74,7 @@ import {
 import type { OrchestratorPlan, OrchestratorSettings } from '../orchestrator/index.js'
 import {
   isLiveGeminiFamily,
+  isProxyChatDefinition,
   parseLiveProxyCatalog,
   PROXY_MODEL_EFFORTS,
   resolveProxyOrchestrator,
@@ -264,8 +266,12 @@ export class AntigravityProxyAdapter extends LlmAdapter {
       },
     })
     if (wire.length === 0 || wire.length > 256 || containsControl(wire)) throw llmError('代理模式模型映射无效', 'INVALID_MODEL')
-    if (Object.values(this.definitions).some(definition => definition.modalities.output.includes('image') && resolveProxyWireModel(definition.id) === wire)) throw llmError('代理模式文本路由不接受图片生成模型映射', 'INVALID_MODEL')
+    if (this.isNonChatWire(wire)) throw llmError('代理模式文本路由不支持此模型映射', 'INVALID_MODEL')
     return wire
+  }
+
+  private isNonChatWire(wire: string): boolean {
+    return isNonChatModel(wire) || Object.values(this.definitions).some(definition => !isProxyChatDefinition(definition) && resolveProxyWireModel(definition.id) === wire)
   }
 
   private resolveModelInGeneration(provider: string, model: string, generation: ProxyGeneration): LlmResolvedModelInfo {
@@ -274,7 +280,7 @@ export class AntigravityProxyAdapter extends LlmAdapter {
     if (model === ORCHESTRATOR_MODEL_ID) return this.resolveOrchestratorModel(generation)
     if (isLiveGeminiFamily(model)) return this.resolveLiveGemini(model, generation)
     const definition = this.definitions[model]
-    if (definition === undefined || definition.modalities.output.includes('image')) throw llmError('该模型不在代理模式审计文本快照内', 'INVALID_MODEL')
+    if (definition === undefined || !isProxyChatDefinition(definition)) throw llmError('该模型不在代理模式审计文本快照内', 'INVALID_MODEL')
     const setting = modelSettingFor(generation.settings, model)
     const wireModel = this.wireModel(model, undefined, generation)
     const native = getAgyNativeModel(wireModel)
@@ -394,7 +400,7 @@ export class AntigravityProxyAdapter extends LlmAdapter {
   }
 
   private definitionForWireModel(wireModel: string): ReturnType<typeof getPublicModelDefinitions>[string] | undefined {
-    return Object.values(this.definitions).find(definition => !definition.modalities.output.includes('image')
+    return Object.values(this.definitions).find(definition => isProxyChatDefinition(definition)
       && [undefined, ...PROXY_MODEL_EFFORTS].some(effort => resolveProxyWireModel(definition.id, effort) === wireModel))
   }
 
@@ -669,7 +675,7 @@ export class AntigravityProxyAdapter extends LlmAdapter {
     if (options.provider !== PROXY_PROVIDER_ID) throw new LlmError('代理模式 adapter 收到未知路由', 'NO_ADAPTER')
     const signal = options.signal
     const requested = this.definitions[options.model]
-    if (!isLiveGeminiFamily(options.model) && (requested === undefined || requested.modalities.output.includes('image'))) {
+    if (!isLiveGeminiFamily(options.model) && (requested === undefined || !isProxyChatDefinition(requested))) {
       throw llmError('该模型不在代理模式审计文本快照内', 'INVALID_MODEL')
     }
     if (signal?.aborted) { yield finishChunk('aborted', 'CANCELLED'); return }
@@ -876,12 +882,14 @@ export class AntigravityProxyAdapter extends LlmAdapter {
 
   private pinnedTextModelInfos(generation: ProxyGeneration, catalog: CatalogSnapshot): readonly (LlmModelInfo & ModelCapacity)[] {
     const bound = { ...generation, catalog }
-    const rows = Array.from(catalog.data.models.keys(), id => {
+    const rows = Array.from(catalog.data.models.keys()).flatMap(id => {
+      const target = modelSettingFor(generation.settings, id).target
+      if (target !== undefined && this.isNonChatWire(target)) return []
       const resolved = this.resolveModelInGeneration(PROXY_PROVIDER_ID, id, bound)
       const wire = this.wireModel(id, undefined, bound)
       const { maxOutputTokens } = this.liveLimits(this.possibleWires(id, wire, bound), bound)
-      return { provider: resolved.provider, id: resolved.id, name: resolved.name, inputModalities: resolved.inputModalities,
-        contextWindow: resolved.context?.contextWindow, maxOutputTokens }
+      return [{ provider: resolved.provider, id: resolved.id, name: resolved.name, inputModalities: resolved.inputModalities,
+        contextWindow: resolved.context?.contextWindow, maxOutputTokens }]
     })
     const orchestrated = synthesizeProxyOrchestratorModel({
       settings: generation.orchestrator,

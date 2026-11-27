@@ -8,6 +8,8 @@
  * 模型 ID 约定：DSH 选择器键带 `aistudio-` 前缀（与代理线 `antigravity-` 同口径，
  * 供设置页按链路过滤 modelOverrides）；发往上游的线模型去掉前缀。
  */
+import { defaultChatModelEnabled, isNonChatModel } from '../adapter/model-catalog-policy.js'
+
 export const AISTUDIO_PROVIDER_ID = 'aistudio'
 export const AISTUDIO_BASE = 'https://generativelanguage.googleapis.com/v1beta'
 export const AISTUDIO_MODEL_PREFIX = 'aistudio-'
@@ -30,8 +32,11 @@ export function aistudioCatalogId(wireModel: string): string {
  * 内置同口径函数的一致性由测试锁定。纯函数，无 IO。
  */
 export function aistudioDefaultEnabled(catalogId: string): boolean {
-  const match = /^gemini-(\d+)/.exec(aistudioWireModel(catalogId))
-  return match !== null && Number(match[1]) === 4
+  return defaultChatModelEnabled(aistudioCatalogId(aistudioWireModel(catalogId)))
+}
+
+export function isAistudioChatModel(wireModel: string): boolean {
+  return /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,255}$/u.test(wireModel) && !isNonChatModel(wireModel)
 }
 
 /** 路径里的模型段：剥 `models/` 前缀后逐段编码（与 magpie GeminiModelPath 同口径）。 */

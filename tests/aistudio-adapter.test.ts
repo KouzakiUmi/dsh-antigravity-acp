@@ -32,6 +32,34 @@ async function collect(stream: AsyncIterable<StreamChunk>) {
   return chunks
 }
 
+describe('AI Studio 目录策略', () => {
+  it('默认仅显示 Gemini 4，旧版可显式启用，停用只影响列表', async () => {
+    const rows = ['gemini-4-hydrogen', 'gemini-3.5-flash-lite', 'gemini-5-pro', 'gemini-4-image'].map(id => ({
+      name: `models/${id}`, supportedGenerationMethods: ['generateContent'],
+    }))
+    const overrides: Record<string, ModelOverride> = {}
+    const { adapter } = makeAdapter({ models: rows, readSettings: () => ({ modelOverrides: overrides }) })
+    expect((await adapter.listModels(AISTUDIO_PROVIDER_ID)).map(row => row.id)).toEqual(['aistudio-gemini-4-hydrogen'])
+    overrides['aistudio-gemini-3.5-flash-lite'] = { enabled: true, name: '自定义显示名' }
+    overrides['aistudio-gemini-4-hydrogen'] = { enabled: false }
+    expect(await adapter.listModels(AISTUDIO_PROVIDER_ID)).toMatchObject([{ id: 'aistudio-gemini-3.5-flash-lite', name: '自定义显示名' }])
+    await expect(adapter.resolveModel(AISTUDIO_PROVIDER_ID, 'aistudio-gemini-4-hydrogen')).resolves.toMatchObject({ name: 'Gemini 4 Hydrogen' })
+  })
+
+  it('拒绝已知非聊天映射，既拦截专用 ID，也尊重发现时的明确输出元数据', async () => {
+    const overrides: Record<string, ModelOverride> = { [model]: { enabled: true, target: 'gemini-4-image' } }
+    const models = [...defaultModels, { name: 'models/gemini-fixture', supportedGenerationMethods: ['generateContent'], outputModalities: ['IMAGE'] }]
+    const { adapter, fetch } = makeAdapter({ models, readSettings: () => ({ modelOverrides: overrides }) })
+    await expect(collect(adapter.stream(options))).rejects.toMatchObject({ code: 'INVALID_MODEL' })
+    expect(fetch).not.toHaveBeenCalled()
+    overrides[model] = { enabled: true, target: 'models/gemini-fixture' }
+    await expect(adapter.listModels(AISTUDIO_PROVIDER_ID)).resolves.toEqual([])
+    await expect(adapter.prepareCall(AISTUDIO_PROVIDER_ID, model)).rejects.toMatchObject({ code: 'INVALID_MODEL' })
+    await expect(collect(adapter.stream(options))).rejects.toMatchObject({ code: 'INVALID_MODEL' })
+    expect(fetch).toHaveBeenCalledOnce()
+  })
+})
+
 describe('AI Studio 热切换', () => {
   it('外部轮换后已准备请求不会用新 key 发送', async () => {
     let key = 'fixture-original'

@@ -721,7 +721,7 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
         // 排队、启动握手和 session/new 各自已有超时，不再用普通请求预算截断整个冷启动。
         else await adapter.discoverModels(undefined, false)
       }
-      return adapter.listModels(AGY_PROVIDER_ID)
+      return adapter.listSettingsModels(AGY_PROVIDER_ID)
     },
   })
 

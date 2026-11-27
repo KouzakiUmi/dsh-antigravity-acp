@@ -201,7 +201,7 @@ export const MODEL_EFFORTS = ['low', 'medium', 'high'] as const
  * `ModelOverride`，只经过可移植路径。
  */
 const ModelOverrideSchema = Schema.object({
-  enabled: Schema.boolean().default(true).description('是否出现在 DSH 模型选择器'),
+  enabled: Schema.boolean().description('是否出现在 DSH 模型选择器；未设置时使用对应路由的目录默认值'),
   effort: Schema.union(MODEL_EFFORTS).description('默认思考档位：low / medium / high'),
   name: Schema.string().description('显示名覆盖'),
   target: Schema.string().description('映射到的官方模型 ID，优先于家族 + 档位路由'),

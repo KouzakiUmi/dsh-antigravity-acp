@@ -9,7 +9,6 @@ const MAX_PAGES = 20
 const MAX_MODELS = 512
 const MAX_PAGE_BYTES = 2 * 1024 * 1024
 const TIMEOUT_MS = 30_000
-const NON_TEXT = /(?:^|[-.])(?:embedding|embeddings|image|images|imagegen|vision-generation|tts|speech|audio|music|video|live|robotics|computer-use)(?:[-.]|$)/u
 
 interface DiscoveryOptions {
   project: string
@@ -89,7 +88,7 @@ function publisherGeminiId(value: unknown): string | undefined {
   // Model Garden's @version is a catalog revision, not a Gemini generation alias.
   const match = /^([^@]+)(?:@[0-9]{1,32})?$/u.exec(name.slice(MODEL_PREFIX.length))
   const id = match?.[1]
-  if (id === undefined || !isVertexPublisherModel(id) || NON_TEXT.test(id)) return undefined
+  if (id === undefined || !isVertexPublisherModel(id)) return undefined
   // Model Garden supportedActions is a CallToAction object, not a list of inference APIs.
   if (Array.isArray(row?.supportedGenerationMethods) && !row.supportedGenerationMethods.some(method => method === 'generateContent' || method === 'streamGenerateContent')) return undefined
   if (Array.isArray(row?.outputModalities) && !row.outputModalities.some(modality => typeof modality === 'string' && modality.toUpperCase() === 'TEXT')) return undefined

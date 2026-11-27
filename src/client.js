@@ -117,14 +117,13 @@ window.__ModuleLoader__.load({
       const retiring = retirementForModel(id)
       return retiring !== undefined && isRetired(retiring)
     }
-    /** AI Studio 默认启用口径：仅 Gemini 4 系默认开（与 host endpoints.ts 同口径，测试锁定）。 */
-    function aistudioDefaultEnabled(id) {
-      const match = /^gemini-(\d+)/.exec(String(id ?? '').replace(/^aistudio-/, ''))
-      return match !== null && Number(match[1]) === 4
-    }
-    /** 链路默认启用态：AI Studio 按代际，ACP / 代理按退役表。 */
+    /* @include-catalog-policy */
+
+    /** ACP / 代理额外应用其官方退役表。 */
     function defaultEnabledFor(id) {
-      return String(id ?? '').startsWith('aistudio-') ? aistudioDefaultEnabled(id) : !retirementForModel(id)
+      const routeId = String(id ?? '')
+      const direct = routeId.startsWith('aistudio-') || routeId.startsWith(VERTEX_MODEL_PREFIX)
+      return defaultChatModelEnabled(routeId) && (direct || !retirementForModel(id))
     }
     /** 生效启用态：显式配置优先；未配置时按链路默认（退役家族 / AI Studio 非 4 系默认关闭）。 */
     function effectiveEnabled(overrides, id) {
@@ -358,7 +357,7 @@ window.__ModuleLoader__.load({
      * （见 belongsToMode），配置键原样保留。
      */
     function modelRows(models, overrides, proxyMode = false) {
-      const rows = models.filter(({ id }) => !isRetiredModel(id)).map(({ id, name, inputModalities, contextWindow, maxOutputTokens, contextWindowSource }) => {
+      const rows = models.filter(({ id }) => belongsToMode(id, proxyMode) && !isNonChatModel(id) && !isRetiredModel(id)).map(({ id, name, inputModalities, contextWindow, maxOutputTokens, contextWindowSource }) => {
         const retiring = retirementForModel(id)
         return { id, name, inputModalities, contextWindow, maxOutputTokens, contextWindowSource, inCatalog: true, ...(retiring ? { retiring } : {}) }
       })
@@ -367,7 +366,7 @@ window.__ModuleLoader__.load({
       // 避免 gpt-oss（真实键 antigravity-gpt-oss-120b-medium）出现重复死行。
       const presentFamilies = new Set(rows.map((row) => retirementFamilyKey(row.id)))
       for (const retiring of MODEL_RETIREMENTS) {
-        if (isRetired(retiring) || presentFamilies.has(retiring.familyId)) continue
+        if (isNonChatModel(retiring.familyId) || isRetired(retiring) || presentFamilies.has(retiring.familyId)) continue
         // ACP 目录键是裸家族 id；代理目录键带 antigravity- 前缀。
         const id = proxyMode ? `antigravity-${retiring.familyId}` : retiring.familyId
         if (!known.has(id)) {
@@ -378,8 +377,8 @@ window.__ModuleLoader__.load({
       // 按服务端原始值列键：只有默认值（如 enabled: true）的已配置 ID 也要能在此编辑。
       for (const id of Object.keys(rawOverrides(overrides))) {
         // 另一链路的键（代理带 antigravity- 前缀 / ACP 裸 ID）不补行，切回该链路时再出现。
-        if (known.has(id) || isRetiredModel(id) || !belongsToMode(id, proxyMode)) continue
-        rows.push({ id, name: fallbackModelName(id), inCatalog: false })
+        if (known.has(id) || isNonChatModel(id) || isRetiredModel(id) || !belongsToMode(id, proxyMode)) continue
+        rows.push({ id, name: fallbackModelName(id), inCatalog: false, retiring: retirementForModel(id) })
       }
       return rows
     }
@@ -389,15 +388,13 @@ window.__ModuleLoader__.load({
      * 无退役家族补行。目录行来自实时发现；已配置但不在目录的 aistudio- 键补行。
      */
     function aistudioModelRows(models, overrides) {
-      const rows = models.map(({ id, name, inputModalities, contextWindow, maxOutputTokens, contextWindowSource }) =>
+      const rows = models.filter(({ id }) => id.startsWith('aistudio-') && !isNonChatModel(id)).map(({ id, name, inputModalities, contextWindow, maxOutputTokens, contextWindowSource }) =>
         ({ id, name, inputModalities, contextWindow, maxOutputTokens, contextWindowSource, inCatalog: true }))
       const known = new Set(rows.map((row) => row.id))
       for (const id of Object.keys(rawOverrides(overrides))) {
-        if (!id.startsWith('aistudio-') || known.has(id)) continue
-        rows.push({ id, name: fallbackModelName(id), inCatalog: false })
+        if (!id.startsWith('aistudio-') || known.has(id) || isNonChatModel(id)) continue
+        rows.push({ id, name: id, inCatalog: false })
       }
-      // 启用的模型置顶（镜像 Unified 插件）；稳定排序，同组内保持目录顺序。
-      rows.sort((a, b) => Number(effectiveEnabled(overrides, b.id)) - Number(effectiveEnabled(overrides, a.id)))
       return rows
     }
 
@@ -406,7 +403,7 @@ window.__ModuleLoader__.load({
     }
 
     function vertexModelRows(value) {
-      return vertexModelLines(value).filter(id => VERTEX_MODEL_PATTERN.test(id))
+      return vertexModelLines(value).filter(id => VERTEX_MODEL_PATTERN.test(id) && !isNonChatModel(id))
         .map(name => ({ id: VERTEX_MODEL_PREFIX + name, name, inputModalities: ['text'], inCatalog: true }))
     }
 
@@ -473,7 +470,7 @@ window.__ModuleLoader__.load({
       if (!status) return null
       const error = status.kind === 'error'
       const tone = error ? '#ef4444' : status.kind === 'busy' ? '#eab308' : '#22c55e'
-      return h('p', { role: error ? 'alert' : 'status', style: { margin: 0, padding: '8px 12px', borderRadius: '10px', border: '1px solid ' + tone + '47', fontSize: '12px', lineHeight: 1.5, overflowWrap: 'anywhere', color: error ? '#ef4444' : 'inherit', background: tone + '1a' } }, t(status.text))
+       return h('p', { role: error ? 'alert' : 'status', style: { margin: 0, padding: '8px 12px', borderRadius: '10px', border: '1px solid ' + tone + '47', fontSize: '12px', lineHeight: 1.5, overflowWrap: 'anywhere', color: error ? 'var(--agy-error-text)' : 'inherit', background: tone + '1a' } }, t(status.text))
     }
     function RuntimeDetails({ runtime }) {
       if (!runtime) return null
@@ -497,11 +494,11 @@ window.__ModuleLoader__.load({
         runtime.error ? h('p', { role: 'alert', style: { margin: '4px 0 0', color: '#ef4444', overflowWrap: 'anywhere' } }, t(runtime.error)) : null)
     }
     function SectionHeading({ eyebrow, title, description, action }) {
-      return h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', marginBottom: '8px', minHeight: '24px' } },
+      return h('div', { className: 'agy-section-heading', style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', marginBottom: '8px', minHeight: '24px' } },
         h('div', { style: { flex: 1, minWidth: 0 } },
           eyebrow ? h('div', { style: { fontSize: '10px', fontWeight: 600, letterSpacing: '.06em', opacity: .55, marginBottom: '2px' } }, eyebrow) : null,
-          h('h3', { style: { fontSize: '12px', lineHeight: 1.4, fontWeight: 600, letterSpacing: '.01em', opacity: .72, margin: 0 } }, title),
-          description ? h('p', { style: { fontSize: '11.5px', lineHeight: 1.45, opacity: .62, margin: '2px 0 0' } }, description) : null),
+          h('h3', null, title),
+          description ? h('p', null, description) : null),
         action ?? null)
     }
     function TextField({ field, value, disabled, invalid, onChange }) {
@@ -517,13 +514,13 @@ window.__ModuleLoader__.load({
           style: { ...ACTION, cursor: disabled ? 'not-allowed' : 'text', width: '100%', minHeight: '32px', boxSizing: 'border-box', background: 'transparent', opacity: disabled ? .55 : 1 },
           onChange: (event) => onChange(field.numeric && event.target.value !== '' ? Number(event.target.value) : event.target.value),
         }),
-        field.hint ? h('small', { id: inputId + '-hint', style: { fontSize: '11px', lineHeight: 1.45, opacity: .6 } }, t(field.hint)) : null)
+        field.hint ? h('small', { id: inputId + '-hint', className: 'agy-field-hint' }, t(field.hint)) : null)
     }
     function SwitchField({ field, checked, disabled, onChange }) {
       return h('label', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', cursor: disabled ? 'default' : 'pointer', padding: '4px 0', opacity: disabled ? .55 : 1 } },
         h('span', { style: { display: 'grid', gap: '2px', minWidth: 0, flex: 1 } },
           h('span', { style: { fontSize: '13px', fontWeight: 550 } }, t(field.label)),
-          field.hint ? h('small', { style: { fontSize: '11.5px', lineHeight: 1.45, opacity: .6 } }, t(field.hint)) : null),
+          field.hint ? h('small', { className: 'agy-field-hint' }, t(field.hint)) : null),
         h('input', { className: 'agy-switch', name: field.key, type: 'checkbox', checked: checked === true, disabled, style: { accentColor: '#3b82f6' }, onChange: (event) => onChange(event.target.checked) }))
     }
     function SelectField({ field, value, disabled, onChange }) {
@@ -536,7 +533,7 @@ window.__ModuleLoader__.load({
           style: { ...ACTION, cursor: disabled ? 'not-allowed' : 'pointer', width: '100%', minHeight: '32px', boxSizing: 'border-box', background: 'transparent', colorScheme: 'inherit', opacity: disabled ? .55 : 1 },
           onChange: (event) => onChange(event.target.value),
         }, ...(field.options ?? []).map((option) => h('option', { key: option.value, value: option.value, style: { color: 'CanvasText', backgroundColor: 'Canvas' } }, t(option.label)))),
-        field.hint ? h('small', { id: inputId + '-hint', style: { fontSize: '11px', lineHeight: 1.45, opacity: .6 } }, t(field.hint)) : null)
+        field.hint ? h('small', { id: inputId + '-hint', className: 'agy-field-hint' }, t(field.hint)) : null)
     }
     function OrchestratorSection({ value, dirty, disabled, onEdit }) {
       const current = value && typeof value === 'object' ? value : orchestratorDraftFrom(undefined)
@@ -568,7 +565,7 @@ window.__ModuleLoader__.load({
           feature.experimental ? h('small', { style: { fontSize: '10.5px', lineHeight: 1.4, opacity: .55 } }, t('实验性功能：行为与可用性可能随上游变化。')) : null)
       })
       return h('section', { 'aria-label': t(FEATURES_LABEL) },
-        h(SectionHeading, { title: t(FEATURES_LABEL), description: t('Google One / Google AI Pro 订阅的附属能力，逐项手动开启，保存后即时生效、不重载宿主；仅在兼容的生成模式下实际挂载。') }),
+        h(SectionHeading, { title: t(FEATURES_LABEL), description: t('Google One / Google AI Pro 附属能力。逐项开启后，在兼容模式下即时生效。') }),
         h('div', { style: PANEL },
           h('div', { style: { display: 'grid', gap: '8px' } }, ...rows)))
     }
@@ -588,7 +585,7 @@ window.__ModuleLoader__.load({
           h('span', { style: { fontSize: '12.5px', fontWeight: 550 } }, (open ? '▾ ' : '▸ ') + t('普通配置（并发 / 二进制 / 超时）')),
           h('small', { style: { fontSize: '11px', opacity: .58 } }, t('{count} 项', { count: labels.length }))),
         h('div', { style: { display: open ? 'block' : 'none', marginTop: '10px', paddingTop: '10px', borderTop: '1px solid var(--agy-line)' } },
-          h('div', { style: { opacity: .75, fontSize: '11.5px' } }, t('这些不是即时配置：宿主只把即时字段投影到本卡片，也会拒绝在这里写入普通字段。请在插件的普通配置编辑器里修改，保存后由宿主重载生效。字段清单：')),
+          h('div', { className: 'agy-field-hint' }, t('请在插件配置编辑器中修改这些字段。保存后宿主会重载插件。')),
           h('ul', { style: { margin: '6px 0 0', paddingLeft: '18px', opacity: .75, fontSize: '11.5px' } },
             ...labels.map((label) => h('li', { key: label }, t(label))))))
     }
@@ -611,24 +608,24 @@ window.__ModuleLoader__.load({
       return h('span', {
         title,
         'aria-label': title,
-        style: { flex: '0 0 auto', padding: '1px 7px', borderRadius: '99px', fontSize: '10.5px', fontWeight: 600, color: '#b45309', background: 'rgba(234,179,8,.16)', border: '1px solid rgba(234,179,8,.35)', whiteSpace: 'nowrap' },
+        className: 'agy-model-retirement',
       }, retired ? t('已下线 {date}', { date: monthDay }) : t('即将下线 {date}', { date: monthDay }))
     }
-    function ModelOverrideRow({ row, override, disabled, onEdit, showEffort = true }) {
-      const retiring = row.retiring ?? retirementForModel(row.id)
+    function ModelOverrideRow({ row, override, disabled, onEdit, rememberFocus, showEffort = true }) {
+      const retiring = row.retiring
       const enabled = override.enabled !== undefined ? override.enabled : defaultEnabledFor(row.id)
       const inputId = 'agy-model-' + row.id.replace(/[^\w.-]/g, '_')
-      const labelStyle = { fontSize: '11.5px', opacity: .66 }
+      const labelStyle = { fontSize: 'var(--agy-text-caption)', color: 'var(--agy-text-secondary)' }
       const inputStyle = { ...ACTION, width: '100%', minWidth: 0, minHeight: '32px', boxSizing: 'border-box', background: 'transparent', cursor: disabled ? 'not-allowed' : 'text' }
       const displayName = override.name?.trim() || row.name
       const toggleId = inputId + '-enabled'
-      return h('div', { role: 'listitem', style: { padding: '10px 14px', borderTop: '1px solid var(--agy-line)', opacity: enabled ? 1 : .54 } },
+      return h('div', { role: 'listitem', className: 'agy-model-row', 'data-enabled': enabled },
         h('div', { style: { display: 'grid', gridTemplateColumns: showEffort ? 'minmax(0, 1fr) auto auto' : 'minmax(0, 1fr) auto', alignItems: 'center', gap: '10px' } },
           h('label', { htmlFor: toggleId, title: displayName, style: { minWidth: 0, cursor: disabled ? 'default' : 'pointer' } },
-            h('div', { title: displayName, style: { display: 'flex', alignItems: 'center', gap: '7px', overflow: 'hidden' } },
-              h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: '13px', fontWeight: 560 } }, displayName),
-              retiring ? h(RetirementBadge, { retiring }) : null),
-            h('div', { style: { fontSize: '11px', opacity: .55, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, row.id)),
+            h('div', { className: 'agy-model-title', title: displayName },
+              h('span', { className: 'agy-model-name' }, displayName),
+               retiring ? h(RetirementBadge, { retiring }) : row.legacy ? h('span', { className: 'agy-model-legacy' }, t('旧版')) : null),
+            h('div', { className: 'agy-model-id', title: row.id }, row.id)),
           showEffort ? h('label', { htmlFor: inputId + '-effort', style: { display: 'flex', alignItems: 'center', gap: '5px', fontSize: '11.5px' } },
             h('span', { style: { opacity: .62 } }, t('思考')),
             h('select', { id: inputId + '-effort', name: 'model-effort-' + row.id, disabled, value: EFFORT_IDS.has(override.effort) ? override.effort : '',
@@ -638,13 +635,13 @@ window.__ModuleLoader__.load({
               ...EFFORT_OPTIONS.map((option) => h('option', { key: option.value, value: option.value, style: { color: 'CanvasText', backgroundColor: 'Canvas' } }, t(option.label))))) : null,
           h('input', { id: toggleId, className: 'agy-switch', name: 'model-enabled-' + row.id, type: 'checkbox', checked: enabled, disabled,
             'aria-label': displayName, style: { accentColor: '#3b82f6' },
-            onChange: (event) => onEdit(row.id, { enabled: event.target.checked }) })),
+            onChange: (event) => { rememberFocus(event.currentTarget); onEdit(row.id, { enabled: event.target.checked }) } })),
         h('details', { style: { marginTop: '6px' } },
-          h('summary', { style: { ...SUMMARY, justifyContent: 'flex-start', fontSize: '11px', opacity: .62 } }, t('模型设置')),
+          h('summary', { style: { ...SUMMARY, ...labelStyle, justifyContent: 'flex-start' } }, t('模型设置')),
           h('div', { style: { display: 'grid', gap: '10px', marginTop: '8px', paddingLeft: '12px', borderLeft: '2px solid color-mix(in srgb, #3b82f6 55%, transparent)' } },
             h('div', { style: { display: 'grid', gap: '3px' } },
               h('span', { style: labelStyle }, t('模型 ID')),
-              h('code', { style: { fontSize: '11px', overflowWrap: 'anywhere', opacity: .78 } }, row.id),
+               h('code', { style: { ...labelStyle, overflowWrap: 'anywhere' } }, row.id),
               row.inCatalog ? h('span', { style: labelStyle }, Number.isSafeInteger(row.contextWindow)
                 ? (row.contextWindowSource === 'audited'
                   ? t('上下文窗口 {tokens} tokens（审计参考，实测后更新）', { tokens: row.contextWindow.toLocaleString() })
@@ -669,36 +666,55 @@ window.__ModuleLoader__.load({
     function ModelOverrideList({ rows, overrides, disabled, onEdit, showEffort = true, emptyHint, hiddenWarning }) {
       const [query, setQuery] = React.useState('')
       const [filter, setFilter] = React.useState('all')
+      const movedFocus = React.useRef(null)
+       const filterControl = React.useRef(null)
+       const list = React.useRef(null)
+       const switches = () => [...(list.current?.querySelectorAll('input.agy-switch') ?? [])]
+      React.useLayoutEffect(() => {
+         const pending = movedFocus.current
+        movedFocus.current = null
+         if (!pending || pending.element.ownerDocument.activeElement !== pending.element.ownerDocument.body) return
+         const remaining = switches()
+         const target = pending.element.isConnected ? pending.element : remaining[Math.min(pending.index, remaining.length - 1)] ?? filterControl.current
+         target?.focus({ preventScroll: true })
+      })
+      const rememberFocus = (element) => {
+         if (element && element.ownerDocument?.activeElement === element) movedFocus.current = { element, index: Math.max(0, switches().indexOf(element)) }
+      }
       if (rows.length === 0) {
         return h('p', { role: 'status', style: { margin: 0, fontSize: '12px', lineHeight: 1.5, opacity: .6 } }, t(emptyHint || '暂无模型。请先连接当前账户，再刷新目录。'))
       }
-      const hidden = rows.filter((row) => !effectiveEnabled(overrides, row.id)).length
+      const ordered = rows.map((row) => ({ ...row, originalName: row.name,
+        name: catalogDisplayName(row.id, row.name), legacy: isLegacyModel(row.id), enabled: effectiveEnabled(overrides, row.id) }))
+        .sort((a, b) => Number(b.enabled) - Number(a.enabled))
+      const hidden = ordered.filter((row) => !row.enabled).length
       const keyword = query.trim().toLowerCase()
-      const visible = rows.filter((row) => {
-        if (filter === 'enabled' && !effectiveEnabled(overrides, row.id)) return false
-        if (filter === 'hidden' && effectiveEnabled(overrides, row.id)) return false
+       const narrowed = Boolean(keyword) || filter !== 'all'
+      const visible = ordered.filter((row) => {
+        if (filter === 'enabled' && !row.enabled) return false
+        if (filter === 'hidden' && row.enabled) return false
         const override = overrideFor(overrides, row.id)
-        return !keyword || (row.name + ' ' + row.id + ' ' + (override.name ?? '')).toLowerCase().includes(keyword)
+        return !keyword || [row.name, row.originalName, row.id, override.name].some(value => String(value ?? '').toLowerCase().includes(keyword))
       })
       const setVisible = (enabled) => { for (const row of visible) onEdit(row.id, { enabled }) }
       return h('div', { style: { display: 'grid', gap: '8px' } },
         h('div', { style: { display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', gap: '8px' } },
           h('input', { type: 'search', value: query, onChange: (event) => setQuery(event.target.value), placeholder: t('搜索模型'), 'aria-label': t('搜索模型'),
             style: { ...ACTION, width: '100%', minWidth: 0, boxSizing: 'border-box', cursor: 'text' } }),
-          h('select', { value: filter, onChange: (event) => setFilter(event.target.value), 'aria-label': t('筛选模型'), style: ACTION },
+           h('select', { ref: filterControl, value: filter, onChange: (event) => setFilter(event.target.value), 'aria-label': t('筛选模型'), style: ACTION },
             h('option', { value: 'all' }, t('全部 {count}', { count: rows.length })),
             h('option', { value: 'enabled' }, t('已启用 {count}', { count: rows.length - hidden })),
             h('option', { value: 'hidden' }, t('已隐藏 {count}', { count: hidden })))),
-        h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', fontSize: '10px', opacity: .7 } },
+        h('div', { className: 'agy-model-toolbar' },
           h('span', { style: { marginRight: 'auto' } }, t('显示 {shown} / {total}', { shown: visible.length, total: rows.length })),
-          h('button', { type: 'button', disabled: disabled || visible.length === 0, onClick: () => setVisible(true), style: { ...ACTION, minHeight: '26px', padding: '2px 7px', fontSize: '10px' } }, t('全部启用')),
-          h('button', { type: 'button', disabled: disabled || visible.length === 0, onClick: () => setVisible(false), style: { ...ACTION, minHeight: '26px', padding: '2px 7px', fontSize: '10px' } }, t('全部隐藏'))),
+           h('button', { type: 'button', disabled: disabled || visible.length === 0, onClick: () => setVisible(true), style: { ...ACTION, minHeight: '26px', padding: '2px 7px' } }, t(narrowed ? '启用筛选结果' : '全部启用')),
+           h('button', { type: 'button', disabled: disabled || visible.length === 0, onClick: () => setVisible(false), style: { ...ACTION, minHeight: '26px', padding: '2px 7px' } }, t(narrowed ? '隐藏筛选结果' : '全部隐藏'))),
         hidden === rows.length
-          ? h('p', { role: 'status', style: { margin: 0, fontSize: '11px', lineHeight: 1.5, color: '#946200' } }, t(hiddenWarning || '全部隐藏后，Antigravity 将从模型选择器消失。'))
+          ? h('p', { role: 'status', className: 'agy-model-warning' }, t(hiddenWarning || '全部隐藏后，Antigravity 将从模型选择器消失。'))
           : null,
         visible.length
-          ? h('div', { role: 'list', className: 'agy-list' }, ...visible.map((row) => h(ModelOverrideRow, {
-            key: row.id, row, override: overrideFor(overrides, row.id), disabled, onEdit, showEffort,
+           ? h('div', { ref: list, role: 'list', className: 'agy-list' }, ...visible.map((row) => h(ModelOverrideRow, {
+            key: row.id, row, override: overrideFor(overrides, row.id), disabled, onEdit, rememberFocus, showEffort,
           })))
           : h('p', { role: 'status', style: { margin: 0, fontSize: '12px', opacity: .6 } }, t('没有符合条件的模型。')))
     }
@@ -766,9 +782,9 @@ window.__ModuleLoader__.load({
       }, [control, credentialChanging, refresh])
       const status = credentialChanging ? 'changing' : !control ? 'error' : snapshot?.status
       const hint = { changing: '正在更换 API key…', error: '读取本地用量失败，可刷新重试。', unconfigured: '配置 API key 后即可查看本地用量。' }[status] ?? '正在读取本地用量…'
-      return h('section', { 'aria-label': t('本地用量与限流') },
+       return h('section', { className: 'agy-usage-type', 'aria-label': t('本地用量与限流') },
         h(SectionHeading, { title: t('本地用量与限流'), action:
-          h('button', { type: 'button', style: ACTION, 'aria-label': t('刷新 AI Studio 本地用量'), 'aria-busy': busy || undefined,
+           h('button', { type: 'button', style: { ...ACTION, fontSize: 'inherit' }, 'aria-label': t('刷新 AI Studio 本地用量'), 'aria-busy': busy || undefined,
             disabled: busy || !control || credentialChanging, onClick: refresh }, t('刷新')) }),
         h('div', { style: { ...PANEL, display: 'grid', gap: '8px' } },
           h('p', { style: { margin: 0 } }, t('统计当前 API key 由此 DSH Host 发出的生成尝试；Host 重启后归零。')),
@@ -837,7 +853,7 @@ window.__ModuleLoader__.load({
             setState({ busy: false, text: t(value.message) })
             return
           }
-          const ids = [...new Set(value.ids.map(id => id.trim()).filter(id => VERTEX_MODEL_PATTERN.test(id)))]
+          const ids = [...new Set(value.ids.map(id => id.trim()).filter(id => VERTEX_MODEL_PATTERN.test(id) && !isNonChatModel(id)))]
           const added = ids.length ? mergeModels(scope, ids) : undefined
           setState({ busy: false, text: ids.length === 0 ? t('发布商目录未返回 Gemini 模型。')
             : added === undefined ? undefined
@@ -1117,6 +1133,7 @@ window.__ModuleLoader__.load({
         if (savingRef.current) return
         const current = overrideFor(draftRef.current[OVERRIDES_KEY], id)
         const merged = canonicalOverride(id, { ...current, ...patch })
+        if (current.enabled === true && patch.enabled !== false) merged.enabled = true
         // 其它记录保持原样（含仅默认值的记录），只规范化被编辑的这一条。
         const overrides = { ...rawOverrides(draftRef.current[OVERRIDES_KEY]) }
         const base = rawOverrides(baseline.current[OVERRIDES_KEY])
@@ -1198,7 +1215,7 @@ window.__ModuleLoader__.load({
             return
           }
           setLoading(true)
-          const settings = unwrap(await remote.settings.describe())
+           const settings = unwrap(await withTimeout(remote.settings.describe(), 12_000, t('读取设置超时，请点击刷新重试。')))
           if (!alive.current || version !== settingsVersion.current) return
           const namespaces = Array.isArray(settings?.namespaces) ? settings.namespaces : []
           // 只按精确 namespace 匹配：按字段回退会命中别人的配置，而保存用的
@@ -1390,12 +1407,26 @@ window.__ModuleLoader__.load({
         && (!effectiveProxyMode || !field.acpOnly)
         && (effectiveProxyMode || !field.proxyOnly))
       const fieldProps = { draft, dirtyKeys, conflicts, disabled: editingDisabled, editField }
-      const pageStyle = (id) => ({ display: settingsPage === id ? 'flex' : 'none', flexDirection: 'column', gap: '14px' })
-      const pageButton = (id, label) => h('button', {
-        type: 'button', role: 'tab', 'aria-selected': settingsPage === id, 'aria-controls': 'agy-settings-page-' + id,
-        className: 'agy-tab',
-        onClick: () => setSettingsPage(id),
-      }, label)
+       const tabsId = React.useId()
+       const pages = [['connection', t('连接')], ['models', t('模型')], ['aistudio', t('AI Studio')], ['vertex', 'Vertex AI'], ['quota', t('额度')], ['advanced', t('高级')]]
+       const tabId = (id) => `agy-settings-tab-${tabsId}-${id}`
+       const panelId = (id) => `agy-settings-page-${tabsId}-${id}`
+       const pageProps = (id) => ({ id: panelId(id), role: 'tabpanel', 'aria-labelledby': tabId(id),
+         hidden: settingsPage !== id, style: { display: settingsPage === id ? 'flex' : 'none', flexDirection: 'column', gap: '14px', minWidth: 0 } })
+       const pageButton = ([id, label], index) => h('button', {
+         key: id, id: tabId(id), type: 'button', role: 'tab', 'aria-selected': settingsPage === id, 'aria-controls': panelId(id),
+         className: 'agy-tab', tabIndex: settingsPage === id ? 0 : -1,
+         onClick: () => setSettingsPage(id),
+         onKeyDown: (event) => {
+           const next = event.key === 'Home' ? 0 : event.key === 'End' ? pages.length - 1
+             : event.key === 'ArrowRight' ? (index + 1) % pages.length
+               : event.key === 'ArrowLeft' ? (index + pages.length - 1) % pages.length : undefined
+           if (next === undefined || event.altKey || event.metaKey || event.ctrlKey) return
+           event.preventDefault()
+           setSettingsPage(pages[next][0])
+           event.currentTarget.parentElement?.querySelectorAll('[role="tab"]')[next]?.focus()
+         },
+       }, label)
       const busy = ['connecting', 'cancelling'].includes(account?.state) || runtimeBusy(account?.runtime)
       const readonly = !loading && view && !writable
       const saveVisible = dirtyKeys.length > 0 || loading || readonly || conflicts.length > 0 || Boolean(status)
@@ -1421,15 +1452,9 @@ window.__ModuleLoader__.load({
 
         connectionSettingsDirty ? h(StatusNotice, { status: { kind: 'busy', text: t('请先保存网络设置，再连接或登录。') } }) : null,
         proxyUnavailable ? h(StatusNotice, { status: { kind: 'error', text: t('代理路由未就绪，ACP 保持停用。请启用 Antigravity Proxy Router 组件。') } }) : null,
-        h('div', { role: 'tablist', 'aria-label': t('设置分页'), className: 'agy-tabs' },
-          pageButton('connection', t('连接')),
-          pageButton('models', t('模型')),
-          pageButton('aistudio', t('AI Studio')),
-          pageButton('vertex', 'Vertex AI'),
-          pageButton('quota', t('额度')),
-          pageButton('advanced', t('高级'))),
+         h('div', { role: 'tablist', 'aria-label': t('设置分页'), className: 'agy-tabs' }, ...pages.map(pageButton)),
 
-        h('div', { id: 'agy-settings-page-connection', role: 'tabpanel', style: pageStyle('connection') },
+         h('div', pageProps('connection'),
           h('section', { 'aria-label': t('运行模式') },
             h(SectionHeading, { title: t('运行模式') }),
             h('div', { style: PANEL },
@@ -1453,7 +1478,7 @@ window.__ModuleLoader__.load({
                   h('button', { type: 'button', style: ACTION, disabled: !props.control || busy || connection.ready || connectionSettingsDirty, onClick: () => accountAction('warmup') }, t(connection.ready ? '已预热' : '立即预热')),
                   ['connecting', 'cancelling'].includes(account?.state) ? h('button', { type: 'button', style: ACTION, disabled: account?.state === 'cancelling', onClick: () => accountAction('cancel') }, t(account?.state === 'cancelling' ? '正在取消…' : '取消连接')) : null)))),
 
-        h('div', { id: 'agy-settings-page-models', role: 'tabpanel', style: pageStyle('models') },
+         h('div', pageProps('models'),
           h('section', { 'aria-label': t('模型列表') },
             h(SectionHeading, { title: t('模型'),
               action: h('button', { type: 'button', title: t('刷新模型目录'), 'aria-label': t('刷新模型目录'), 'aria-busy': modelBusy || undefined, style: { ...ACTION, minHeight: '26px', padding: '3px 10px', flex: '0 0 auto', whiteSpace: 'nowrap' }, disabled: modelBusy || !props.control, onClick: () => pullModels(true) }, t(modelBusy ? '正在刷新…' : '刷新')) }),
@@ -1466,7 +1491,7 @@ window.__ModuleLoader__.load({
             })(),
             modelMessage ? h('p', { role: 'status', style: { fontSize: '11.5px', lineHeight: 1.5, opacity: .66, margin: '6px 0 0', overflowWrap: 'anywhere' } }, t(modelMessage)) : null)),
 
-        h('div', { id: 'agy-settings-page-aistudio', role: 'tabpanel', style: pageStyle('aistudio') },
+         h('div', pageProps('aistudio'),
           h('section', { 'aria-label': t('AI Studio') },
             h(SectionHeading, { title: t('AI Studio') }),
             h('div', { style: PANEL },
@@ -1482,18 +1507,18 @@ window.__ModuleLoader__.load({
               emptyHint: '暂无模型。请先配置 API key，再刷新目录。', hiddenWarning: '全部隐藏后，AI Studio 将从模型选择器消失。' }),
             aistudioModelMessage ? h('p', { role: 'status', style: { fontSize: '11.5px', lineHeight: 1.5, opacity: .66, margin: '6px 0 0', overflowWrap: 'anywhere' } }, t(aistudioModelMessage)) : null)),
 
-        h('div', { id: 'agy-settings-page-vertex', role: 'tabpanel', style: pageStyle('vertex') },
+         h('div', pageProps('vertex'),
           h('section', { 'aria-label': 'Vertex AI' },
             h(SectionHeading, { title: 'Vertex AI', action: settingsPage === 'vertex' ? h('a', { href: 'https://docs.cloud.google.com/vertex-ai/generative-ai/docs/start/gcp-auth', target: '_blank', rel: 'noopener noreferrer', style: ACTION }, t('配置 ADC')) : null }),
-             h('div', { style: PANEL }, h(SettingsFields, { ...fieldProps, fields: fieldsFor('vertex') }),
-               h('p', { style: { margin: '8px 0 0', overflowWrap: 'anywhere' } }, t('留空时使用宿主环境变量：项目依次读取 GOOGLE_CLOUD_PROJECT、VERTEXAI_PROJECT；区域依次读取 GOOGLE_CLOUD_LOCATION、VERTEXAI_LOCATION，最后使用 global。')))),
+              h('div', { style: PANEL }, h(SettingsFields, { ...fieldProps, fields: fieldsFor('vertex') }),
+                h('p', { className: 'agy-field-hint', style: { margin: '8px 0 0' } }, t('项目和区域留空时，优先读取 GOOGLE_CLOUD_*，其次读取 VERTEXAI_*；区域未设置时使用 global。')))),
           h('section', { 'aria-label': t('Vertex AI 模型') },
              h(VertexCatalogAction, { key: `${savedVertexScope}:${vertexScopeDirty}`, readModels: props.readVertexModels,
                scope: savedVertexScope, scopeDirty: vertexScopeDirty, disabled: editingDisabled, mergeModels: mergeVertexModels }),
             h(ModelOverrideList, { rows: vertexModelRows(draft.vertexModels), overrides: draft[OVERRIDES_KEY], disabled: editingDisabled, onEdit: editOverride, showEffort: false,
               emptyHint: '填写 Gemini 发布商模型 ID 后，这里会显示可编辑的模型。', hiddenWarning: '全部隐藏后，Vertex AI 将从模型选择器消失。' }))),
 
-        h('div', { id: 'agy-settings-page-quota', role: 'tabpanel', style: pageStyle('quota') },
+         h('div', pageProps('quota'),
           h(SettingsQuotaPanel, { readQuota: props.readQuota, source: effectiveProxyMode ? PROXY_PROVIDER : PROVIDER,
             accountRevision: effectiveProxyMode ? previousProxyAccount.current?.revision : undefined,
             cliQuotaOn: (dirtyKeys.includes('cliQuotaEnabled') ? baseline.current.cliQuotaEnabled : draft.cliQuotaEnabled) === true,
@@ -1503,7 +1528,7 @@ window.__ModuleLoader__.load({
             h('div', { style: PANEL },
               h(SettingsFields, { ...fieldProps, fields: fieldsFor('quota') })))),
 
-        h('div', { id: 'agy-settings-page-advanced', role: 'tabpanel', style: pageStyle('advanced') },
+         h('div', pageProps('advanced'),
           !effectiveProxyMode ? h('section', { 'aria-label': t('常用设置') },
             h(SectionHeading, { title: t('会话偏好') }),
             h('div', { style: PANEL },
@@ -1657,21 +1682,21 @@ window.__ModuleLoader__.load({
       const label = valid ? credits.remainingCredits.toLocaleString() : t(pending ? '正在读取…' : credits?.status === 'error' ? '查询失败' : '未提供')
       return h('section', { style: { padding: '9px 0', borderTop: '1px solid color-mix(in srgb, currentColor 12%, transparent)' }, 'aria-label': t('AI Credits 余额') },
         h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: '12px' } },
-          h('strong', { style: { fontSize: '12px' } }, 'AI Credits'),
-          h('strong', { style: { fontSize: valid ? '17px' : '12px', fontVariantNumeric: 'tabular-nums', color: credits?.stale ? 'var(--agy-warn-text, #ca8a04)' : 'inherit' } }, label)),
-        credits?.planName || credits?.updatedAt ? h('div', { style: { display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', gap: '3px 10px', fontSize: '10.5px', opacity: .6, marginTop: '3px' } },
+           h('strong', null, 'AI Credits'),
+           h('strong', { className: valid ? 'agy-usage-number' : undefined, style: { color: credits?.stale ? 'var(--agy-warn-text)' : 'inherit' } }, label)),
+         credits?.planName || credits?.updatedAt ? h('div', { className: 'agy-usage-secondary', style: { display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', gap: '3px 10px', marginTop: '3px' } },
           credits?.planName ? h('span', null, credits.planName) : null,
           credits?.updatedAt ? h('span', null, t(valid ? '余额更新于 {time}' : '最近查询 {time}', { time: new Date(credits.updatedAt).toLocaleString() })) : null) : null,
-        credits?.stale ? h('p', { role: 'status', style: { margin: '4px 0 0', fontSize: '10.5px', color: 'var(--agy-warn-text, #ca8a04)' } }, t('余额缓存 · {reason}', { reason: t(credits.staleReason ?? '余额刷新失败') })) : null,
-        credits?.error?.message ? h('p', { role: credits.status === 'error' ? 'alert' : 'status', style: { margin: '4px 0 0', fontSize: '10.5px', overflowWrap: 'anywhere' } }, t(credits.error.message)) : null)
+         credits?.stale ? h('p', { role: 'status', style: { margin: '4px 0 0', color: 'var(--agy-warn-text)' } }, t('余额缓存 · {reason}', { reason: t(credits.staleReason ?? '余额刷新失败') })) : null,
+         credits?.error?.message ? h('p', { role: credits.status === 'error' ? 'alert' : 'status', style: { margin: '4px 0 0', overflowWrap: 'anywhere' } }, t(credits.error.message)) : null)
     }
     function SettingsQuotaPanel({ readQuota, source, accountRevision, cliQuotaOn, cliQuotaDirty }) {
       const { data, refreshing, load } = useQuota(readQuota, true, source, undefined, accountRevision)
-      return h('section', { 'aria-label': t('套餐额度查询') },
+       return h('section', { className: 'agy-usage-type', 'aria-label': t('套餐额度查询') },
         h(SectionHeading, { title: t('套餐额度'), description: t(source === PROXY_PROVIDER ? '代理账户' : 'ACP 账户') + (cliQuotaDirty ? t(' · CLI 开关未保存') : cliQuotaOn ? t(' · CLI 补充取数') : ''),
-          action: h('button', { type: 'button', style: { ...ACTION, minHeight: '26px', padding: '3px 10px' }, disabled: !readQuota || refreshing, 'aria-busy': refreshing || undefined, onClick: () => load(true) }, t(refreshing ? '正在拉取…' : '拉取额度')) }),
+           action: h('button', { type: 'button', style: { ...ACTION, fontSize: 'inherit', minHeight: '26px', padding: '3px 10px' }, disabled: !readQuota || refreshing, 'aria-busy': refreshing || undefined, onClick: () => load(true) }, t(refreshing ? '正在拉取…' : '拉取额度')) }),
         h('div', { style: PANEL },
-          data && (data.error?.code !== 'not-fetched' || data.credits?.status === 'ok') ? QuotaDetails({ data, refreshing, source }) : h('p', { role: 'status', style: { margin: 0, fontSize: '12px', lineHeight: 1.5, opacity: .65 } }, t(refreshing ? '正在拉取…' : '暂无额度快照'))))
+           data && (data.error?.code !== 'not-fetched' || data.credits?.status === 'ok') ? QuotaDetails({ data, refreshing, source }) : h('p', { role: 'status', className: 'agy-usage-secondary', style: { margin: 0 } }, t(refreshing ? '正在拉取…' : '暂无额度快照'))))
     }
     function QuotaDetails({ data, refreshing, load, model, source, onClose }) {
       const groups = quotaGroups(data)
@@ -1681,31 +1706,31 @@ window.__ModuleLoader__.load({
       const headerStyle = onClose
         ? { position: 'sticky', top: -14, zIndex: 2, margin: '-14px -14px 0', padding: '14px 14px 8px', background: 'var(--dsh-surface, var(--dsw-alias-bg-layer-1, Canvas))', display: 'flex', gap: '8px', alignItems: 'center', borderBottom: '1px solid color-mix(in srgb, currentColor 12%, transparent)' }
         : { display: 'flex', gap: '8px', alignItems: 'center', paddingBottom: '10px', borderBottom: '1px solid color-mix(in srgb, currentColor 12%, transparent)' }
-      return h('div', { style: { display: 'grid', gap: 0 } },
+       return h('div', { className: 'agy-quota-details', style: { display: 'grid', gridTemplateColumns: 'minmax(0, 1fr)', gap: 0 } },
         h('div', { style: headerStyle },
-          h('strong', { style: { fontSize: '14px', flex: 1 } }, t('Antigravity · 套餐额度')),
-          data?.plan ? h('span', { style: { fontSize: '11px', padding: '2px 8px', background: 'rgba(128,128,128,.12)', borderRadius: '99px' } }, data.plan) : null,
-          onClose ? h('button', { type: 'button', 'aria-label': t('关闭额度详情'), onClick: onClose, style: { ...ACTION, padding: '2px 7px', minHeight: '26px', minWidth: '26px', borderColor: 'transparent' } }, '×') : null),
-        data?.stale ? h('p', { role: 'status', style: { margin: '8px 0 0', padding: '8px 10px', borderRadius: '10px', background: 'rgba(234,179,8,.10)', border: '1px solid rgba(234,179,8,.28)', color: 'var(--agy-warn-text, #ca8a04)', fontSize: '11.5px' } }, t('缓存数据 · {reason}', { reason: t(data.staleReason ?? '刷新失败') })) : null,
-        data?.status === 'error' ? h('p', { role: data.error?.code === 'not-fetched' ? 'status' : 'alert', style: { margin: '8px 0 0', padding: '8px 10px', borderRadius: '10px', background: bannerColor + '1a', border: '1px solid ' + bannerColor + '47', color: data.error?.code === 'not-fetched' ? 'inherit' : '#ef4444', fontSize: '11.5px', overflowWrap: 'anywhere' } }, t(data.error?.message ?? data.error?.text ?? '额度读取失败')) : null,
+           h('strong', { className: 'agy-usage-heading', style: { flex: 1, minWidth: 0 } }, t('Antigravity · 套餐额度')),
+           data?.plan ? h('span', { style: { padding: '2px 8px', minWidth: 0, maxWidth: '50%', background: 'var(--agy-surface)', borderRadius: '99px' } }, data.plan) : null,
+           onClose ? h('button', { type: 'button', 'aria-label': t('关闭额度详情'), onClick: onClose, style: { ...ACTION, fontSize: 'inherit', padding: '2px 7px', minHeight: '26px', minWidth: '26px', borderColor: 'transparent' } }, '×') : null),
+         data?.stale ? h('p', { role: 'status', style: { margin: '8px 0 0', padding: '8px 10px', borderRadius: '10px', background: 'rgba(234,179,8,.10)', border: '1px solid rgba(234,179,8,.28)', color: 'var(--agy-warn-text)' } }, t('缓存数据 · {reason}', { reason: t(data.staleReason ?? '刷新失败') })) : null,
+         data?.status === 'error' ? h('p', { role: data.error?.code === 'not-fetched' ? 'status' : 'alert', style: { margin: '8px 0 0', padding: '8px 10px', borderRadius: '10px', background: bannerColor + '1a', border: '1px solid ' + bannerColor + '47', color: data.error?.code === 'not-fetched' ? 'inherit' : 'var(--agy-error-text)', overflowWrap: 'anywhere' } }, t(data.error?.message ?? data.error?.text ?? '额度读取失败')) : null,
         ...groups.map((group) => h('section', { key: group.key, style: { padding: '9px 0', borderBottom: '1px solid color-mix(in srgb, currentColor 12%, transparent)' }, 'aria-label': t('{name}额度', { name: group.name }) },
           h('div', { style: { display: 'flex', alignItems: 'center', gap: '7px', marginBottom: '7px' } },
-            h('strong', { style: { fontSize: '12px' } }, group.name),
-            group.key === modelGroup(model) ? h('span', { style: { fontSize: '10px', padding: '1px 6px', borderRadius: '99px', color: '#22c55e', background: 'rgba(34,197,94,.12)', fontWeight: 560 } }, t('当前模型')) : null),
-          group.buckets.length ? h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', gap: '8px' } }, ...orderedBuckets(group.buckets).map((bucket, index) => {
+             h('strong', null, group.name),
+             group.key === modelGroup(model) ? h('span', { className: 'agy-usage-secondary', style: { padding: '1px 6px', borderRadius: '99px', background: 'var(--agy-surface-2)', fontWeight: 600, flexShrink: 0 } }, t('当前模型')) : null),
+           group.buckets.length ? h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(120px, 100%), 1fr))', gap: '8px' } }, ...orderedBuckets(group.buckets).map((bucket, index) => {
             const pct = percentage(bucket)
             return h('div', { key: index, style: CARD },
               h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: '6px', marginBottom: '4px' } },
-                h('span', { style: { fontSize: '11.5px', fontWeight: 600 } }, windowName(bucket)),
-                h('strong', { style: { fontSize: bucket.disabled ? '12px' : '16px', fontVariantNumeric: 'tabular-nums' } }, bucket.disabled ? t('已停用') : pct === undefined ? t('未知') : Math.round(pct) + '%')),
+               h('span', { style: { fontWeight: 600, minWidth: 0 } }, windowName(bucket)),
+               h('strong', { className: !bucket.disabled && pct !== undefined ? 'agy-usage-number' : undefined, style: { flexShrink: 0 } }, bucket.disabled ? t('已停用') : pct === undefined ? t('未知') : Math.round(pct) + '%')),
               remainingBar(bucket, false, data?.stale, t('{name} {window}剩余额度', { name: group.name, window: windowName(bucket) })),
-              h('div', { title: bucket.disabled ? bucket.description : bucket.resetTime, style: { display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden', fontSize: '10.5px', lineHeight: 1.35, opacity: .62, marginTop: '5px' } }, bucket.disabled ? t(bucket.description ?? '此窗口不可用') : resetCountdown(bucket.resetTime)))
-          })) : h('span', { style: { opacity: .55, fontSize: '11px' } }, t(data ? '未提供额度数据' : '正在读取…')))),
+               h('div', { className: 'agy-usage-secondary', title: bucket.disabled ? bucket.description : bucket.resetTime, style: { display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden', marginTop: '5px' } }, bucket.disabled ? t(bucket.description ?? '此窗口不可用') : resetCountdown(bucket.resetTime)))
+           })) : h('span', { className: 'agy-usage-secondary' }, t(data ? '未提供额度数据' : '正在读取…')))),
         CreditsDetails({ credits: data?.credits, pending: !data }),
         HistoryNoticesDetails({ notices: data?.historyNotices }),
         h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', paddingTop: '10px' } },
-          h('small', { style: { flex: 1, opacity: .55, minWidth: 0, fontSize: '11px' } }, data?.status === 'ok' && data.updatedAt ? t('更新于 {time}', { time: new Date(data.updatedAt).toLocaleString() }) : t('尚无成功快照')),
-          load ? h('button', { type: 'button', disabled: refreshing, onClick: () => load(true), style: { padding: '4px 12px', borderRadius: '8px', border: 'none', background: 'rgba(59,130,246,.14)', color: '#3b82f6', font: 'inherit', fontSize: '12px', fontWeight: 500, cursor: 'pointer' } }, t(refreshing ? '刷新中…' : '刷新额度')) : null))
+           h('span', { className: 'agy-usage-secondary', style: { flex: 1, minWidth: 0 } }, data?.status === 'ok' && data.updatedAt ? t('更新于 {time}', { time: new Date(data.updatedAt).toLocaleString() }) : t('尚无成功快照')),
+           load ? h('button', { type: 'button', disabled: refreshing, onClick: () => load(true), style: { ...ACTION, fontSize: 'inherit', color: 'inherit' } }, t(refreshing ? '刷新中…' : '刷新额度')) : null))
     }
     /** 历史裁剪提示的展示窗口：只提示最近 10 分钟内的裁剪事件（issue #16）。 */
     const HISTORY_NOTICE_WINDOW_MS = 10 * 60_000
@@ -1723,10 +1748,10 @@ window.__ModuleLoader__.load({
       return h('section', { style: { padding: '9px 0', borderTop: '1px solid color-mix(in srgb, currentColor 12%, transparent)' }, 'aria-label': t('历史裁剪记录') },
         h('div', { style: { display: 'flex', alignItems: 'center', gap: '7px', marginBottom: '5px' } },
           h('span', { 'aria-hidden': true, style: { width: '8px', height: '8px', borderRadius: '50%', background: '#eab308' } }),
-          h('strong', { style: { fontSize: '12px' } }, t('历史已裁剪'))),
-        h('p', { style: { margin: '0 0 5px', fontSize: '10.5px', lineHeight: 1.45, opacity: .62 } }, t('单次 ACP prompt 有字节上限，超限时先裁剪最旧历史；DSH 上下文条不反映被裁剪部分。')),
+           h('strong', null, t('历史已裁剪'))),
+         h('p', { className: 'agy-usage-secondary', style: { margin: '0 0 5px' } }, t('单次 ACP prompt 有字节上限，超限时先裁剪最旧历史；DSH 上下文条不反映被裁剪部分。')),
         h('div', { style: { display: 'grid', gap: '3px' } }, ...recent.slice(0, 5).map((notice, index) =>
-          h('div', { key: index, style: { fontSize: '10.5px', fontVariantNumeric: 'tabular-nums', opacity: .75 } },
+           h('div', { key: index, className: 'agy-usage-secondary', style: { fontVariantNumeric: 'tabular-nums' } },
             t('{time} · 省略 {count} 条消息（约 {kb} KB）', { time: new Date(notice.at).toLocaleString(), count: notice.omittedCount, kb: Math.ceil(notice.omittedBytes / 1024) })))))
     }
     /** 紧凑余量条与单词状态的交互参考 dsh-subusage；取数仍由本插件负责。 */
@@ -1754,6 +1779,9 @@ window.__ModuleLoader__.load({
       const [position, setPosition] = React.useState(null)
       const root = React.useRef(null)
       const button = React.useRef(null)
+       const dialog = React.useRef(null)
+       const dialogId = `agy-quota-${React.useId()}`
+       const closeDetails = () => { setExpanded(false); button.current?.focus?.({ preventScroll: true }) }
       React.useEffect(() => {
         if (!isProxy || !proxyControl) return
         let active = true
@@ -1781,31 +1809,34 @@ window.__ModuleLoader__.load({
           const rect = button.current.getBoundingClientRect()
           const viewport = document.documentElement.clientWidth
           const height = window.innerHeight
-          const width = Math.min(340, viewport - 24)
+           const width = Math.max(1, Math.min(340, viewport - 24))
           const above = rect.top - 20
           const below = height - rect.bottom - 20
           // 弹层用 absolute 锚在药丸自身（right:0 右缘对齐，向输入区左侧展开），不换算
           // 视口坐标：0.1.51 改成 fixed + 12px 视口钳位后，窄面板里的药丸被整体推离锚点、
           // 悬到宿主面板外被裁掉（本版回归）。只有右缘对齐真的越过视口左缘、且左缘对齐
-          // 更放得下时才翻转成 left:0；两种对齐都出界时选溢出更小的一侧。
+           // 更放得下时翻转成 left:0；两种对齐都真的出界时才在锚点内调整横向偏移。
           const overflowRightAlign = Math.max(0, 12 - (rect.right - width))
           const overflowLeftAlign = Math.max(0, rect.left + width - (viewport - 12))
           const alignLeft = overflowLeftAlign < overflowRightAlign
+           const alignedX = alignLeft ? rect.left : rect.right - width
+           const fits = alignedX >= 0 && alignedX + width <= viewport
+           const horizontal = fits ? (alignLeft ? { left: 0, right: 'auto' } : { right: 0, left: 'auto' })
+             : { left: Math.max(12, Math.min(viewport - width - 12, alignedX)) - rect.left, right: 'auto' }
           setPosition({ position: 'absolute', width,
-            ...(alignLeft ? { left: 0, right: 'auto' } : { right: 0, left: 'auto' }),
+             ...horizontal,
             ...(above >= Math.min(480, below)
               ? { bottom: 'calc(100% + 8px)', top: 'auto', maxHeight: Math.max(32, above) }
               : { top: 'calc(100% + 8px)', bottom: 'auto', maxHeight: Math.max(32, below) }),
           })
         }
         reposition()
+         dialog.current?.focus?.({ preventScroll: true })
         window.addEventListener('resize', reposition)
         window.addEventListener('scroll', reposition, true)
         const outside = (event) => { if (!root.current?.contains(event.target)) setExpanded(false) }
-        const key = (event) => { if (event.key === 'Escape') { setExpanded(false); button.current?.focus() } }
         document.addEventListener('pointerdown', outside)
-        document.addEventListener('keydown', key)
-        return () => { document.removeEventListener('pointerdown', outside); document.removeEventListener('keydown', key); window.removeEventListener('resize', reposition); window.removeEventListener('scroll', reposition, true) }
+         return () => { document.removeEventListener('pointerdown', outside); window.removeEventListener('resize', reposition); window.removeEventListener('scroll', reposition, true) }
       }, [expanded])
       if (!enabled) return null
       const groups = quotaGroups(quota.data)
@@ -1820,18 +1851,21 @@ window.__ModuleLoader__.load({
       const label = quota.data?.error?.code === 'not-fetched' ? t('暂无额度快照') : quota.data?.status === 'error' ? t('额度读取失败') : !quota.data ? t('正在读取额度') : !group ? t('额度未匹配，请选择具体模型') : !buckets.length ? t('额度未知') : buckets.map((b) => windowName(b) + ' ' + (b.disabled ? t('已停用') : percentage(b) === undefined ? t('额度未知') : t('{pct}% 剩余', { pct: Math.round(percentage(b)) }))).join(' · ')
       const title = modeTag + ' · ' + String(model ?? t('未选择模型')) + ' · ' + label + (quota.data?.stale ? t(' · 缓存数据') : '')
         + (notices.length ? t(' · 历史已裁剪') : '')
-      return h('span', { ref: root, className: 'antigravity-usage-pill', 'data-expanded': String(expanded), style: { position: 'relative', display: 'inline-flex', alignItems: 'center' } },
-        h('button', { ref: button, type: 'button', title, 'aria-label': title, 'aria-expanded': expanded, 'aria-haspopup': 'dialog', onClick: () => setExpanded((value) => !value),
-          style: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: '8px', padding: pillStatus.short ? '4px 11px 4px 9px' : '5px 10px', minHeight: '26px', boxSizing: 'border-box', borderRadius: '99px', border: '1px solid ' + (pillStatus.tint ? pillStatus.color + '73' : 'rgba(128,128,128,.3)'), background: pillStatus.tint ? pillStatus.color + '1a' : 'transparent', color: 'inherit', cursor: 'pointer', font: 'inherit', fontSize: '12px', fontWeight: 600, whiteSpace: 'nowrap', maxWidth: 'min(46vw, 240px)' } },
+       return h('span', { ref: root, className: 'antigravity-usage-pill', 'data-expanded': String(expanded), style: { position: 'relative', display: 'inline-flex', alignItems: 'center' },
+         onKeyDown: (event) => { if (expanded && event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); closeDetails() } },
+         onBlur: (event) => { if (expanded && event.relatedTarget && !event.currentTarget.contains(event.relatedTarget)) setExpanded(false) },
+       },
+         h('button', { ref: button, type: 'button', title, 'aria-label': title, 'aria-expanded': expanded, 'aria-controls': expanded ? dialogId : undefined, 'aria-haspopup': 'dialog', onClick: () => setExpanded((value) => !value),
+           style: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: '8px', padding: pillStatus.short ? '4px 11px 4px 9px' : '5px 10px', minHeight: '26px', boxSizing: 'border-box', borderRadius: '99px', border: '1px solid ' + (pillStatus.tint ? pillStatus.color + '73' : 'rgba(128,128,128,.3)'), background: pillStatus.tint ? pillStatus.color + '1a' : 'transparent', color: 'inherit', cursor: 'pointer', font: 'inherit', fontWeight: 600, whiteSpace: 'nowrap', maxWidth: 'min(46vw, 240px)' } },
           miniBuckets.length ? h('span', { style: { display: 'grid', gap: miniBuckets.length <= 2 ? '3px' : '2px', opacity: quota.data?.stale ? .5 : 1 } }, ...miniBuckets.map((b, i) => h('span', { key: i }, remainingBar(b, true, quota.data?.stale, t('{name} {window}剩余额度', { name: group.name, window: windowName(b) }), miniHeight))))
             : h('span', { 'aria-hidden': true, style: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: '16px', height: '16px', borderRadius: '50%', background: pillStatus.color, color: '#fff', fontSize: '11px' } }, pillStatus.icon),
           notices.length ? h('span', { 'aria-hidden': true, style: { width: '8px', height: '8px', borderRadius: '50%', background: '#eab308', flexShrink: 0 } }) : null,
           pillStatus.short ? h('span', null, pillStatus.short) : null),
-        expanded ? h('div', { className: 'antigravity-quota-popover', role: 'dialog', 'aria-label': t('Antigravity 额度详情'), style: { zIndex: 50, width: 'min(340px, calc(100vw - 24px))', maxHeight: 'min(70vh, calc(100vh - 72px))', overflowY: 'auto', boxSizing: 'border-box', overflowWrap: 'anywhere', padding: '14px', borderRadius: '14px', background: 'var(--dsh-surface, var(--dsw-alias-bg-layer-1, Canvas))', color: 'var(--dsh-text, var(--dsw-alias-label-primary, CanvasText))', border: '1px solid rgba(128,128,128,.28)', boxShadow: '0 12px 32px rgba(0,0,0,.28)', font: '12px/1.5 sans-serif',
+         expanded ? h('div', { id: dialogId, ref: dialog, className: 'antigravity-quota-popover agy-usage-type', role: 'dialog', tabIndex: -1, 'aria-label': t('Antigravity 额度详情'), style: { zIndex: 50, width: 'min(340px, calc(100vw - 24px))', maxHeight: 'min(70vh, calc(100vh - 72px))', overflowY: 'auto', boxSizing: 'border-box', overflowWrap: 'anywhere', padding: '14px', borderRadius: '14px', background: 'var(--dsh-surface, var(--dsw-alias-bg-layer-1, Canvas))', color: 'var(--dsh-text, var(--dsw-alias-label-primary, CanvasText))', border: '1px solid rgba(128,128,128,.28)', boxShadow: '0 12px 32px rgba(0,0,0,.28)',
           // 坐标由 useLayoutEffect 给出：absolute 锚在药丸上，右缘对齐向左展开，
           // 左缘出界时翻转 left:0。首帧未算好时放屏外，避免闪现在错误位置。
           ...(position ?? { position: 'fixed', left: -9999, top: 0 }) } },
-          QuotaDetails({ ...quota, model, source: state?.current?.provider, onClose: () => { setExpanded(false); button.current?.focus?.() } })) : null)
+           QuotaDetails({ ...quota, model, source: state?.current?.provider, onClose: closeDetails })) : null)
     }
 
     /** 给 promise 加超时：Host 侧异常时界面也要落到可读错误，而不是永远 pending。 */
@@ -2195,14 +2229,35 @@ window.__ModuleLoader__.load({
           if (typeof document === 'undefined' || !document.head || !document.createElement) return () => {}
           const style = document.createElement('style')
           style.textContent = [
-            ':where(.antigravity-settings-card,.antigravity-usage-pill,.antigravity-quota-popover){--agy-accent:#3b82f6;--agy-warn-text:#ca8a04;--agy-line:color-mix(in srgb,currentColor 12%,transparent);--agy-line-strong:color-mix(in srgb,currentColor 20%,transparent);--agy-surface:color-mix(in srgb,currentColor 4%,transparent);--agy-surface-2:color-mix(in srgb,currentColor 7%,transparent);color-scheme:light}',
-            ':where(body[data-ds-dark-theme],.dark,[data-theme=dark],[data-color-scheme=dark]) :is(.antigravity-settings-card,.antigravity-quota-popover),:is(.antigravity-settings-card,.antigravity-quota-popover):where(.dark,[data-theme=dark],[data-color-scheme=dark]){--agy-warn-text:#eab308;color-scheme:dark}',
-            '@media (prefers-color-scheme:dark){:where(:root:not(.light,[data-theme=light],[data-color-scheme=light],[data-ds-theme-source=light],[data-ds-dark-theme=false])) :is(.antigravity-settings-card,.antigravity-quota-popover){--agy-warn-text:#eab308;color-scheme:dark}}',
+             ':where(.antigravity-settings-card,.antigravity-usage-pill,.antigravity-quota-popover){--agy-accent:#3b82f6;--agy-warn-text:#ca8a04;--agy-error-text:#a32020;--agy-line:color-mix(in srgb,currentColor 12%,transparent);--agy-line-strong:color-mix(in srgb,currentColor 20%,transparent);--agy-surface:color-mix(in srgb,currentColor 4%,transparent);--agy-surface-2:color-mix(in srgb,currentColor 7%,transparent);color-scheme:light}',
+             ':where(body[data-ds-dark-theme]:not([data-ds-dark-theme=false]),.dark,[data-theme=dark],[data-color-scheme=dark]) :is(.antigravity-settings-card,.antigravity-quota-popover),:is(.antigravity-settings-card,.antigravity-quota-popover):where(.dark,[data-theme=dark],[data-color-scheme=dark]){--agy-warn-text:#eab308;--agy-error-text:#fca5a5;color-scheme:dark}',
+             '@media (prefers-color-scheme:dark){:where(:root:not(.light,[data-theme=light],[data-color-scheme=light],[data-ds-theme-source=light],[data-ds-dark-theme=false])) :is(.antigravity-settings-card,.antigravity-quota-popover){--agy-warn-text:#eab308;--agy-error-text:#fca5a5;color-scheme:dark}}',
+             ':where(html,body):is(.light,[data-theme=light],[data-color-scheme=light],[data-ds-theme-source=light],[data-ds-dark-theme=false]) :is(.antigravity-settings-card,.antigravity-quota-popover){--agy-warn-text:#ca8a04;--agy-error-text:#a32020;color-scheme:light}',
             '.antigravity-settings-card select option,.antigravity-quota-popover select option{color:CanvasText;background:Canvas}',
-            '.antigravity-settings-card .agy-tabs{display:flex;gap:2px;overflow-x:auto;border-bottom:1px solid var(--agy-line)}',
+             '.antigravity-settings-card{--agy-text-body:14px;--agy-text-caption:12px;--agy-text-secondary:color-mix(in srgb,currentColor 78%,transparent);font-size:var(--agy-text-body)}',
+             '.antigravity-settings-card .agy-section-heading h3{margin:0;font-size:15px;font-weight:650;line-height:1.4}',
+             '.antigravity-settings-card .agy-section-heading p,.antigravity-settings-card .agy-field-hint{color:var(--agy-text-secondary);font-size:13px;line-height:1.5;overflow-wrap:anywhere}',
+             '.antigravity-settings-card .agy-section-heading p{margin:4px 0 0}',
+             '.antigravity-settings-card .agy-model-row{padding:10px 14px;border-top:1px solid var(--agy-line)}',
+             '.antigravity-settings-card .agy-model-title{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}',
+             '.antigravity-settings-card .agy-model-name{font-size:14px;font-weight:620;overflow-wrap:anywhere}',
+             '.antigravity-settings-card .agy-model-id{font-size:var(--agy-text-caption);color:var(--agy-text-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+             '.antigravity-settings-card .agy-model-row[data-enabled=false] .agy-model-name{color:var(--agy-text-secondary)}',
+             '.antigravity-settings-card .agy-model-legacy,.antigravity-settings-card .agy-model-retirement{font-size:var(--agy-text-caption);font-weight:600;padding:0 8px;border:1px solid var(--agy-line-strong);border-radius:99px;white-space:nowrap}',
+             '.antigravity-settings-card .agy-model-legacy{color:var(--agy-text-secondary);background:var(--agy-surface)}',
+             '.antigravity-settings-card .agy-model-retirement,.antigravity-settings-card .agy-model-warning{color:color-mix(in srgb,var(--agy-warn-text) 55%,currentColor)}',
+             '.antigravity-settings-card .agy-model-warning{margin:0;font-size:var(--agy-text-caption)}',
+             '.antigravity-settings-card .agy-model-toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;font-size:var(--agy-text-caption);color:var(--agy-text-secondary)}',
+              '.antigravity-settings-card .agy-tabs{display:flex;flex-wrap:wrap;gap:2px 4px;border-bottom:1px solid var(--agy-line)}',
             '.antigravity-settings-card .agy-tab{flex:none;min-height:34px;padding:6px 12px;margin-bottom:-1px;border:0;border-bottom:2px solid transparent;border-radius:8px 8px 0 0;background:transparent;color:inherit;opacity:.68;font:inherit;font-size:13px;font-weight:500;cursor:pointer;white-space:nowrap}',
             '.antigravity-settings-card .agy-tab:hover{opacity:.95;background:var(--agy-surface)}',
             '.antigravity-settings-card .agy-tab[aria-selected=true]{opacity:1;font-weight:600;border-bottom-color:var(--agy-accent)}',
+             '.agy-quota-details{min-width:0;overflow-wrap:anywhere}',
+             ':is(.agy-usage-type,.antigravity-usage-pill){--agy-usage-copy-size:13px;--agy-usage-heading-size:15px;--agy-usage-value-size:16px;font-family:inherit;font-size:var(--agy-usage-copy-size);line-height:1.5}',
+             '.agy-usage-type :is(button,table){font-family:inherit;font-size:inherit;line-height:inherit}',
+             '.agy-usage-type .agy-usage-heading,.antigravity-settings-card .agy-usage-type .agy-section-heading h3{font-size:var(--agy-usage-heading-size);font-weight:650;line-height:1.4}',
+             '.agy-usage-type .agy-usage-number{font-size:var(--agy-usage-value-size);font-weight:650;font-variant-numeric:tabular-nums}',
+             '.agy-usage-type .agy-usage-secondary{color:color-mix(in srgb,currentColor 78%,transparent)}',
             '.antigravity-settings-card .agy-list{display:flex;flex-direction:column;border:1px solid var(--agy-line);border-radius:12px;background:var(--agy-surface);overflow:hidden}',
             '.antigravity-settings-card .agy-list>[role=listitem]:first-child{border-top:0!important}',
             '.antigravity-settings-card .agy-switch{appearance:none;-webkit-appearance:none;position:relative;flex:none;width:36px;height:20px;margin:0;border:0;border-radius:999px;background:var(--agy-line-strong);cursor:pointer;transition:background .15s ease}',
@@ -2214,7 +2269,9 @@ window.__ModuleLoader__.load({
             '.antigravity-settings-card .agy-fold summary::before{content:"▸";font-size:11px;margin-right:6px;display:inline-block;transition:transform .15s ease}',
             '.antigravity-settings-card .agy-fold[open] summary::before{transform:rotate(90deg)}',
             '.antigravity-usage-pill>button:hover{background:color-mix(in srgb,currentColor 7%,transparent)}',
-            '.antigravity-usage-pill button:focus-visible,.antigravity-settings-card button:focus-visible,.antigravity-settings-card input:focus-visible,.antigravity-settings-card select:focus-visible,.antigravity-settings-card a:focus-visible{outline:2px solid var(--agy-accent,#3b82f6);outline-offset:2px}',
+             ':is(.antigravity-usage-pill,.antigravity-settings-card) :is(button,input,select,textarea,summary,a):focus-visible{outline:2px solid var(--agy-accent);outline-offset:2px}',
+             '.antigravity-settings-card .agy-tab:focus-visible,.antigravity-quota-popover:focus-visible{outline:2px solid var(--agy-accent);outline-offset:-2px}',
+             '@media (prefers-reduced-motion:reduce){.antigravity-settings-card .agy-switch,.antigravity-settings-card .agy-switch::after,.antigravity-settings-card .agy-fold summary::before{transition:none}}',
             '.antigravity-settings-card button:disabled{cursor:not-allowed;opacity:.45}',
             'html[data-dsh-go-island][data-dsh-go-island-form="panel"] .antigravity-quota-popover{position:static!important;top:auto!important;bottom:auto!important;left:auto!important;right:auto!important;width:100%!important;max-height:none!important;overflow:visible!important;margin-top:8px;box-shadow:none!important;background:transparent!important;border-color:rgba(128,128,128,.2)!important}',
           ].join('')

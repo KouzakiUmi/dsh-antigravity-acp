@@ -15,6 +15,7 @@ import { homedir } from 'node:os'
 import { dirname, posix, win32 } from 'node:path'
 import type { SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import { redactSensitiveText } from './redact.js'
+import { catalogDisplayName, isNonChatModel } from '../adapter/model-catalog-policy.js'
 import { ambientProxyEnv, buildProxyEnv } from './proxy-env.js'
 import type { ProxySettings } from './proxy-env.js'
 import type { QuotaBucket, QuotaGroup, QuotaSnapshot } from './quota.js'
@@ -150,11 +151,12 @@ export function foldAgyModelFamilies(
 ): { models: Array<{ id: string; name: string; description?: string }>; tiers: Map<string, ReadonlySet<AgyModelTier>> } {
   const families = new Map<string, { id: string; name: string; description?: string; tiers: Set<AgyModelTier> }>()
   for (const row of rows) {
+    if (isNonChatModel(row.id)) continue
     const tier = tierForModelId(row.id)
     const familyId = modelFamilyId(row.id)
     const entry = families.get(familyId) ?? {
       id: familyId,
-      name: stripTierLabel(row.name),
+      name: row.name === row.id ? familyId : stripTierLabel(row.name),
       ...(row.description === undefined ? {} : { description: row.description }),
       tiers: new Set<AgyModelTier>(),
     }
@@ -167,7 +169,7 @@ export function foldAgyModelFamilies(
   for (const entry of families.values()) {
     models.push({
       id: entry.id,
-      name: entry.name,
+      name: catalogDisplayName(entry.id, entry.name),
       ...(entry.description === undefined ? {} : { description: entry.description }),
     })
     tiers.set(entry.id, entry.tiers)

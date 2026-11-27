@@ -2,6 +2,7 @@
 import { getAgyNativeModel } from '@cortexkit/antigravity-auth-core'
 import type { getPublicModelDefinitions } from '@cortexkit/antigravity-auth-core'
 import type { LlmModelInfo } from '@deepseek-ai/dsh-llm'
+import { isNonChatModel } from '../adapter/model-catalog-policy.js'
 import { modelDisplayName } from '../adapter/model-settings.js'
 import type { ModelCapacity, ModelEffort, ModelSetting } from '../adapter/model-settings.js'
 import {
@@ -69,6 +70,7 @@ export function parseLiveProxyCatalog(value: unknown, definitions: ReturnType<ty
       continue
     }
     const wire = cleanModelId(id)
+    if (isNonChatModel(wire)) continue
     live.add(wire)
     const contextWindow = positiveInteger(row.maxTokens)
     const maxOutputTokens = positiveInteger(row.maxOutputTokens)
@@ -79,7 +81,8 @@ export function parseLiveProxyCatalog(value: unknown, definitions: ReturnType<ty
     })
     if (row.modelName !== undefined) {
       if (!safeModelId(row.modelName)) throw invalidCatalog()
-      live.add(cleanModelId(row.modelName))
+      const alias = cleanModelId(row.modelName)
+      if (!isNonChatModel(alias)) live.add(alias)
     }
     if (row.displayName !== undefined && (typeof row.displayName !== 'string' || row.displayName.length > 512)) throw invalidCatalog()
   }
@@ -87,7 +90,7 @@ export function parseLiveProxyCatalog(value: unknown, definitions: ReturnType<ty
 
   const catalog = new Map<string, LiveProxyModel>()
   for (const definition of Object.values(definitions)) {
-    if (definition.modalities.output.includes('image')) continue
+    if (!isProxyChatDefinition(definition)) continue
     const id = definition.id
     const preferred = resolveProxyWireModel(id)
     const variants = PROXY_MODEL_EFFORTS.map(effort => ({ effort, wire: resolveProxyWireModel(id, effort) }))
@@ -104,6 +107,10 @@ export function parseLiveProxyCatalog(value: unknown, definitions: ReturnType<ty
   }
   addLiveGeminiFamilies(catalog, live)
   return { models: catalog, wire: metadata }
+}
+
+export function isProxyChatDefinition(definition: ReturnType<typeof getPublicModelDefinitions>[string]): boolean {
+  return definition.modalities.output.includes('text') && !isNonChatModel(definition.id)
 }
 
 function positiveInteger(value: unknown): number | undefined {
@@ -185,7 +192,7 @@ export function resolveProxyOrchestratorEndpoint(
     }
   }
   const definition = definitions[familyId]
-  if (definition === undefined || definition.modalities.output.includes('image')) return undefined
+  if (definition === undefined || !isProxyChatDefinition(definition)) return undefined
   const observed = catalog.models.get(familyId)
   const definitionEfforts = PROXY_MODEL_EFFORTS.filter((candidate) => catalog.wire.has(resolveProxyWireModel(familyId, candidate)))
   const availableEfforts = observed && observed.efforts.length > 0
@@ -194,7 +201,7 @@ export function resolveProxyOrchestratorEndpoint(
   const converged = convergeOrchestratorEffort(effort, availableEfforts) as ModelEffort | undefined
   if (converged === undefined) return undefined
   const wire = resolveProxyWireModel(familyId, converged)
-  if (Object.values(definitions).some((def) => def.modalities.output.includes('image') && resolveProxyWireModel(def.id) === wire)) {
+  if (isNonChatModel(wire) || Object.values(definitions).some(def => !isProxyChatDefinition(def) && resolveProxyWireModel(def.id) === wire)) {
     return undefined
   }
   const liveWire = catalog.wire.get(wire)

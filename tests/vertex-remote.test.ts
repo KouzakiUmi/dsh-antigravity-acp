@@ -61,6 +61,7 @@ describe('Vertex Typert catalog', () => {
     if (result.mode !== 'strict') throw new Error('Expected strict codec')
     const schema = result.create()
     expect(() => schema.parse({ status: 'ok', ids: ['https://example.invalid'] })).toThrow(TypeError)
+    expect(() => schema.parse({ status: 'ok', ids: ['gemini-4-image'] })).toThrow(TypeError)
     expect(() => schema.parse({ status: 'ok', ids: Array(513).fill('gemini-fixture') })).toThrow(TypeError)
   })
 })

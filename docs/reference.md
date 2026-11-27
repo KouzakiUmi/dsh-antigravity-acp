@@ -2,7 +2,7 @@
 
 [返回主页](../README.md) · [配置](configuration.md) · [更新记录](changelog.md) · [开发与验证](development.md)
 
-本文对应 `dsh-bundle-antigravity-host` **0.1.55**。需要 DSH Core `0.2.2-rc.5` 起的 `0.2.2` 发布线。
+本文对应 `dsh-bundle-antigravity-host` **0.1.56**。需要 DSH Core `0.2.2-rc.5` 起的 `0.2.2` 发布线。
 
 ## 安装与更新
 
@@ -13,7 +13,7 @@
 dsh plugin --profile web add dsh-bundle-antigravity-host
 
 # 需要固定版本时
-dsh plugin --profile web add dsh-bundle-antigravity-host@0.1.55
+dsh plugin --profile web add dsh-bundle-antigravity-host@0.1.56
 ```
 
 更新时通过目标插件管理器选择本包的目标版本，或使用目标 CLI 支持的单包更新方式；先核对该入口的 `plugin --help`。不要用不限定包名的批量更新命令替代一次单插件更新。
@@ -23,7 +23,7 @@ dsh plugin --profile web add dsh-bundle-antigravity-host@0.1.55
 在源码仓库完成构建并打包后，也可安装本地 tarball：
 
 ```console
-dsh plugin --profile web add ./dsh-bundle-antigravity-host-0.1.55.tgz
+dsh plugin --profile web add ./dsh-bundle-antigravity-host-0.1.56.tgz
 ```
 
 文件名以实际打包结果为准；构建与打包步骤见[开发说明](development.md#构建与本地打包)。本仓库现有发布工作流发布到 npm，**不生成 GitHub Release tarball**，因此没有可用的 `releases/latest/download/...` 安装入口。
@@ -63,6 +63,8 @@ dsh plugin --profile web add ./dsh-bundle-antigravity-host-0.1.55.tgz
 手动预热 / 目录刷新可从一次暂时回收故障中恢复，但持续无法确认进程退出时仍会失败，不复用未确认退出的连接。会话配置缺少模型选择器时保留已知目录，不把一次不完整响应当成模型已下架。
 
 ## 模型目录与请求项
+
+四条设置页模型列表都将启用项放在前面。「旧版」表示默认隐藏的历史聊天型号，仍可手动启用；有独立即将下线日期的 Antigravity 型号显示「即将下线」。AI Studio 与 Vertex AI 默认只开启 Gemini 4 文本对话模型，ACP 与代理里 Claude 等非 Gemini 模型仍沿用原有默认规则。专用的图像生成、语音、视频、音乐和向量嵌入模型不会出现在聊天选择器。
 
 模型目录来自会话 `configOptions`、`config_option_update` 与官方 CLI 的只读 `agy models`。`initialize` 本身不是无需登录即可获取完整模型目录的接口。没有缓存时目录可以为空，应先显式连接或刷新。
 
@@ -167,7 +169,7 @@ ACP fs / terminal 与未知原生权限请求始终拒绝并记录，但不因�
 
 选中 `antigravity-acp` 或 `antigravity-proxy` 时显示；药丸保留原尺寸，只显示一个额度入口，不再并排显示 ACP 预热按钮，预热集中在 ACP 设置页。展开详情按模型组分隔，各时间窗口在可用宽度内并排显示百分比、细进度条与重置时间，Credits 和底部刷新采用紧凑布局。代理模式标题带「代理」标记。药丸位于模型选择器左侧，按已保存的官方映射匹配 Gemini、Claude/GPT、Gemini 4 Argon 额度组；未知型号与旧 `server-default` 不借用其它模型数字（显示名不影响分组）。
 
-展开固定展示三个组；缺数据标为未提供，显示每窗剩余百分比、重置时间、当前模型、缓存状态与刷新。未开启 CLI 积分查询时 AI Credits 区块整体隐藏，开启后的查询失败仍展示；支持深浅主题、Escape 与外部点击关闭。展开弹窗以绝对定位锚在药丸上：默认右缘对齐向左展开，贴近视口左缘且左对齐更放得下时翻转为左缘对齐；上下方向按可用空间选边并限制高度。弹窗随药丸移动，不按视口坐标钳位（0.1.51 的视口钳位在窄面板里会把弹窗推离药丸并被面板边缘裁剪，已回归修复）。
+展开显示额度、重置时间、当前模型和缓存状态。未开启 CLI 积分查询时隐藏 AI Credits；开启后的查询失败会显示错误。弹层打开时接收键盘焦点，按 Escape 关闭并返回药丸；点击外部或将焦点移到外部也会关闭。弹层默认与药丸右缘对齐，左对齐空间更足时翻转；两种对齐都超出视口时相对药丸横移。上下方向按可用空间展开，内容过长可滚动。
 
 药丸外观交互参考 [dsh-subusage](https://github.com/KouzakiUmi/dsh-subusage) 0.23.0（MIT）：正常只显示当前模型窗口的迷你条，额度偏少、用尽、缓存或失败时增加简短状态，详情有关闭按钮。本插件独立取数，不依赖 subusage 服务，也不读取其它订阅。
 

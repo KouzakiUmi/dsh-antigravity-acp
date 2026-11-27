@@ -35,6 +35,7 @@ class FakeWorker implements AcpWorker {
     get busy() { return owner(this).busy },
     stream: (options) => this.stream(options),
     listModels: vi.fn(async () => this.catalog),
+    listSettingsModels: vi.fn(async () => this.catalog),
     resolveModel: vi.fn(async () => this.resolved),
     warmup: vi.fn(async () => { this.running = true; await this.warmupGate?.promise }),
     discoverModels: vi.fn(async () => { this.running = true; await this.discoveryGate?.promise; return this.catalog }),

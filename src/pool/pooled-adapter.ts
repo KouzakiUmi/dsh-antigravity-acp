@@ -9,7 +9,7 @@ import { AGY_TURN_ERROR } from '../adapter/prompt-turn.js'
 
 /** Workers own independent transports, bridges and prompt state. No tool execution lives here. */
 export interface AcpWorker {
-  adapter: Pick<AntigravityAcpAdapter, 'busy' | 'stream' | 'listModels' | 'resolveModel' | 'warmup' | 'discoverModels'> & Partial<Pick<AntigravityAcpAdapter, 'prepareCall'>>
+  adapter: Pick<AntigravityAcpAdapter, 'busy' | 'stream' | 'listModels' | 'listSettingsModels' | 'resolveModel' | 'warmup' | 'discoverModels'> & Partial<Pick<AntigravityAcpAdapter, 'prepareCall'>>
   ensureImages?: (signal?: AbortSignal) => Promise<void>
   read(): AcpLifecycleSnapshot
   dispose(): Promise<void>
@@ -59,7 +59,13 @@ export class PooledAcpAdapter extends LlmAdapter {
   get busy(): boolean { return this.slots.some(s => s.leased || s.worker.adapter.busy) }
   override providerInfo(provider: string) { return { id: provider, name: 'Antigravity (ACP)' } }
   override async listModels(provider: string): Promise<readonly LlmModelInfo[]> {
-    const lists = await Promise.all(this.slots.map(s => s.worker.adapter.listModels(provider)))
+    return this.listWorkerModels(provider, 'listModels')
+  }
+  async listSettingsModels(provider: string): Promise<readonly LlmModelInfo[]> {
+    return this.listWorkerModels(provider, 'listSettingsModels')
+  }
+  private async listWorkerModels(provider: string, method: 'listModels' | 'listSettingsModels'): Promise<readonly LlmModelInfo[]> {
+    const lists = await Promise.all(this.slots.map(s => s.worker.adapter[method](provider)))
     return [...new Map(lists.flat().map(m => [m.id, m])).values()]
   }
   override async resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {

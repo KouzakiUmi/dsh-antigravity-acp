@@ -128,17 +128,21 @@ describe('Vertex AI standard Gemini stream', () => {
 
   it('models are explicit and offline; hidden rows still resolve and unknown sizes remain absent', async () => {
     const { adapter, state, token, fetch } = fixture()
-    state.models = [wire, 'invalid/image', ' gemini-x-preview ', wire]
+    state.models = [wire, 'invalid/image', ' gemini-x-preview ', 'gemini-4-image', wire]
     state.overrides = { [model]: { enabled: false, name: 'Fixture' } }
     expect(listConfiguredVertexModels(state.models, state.overrides)).toMatchObject([
       { id: model, name: 'Fixture', enabled: false, upstreamId: wire, contextWindow: 1_048_576, maxOutputTokens: 65_536 },
-      { id: 'vertex-ai-gemini-x-preview', enabled: true },
+      { id: 'vertex-ai-gemini-x-preview', enabled: false },
     ])
+    expect(await adapter.listModels(provider)).toEqual([])
+    state.overrides['vertex-ai-gemini-x-preview'] = { enabled: true }
     expect(await adapter.listModels(provider)).toEqual([expect.not.objectContaining({ contextWindow: expect.anything() })])
     expect(await adapter.resolveModel(provider, model)).toMatchObject({ name: 'Fixture', context: { contextWindow: 1_048_576 } })
-    state.overrides = { [model]: { target: '../invalid' } }
-    expect(await adapter.listModels(provider)).toHaveLength(1)
+    state.overrides = { [model]: { target: 'gemini-4-live', enabled: true } }
+    expect(await adapter.listModels(provider)).toEqual([])
     await expect(adapter.resolveModel(provider, model)).rejects.toMatchObject({ code: 'INVALID_MODEL' })
+    await expect(collect(adapter.stream(prompt))).rejects.toMatchObject({ code: 'INVALID_MODEL' })
+    await expect(adapter.resolveModel(provider, 'vertex-ai-gemini-4-image')).rejects.toMatchObject({ code: 'INVALID_MODEL' })
     expect(token).not.toHaveBeenCalled(); expect(fetch).not.toHaveBeenCalled()
   })
 })

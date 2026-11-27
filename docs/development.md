@@ -21,6 +21,7 @@
 | [`src/client-i18n/`](https://github.com/KouzakiUmi/dsh-antigravity-acp/tree/main/src/client-i18n) | 客户端界面 i18n：`core.js`（`t()` / `msg()` 与语言判定）、`en-ui.js`（界面英文字典）、`en-host.js`（Host 固定状态文本的英文字典）；键是中文原文，缺译回落中文。新增文案必须同步字典，`tests/client-i18n.test.ts` 会拦截缺项与占位符不一致 |
 | [`src/settings.ts`](https://github.com/KouzakiUmi/dsh-antigravity-acp/blob/main/src/settings.ts) | 完整 Config 与默认值 |
 | [`src/vertex/`](../src/vertex/) | 标准 Vertex AI：ADC、宿主环境变量回退、发布商目录读取、按项目与区域路由、replay 校验 |
+| [`model-catalog-policy.ts`](../src/adapter/model-catalog-policy.ts) | 四条路由共用的聊天型号过滤、代际默认和显示名整理，构建时注入独立客户端 |
 | [`src/adapter/gemini-payload.ts`](../src/adapter/gemini-payload.ts) | AI Studio 与 Vertex AI 共用的标准 Gemini REST 请求构造 |
 | [`src/colab/`](../src/colab/) | 可单独启停的 Colab Host 组件，使用 DSH 审批、受管子进程和附件服务；同包导出 `./colab` |
 | [`cordis.patch.yml`](../cordis.patch.yml) | 仅插入本插件，不抢占默认模型 |
@@ -77,6 +78,7 @@ ELECTRON_RUN_AS_NODE=1 "$DSH_NODE_EXECUTABLE" scripts/check-desktop-compat.cjs
 | 验证项 | 状态与范围 |
 |---|---|
 | TypeScript | `npm run typecheck` 通过 |
+| UI 键盘和窄屏 | Windows 全量回归覆盖页签方向键、筛选后焦点转移、设置读取超时与草稿保留、额度弹层的 Escape 和定位。使用 Chrome 在 320px 浅色、375px 暗色设置页及 320px 的长文案额度夹具检查横向溢出；使用离线模拟数据，没有访问运行中的 DSH Web。 |
 | 0.1.55 核心依赖与隔离回归 | Core `0.2.2-rc.5`：全量回归覆盖模式切换的排队、启动与实际派发边界、额度往返、代理账户绑定、AI Studio / Vertex 配置变化和 Colab 产物。Desktop 2.0.24-next 的实际解析表提供五个 DSH peer，隔离探针使用宿主模块装载全部 Host 入口。未改动本机 Profile。 |
 | 0.1.54：AI Studio 本地用量 / Vertex AI / Colab | `npm run check`：68 个测试文件，1129 项通过、1 项跳过。覆盖凭据切换时的用量、掩码与目录隔离，HTTP/SSE 429、Vertex 流式工具回填，以及 Colab 固定 argv、审批、Notebook 副本和退出边界。Desktop 2.0.24-next / Core 0.2.2-rc.5 的隔离组件探针校验了默认关闭声明、Colab 工具注册及卸载不影响已有模型路由。真实项目、Colab 账号、Notebook 远程执行与桌面 GUI 尚未验收。 |
 | macOS 钥匙串登录态（#23） | 2026-11-26 Windows / 系统 Node：57 个文件 / 975 项通过、1 项跳过。`tests/cli-login.test.ts` 锁定 `go-keyring-base64:` 解码（含原样 JSON 与坏值降级）、`expiry_date` 毫秒→ISO、`security find-generic-password` 只读 argv 与非 0 退出 / spawn 抛错降级；`tests/credentials.test.ts` 覆盖文件优先 → 钥匙串 → 旧版 `oauth_creds.json` 候选链、既有凭据可用时不读钥匙串、吊销后改用钥匙串、三源换发失败顺序与全缺席降级文案；`tests/agent-link.test.ts` 锁定 `AGY_ACP_FORCE_FILE_STORAGE=1` 注入（父环境覆盖无效）与首个 `session/new` 36 秒冷启动在握手档下成功、后续会话回普通档、显式 `timeoutMs` 优先；`tests/quota.test.ts` / `tests/snapshot-store.test.ts` 覆盖额度取数与快照身份的钥匙串兜底同序。全部为注入依赖的合成测试：真实 macOS 钥匙串读取、`AGY_ACP_FORCE_FILE_STORAGE` 对官方二进制的实际效果与 macOS 冷启动整链均未实机验证 |
