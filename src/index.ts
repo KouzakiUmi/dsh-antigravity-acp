@@ -16,6 +16,9 @@ import type {} from '@deepseek-ai/dsh-llm'
 import type { ClientCapabilities } from '@agentclientprotocol/sdk'
 import type { SubprocessHandle, SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
+// 导入 dsh-tools 同时激活其对 cordis Context.tools 的 module augmentation（类型层）；
+// 运行时不引入包（type-only），tools 服务实例由宿主 provide，经 ctx.inject(['tools']) 软获取。
+import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { AntigravityAcpAdapter, AGY_PROVIDER_ID } from './adapter/antigravity-adapter.js'
 import type { AdapterMetadata } from './adapter/antigravity-adapter.js'
 import { PooledAcpAdapter } from './pool/pooled-adapter.js'
@@ -55,9 +58,12 @@ import { ProxyAccountService } from './proxy/account-service.js'
 import { AgYProxyAccountService } from './proxy/account-remote.js'
 import { createProxyModeBus } from './proxy/mode-bus.js'
 import type { ProxyModeBus } from './proxy/mode-bus.js'
+import { createAistudioSettingsBus } from './aistudio/settings-bus.js'
+import type { VertexSettingsBus } from './vertex/settings-bus.js'
 import { fetchProxyQuotaSnapshot } from './proxy/quota-source.js'
 import { createProxyTransport } from './proxy/transport.js'
 import type { ProxyModelCatalog } from './proxy/adapter.js'
+import { mountFeatureRuntime } from './features/feature-runtime.js'
 
 export { AGY_PROVIDER_ID } from './adapter/antigravity-adapter.js'
 export { Config } from './settings.js'
@@ -529,6 +535,11 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
     if (paths.some(([key]) => key === 'modelOverrides')) catalogChanged()
   })
   let attachmentStore: AttachmentStore | undefined
+  // tools 服务是附属功能注册 DSH 工具的入口；软注入（核心 ACP 路径不依赖它），
+  // 服务后到时触发 feature 强制重挂，避免首次挂载因 tools 缺席而降级。
+  let toolsService: { register(definition: ToolDefinition): () => void } | undefined
+  // feature 运行时在 apply 后段创建；tools / attachments 后到的软注入闭包需要引用它。
+  let featureRuntime: { resync(force?: boolean): void; dispose(): Promise<void> } | undefined
 
   /**
    * 官方模型清单：缓存先行（选择器即时可用），并在**后台**刷新一遍供下次生效。
@@ -659,6 +670,20 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
       }
     })
   })
+  ctx.inject(['tools'], (scope) => {
+    const tools = scope.get('tools') as { register(definition: ToolDefinition): () => void } | undefined
+    if (tools) {
+      toolsService = tools
+      // 能力后到：首次挂载可能因 tools 缺席降级，到达后强制重挂补注册工具。
+      featureRuntime?.resync(true)
+    }
+    scope.effect(() => () => {
+      if (toolsService === tools) {
+        toolsService = undefined
+        featureRuntime?.resync(true)
+      }
+    })
+  })
   const modeBus = createProxyModeBus({
     mode: () => config.proxyMode === true,
     proxySettings: () => ({ url: config.proxyUrl, bypass: config.proxyBypass }),
@@ -735,6 +760,22 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
     catalogChanged()
   })
 
+  // ------------------------------------------------------------- AI Studio
+  // 独立 provider 的设置总线：aistudioEnabled / aistudioCredentialRef 只从 volatile
+  // 配置读；AI Studio 行订阅注册。与 ACP / 代理互斥仲裁无关，三条路由可并存。
+  const aistudioBus = createAistudioSettingsBus({
+    enabled: () => config.aistudioEnabled,
+    credentialRef: () => config.aistudioCredentialRef,
+    modelSettings: () => ({ modelOverrides: config.modelOverrides }),
+    proxySettings: () => ({ url: config.proxyUrl, bypass: config.proxyBypass }),
+  })
+  const unprovideAistudio = ctx.provide('antigravityAistudioSettings', aistudioBus)
+  const unsubscribeAistudio = ctx.on('loader/volatile-update', (paths) => {
+    if (!paths.some(([key]) => key === 'aistudioEnabled' || key === 'aistudioCredentialRef')) return
+    aistudioBus.notify()
+  })
+  const disposeVertexSettings = provideVertexSettings(ctx, config)
+
   // 额度监控：套餐额度取数服务 + Typert remote（供浏览器端药丸读取）。
   // 默认不调用本机 agy：ACP 模式走 Cloud Code Assist HTTP，代理模式走代理账户。
   // 仅当设置显式开启 cliQuotaEnabled 时才 spawn `agy -p /usage` 与 `/credits`
@@ -784,9 +825,29 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
     )
   })
 
+  // 附属功能模块（Google One / Google AI Pro 订阅的能力，如图像生成）：
+  // 按 Config.features 逐项开关 + 当前生成模式动态挂载，与核心 ACP / 代理链路解耦。
+  // 规格与实现不一致会在加载期抛错，阻断装载（不静默失效）。
+  featureRuntime = mountFeatureRuntime({
+    ctx,
+    readFeatures: () => config.features,
+    modeBus,
+    fetch: pluginFetch,
+    catalogChanged,
+    proxyCredential: () => proxyAccount.credential(),
+    registerTool: (definition) => toolsService?.register(definition),
+    attachments: () => attachmentStore,
+    proxyTransport: proxyQuotaTransport,
+    readImage: (ref, signal) => {
+      if (!attachmentStore) return Promise.reject(llmError('宿主附件服务不可用', 'AGY_IMAGE_UNAVAILABLE'))
+      return attachmentStore.readImage(ref as never, signal)
+    },
+  })
+
   // cordis 4.x 的规范 dispose 挂点：generator effect，卸载时逆序执行。
   ctx.effect(function* () {
-    yield () => { unsubscribeMode(); unsubscribeModeBus(); unsubscribeAccount(); unprovideMode(); unprovideAuth() }
+    yield () => featureRuntime.dispose()
+    yield () => { disposeVertexSettings(); unsubscribeAistudio(); unprovideAistudio(); unsubscribeMode(); unsubscribeModeBus(); unsubscribeAccount(); unprovideMode(); unprovideAuth() }
     yield () => registration()
     yield async () => control.dispose()
     yield async () => {
@@ -802,6 +863,29 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
   }, 'antigravity-acp 生命周期清理')
   if (config.autoWarmup === true && config.proxyMode !== true) control.account('warmup')
   else if (config.autoWarmup === false && config.proxyMode !== true) void prefetchAgentBinary(config, ctx)
+}
+
+function provideVertexSettings(ctx: Context, config: AntigravityHostConfig): () => void {
+  const listeners = new Set<() => void>()
+  const bus: VertexSettingsBus = {
+    enabled: () => config.vertexEnabled === true,
+    project: () => config.vertexProject?.trim() ?? '',
+    location: () => config.vertexLocation?.trim() || 'global',
+    models: () => config.vertexModels ?? [],
+    modelSettings: () => ({ modelOverrides: config.modelOverrides }),
+    proxySettings: () => ({ proxyUrl: config.proxyUrl, proxyBypass: config.proxyBypass }),
+    subscribe(listener) {
+      listeners.add(listener)
+      return () => { listeners.delete(listener) }
+    },
+  }
+  const unprovide = ctx.provide('antigravityVertexSettings', bus)
+  const keys = new Set(['vertexEnabled', 'vertexProject', 'vertexLocation', 'vertexModels', 'modelOverrides', 'proxyUrl', 'proxyBypass'])
+  const unsubscribe = ctx.on('loader/volatile-update', paths => {
+    if (!paths.some(([key]) => key !== undefined && keys.has(key))) return
+    for (const listener of [...listeners]) listener()
+  })
+  return () => { unsubscribe(); unprovide(); listeners.clear() }
 }
 
 /**

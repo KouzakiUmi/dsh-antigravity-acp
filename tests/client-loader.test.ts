@@ -837,6 +837,10 @@ describe('额度药丸：remote 客户端挂载', () => {
       'dsh-bundle-antigravity-host#agyQuota/account',
       'dsh-bundle-antigravity-host#agyQuota/models',
       'dsh-bundle-antigravity-host#agyProxyAccount/account',
+      'dsh-bundle-antigravity-host#agyAistudio/models',
+      'dsh-bundle-antigravity-host#agyAistudio/setKey',
+      'dsh-bundle-antigravity-host#agyAistudio/keyStatus',
+      'dsh-bundle-antigravity-host#agyAistudio/usage',
     ])
     expect(call.package).toBe('dsh-bundle-antigravity-host')
     expect(call.descriptors?.[0]?.id).toBe('dsh-bundle-antigravity-host#agyQuota/read')
@@ -894,6 +898,25 @@ describe('退役模型表：client 内置表与 host 单一规则源一致', () 
   })
 })
 
+describe('附属功能表：client 内置表与 host FEATURE_SPECS 一致', () => {
+  it('client bundle 内的功能 id 与默认开关和 host FEATURE_SPECS 完全相同', async () => {
+    const { FEATURE_SPECS: hostSpecs } = await import('../src/features/specs.js')
+    const source = buildClientSource()
+    // FEATURES 字面量含 msg() 调用，不能用 new Function 直接求值；正则依赖 client.js
+    // 中字面量的 4 空格缩进，改表结构时同步本断言。
+    const match = source.match(/const FEATURES = (\[[\s\S]*?\n    \])/)
+    expect(match, 'client.js 缺少常量 FEATURES').not.toBeNull()
+    const block = match![1] ?? ''
+    const pairs: Array<{ id: string; defaultEnabled: boolean }> = []
+    const itemRe = /id: '([^']+)'[^]*?defaultEnabled: (true|false)/g
+    let item: RegExpExecArray | null
+    while ((item = itemRe.exec(block)) !== null) pairs.push({ id: item[1]!, defaultEnabled: item[2] === 'true' })
+    expect(pairs.map(({ id }) => id)).toEqual(hostSpecs.map((spec) => spec.id))
+    expect(pairs.map(({ id, defaultEnabled }) => ({ id, defaultEnabled })))
+      .toEqual(hostSpecs.map((spec) => ({ id: spec.id, defaultEnabled: spec.defaultEnabled })))
+  })
+})
+
 describe('编排合成条目常量：client 内置值与 host 单一规则源一致', () => {
   it('client 内置的 ORCHESTRATOR_MODEL_ID / NAME 与 src/orchestrator/types.ts 完全相同', async () => {
     const host = await import('../src/orchestrator/types.js')
@@ -905,5 +928,23 @@ describe('编排合成条目常量：client 内置值与 host 单一规则源一
     }
     expect(literal('ORCHESTRATOR_MODEL_ID')).toBe(host.ORCHESTRATOR_MODEL_ID)
     expect(literal('ORCHESTRATOR_MODEL_NAME')).toBe(host.ORCHESTRATOR_MODEL_NAME)
+  })
+})
+
+describe('AI Studio 默认启用口径：client 内置函数与 host 单一规则源一致', () => {
+  it('client aistudioDefaultEnabled 与 host endpoints.aistudioDefaultEnabled 逐 ID 同结论', async () => {
+    const { aistudioDefaultEnabled: hostFn } = await import('../src/aistudio/endpoints.js')
+    const source = buildClientSource()
+    // 正则依赖 client.js 中函数的 4 空格缩进；改函数结构时同步本断言。
+    const match = source.match(/function aistudioDefaultEnabled\(id\) \{([\s\S]*?)\n    \}/)
+    expect(match, 'client.js 缺少函数 aistudioDefaultEnabled').not.toBeNull()
+    const clientFn = new Function('id', match![1]!) as (id: string) => boolean
+    const ids = [
+      'aistudio-gemini-4-argon', 'aistudio-gemini-4.5-flash', 'gemini-4-hydrogen',
+      'aistudio-gemini-3.8-flash', 'aistudio-gemini-3-pro', 'aistudio-gemini-2.5-flash',
+      'aistudio-gemini-2.0-flash', 'aistudio-gemini-1.5-pro', 'aistudio-gemini-1.0-pro',
+      'aistudio-gemma-3-27b-it', 'aistudio-learnlm-2.0-flash-experimental', '',
+    ]
+    for (const id of ids) expect(clientFn(id), id).toBe(hostFn(id))
   })
 })

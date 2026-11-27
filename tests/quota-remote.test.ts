@@ -100,7 +100,7 @@ describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
       expect(credential).toHaveBeenCalledTimes(2)
     } finally { await ctx.fiber.dispose(); vi.useRealTimers() }
   })
-  it('同一 package-face 只注册一次，同时贡献额度与代理账户两个命名空间', () => {
+  it('同一 package-face 只注册一次，同时贡献额度、代理账户与 AI Studio 三个命名空间', () => {
     const register = vi.fn((_contribution: unknown) => () => {})
     const scope = { get: () => ({ register }), effect: (callback: () => unknown) => callback() }
     const ctx = { inject: (_services: string[], callback: (scope: unknown) => void) => callback(scope) } as unknown as Context
@@ -108,8 +108,9 @@ describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
     expect(register).toHaveBeenCalledOnce()
     const contribution = register.mock.calls[0]![0] as unknown as { package: string; face: string; invocations: { namespace: string; method: string }[] }
     expect(contribution).toMatchObject({ package: 'dsh-bundle-antigravity-host', face: 'host' })
-    expect(new Set(contribution.invocations.map(item => item.namespace))).toEqual(new Set(['agyQuota', 'agyProxyAccount']))
+    expect(new Set(contribution.invocations.map(item => item.namespace))).toEqual(new Set(['agyQuota', 'agyProxyAccount', 'agyAistudio']))
     expect(contribution.invocations.filter(item => item.namespace === 'agyProxyAccount').map(item => item.method)).toEqual(['account'])
+    expect(contribution.invocations.filter(item => item.namespace === 'agyAistudio').map(item => item.method)).toEqual(['models', 'setKey', 'keyStatus', 'usage'])
   })
 
   it('首次导入提高 revision 后只重取一次，后续读取可命中缓存', async () => {

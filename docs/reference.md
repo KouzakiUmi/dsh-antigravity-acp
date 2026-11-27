@@ -2,7 +2,7 @@
 
 [返回主页](../README.md) · [配置](configuration.md) · [更新记录](changelog.md) · [开发与验证](development.md)
 
-本文对应 `dsh-bundle-antigravity-host` **0.1.38**。安装或连接成功不等于真实模型生成、图片识别或所有平台已验收。
+本文对应 `dsh-bundle-antigravity-host` **0.1.54**。
 
 ## 安装与更新
 
@@ -13,7 +13,7 @@
 dsh plugin --profile web add dsh-bundle-antigravity-host
 
 # 需要固定版本时
-dsh plugin --profile web add dsh-bundle-antigravity-host@0.1.24
+dsh plugin --profile web add dsh-bundle-antigravity-host@0.1.54
 ```
 
 更新时通过目标插件管理器选择本包的目标版本，或使用目标 CLI 支持的单包更新方式；先核对该入口的 `plugin --help`。不要用不限定包名的批量更新命令替代一次单插件更新。
@@ -23,7 +23,7 @@ dsh plugin --profile web add dsh-bundle-antigravity-host@0.1.24
 在源码仓库完成构建并打包后，也可安装本地 tarball：
 
 ```console
-dsh plugin --profile web add ./dsh-bundle-antigravity-host-0.1.24.tgz
+dsh plugin --profile web add ./dsh-bundle-antigravity-host-0.1.54.tgz
 ```
 
 文件名以实际打包结果为准；构建与打包步骤见[开发说明](development.md#构建与本地打包)。本仓库现有发布工作流发布到 npm，**不生成 GitHub Release tarball**，因此没有可用的 `releases/latest/download/...` 安装入口。
@@ -41,6 +41,14 @@ dsh plugin --profile web add ./dsh-bundle-antigravity-host-0.1.24.tgz
 ## 第一次连接
 
 打开 **设置 → Antigravity ACP**。需要代理时先填写并保存，再连接。
+
+### AI Studio、Vertex AI 与 Colab
+
+- **AI Studio**：用量面板显示此 Host 交给 HTTP 客户端的生成尝试、上游报告的输入 token 和最近限流。窗口为最近一分钟和太平洋时间当天，Host 重启后清空；项目级速率限制见 [AI Studio](https://aistudio.google.com/rate-limit)。
+- **Vertex AI**：在运行 DSH 的主机准备 [Google Cloud CLI 与 ADC](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/start/gcp-auth)，再填写项目、区域与 [Gemini 模型 ID](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/learn/locations)。插件不启动登录，生成请求走配置的项目。标准按量模式的 `429` 可能是共享容量拥堵。当前走标准 Vertex AI 端点，不支持 Express key。
+- **Colab**：用同包的 [`antigravity-colab` 工具组件](colab.md)查询 Compute Units 或经审批执行 Python / Notebook。在 DSH 插件页单独启停，默认关闭，不需要切换或启用任何 Antigravity 模式。
+
+### Antigravity 的连接操作
 
 | 操作 | 做什么 | 不做什么 |
 |---|---|---|
@@ -133,14 +141,27 @@ ACP fs / terminal 与未知原生权限请求始终拒绝并记录，但不因�
 - 页面区分检查登录态、等待浏览器、完成登录；取消也覆盖授权前的凭据换发与项目请求。失败显示授权、项目或保存的具体原因。授权链接过期或遗失时取消后重连；端口占用时先结束占用端口的旧授权流程。
 - 线身份：User-Agent 为 `antigravity/cli/<version> (aidev_client; os_type=…; arch=…; cl=…; auth_method=consumer)`（取自 `@cortexkit/antigravity-auth-core` 3.0.14 的审计实现），头顺序 Host → User-Agent → (Transfer-Encoding|Content-Length) → Authorization → Content-Type → Accept-Encoding；`:streamGenerateContent` 固定 chunked。端点白名单仅 Cloud Code Assist 的 `streamGenerateContent` / `generateContent` / `fetchAvailableModels` / `loadCodeAssist` / `retrieveUserQuotaSummary` 与 `oauth2.googleapis.com/token`。
 - 与参考实现（dsh-tool-antigravity）的差异：不携带 DSH 归属第二头（归属 User-Agent 与 agy 伪装互斥，代理模式是用户显式开启的功能）；SOCKS 代理在代理模式明确报错而非静默直连；单账户，429 不轮转、不自动重试。429 错误（HTTP 与流内事件）附带上游原话（脱敏、最多 300 字符），配额耗尽时的重置时间等诊断信息随错误可见；ACP 登录与代理账户是不同额度池，一侧有额度不代表另一侧可用。
-- 图片输入：宿主附件服务在场时经 `readImageRequest` 有界投影（单图 4MP / 1MB）转 `inlineData`；整请求 12MB 内联预算，超预算报 `IMAGE_OFFLOAD_REQUIRED` 并按最旧优先协商 offload；已 offload 的图片投影为占位文本。附件服务缺席时报 `UNSUPPORTED_MODALITY`。输出含图片的型号（图像生成类）不在代理路由内；上游对文本模型返回媒体输出按协议漂移拒绝。
-- 工具调用：同一响应中的多个完整 `functionCall` 分别交给 DSH，即使上游省略调用 ID 也保持独立；同一 ID 的字符串参数分片继续组装为一条调用。工具响应即使附带 `STOP` 也进入工具续轮。文本与思考块的后到签名随历史回放保留，模型映射或档位改变后不误用旧签名；未收到完成标记就断开会报告传输错误。
+- 图片输入：宿主附件服务在场时经 `readImageRequest` 有界投影（单图 4MP / 1MB）转 `inlineData`；整请求 12MB 内联预算，超预算报 `IMAGE_OFFLOAD_REQUIRED` 并按最旧优先协商 offload；已 offload 的图片投影为占位文本。附件服务缺席时报 `UNSUPPORTED_MODALITY`。输出含图片的型号（图像生成类）不在代理路由内；上游对文本模型返回媒体输出按协议漂移拒绝。图像生成走附属功能工具路径：开启 `image-gen` 后注册 `agy_image_generate` 工具，模型调用即直连 `generateContent` 生成图片（不经过核心 SSE 解析，不改变文本模型的路由与过滤）。
+- 工具调用：同一响应中的多个完整 `functionCall` 分别交给 DSH，即使上游省略调用 ID 也保持独立；同一 ID 的字符串参数分片继续组装为一条调用。工具响应即使附带 `STOP` 也进入工具续轮。文本与思考块的后到签名随历史回放保留，模型映射或档位改变后不误用旧签名；未收到完成标记就断开会报告传输错误。上游 finishReason `MALFORMED_FUNCTION_CALL`（模型侧工具参数校验失败、流无合法 functionCall）在**未出块**时自动重试一次，仍失败才报错误；已出块不重试以避免重复文本。
 - Claude 续聊会保留中断前已经取得的工具结果。历史批次缺失的结果会标记为「未取得结果，工具可能已执行」，插件不会重跑该工具。当前批次若仍缺结果，先提示检查该批次的执行状态。
 - 响应预算：模型目录和生成流分别计数。读取模型目录时发生超限，缩短聊天输出不会改变目录大小；「响应帧超出上限」指单个 SSE 帧过大。具体限制见[代理模式配置](configuration.md#代理模式默认关闭)。
 - 目录刷新：设置页按实际生效模式和代理账户代际读取目录，登录完成和退出自动刷新；退出或换账户后不会复用前一账户目录。手动刷新重取上游目录；失败仅保留同账户已观测目录。上游标记停用的模型与档位会被排除，只有家族 ID 时不推断档位。已有代理账户刷新失败不会静默切换到 CLI 的另一账户；用户手动隐藏的条目仍可重新启用。
 - Gemini 4 Hydrogen 与 Gemini 4 Neon 使用目录中实际出现的档位 ID，并用 `includeThoughts` 请求思考摘要，不覆盖档位的思考预算。只有上游返回摘要文本时，会话才显示思考块；签名单独保留用于续轮。Host 有附件服务时，只要家族中有档位支持图片，就保留附件到派发阶段，再按实际档位校验；不支持时明确报错。代理用量保留 Google 的 `totalTokenCount`，并将目录报告的上下文窗口交给 Core；设置页的输出上限是只读目录信息。
-- 服务挂载：本包的额度与代理账户使用一次 Host Typert contribution 和一次客户端 `$mount`，合并两个命名空间；重复注册相同包身份会被宿主拒绝。
+- 服务挂载：额度、代理账户和 AI Studio 共用一次 Host Typert 注册和一次客户端 `$mount`。
 - 连接卡在准备授权或目录刷新时，检查「高级设置 → 出网代理」。0.1.33 起，留空会继承 Host 的 HTTPS / ALL / HTTP 代理环境，OAuth 和原生 TLS 请求使用相同解析规则；仅有其它插件配置的全局 fetch 代理时，可在此显式填写 HTTP(S) 代理地址。连接失败不退回直连，排除列表只在命中目标时绕过代理。
+
+### AI Studio 独立 provider（默认关闭）
+
+在设置页「AI Studio」Tab（位于「模型」与「额度」之间）勾选并保存 `aistudioEnabled`，启用插件页第三组件 `antigravity-aistudio-router`，配置 API key 凭据引用（或经 Tab 内手动 key 输入直接写入宿主 credentials），随后在会话模型选择器中选择 `aistudio` 的模型（目录键带 `aistudio-` 前缀）。Tab 内含专属模型目录表（实时发现 + 隐藏 / 显示名设置，首期无思考档列；启用项置顶，默认仅 Gemini 4 系开启、其余默认关可显式启用；音乐 / TTS / 图像 / 视频等非聊天模态不进表）。AI Studio 与 ACP / 代理两条互斥链路**并存**：它服务用户自备 Gemini API key 可达的模型，不参与模式仲裁，开启或关闭都不影响 ACP / 代理的当前状态。
+
+- 凭据：设置只存引用名 `aistudioCredentialRef`（默认 `AISTUDIO_API_KEY`），真实值经宿主 `credentials` 接缝按操作解析，不进设置明文 / 日志 / 客户端响应。需宿主装载凭据 provider（如 `dsh-credentials-local`）并把 key 存为该引用名对应的凭据；credentials 服务缺席或 key 未配置时，即使开关打开也不注册可用模型，adapter 报 AUTH 可读态。鉴权用 `x-goog-api-key` 请求头，key 不进 URL。Tab 内手动 key 输入经 `agyAistudio.setKey` 写入宿主 credentials（trim 后写入、只写不回显），`keyStatus` 只显示掩码预览。
+- 端点与发现：直连 `generativelanguage.googleapis.com/v1beta`，生成走 `POST /models/{model}:streamGenerateContent?alt=sse`，目录走 `GET /v1beta/models` 实时发现（过滤支持 `generateContent` 的文本模型、排除图像模型，容量取 `inputTokenLimit` / `outputTokenLimit`，不做 curated allowlist）。标准 Google REST，不需要 agy 线身份伪装或固定头序；出网用普通代理感知 fetch，与官方进程同一套 `proxyUrl` / `proxyBypass` 设置。
+- 能力范围（首期）：文本流式生成、工具调用回填、多轮 history、思考块渲染、模型目录隐藏 / 显示名设置（专属 AI Studio Tab 模型表，复用 `modelOverrides`，键带 `aistudio-` 前缀，不泄漏进 ACP / 代理二元模型编辑器）。默认启用口径「只开 4」（仅 Gemini 4 系默认进选择器，其余默认关可显式启用），模型表启用置顶；音乐 / TTS / 图像 / 视频等非聊天模态在发现层过滤，其单独调用接口另立任务。图片输入 / 图像生成 / 视频延后；图片块请求报 `UNSUPPORTED_MODALITY`。
+- 协议：AI Studio 与 Vertex AI 共用标准 Gemini 请求构造，和代理模式共用流式组装。多轮续聊经 `aistudio` 的 replay 信封按块对齐回填签名。
+- 用量与计费：AI Studio key 使用所属项目的计费设置，与 agy 订阅额度分开。面板记录此 Host 发出的生成尝试、收到的输入 token 与最近一次 HTTP / SSE `429`；项目速率限制和总用量从官方页面读取。`429` 不自动重试。
+- 上游契约（真实 key 探针核实）：`x-goog-api-key` 头鉴权生效（发现与生成均 200，key 不进 URL）；`GET /v1beta/models` 返回 `name`/`displayName`/`inputTokenLimit`/`outputTokenLimit`/`supportedGenerationMethods`；生成 SSE 为裸 `{candidates,usageMetadata,modelVersion,responseId}`、CRLF（`\r\n\r\n`）分隔，思考与工具部分携带 `thoughtSignature`，共享解析层原生处理。
+- 模型可用性随 key 而异：目录会列出对当前 key 不可生成的模型（如 `gemini-2.5-flash` 对新用户停用，生成返回 404 并推荐 `gemini-3.8-flash`）。选择这类模型时 adapter 报可读的 404 上游原话；插件不做逐模型探测过滤，改选目录中可用的模型即可。
+- 待验收：宿主 GUI 中选择 AI Studio 模型聊天与工具回填的真实账号实机验收。
 
 ### 额度药丸与 AI Credits
 
@@ -240,6 +261,7 @@ onefile 临时展开使用用户级根目录内独立的 `runtime/instance-*`，
 | `AGY_INCOMPATIBLE_PROTOCOL` / `AGY_UNSUPPORTED_CAPABILITY` | 协议版本或 MCP 等能力不满足 | 使用兼容 ACP v1 的官方 server；不只修改版本号就假定厂商扩展兼容。 |
 | `AGY_IMAGE_UNAVAILABLE` / `AGY_INVALID_IMAGE` | 附件服务 / image capability 不在场，或附件引用不一致 | 重新连接检查能力与附件；不要将文字描述误当已发送图片像素。 |
 | `AGY_BRIDGE_INVALID_ARGUMENTS` | 参数别名修正后仍缺必填键 | 按错误中签名补齐；模糊别名不由桥猜测。 |
+| `MALFORMED_FUNCTION_CALL`（代理模式） | 上游模型侧工具参数校验失败（参数 JSON 截断/非法；开放 map / 无 properties 的 object 参数易诱发） | 未出块时已自动重试一次；仍失败可重发，或简化该工具的开放 object 参数 schema。 |
 | `AGY_EMPTY_RESPONSE` | 上游结束时没有可见文本或工具调用 | 查看结束原因与连接诊断；不把仅思考、进度或空白当成功。 |
 | `AGY_ARCHIVE_TOO_LARGE` | 下载的 zip 条目数或解压后大小超过上限 | 官方包远低于上限；出现此码说明下载源异常，先核对 `AGY_ACP_URL` 未被改指他处，再重新下载，不要放宽上限。 |
 | 额度 / Credits 不完整 | CLI 未登录、旧版本缺字段、HTTP 产品授权不足或网络失败 | 分别查看额度与 Credits 状态，检查 `agyCliPath`；ACP 登录不等于 CLI 登录。 |

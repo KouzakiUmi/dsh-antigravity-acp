@@ -25,10 +25,28 @@ const documentStub = {
 runInNewContext(source, { window: { __ModuleLoader__: { load(value) { plugin = value } } }, document: documentStub })
 let index = 0
 let states = {}
+const usagePreview = { status: 'ok', pacificDay: '2026-10-22', minuteTruncated: false,
+  minute: { requests: 3, inputTokens: 2560, reportedRequests: 2 },
+  today: { requests: 8, inputTokens: 9800, reportedRequests: 7 },
+  models: [
+    { model: 'gemini-4-argon', minute: { requests: 2, inputTokens: 2560, reportedRequests: 2 }, today: { requests: 6, inputTokens: 9800, reportedRequests: 6 } },
+    { model: 'gemini-3.8-flash', minute: { requests: 1, inputTokens: null, reportedRequests: 0 }, today: { requests: 2, inputTokens: 0, reportedRequests: 1 } },
+  ], last429: { at: '2026-10-22T10:02:30.000Z', source: 'http', model: 'gemini-3.8-flash', retryAfterMs: 30_000 } }
+const isolatedStates = { AistudioCredentialPanels: [undefined], AistudioUsagePanel: [usagePreview, false] }
+let localStates
+let localIndex
+const previewAistudioControl = () => {}
+const previewAistudioScope = { credentialRef: 'AISTUDIO_API_KEY', control: previewAistudioControl, models: 0, key: 0 }
 const React = {
-  createElement: (type, props, ...children) => typeof type === 'function' ? type({ ...(props ?? {}), children: children.flat() }) : ({ type, props: props ?? {}, children: children.flat() }),
-  useState: (initial) => [index in states ? states[index++] : (index++, initial), () => {}],
-  useRef: (value) => ({ current: value }), useCallback: (fn) => fn, useEffect() {}, useLayoutEffect() {}, useId: () => 'preview',
+  createElement(type, props, ...children) {
+    if (typeof type !== 'function') return { type, props: props ?? {}, children: children.flat() }
+    const saved = [localStates, localIndex]
+    localStates = isolatedStates[type.name]
+    localIndex = 0
+    try { return type({ ...(props ?? {}), children: children.flat() }) } finally { [localStates, localIndex] = saved }
+  },
+  useState: (initial) => [localStates ? localStates[localIndex++] ?? initial : index in states ? states[index++] : (index++, initial), () => {}],
+  useRef: (value) => ({ current: value?.control === previewAistudioControl ? previewAistudioScope : value }), useCallback: (fn) => fn, useEffect() {}, useLayoutEffect() {}, useId: () => 'preview',
   useSyncExternalStore: (_subscribe, getSnapshot) => getSnapshot(),
 }
 const components = new Map()
@@ -70,7 +88,7 @@ const settings = render('antigravity-acp', {
     startup: { elapsedMs: 7120, timings: { binary: 20, credentials: 2100, spawn: 10, initialize: 4990 } },
     round: { model: 'gemini-3.8-flash-low', elapsedMs: 4800, timings: { connection: 1, session: 1200, model: 10 }, firstChunkMs: 1800, firstToolMs: 2100, continuations: 2, lastContinuationMs: 1200 },
   } }, 1: models,
-  4: { revision: 1 }, 5: true, 6: { autoWarmup: true, reuseSessions: true, proxyUrl: '', agyCliPath: '', cliQuotaEnabled: false, modelOverrides: { 'gemini-4-argon': { effort: 'high' }, 'claude-sonnet-5-5': { name: 'Claude Sonnet（长上下文）' } } }, 8: false, 9: true, 14: 'connection', 15: '', 16: 'all', 17: quota,
+  4: { revision: 1 }, 5: true, 6: { autoWarmup: true, reuseSessions: true, proxyUrl: '', agyCliPath: '', cliQuotaEnabled: false, modelOverrides: { 'gemini-4-argon': { effort: 'high' }, 'claude-sonnet-5-5': { name: 'Claude Sonnet（长上下文）' } } }, 8: false, 9: true, 14: 'connection', 19: '', 20: 'all', 26: quota,
 }, { remote: {}, control() {}, readQuota() {} })
 const proxySettings = render('antigravity-acp', {
   0: { state: 'idle', message: '代理模式已就绪（模拟）', generationMode: { requested: 'proxy', active: 'proxy', proxyRouterReady: true } },
@@ -79,16 +97,36 @@ const proxySettings = render('antigravity-acp', {
   4: { revision: 1 }, 5: true, 6: { proxyMode: true, proxyUrl: '', agyCliPath: '', cliQuotaEnabled: false, modelOverrides: {} },
   8: false, 9: true, 13: true,
   14: 'connection',
-  15: { phase: 'signed-in', message: '代理账户与上游项目已就绪（模拟）', source: 'cli-import', revision: 1 },
-  16: undefined, 17: '', 18: false, 19: '', 20: 'all', 21: quota,
+  19: { phase: 'signed-in', message: '代理账户与上游项目已就绪（模拟）', source: 'cli-import', revision: 1 },
+  20: undefined, 21: '', 22: false, 23: '', 24: 'all', 30: quota,
 }, { remote: {}, control() {}, proxyControl() {}, readQuota() {} })
 const proxyLoginSettings = render('antigravity-acp', {
   0: { state: 'idle', generationMode: { requested: 'proxy', active: 'proxy', proxyRouterReady: true } },
   1: [], 4: { revision: 1 }, 5: true, 6: { proxyMode: true, proxyUrl: 'http://127.0.0.1:7890', cliQuotaEnabled: false, modelOverrides: {} },
   8: false, 9: true, 11: ['proxyUrl'], 13: true,
   14: 'connection',
-  15: { phase: 'pending-login', connectionStage: 'authorizing', message: '请在浏览器中使用 Google 账户授权（模拟）', revision: 0 },
-  16: 'https://accounts.google.com/o/oauth2/v2/auth?synthetic=offline-preview',
-  17: '', 18: false, 19: '', 20: 'all',
+  19: { phase: 'pending-login', connectionStage: 'authorizing', message: '请在浏览器中使用 Google 账户授权（模拟）', revision: 0 },
+  20: 'https://accounts.google.com/o/oauth2/v2/auth?synthetic=offline-preview',
+  21: '', 22: false, 23: '', 24: 'all',
 }, { remote: {}, control() {}, proxyControl() {}, readQuota() {} })
-export { quota, models, settings, proxySettings, proxyLoginSettings, pill, render, escape, injectedStyles }
+const aistudioModels = [
+  { id: 'aistudio-gemini-3.8-flash', name: 'Gemini 3.8 Flash', inputModalities: ['text'], contextWindow: 1048576, maxOutputTokens: 65536 },
+  { id: 'aistudio-gemini-4-argon', name: 'Gemini 4 Argon', inputModalities: ['text'], contextWindow: 1048576, maxOutputTokens: 65536 },
+  { id: 'aistudio-gemini-3-pro', name: 'Gemini 3 Pro', inputModalities: ['text'], contextWindow: 2097152, maxOutputTokens: 65536 },
+]
+const aistudioSettings = render('antigravity-acp', {
+  0: { state: 'idle', message: 'AI Studio 独立路由（模拟）' },
+  1: models,
+  4: { revision: 1 }, 5: true,
+  6: { aistudioEnabled: true, aistudioCredentialRef: 'AISTUDIO_API_KEY', modelOverrides: { 'aistudio-gemini-3-pro': { enabled: true, name: 'Gemini 3 Pro（长上下文）' } } },
+  8: false, 9: true, 14: 'aistudio',
+  15: { scope: previewAistudioScope, models: aistudioModels },
+  18: { scope: previewAistudioScope, value: { status: 'ok', configured: true, writable: true, source: 'file', masked: 'AIza…xxxx' } },
+  19: '', 20: 'all', 24: '', 25: 'all', 26: quota,
+}, { remote: {}, control() {}, readQuota() {}, aistudioControl: previewAistudioControl })
+const vertexSettings = render('antigravity-acp', {
+  0: { state: 'idle' }, 1: models, 4: { revision: 1 }, 5: true, 8: false, 9: true, 14: 'vertex',
+  6: { vertexEnabled: true, vertexProject: 'example-project', vertexLocation: 'global',
+    vertexModels: 'gemini-4-hydrogen\ngemini-4-neon', modelOverrides: { 'vertex-ai-gemini-4-neon': { enabled: false } } },
+}, { remote: {}, control() {} })
+export { quota, models, aistudioModels, settings, proxySettings, proxyLoginSettings, aistudioSettings, vertexSettings, pill, render, escape, injectedStyles }

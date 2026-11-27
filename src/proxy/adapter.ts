@@ -11,7 +11,7 @@
  * 401/403 在未出块前换发一次凭据重试一次。
  */
 import { getAgyNativeModel, getPublicModelDefinitions } from '@cortexkit/antigravity-auth-core'
-import { createHash, randomUUID } from 'node:crypto'
+import { createHash } from 'node:crypto'
 import type { ImageAttachmentRef, ImageRequestTarget } from '@deepseek-ai/dsh-attachment'
 import {
   CONTEXT_WINDOW_EXCEEDED_CODE,
@@ -19,16 +19,13 @@ import {
   LlmAdapter,
   LlmError,
   ReasoningEffortId,
-  ToolCallId,
   resolveRetryPolicy,
 } from '@deepseek-ai/dsh-llm'
 import type {
-  FinishReason,
   LlmImageRequestPricing,
   LlmModelInfo,
   LlmProviderInfo,
   LlmResolvedModelInfo,
-  ReplayEnvelope,
   ResolvedRetryPolicy,
   StreamChunk,
   TokenUsage,
@@ -45,12 +42,13 @@ import {
   reportsContextWindowExceeded,
   resolveProxyWireModel,
 } from './payload.js'
-import type { ProxyProviderEvent, ProxyProviderPart } from './payload.js'
+import type { ProxyProviderEvent } from './payload.js'
 import { proxyImageRequestTarget, requiredProxyImageOffload } from './image.js'
 import type { ProxyAttachmentReader } from './image.js'
 import { iterateProxySse, proxyStatusError, readProxyText } from './transport.js'
 import type { ProxyTransport } from './transport.js'
 import { ProxyTransportError } from './transport.js'
+import { assembleGeminiStream, createGeminiBlockAssembler, containsControl } from './gemini-stream.js'
 import { redactSensitiveText } from '../runtime/redact.js'
 import { PROXY_RESPONSE_HEADER_TIMEOUT_MS, PROXY_IDLE_TIMEOUT_MS, PROXY_TOTAL_TIMEOUT_MS, PROXY_RESPONSE_BYTES, PROXY_STREAM_RESPONSE_BYTES, PROXY_FRAME_BYTES } from './transport.js'
 import type { ProxyCredential } from './account-store.js'
@@ -85,10 +83,15 @@ import type { LiveProxyCatalog, LiveProxyModel } from './model-catalog.js'
 
 export { PROXY_PROVIDER_ID }
 
+const PROXY_BLOCKS = createGeminiBlockAssembler({ label: '代理模式', idPrefix: 'proxy' })
+const { finishChunk, mapFinishReason, safeProviderErrorCode, isAuthenticationCode } = PROXY_BLOCKS
+
 const STREAM_ENDPOINT = 'https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse'
 const MODELS_ENDPOINT = 'https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels'
 const MODEL_CATALOG_TTL_MS = 30_000
 const MAX_NETWORK_RETRIES = 3
+/** 上游模型侧工具参数校验失败（MALFORMED_FUNCTION_CALL）未出块时的有界重试次数。 */
+const MAX_MALFORMED_RETRIES = 1
 
 export interface ProxyCredentialSource {
   /** 取一份可用凭据；`forceRefresh` 表示先换发再返回。无登录态返回 undefined。 */
@@ -120,16 +123,6 @@ interface ProxyGeneration {
   readonly orchestrator: OrchestratorSettings
   readonly attachments: ProxyAttachmentReader | undefined
   readonly catalog?: CatalogSnapshot
-}
-
-interface BlockState {
-  readonly index: number
-  readonly kind: 'text' | 'reasoning' | 'tool-call'
-  readonly id: ReturnType<typeof ToolCallId>
-  name?: string
-  text: string
-  signature?: string
-  argumentsComplete?: boolean
 }
 
 export class AntigravityProxyAdapter extends LlmAdapter {
@@ -690,6 +683,7 @@ export class AntigravityProxyAdapter extends LlmAdapter {
     let refreshed = false
     let refreshNext = false
     let networkRetries = 0
+    let malformedRetries = 0
     for (;;) {
       const credential = await this.readCredential(signal, refreshNext)
       refreshNext = false
@@ -802,6 +796,15 @@ export class AntigravityProxyAdapter extends LlmAdapter {
           refreshNext = true
           continue
         }
+        if (transportError?.code === 'malformed-function-call' && !hasEmitted.value && !signal?.aborted) {
+          if (malformedRetries < MAX_MALFORMED_RETRIES) {
+            malformedRetries += 1
+            await waitBackoff(malformedRetries, signal)
+            continue
+          }
+          yield finishChunk('error', 'MALFORMED_FUNCTION_CALL')
+          return
+        }
         if (networkRetries < MAX_NETWORK_RETRIES && !hasEmitted.value && !signal?.aborted && isRetryableNetworkError(error)) {
           networkRetries += 1
           await waitBackoff(networkRetries, signal)
@@ -813,74 +816,25 @@ export class AntigravityProxyAdapter extends LlmAdapter {
   }
 
   private async *streamResponse(response: Response, options: AdapterRequestOptions, hasEmitted: { value: boolean }, wireModel: string): AsyncGenerator<StreamChunk, boolean> {
-    const states: BlockState[] = []
-    let current: BlockState | undefined
-    let usage: TokenUsage | undefined
-    let finish: string | undefined
-    let sawDone = false
-    let eventError: ProxyProviderEvent['error']
-    for await (const sse of iterateProxySse(response, {
+    const { finish, eventError, states, sawDone } = yield* assembleGeminiStream(response, {
       ...(options.signal === undefined ? {} : { signal: options.signal }),
-      idleTimeoutMs: PROXY_IDLE_TIMEOUT_MS,
-      totalTimeoutMs: PROXY_TOTAL_TIMEOUT_MS,
-      maxBytes: PROXY_STREAM_RESPONSE_BYTES,
-      maxFrameBytes: PROXY_FRAME_BYTES,
-    })) {
-      if (sse.data.trim() === '[DONE]') { sawDone = true; break }
-      let event: ProxyProviderEvent
-      try {
-        event = parseProxyProviderEvent(sse.data)
-      } catch (error) {
-        if (hasEmitted.value) throw new LlmError('代理模式响应流在中途截断', 'TRANSPORT', { cause: error })
-        throw error
-      }
-      if (event.error !== undefined) {
-        eventError = event.error
-        if (event.error.status === 401 || isAuthenticationCode(event.error.code)) {
-          throw new ProxyTransportError('authentication', '代理模式凭据被上游拒绝', { status: event.error.status ?? 401 })
+      sse: {
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+        idleTimeoutMs: PROXY_IDLE_TIMEOUT_MS,
+        totalTimeoutMs: PROXY_TOTAL_TIMEOUT_MS,
+        maxBytes: PROXY_STREAM_RESPONSE_BYTES,
+        maxFrameBytes: PROXY_FRAME_BYTES,
+      },
+      blocks: PROXY_BLOCKS,
+      hasEmitted,
+      label: '代理模式',
+      onAuthError: (error) => {
+        if (error.status === 401 || isAuthenticationCode(error.code)) {
+          throw new ProxyTransportError('authentication', '代理模式凭据被上游拒绝', { status: error.status ?? 401 })
         }
-        if (event.error.status === 403 || event.error.code?.toUpperCase() === 'PERMISSION_DENIED') throw new ProxyTransportError('forbidden', '代理模式账户被上游拒绝', { status: 403 })
-        break
-      }
-      if (event.usage !== undefined) usage = event.usage
-      if (event.finish !== undefined) finish = event.finish
-      for (const part of event.parts) {
-        if (part.signatureOnly === true && current !== undefined) { current.signature = part.signature; continue }
-        if (current === undefined || !sameBlock(current, part)) {
-          if (current !== undefined) yield endBlock(current)
-          current = beginBlock(states, part)
-          yield { type: 'block-start', index: current.index, blockType: current.kind }
-        }
-        if (part.kind === 'tool-call') {
-          if (part.name !== undefined) current.name = assembleFunctionName(current.name, part.name)
-          current.text += part.arguments ?? ''
-          current.argumentsComplete = part.argumentsComplete
-          hasEmitted.value ||= (part.arguments?.length ?? 0) > 0 || part.name !== undefined
-          yield {
-            type: 'tool-call-delta',
-            index: current.index,
-            id: current.id,
-            ...(part.name === undefined ? {} : { name: part.name }),
-            argumentsDelta: part.arguments ?? '',
-          }
-        } else {
-          current.text += part.text ?? ''
-          hasEmitted.value ||= (part.text?.length ?? 0) > 0
-          if ((part.text?.length ?? 0) > 0) yield { type: part.kind === 'reasoning' ? 'reasoning-delta' : 'text-delta', index: current.index, text: part.text ?? '' }
-        }
-        if (part.signature !== undefined) current.signature = part.signature
-      }
-    }
-    if (current !== undefined) {
-      try {
-        yield endBlock(current)
-      } catch (error) {
-        // 上游已经给出错误事件（429 / SAFETY / 上下文超限）或本轮被取消时，半截
-        // 工具调用参数不该把真实原因盖成 PROTOCOL_DRIFT。
-        if (eventError === undefined && !options.signal?.aborted) throw error
-      }
-    }
-    if (usage !== undefined) yield { type: 'usage', usage }
+        if (error.status === 403 || error.code?.toUpperCase() === 'PERMISSION_DENIED') throw new ProxyTransportError('forbidden', '代理模式账户被上游拒绝', { status: 403 })
+      },
+    })
     if (eventError !== undefined) {
       // 停用也会以流内 error 事件出现（magpie 记录过这条形态）：先认它，再谈别的。
       const suspended = suspendedErrorFor(eventError.message ?? '', eventError.status)
@@ -898,6 +852,12 @@ export class AntigravityProxyAdapter extends LlmAdapter {
       return false
     }
     if (options.signal?.aborted) { yield finishChunk('aborted', 'CANCELLED'); return false }
+    // 上游模型侧工具参数校验失败（finishReason MALFORMED_FUNCTION_CALL，流里无合法
+    // functionCall）：未出块时交外层有界重试一次（镜像 gemini-cli 的内部重试）；已出块
+    // 则不能重发（会重复文本），落回下面的普通错误收尾。
+    if (finish?.toUpperCase() === 'MALFORMED_FUNCTION_CALL' && !hasEmitted.value && !options.signal?.aborted) {
+      throw new ProxyTransportError('malformed-function-call', '代理模式上游工具参数校验失败（MALFORMED_FUNCTION_CALL）')
+    }
     if (mapFinishReason(finish) === 'error') { yield finishChunk('error', finish ?? 'UPSTREAM'); return false }
     if (states.length === 0) { yield finishChunk('error', 'EMPTY_RESPONSE'); return false }
     if (finish === undefined && !sawDone) throw new LlmError('代理模式响应流在完成标记之前结束', 'TRANSPORT')
@@ -1067,110 +1027,6 @@ function selectLiveGeminiWire(observed: LiveProxyModel | undefined, setting: Mod
   const wire = requested === undefined ? undefined : variants.get(requested)
   if (wire === undefined) throw new LlmError('当前账户的模型目录未提供所选思考档位', 'UNSUPPORTED_REASONING_EFFORT')
   return wire
-}
-
-function containsControl(value: string): boolean {
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index)
-    if (code < 0x20 || code === 0x7f) return true
-  }
-  return false
-}
-
-function beginBlock(states: BlockState[], part: ProxyProviderPart): BlockState {
-  const index = states.length
-  const block: BlockState = part.kind === 'tool-call'
-    ? {
-        index,
-        kind: 'tool-call',
-        id: ToolCallId(part.id ?? `proxy-call-${randomUUID()}`),
-        ...(part.name === undefined ? {} : { name: part.name }),
-        text: '',
-        ...(part.signature === undefined ? {} : { signature: part.signature }),
-      }
-    : {
-        index,
-        kind: part.kind,
-        id: ToolCallId(`proxy-block-${String(index)}`),
-        text: '',
-        ...(part.signature === undefined ? {} : { signature: part.signature }),
-      }
-  states.push(block)
-  return block
-}
-
-function sameBlock(state: BlockState, part: ProxyProviderPart): boolean {
-  if (state.kind !== part.kind) return false
-  if (part.kind !== 'tool-call') return true
-  if (part.id !== undefined) return part.id === String(state.id)
-  // Gemini 的并行调用可省略 id，每个完整参数对象都对应独立的调用。
-  return state.argumentsComplete !== true
-}
-
-function assembleFunctionName(current: string | undefined, fragment: string): string {
-  if (fragment.length === 0 || fragment.length > 256 || containsControl(fragment)) throw llmError('代理模式工具调用名无效', 'PROTOCOL_DRIFT')
-  if (current === undefined || current.length === 0) return fragment
-  if (fragment === current) return current
-  if (fragment.startsWith(current)) return fragment
-  const combined = `${current}${fragment}`
-  if (combined.length > 256) throw llmError('代理模式工具调用名超出上限', 'PROTOCOL_DRIFT')
-  return combined
-}
-
-function endBlock(state: BlockState): StreamChunk {
-  if (state.kind === 'text') return { type: 'block-end', index: state.index, block: { type: 'text', text: state.text } }
-  if (state.kind === 'reasoning') return { type: 'block-end', index: state.index, block: { type: 'reasoning', text: state.text } }
-  try {
-    const parsed: unknown = JSON.parse(state.text || '{}')
-    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error('not an object')
-  } catch {
-    throw llmError('代理模式工具调用参数不是完整 JSON', 'PROTOCOL_DRIFT')
-  }
-  if (state.name === undefined || !/^[A-Za-z_][A-Za-z0-9_.:-]{0,255}$/u.test(state.name)) {
-    throw llmError('代理模式工具调用名缺失或无效', 'PROTOCOL_DRIFT')
-  }
-  return { type: 'block-end', index: state.index, block: { type: 'tool-call', id: state.id, name: state.name, arguments: state.text || '{}' } }
-}
-
-function finishChunk(kind: FinishReason['kind'], code: string, status?: number, replayState?: ReplayEnvelope, detail?: string): StreamChunk {
-  const reason: FinishReason = kind === 'aborted'
-    ? { kind: 'aborted', failure: { code, message: '代理模式请求已取消' } }
-    : kind === 'error'
-      ? { kind: 'error', failure: { code, message: detail === undefined ? '代理模式上游请求失败' : `代理模式上游请求失败：${detail}`, ...(status === undefined ? {} : { status }) } }
-      : kind === 'max-tokens'
-        ? { kind: 'max-tokens' }
-        : kind === 'tool-calls'
-          ? { kind: 'tool-calls' }
-          : { kind: 'stop' }
-  return { type: 'finish', reason, ...(replayState === undefined ? {} : { replayState }) }
-}
-
-function mapFinishReason(value: string | undefined): FinishReason['kind'] {
-  const normalized = value?.toUpperCase()
-  if (normalized === 'MAX_TOKENS' || normalized === 'LENGTH') return 'max-tokens'
-  if (normalized === 'SAFETY' || normalized === 'BLOCKLIST' || normalized === 'ERROR') return 'error'
-  if (normalized === 'TOOL_CALLS' || normalized === 'FUNCTION_CALL') return 'tool-calls'
-  if (normalized !== undefined && normalized !== 'STOP') return 'error'
-  return 'stop'
-}
-
-function safeProviderErrorCode(code: string | undefined, status?: number): string {
-  if (status === 429) return 'RATE_LIMIT'
-  if (status === 401) return 'AUTH'
-  if (status === 403) return 'FORBIDDEN'
-  const normalized = code?.toUpperCase()
-  if (normalized === undefined) return 'UPSTREAM'
-  if (normalized.includes('RATE') || normalized === 'RESOURCE_EXHAUSTED') return 'RATE_LIMIT'
-  if (normalized.includes('QUOTA')) return 'RATE_LIMIT'
-  if (normalized === 'UNAUTHENTICATED' || normalized === 'INVALID_GRANT') return 'AUTH'
-  if (normalized === 'PERMISSION_DENIED' || normalized === 'FORBIDDEN') return 'FORBIDDEN'
-  if (normalized.includes('INVALID') || normalized.includes('BAD_REQUEST')) return 'PROTOCOL_DRIFT'
-  return 'UPSTREAM'
-}
-
-function isAuthenticationCode(code: string | undefined): boolean {
-  const normalized = code?.toUpperCase()
-  return normalized === 'UNAUTHENTICATED' || normalized === 'AUTHENTICATION' || normalized === 'INVALID_GRANT' || normalized === 'UNAUTHENTICATED_REQUEST'
 }
 
 function isRetryableNetworkError(error: unknown): boolean {

@@ -131,6 +131,35 @@ describe('代理模式流式工具与签名', () => {
     expect(credential.mock.calls.map(call => call[1])).toEqual([undefined, { forceRefresh: true }])
   })
 
+  it('MALFORMED_FUNCTION_CALL 未出块时有界重试一次并成功', async () => {
+    const request = vi.fn()
+      .mockResolvedValueOnce(new Response(`data: ${JSON.stringify(event([], 'MALFORMED_FUNCTION_CALL'))}\n\n`))
+      .mockResolvedValueOnce(new Response(`data: ${JSON.stringify(event([{ text: 'ok' }], 'STOP'))}\n\n`))
+    const instance = new AntigravityProxyAdapter({ credential: { credential: async () => ({ accessToken: 'synthetic', source: 'login', updatedAt: 'x' }) }, transport: { request } })
+    const chunks = await collect(instance.stream(options))
+    expect(chunks.at(-1)).toMatchObject({ type: 'finish', reason: { kind: 'stop' } })
+    expect(request).toHaveBeenCalledTimes(2)
+  })
+
+  it('MALFORMED_FUNCTION_CALL 重试一次仍失败则按错误收尾', async () => {
+    const request = vi.fn(async () => new Response(`data: ${JSON.stringify(event([], 'MALFORMED_FUNCTION_CALL'))}\n\n`))
+    const instance = new AntigravityProxyAdapter({ credential: { credential: async () => ({ accessToken: 'synthetic', source: 'login', updatedAt: 'x' }) }, transport: { request } })
+    const chunks = await collect(instance.stream(options))
+    expect(chunks.at(-1)).toMatchObject({ type: 'finish', reason: { kind: 'error', failure: { code: 'MALFORMED_FUNCTION_CALL' } } })
+    expect(request).toHaveBeenCalledTimes(2)
+  })
+
+  it('已出文本后 MALFORMED_FUNCTION_CALL 不重试（避免重复文本）', async () => {
+    const request = vi.fn(async () => new Response([
+      `data: ${JSON.stringify(event([{ text: 'partial' }]))}\n\n`,
+      `data: ${JSON.stringify(event([], 'MALFORMED_FUNCTION_CALL'))}\n\n`,
+    ].join('')))
+    const instance = new AntigravityProxyAdapter({ credential: { credential: async () => ({ accessToken: 'synthetic', source: 'login', updatedAt: 'x' }) }, transport: { request } })
+    const chunks = await collect(instance.stream(options))
+    expect(chunks.at(-1)).toMatchObject({ type: 'finish', reason: { kind: 'error', failure: { code: 'MALFORMED_FUNCTION_CALL' } } })
+    expect(request).toHaveBeenCalledTimes(1)
+  })
+
   it('已出文本后鉴权失败不重新派发生成', async () => {
     const request = vi.fn(async () => new Response([
       `data: ${JSON.stringify(event([{ text: 'partial' }]))}\n\n`,

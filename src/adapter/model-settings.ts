@@ -48,7 +48,7 @@ export interface ModelSetting {
  * 把配置里的原始记录收敛成可用设置：非法档位、空串与非对象条目一律丢弃，
  * 不让一份手写配置让整个目录失败。
  */
-export function normalizeModelSettings(input: unknown): Map<string, ModelSetting> {
+export function normalizeModelSettings(input: unknown, defaultEnabled?: (id: string) => boolean): Map<string, ModelSetting> {
   const settings = new Map<string, ModelSetting>()
   if (!input || typeof input !== 'object' || Array.isArray(input)) return settings
   for (const [rawId, row] of Object.entries(input as Record<string, unknown>)) {
@@ -57,8 +57,10 @@ export function normalizeModelSettings(input: unknown): Map<string, ModelSetting
     const record = row as ModelOverride
     const name = text(record.name)
     const target = text(record.target)
+    // 显式 enabled 优先；缺省时交给链路默认谓词（AI Studio 按代际），无谓词保持启用。
+    const enabled = record.enabled !== undefined ? record.enabled !== false : (defaultEnabled ? defaultEnabled(id) : true)
     settings.set(id, {
-      enabled: record.enabled !== false,
+      enabled,
       ...(isEffort(record.effort) ? { effort: record.effort } : {}),
       ...(name === '' ? {} : { name }),
       ...(target === '' ? {} : { target }),
@@ -68,16 +70,16 @@ export function normalizeModelSettings(input: unknown): Map<string, ModelSetting
 }
 
 /** 该模型的显示设置；未配置时返回启用且不带覆盖项。 */
-export function modelSettingFor(settings: ReadonlyMap<string, ModelSetting>, id: string): ModelSetting {
+export function modelSettingFor(settings: ReadonlyMap<string, ModelSetting>, id: string, defaultEnabled?: (id: string) => boolean): ModelSetting {
   const stored = settings.get(id)
   if (stored) return stored
   // 未显式配置时，官方公告即将下线的家族默认关闭；用户仍可在设置页手动打开。
-  return { enabled: !isRetiringModel(id) }
+  return { enabled: defaultEnabled ? defaultEnabled(id) : !isRetiringModel(id) }
 }
 
 /** 是否列入 DSH 模型选择器。 */
-export function modelVisible(settings: ReadonlyMap<string, ModelSetting>, id: string): boolean {
-  return modelSettingFor(settings, id).enabled
+export function modelVisible(settings: ReadonlyMap<string, ModelSetting>, id: string, defaultEnabled?: (id: string) => boolean): boolean {
+  return modelSettingFor(settings, id, defaultEnabled).enabled
 }
 
 /**

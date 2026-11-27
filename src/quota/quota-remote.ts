@@ -26,6 +26,7 @@ import { fetchProxyQuotaSnapshot } from '../proxy/quota-source.js'
 import type { ProxyCredentialSource } from '../proxy/adapter.js'
 import type { ProxyTransport } from '../proxy/transport.js'
 import { AGY_PROXY_ACCOUNT_INVOCATIONS } from '../proxy/account-remote.js'
+import { AGY_AISTUDIO_INVOCATIONS } from '../aistudio/remote.js'
 import { cliQuotaIdentity, markQuotaAge, quotaIdentity, QuotaSnapshotStore } from './snapshot-store.js'
 import type { QuotaMode } from './snapshot-store.js'
 import type { HistoryTruncationNotice } from '../runtime/history-notices.js'
@@ -153,7 +154,7 @@ export function registerAgYQuotaRemote(ctx: Context): void {
           face: 'host',
           schemas: [],
           model: { services: [], events: [], objects: [] },
-          invocations: [...AGY_QUOTA_INVOCATIONS, ...AGY_PROXY_ACCOUNT_INVOCATIONS],
+          invocations: [...AGY_QUOTA_INVOCATIONS, ...AGY_PROXY_ACCOUNT_INVOCATIONS, ...AGY_AISTUDIO_INVOCATIONS],
         })
       } catch (error) {
         ctx.logger?.warn?.('antigravity-acp: 额度 remote 注册失败', error)

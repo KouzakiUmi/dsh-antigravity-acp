@@ -27,11 +27,19 @@ window.__ModuleLoader__.load({
     /* @include client-i18n/core.js */
     const PROVIDER = 'antigravity-acp'
     const PROXY_PROVIDER = 'antigravity-proxy'
+    const VERTEX_MODEL_PREFIX = 'vertex-ai-'
+    const VERTEX_MODEL_PATTERN = /^gemini-[a-z0-9](?:[a-z0-9.-]{0,119}[a-z0-9])?$/u
     /** Settings namespace projected from Config's volatile fields in src/settings.ts. */
     const ENTRY_ID = 'llm-antigravity-acp'
     /** Live fields owned by this card; ordinary fields stay in the host config editor. */
     const FIELDS = [
       { key: 'proxyMode', group: 'mode', checkbox: true, label: msg('使用代理模式'), hint: msg('直连上游；需启用代理路由并连接代理账户。') },
+      { key: 'aistudioEnabled', group: 'aistudio', checkbox: true, label: msg('使用 AI Studio'), hint: msg('独立 Gemini API 路由，与 ACP / 代理并存；需配置 API key 凭据引用。') },
+      { key: 'aistudioCredentialRef', group: 'aistudio', label: msg('AI Studio 凭据引用名'), placeholder: 'AISTUDIO_API_KEY', hint: msg('环境变量名；真实值经宿主凭据接缝解析，不存入设置。') },
+      { key: 'vertexEnabled', group: 'vertex', checkbox: true, label: msg('使用 Vertex AI'), hint: msg('独立模型路由，使用宿主已有的 Google 应用默认凭据（ADC）。') },
+      { key: 'vertexProject', group: 'vertex', label: msg('Google Cloud 项目'), placeholder: 'example-project' },
+      { key: 'vertexLocation', group: 'vertex', label: msg('Vertex AI 区域'), defaultValue: 'global', placeholder: 'global' },
+      { key: 'vertexModels', group: 'vertex', lines: true, label: msg('Gemini 发布商模型 ID'), placeholder: 'gemini-4-hydrogen', hint: msg('每行一个模型 ID。模型须在所选项目与区域可用。') },
       { key: 'cliQuotaEnabled', group: 'quota', checkbox: true, label: msg('使用 agy CLI 补充额度'), hint: msg('默认不启动 agy；开启后才读取 AI Credits。') },
       { key: 'autoWarmup', group: 'general', checkbox: true, defaultChecked: true, acpOnly: true, label: msg('启动时自动预热'), hint: msg('不发送消息；下次启用插件时生效。') },
       { key: 'reuseSessions', group: 'general', checkbox: true, defaultChecked: true, acpOnly: true, label: msg('复用 ACP 会话'), hint: msg('只发送新增消息；上下文不一致时自动重建。') },
@@ -109,10 +117,19 @@ window.__ModuleLoader__.load({
       const retiring = retirementForModel(id)
       return retiring !== undefined && isRetired(retiring)
     }
-    /** 生效启用态：显式配置优先；未配置时退役家族默认关闭。 */
+    /** AI Studio 默认启用口径：仅 Gemini 4 系默认开（与 host endpoints.ts 同口径，测试锁定）。 */
+    function aistudioDefaultEnabled(id) {
+      const match = /^gemini-(\d+)/.exec(String(id ?? '').replace(/^aistudio-/, ''))
+      return match !== null && Number(match[1]) === 4
+    }
+    /** 链路默认启用态：AI Studio 按代际，ACP / 代理按退役表。 */
+    function defaultEnabledFor(id) {
+      return String(id ?? '').startsWith('aistudio-') ? aistudioDefaultEnabled(id) : !retirementForModel(id)
+    }
+    /** 生效启用态：显式配置优先；未配置时按链路默认（退役家族 / AI Studio 非 4 系默认关闭）。 */
     function effectiveEnabled(overrides, id) {
       const stored = overrideFor(overrides, id).enabled
-      return stored !== undefined ? stored : !retirementForModel(id)
+      return stored !== undefined ? stored : defaultEnabledFor(id)
     }
 
     /** 只保留有意义的字段：启用是默认值，空串等于未设置；退役家族的显式启用需要落盘。 */
@@ -120,7 +137,7 @@ window.__ModuleLoader__.load({
       const source = row && typeof row === 'object' ? row : {}
       const result = {}
       if (source.enabled === false) result.enabled = false
-      else if (source.enabled === true && retirementForModel(id)) result.enabled = true
+      else if (source.enabled === true && !defaultEnabledFor(id)) result.enabled = true
       if (EFFORT_IDS.has(source.effort)) result.effort = source.effort
       const name = typeof source.name === 'string' ? source.name.trim() : ''
       if (name) result.name = name
@@ -233,10 +250,12 @@ window.__ModuleLoader__.load({
     /**
      * 已配置但不在当前目录的 ID 是否属于当前链路：代理目录键一律带 antigravity- 前缀
      * （auth-core 定义与 live Gemini 家族），ACP 目录键是裸 ID；编排合成条目两条链路同名，
-     * 不按前缀判断。另一链路的键留在配置里，切回时照常出现。
+     * 不按前缀判断。另一链路的键留在配置里，切回时照常出现。AI Studio 是独立第三路由
+     * （aistudio- 前缀），不进 ACP / 代理二元编辑器，其键留在配置里由该路由自行消费。
      */
     function belongsToMode(id, proxyMode) {
       if (id === ORCHESTRATOR_MODEL_ID) return true
+      if (id.startsWith('aistudio-') || id.startsWith(VERTEX_MODEL_PREFIX)) return false
       return id.startsWith('antigravity-') === proxyMode
     }
     const ORCHESTRATOR_EFFORT_OPTIONS = EFFORT_OPTIONS.filter((entry) => Boolean(entry.value))
@@ -300,6 +319,37 @@ window.__ModuleLoader__.load({
       return Boolean(value && typeof value === 'object' && isValidOrchestratorMaxPlans(value.maxPlansPerTurn))
     }
     /**
+     * 附属功能模块（Google One / Google AI Pro 订阅的能力）：client 内置规格元数据，
+     * 须与 src/features/specs.ts 的 FEATURE_SPECS 一致（id 与 defaultEnabled 由
+     * tests/client-loader.test.ts 锁定）。client 不能 import TS，内置同份表。
+     */
+    const FEATURES = [
+      { id: 'image-gen', name: msg('图像生成'), description: msg('注册 agy_image_generate 工具：模型调用后用代理账户的 Gemini 图像模型生成图片，预览图落到对话、原始文件保留生成格式。仅代理模式生效，需登录代理账户。'), defaultEnabled: false, experimental: false },
+    ]
+    const FEATURE_IDS = new Set(FEATURES.map((entry) => entry.id))
+    const FEATURES_KEY = 'features'
+    const FEATURES_LABEL = msg('附属功能')
+    function rawFeatures(value) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+      const result = {}
+      for (const [id, on] of Object.entries(value)) {
+        if (FEATURE_IDS.has(id) && typeof on === 'boolean') result[id] = on
+      }
+      return result
+    }
+    /** 规范化：默认关闭，只保留显式开启的键，便于脏值比较与保存。 */
+    function canonicalFeatures(value) {
+      const raw = rawFeatures(value)
+      const result = {}
+      for (const feature of FEATURES) {
+        if (raw[feature.id] === true) result[feature.id] = true
+      }
+      return result
+    }
+    function sameFeatures(a, b) {
+      return JSON.stringify(canonicalFeatures(a)) === JSON.stringify(canonicalFeatures(b))
+    }
+    /**
      * 目录条目 + 已配置但当前目录没有的 ID + 退役表内置家族，都要能在此编辑。
      * proxyMode 必须由调用方按当前链路显式传入：不能用目录里是否出现 antigravity-
      * 前缀来猜（ACP 模式的编排合成条目同样带该前缀，会导致补行写错 ID 风格）。
@@ -332,6 +382,28 @@ window.__ModuleLoader__.load({
         rows.push({ id, name: fallbackModelName(id), inCatalog: false })
       }
       return rows
+    }
+
+    /**
+     * AI Studio 模型行：独立第三路由（aistudio- 前缀），不进 ACP / 代理二元编辑器，
+     * 无退役家族补行。目录行来自实时发现；已配置但不在目录的 aistudio- 键补行。
+     */
+    function aistudioModelRows(models, overrides) {
+      const rows = models.map(({ id, name, inputModalities, contextWindow, maxOutputTokens, contextWindowSource }) =>
+        ({ id, name, inputModalities, contextWindow, maxOutputTokens, contextWindowSource, inCatalog: true }))
+      const known = new Set(rows.map((row) => row.id))
+      for (const id of Object.keys(rawOverrides(overrides))) {
+        if (!id.startsWith('aistudio-') || known.has(id)) continue
+        rows.push({ id, name: fallbackModelName(id), inCatalog: false })
+      }
+      // 启用的模型置顶（镜像 Unified 插件）；稳定排序，同组内保持目录顺序。
+      rows.sort((a, b) => Number(effectiveEnabled(overrides, b.id)) - Number(effectiveEnabled(overrides, a.id)))
+      return rows
+    }
+
+    function vertexModelRows(value) {
+      const ids = new Set(String(value ?? '').split(/\r?\n/).map(id => id.trim()).filter(id => VERTEX_MODEL_PATTERN.test(id)))
+      return [...ids].map(name => ({ id: VERTEX_MODEL_PREFIX + name, name, inputModalities: ['text'], inCatalog: true }))
     }
 
     function unwrap(result) {
@@ -476,6 +548,22 @@ window.__ModuleLoader__.load({
             h(TextField, { field: ORCHESTRATOR_FIELDS.maxPlansPerTurn, value: current.maxPlansPerTurn, disabled, invalid: maxPlansInvalid, onChange: (next) => onEdit({ maxPlansPerTurn: next }) }),
             h(SwitchField, { field: ORCHESTRATOR_FIELDS.showPlan, checked: current.showPlan, disabled, onChange: (checked) => onEdit({ showPlan: checked }) }))))
     }
+    function FeatureSection({ value, disabled, onEdit }) {
+      const current = rawFeatures(value)
+      const rows = FEATURES.map((feature) => {
+        const checked = current[feature.id] === true
+        return h('div', { key: feature.id, style: { display: 'grid', gap: '2px', minWidth: 0 } },
+          h(SwitchField, {
+            field: { key: 'feature-' + feature.id, label: feature.name, hint: feature.description },
+            checked, disabled, onChange: (on) => onEdit(feature.id, on),
+          }),
+          feature.experimental ? h('small', { style: { fontSize: '10.5px', lineHeight: 1.4, opacity: .55 } }, t('实验性功能：行为与可用性可能随上游变化。')) : null)
+      })
+      return h('section', { 'aria-label': t(FEATURES_LABEL) },
+        h(SectionHeading, { title: t(FEATURES_LABEL), description: t('Google One / Google AI Pro 订阅的附属能力，逐项手动开启，保存后即时生效、不重载宿主；仅在兼容的生成模式下实际挂载。') }),
+        h('div', { style: PANEL },
+          h('div', { style: { display: 'grid', gap: '8px' } }, ...rows)))
+    }
     function SettingsFields({ fields, draft, dirtyKeys, conflicts, disabled, editField }) {
       const numericGrid = fields.length > 1 && fields.every((field) => field.numeric)
       return h('div', { style: { display: 'grid', gap: '10px', gridTemplateColumns: numericGrid ? 'repeat(auto-fit, minmax(180px, 1fr))' : undefined } }, ...fields.map((field) => {
@@ -518,28 +606,28 @@ window.__ModuleLoader__.load({
         style: { flex: '0 0 auto', padding: '1px 7px', borderRadius: '99px', fontSize: '10.5px', fontWeight: 600, color: '#b45309', background: 'rgba(234,179,8,.16)', border: '1px solid rgba(234,179,8,.35)', whiteSpace: 'nowrap' },
       }, retired ? t('已下线 {date}', { date: monthDay }) : t('即将下线 {date}', { date: monthDay }))
     }
-    function ModelOverrideRow({ row, override, disabled, onEdit }) {
+    function ModelOverrideRow({ row, override, disabled, onEdit, showEffort = true }) {
       const retiring = row.retiring ?? retirementForModel(row.id)
-      const enabled = override.enabled !== undefined ? override.enabled : !retiring
+      const enabled = override.enabled !== undefined ? override.enabled : defaultEnabledFor(row.id)
       const inputId = 'agy-model-' + row.id.replace(/[^\w.-]/g, '_')
       const labelStyle = { fontSize: '11.5px', opacity: .66 }
       const inputStyle = { ...ACTION, width: '100%', minWidth: 0, minHeight: '32px', boxSizing: 'border-box', background: 'transparent', cursor: disabled ? 'not-allowed' : 'text' }
       const displayName = override.name?.trim() || row.name
       const toggleId = inputId + '-enabled'
       return h('div', { role: 'listitem', style: { padding: '10px 14px', borderTop: '1px solid var(--agy-line)', opacity: enabled ? 1 : .54 } },
-        h('div', { style: { display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto auto', alignItems: 'center', gap: '10px' } },
+        h('div', { style: { display: 'grid', gridTemplateColumns: showEffort ? 'minmax(0, 1fr) auto auto' : 'minmax(0, 1fr) auto', alignItems: 'center', gap: '10px' } },
           h('label', { htmlFor: toggleId, title: displayName, style: { minWidth: 0, cursor: disabled ? 'default' : 'pointer' } },
             h('div', { title: displayName, style: { display: 'flex', alignItems: 'center', gap: '7px', overflow: 'hidden' } },
               h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: '13px', fontWeight: 560 } }, displayName),
               retiring ? h(RetirementBadge, { retiring }) : null),
             h('div', { style: { fontSize: '11px', opacity: .55, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, row.id)),
-          h('label', { htmlFor: inputId + '-effort', style: { display: 'flex', alignItems: 'center', gap: '5px', fontSize: '11.5px' } },
+          showEffort ? h('label', { htmlFor: inputId + '-effort', style: { display: 'flex', alignItems: 'center', gap: '5px', fontSize: '11.5px' } },
             h('span', { style: { opacity: .62 } }, t('思考')),
             h('select', { id: inputId + '-effort', name: 'model-effort-' + row.id, disabled, value: EFFORT_IDS.has(override.effort) ? override.effort : '',
               'aria-label': t('{name} 默认思考档位', { name: displayName }),
               onChange: (event) => onEdit(row.id, { effort: event.target.value }),
               style: { ...inputStyle, width: 'auto', minHeight: '26px', padding: '2px 7px', fontSize: '12px', colorScheme: 'inherit', cursor: disabled ? 'not-allowed' : 'pointer' } },
-              ...EFFORT_OPTIONS.map((option) => h('option', { key: option.value, value: option.value, style: { color: 'CanvasText', backgroundColor: 'Canvas' } }, t(option.label))))),
+              ...EFFORT_OPTIONS.map((option) => h('option', { key: option.value, value: option.value, style: { color: 'CanvasText', backgroundColor: 'Canvas' } }, t(option.label))))) : null,
           h('input', { id: toggleId, className: 'agy-switch', name: 'model-enabled-' + row.id, type: 'checkbox', checked: enabled, disabled,
             'aria-label': displayName, style: { accentColor: '#3b82f6' },
             onChange: (event) => onEdit(row.id, { enabled: event.target.checked }) })),
@@ -570,11 +658,11 @@ window.__ModuleLoader__.load({
                 ? h('span', null, row.inputModalities.map((modality) => t(MODALITY_LABELS[modality] ?? modality)).join(' · ')) : null))))
     }
 
-    function ModelOverrideList({ rows, overrides, disabled, onEdit }) {
+    function ModelOverrideList({ rows, overrides, disabled, onEdit, showEffort = true, emptyHint, hiddenWarning }) {
       const [query, setQuery] = React.useState('')
       const [filter, setFilter] = React.useState('all')
       if (rows.length === 0) {
-        return h('p', { role: 'status', style: { margin: 0, fontSize: '12px', lineHeight: 1.5, opacity: .6 } }, t('暂无模型。请先连接当前账户，再刷新目录。'))
+        return h('p', { role: 'status', style: { margin: 0, fontSize: '12px', lineHeight: 1.5, opacity: .6 } }, t(emptyHint || '暂无模型。请先连接当前账户，再刷新目录。'))
       }
       const hidden = rows.filter((row) => !effectiveEnabled(overrides, row.id)).length
       const keyword = query.trim().toLowerCase()
@@ -598,20 +686,131 @@ window.__ModuleLoader__.load({
           h('button', { type: 'button', disabled: disabled || visible.length === 0, onClick: () => setVisible(true), style: { ...ACTION, minHeight: '26px', padding: '2px 7px', fontSize: '10px' } }, t('全部启用')),
           h('button', { type: 'button', disabled: disabled || visible.length === 0, onClick: () => setVisible(false), style: { ...ACTION, minHeight: '26px', padding: '2px 7px', fontSize: '10px' } }, t('全部隐藏'))),
         hidden === rows.length
-          ? h('p', { role: 'status', style: { margin: 0, fontSize: '11px', lineHeight: 1.5, color: '#946200' } }, t('全部隐藏后，Antigravity 将从模型选择器消失。'))
+          ? h('p', { role: 'status', style: { margin: 0, fontSize: '11px', lineHeight: 1.5, color: '#946200' } }, t(hiddenWarning || '全部隐藏后，Antigravity 将从模型选择器消失。'))
           : null,
         visible.length
           ? h('div', { role: 'list', className: 'agy-list' }, ...visible.map((row) => h(ModelOverrideRow, {
-            key: row.id, row, override: overrideFor(overrides, row.id), disabled, onEdit,
+            key: row.id, row, override: overrideFor(overrides, row.id), disabled, onEdit, showEffort,
           })))
           : h('p', { role: 'status', style: { margin: 0, fontSize: '12px', opacity: .6 } }, t('没有符合条件的模型。')))
     }
 
     /**
-     * 代理账户面板：代理模式的独立登录态（与 ACP / 官方 CLI 登录相互独立）。
-     * 状态与授权 URL 经 Host 的 remote.agyProxyAccount 读取；授权 URL 只在
-     * 点击「连接代理账户」后返回一次，展示为可打开的链接。
+     * AI Studio 手动 API key 输入：密码框 + 保存按钮。key 经 remote.agyAistudio.setKey
+     * 写入宿主凭据存储（只写不回显），保存后清空输入框，仅展示 describe 的掩码预览。
+     * key 不进设置草稿 / 明文 / 日志；引用名由上方 aistudioCredentialRef 字段决定。
      */
+    function AistudioKeyInput({ status, disabled, onSave }) {
+      const [value, setValue] = React.useState('')
+      const [busy, setBusy] = React.useState(false)
+      const [message, setMessage] = React.useState('')
+      const submit = async () => {
+        if (!value.trim() || busy || disabled) return
+        setBusy(true); setMessage('')
+        try {
+          await onSave(value)
+          setValue('')
+          setMessage(t('API key 已保存到凭据存储。'))
+        } catch (error) {
+          setMessage(error instanceof Error ? error.message : String(error))
+        } finally { setBusy(false) }
+      }
+      const configured = status?.configured === true
+      const masked = status?.masked
+      return h('div', { style: { display: 'grid', gap: '8px' } },
+        h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } },
+          h('input', { type: 'password', value, placeholder: t('输入 Gemini API key'), disabled: disabled || busy, autoComplete: 'off',
+            'aria-label': t('AI Studio API key'), style: { ...ACTION, flex: 1, minWidth: '200px', minHeight: '32px', boxSizing: 'border-box', background: 'transparent', cursor: disabled ? 'not-allowed' : 'text' },
+            onChange: (event) => setValue(event.target.value), onKeyDown: (event) => { if (event.key === 'Enter') void submit() } }),
+          h('button', { type: 'button', style: PRIMARY, disabled: disabled || busy || !value.trim(), onClick: () => void submit() }, t(busy ? '保存中…' : '保存 key'))),
+        h('p', { role: 'status', style: { margin: 0, fontSize: '11.5px', lineHeight: 1.5, opacity: .7 } },
+          configured ? t('已配置{masked}', { masked: masked ? ` (${masked})` : '' }) : t('尚未配置 API key。')),
+        message ? h('p', { role: 'status', style: { margin: 0, fontSize: '11.5px', lineHeight: 1.5, overflowWrap: 'anywhere' } }, message) : null)
+    }
+
+    function AistudioUsagePanel({ control, credentialChanging }) {
+      const [snapshot, setSnapshot] = React.useState(undefined)
+      const [busy, setBusy] = React.useState(false)
+      const active = React.useRef(false)
+      const pending = React.useRef(false)
+      const refresh = React.useCallback(async () => {
+        if (!control || pending.current || credentialChanging) return
+        pending.current = true
+        setBusy(true)
+        try {
+          const next = parseAistudioUsageResult(unwrap(await control('usage')))
+          if (active.current) setSnapshot(next)
+        } catch {
+          if (active.current) setSnapshot({ status: 'error' })
+        } finally {
+          pending.current = false
+          if (active.current) setBusy(false)
+        }
+      }, [control, credentialChanging])
+      React.useEffect(() => {
+        active.current = true
+        if (!control || credentialChanging) return () => { active.current = false }
+        void refresh()
+        const timer = setInterval(() => {
+          if (typeof document === 'undefined' || document.visibilityState !== 'hidden') void refresh()
+        }, 10_000)
+        return () => { active.current = false; clearInterval(timer) }
+      }, [control, credentialChanging, refresh])
+      const status = credentialChanging ? 'changing' : !control ? 'error' : snapshot?.status
+      const hint = { changing: '正在更换 API key…', error: '读取本地用量失败，可刷新重试。', unconfigured: '配置 API key 后即可查看本地用量。' }[status] ?? '正在读取本地用量…'
+      return h('section', { 'aria-label': t('本地用量与限流') },
+        h(SectionHeading, { title: t('本地用量与限流'), action:
+          h('button', { type: 'button', style: ACTION, 'aria-label': t('刷新 AI Studio 本地用量'), 'aria-busy': busy || undefined,
+            disabled: busy || !control || credentialChanging, onClick: refresh }, t('刷新')) }),
+        h('div', { style: { ...PANEL, display: 'grid', gap: '8px' } },
+          h('p', { style: { margin: 0 } }, t('统计当前 API key 由此 DSH Host 发出的生成尝试；Host 重启后归零。')),
+          status === 'ok' ? h(AistudioUsageDetails, { snapshot }) : h('p', { role: 'status', style: { margin: 0 } }, t(hint)),
+          h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '12px' } },
+            h('a', { href: 'https://aistudio.google.com/rate-limit', target: '_blank', rel: 'noopener noreferrer' }, t('官方项目限流')),
+            h('a', { href: 'https://aistudio.google.com/usage', target: '_blank', rel: 'noopener noreferrer' }, t('官方项目用量')))))
+    }
+
+    function AistudioUsageDetails({ snapshot }) {
+      const countText = ({ requests, inputTokens, reportedRequests }) => [
+        t('{requests} 次尝试', { requests: String(requests) }),
+        inputTokens === null ? t('上游输入 token 未报告') : t('{tokens} 输入 token', { tokens: String(inputTokens) }),
+        reportedRequests > 0 && reportedRequests < requests ? t('{reported}/{requests} 次尝试报告了 token', { reported: String(reportedRequests), requests: String(requests) }) : null,
+      ].filter(Boolean).join(' · ')
+      const modelText = (model) => model ?? t('其他模型')
+      const rows = [{ model: null, minute: snapshot.minute, today: snapshot.today, total: true }, ...snapshot.models]
+      const last = snapshot.last429
+      const headings = [t('模型'), t('最近 1 分钟'), t('Pacific 今日（{day}）', { day: snapshot.pacificDay })]
+      const tableRows = rows.map(row => h('tr', { key: row.total ? 'total' : `model:${row.model ?? ''}` },
+        h('th', { scope: 'row', style: { textAlign: 'start', overflowWrap: 'anywhere' } }, row.total ? t('全部模型') : modelText(row.model)),
+        h('td', null, countText(row.minute)), h('td', null, countText(row.today))))
+      return h(React.Fragment ?? 'div', null,
+        h('div', { style: { overflowX: 'auto' } }, h('table', { style: { width: '100%', textAlign: 'start' }, 'aria-label': t('AI Studio 本地用量') },
+          h('thead', null, h('tr', null, ...headings.map(title => h('th', { key: title, scope: 'col', style: { textAlign: 'start' } }, title)))),
+          h('tbody', null, ...tableRows))),
+        snapshot.minuteTruncated ? h('p', { role: 'status', style: { margin: 0 } }, t('流量较高，最近 1 分钟仅显示保留的尝试记录。')) : null,
+        h('p', { style: { margin: 0, overflowWrap: 'anywhere' } }, last === undefined ? t('尚未观察到上游 429。') : [
+          t('最近一次 429：{at}（{source} · {model}）', { at: last.at.replace('T', ' ').replace('Z', ' UTC'), source: last.source.toUpperCase(), model: modelText(last.model) }),
+          last.retryAfterMs === undefined ? null : t('上游建议等待 {seconds} 秒', { seconds: String(last.retryAfterMs / 1000) }),
+          last.quotaFailure ? t('上游报告配额限制') : null,
+        ].filter(Boolean).join(' · ')))
+    }
+
+    function AistudioCredentialPanels({ active, control, credentialRef, status, disabled, onSave }) {
+      const [change, setChange] = React.useState({ revision: 0, busy: false })
+      const save = async (value) => {
+        setChange(prev => ({ revision: prev.revision + 1, busy: true }))
+        try { await onSave(value) } finally { setChange(prev => ({ revision: prev.revision + 1, busy: false })) }
+      }
+      return h(React.Fragment ?? 'div', null,
+        h('section', { 'aria-label': t('API key') },
+          h(SectionHeading, { title: t('API key') }),
+          h('div', { style: PANEL },
+            h('p', { style: { margin: '0 0 10px', fontSize: '11.5px', lineHeight: 1.5, opacity: .66 } }, t('手动输入 Gemini API key，经宿主凭据存储按上方引用名保存；key 不存入设置明文。')),
+            h(AistudioKeyInput, { status, disabled, onSave: save }))),
+        active ? h(AistudioUsagePanel, { key: `${credentialRef}:${change.revision}`, control, credentialChanging: change.busy }) : null)
+    }
+
+    /** 代理账户面板：授权 URL 只在显式连接后显示。 */
     function ProxyAccountPanel({ control, disabled, connectDisabled, onAccountChanged }) {
       const [snapshot, setSnapshot] = React.useState(undefined)
       const [authUrl, setAuthUrl] = React.useState(undefined)
@@ -762,6 +961,59 @@ window.__ModuleLoader__.load({
       const activeModeRef = React.useRef(effectiveProxyMode)
       activeModeRef.current = effectiveProxyMode
       React.useEffect(() => { props.readQuota?.observeMode?.(effectiveProxyMode ? PROXY_PROVIDER : PROVIDER) }, [effectiveProxyMode, props.readQuota])
+      // ---- AI Studio Tab：独立目录 / 手动 key 写入 / 掩码状态 ----
+      const [aistudioCatalog, setAistudioCatalog] = React.useState(undefined)
+      const [aistudioModelBusy, setAistudioModelBusy] = React.useState(false)
+      const [aistudioModelMessage, setAistudioModelMessage] = React.useState('')
+      const [aistudioKey, setAistudioKeyStatus] = React.useState(undefined)
+      const savedAistudioRef = baseline.current.aistudioCredentialRef || 'AISTUDIO_API_KEY'
+      const aistudioScope = React.useRef({ credentialRef: savedAistudioRef, control: props.aistudioControl, models: 0, key: 0 })
+      if (aistudioScope.current.credentialRef !== savedAistudioRef || aistudioScope.current.control !== props.aistudioControl) {
+        aistudioScope.current = { credentialRef: savedAistudioRef, control: props.aistudioControl, models: 0, key: 0 }
+      }
+      const scope = aistudioScope.current
+      const aistudioModels = aistudioCatalog?.scope === scope ? aistudioCatalog.models : []
+      const aistudioKeyStatus = aistudioKey?.scope === scope ? aistudioKey.value : undefined
+      const pullAistudioModels = React.useCallback(async (force = false) => {
+        if (aistudioScope.current !== scope) return
+        if (!scope.control) { setAistudioModelMessage(t('AI Studio 控制服务不可用：请确认 Host 与 Client 版本一致。')); return }
+        const request = ++scope.models
+        const current = () => alive.current && aistudioScope.current === scope && scope.models === request
+        setAistudioModelBusy(true)
+        if (force) setAistudioModelMessage(t('正在拉取 AI Studio 模型目录…'))
+        try {
+          const value = unwrap(await scope.control('models', force ? { force: true } : undefined))
+          if (!current()) return
+          setAistudioCatalog({ scope, models: value.models ?? [] })
+          setAistudioModelMessage(value.status === 'error' ? t(value.message ?? 'AI Studio 目录读取失败。') : '')
+        } catch (error) {
+          if (current()) setAistudioModelMessage(error instanceof Error ? error.message : String(error))
+        } finally { if (current()) setAistudioModelBusy(false) }
+      }, [scope])
+      const pullAistudioKeyStatus = React.useCallback(async () => {
+        if (aistudioScope.current !== scope || !scope.control) return
+        const request = ++scope.key
+        try {
+          const value = unwrap(await scope.control('keyStatus'))
+          if (alive.current && aistudioScope.current === scope && scope.key === request) setAistudioKeyStatus({ scope, value })
+        } catch { /* 状态读取失败不阻断 UI；显示为未知 */ }
+      }, [scope])
+      // 手动 key 只写不回显：经 Host credentials.set 写入凭据存储，成功后刷新掩码状态与目录。
+      const saveAistudioKey = React.useCallback(async (value) => {
+        if (!props.aistudioControl) throw new Error(t('AI Studio 控制服务不可用：请确认 Host 与 Client 版本一致。'))
+        const result = unwrap(await props.aistudioControl('setKey', { value }))
+        if (result.status === 'error') throw new Error(t(result.message ?? 'API key 保存失败。'))
+        await pullAistudioKeyStatus()
+        void pullAistudioModels(true)
+      }, [props.aistudioControl, pullAistudioKeyStatus, pullAistudioModels])
+      React.useEffect(() => {
+        setAistudioModelMessage('')
+        setAistudioModelBusy(false)
+      }, [scope])
+      React.useEffect(() => {
+        void pullAistudioKeyStatus()
+        if (draft.aistudioEnabled === true || settingsPage === 'aistudio') void pullAistudioModels(false)
+      }, [settingsPage, draft.aistudioEnabled, pullAistudioModels, pullAistudioKeyStatus])
       const proxyUnavailable = savedProxyMode && account?.generationMode?.proxyRouterReady === false
       const previousProxyAccount = React.useRef(undefined)
       const onProxyAccountChanged = React.useCallback((snapshot) => {
@@ -853,6 +1105,24 @@ window.__ModuleLoader__.load({
         setDraft(next)
       }, [])
 
+      /** 附属功能开关：合并成整份 features 字典再参与脏值与保存（与 modelOverrides 同模式）。 */
+      const editFeature = React.useCallback((id, on) => {
+        if (savingRef.current) return
+        if (!FEATURE_IDS.has(id)) return
+        const current = rawFeatures(draftRef.current[FEATURES_KEY])
+        const nextFeatures = { ...current, [id]: on === true }
+        // 显式关闭 = 删除该键（默认关闭），保持字典只含开启项。
+        if (!nextFeatures[id]) delete nextFeatures[id]
+        const value = canonicalFeatures(nextFeatures)
+        const next = { ...draftRef.current, [FEATURES_KEY]: value }
+        draftRef.current = next
+        if (sameFeatures(value, baseline.current[FEATURES_KEY])) dirty.current.delete(FEATURES_KEY)
+        else dirty.current.add(FEATURES_KEY)
+        setDirtyKeys([...dirty.current])
+        setConflicts((previous) => previous.filter((field) => field !== FEATURES_KEY))
+        setDraft(next)
+      }, [])
+
       const reload = React.useCallback(async (preserveStatus = false) => {
         const version = ++settingsVersion.current
         // 同步段整体兜底：remote.<ns> 是代理属性，缺 inject 时连「读属性」都会抛；
@@ -893,6 +1163,7 @@ window.__ModuleLoader__.load({
           const withoutRetired = cleanup ? { ...latest } : latest
           if (cleanup) for (const id of retiredOverrideKeys(withoutRetired)) delete withoutRetired[id]
           server[ORCHESTRATOR_KEY] = orchestratorDraftFrom(current[ORCHESTRATOR_KEY])
+          server[FEATURES_KEY] = canonicalFeatures(current[FEATURES_KEY])
           const changed = []
           const next = { ...server, [OVERRIDES_KEY]: withoutRetired }
           for (const key of dirty.current) {
@@ -904,7 +1175,9 @@ window.__ModuleLoader__.load({
               ? !overridesChanged(draftValue, withoutRetired, dirty.current.touchedIds)
               : key === ORCHESTRATOR_KEY
                 ? isOrchestratorDraftValid(draftValue) && sameOrchestrator(draftValue, server[key])
-                : draftValue === server[key]
+                : key === FEATURES_KEY
+                  ? sameFeatures(draftValue, server[key])
+                  : draftValue === server[key]
             if (same) dirty.current.delete(key)
             else {
               next[key] = draftValue
@@ -913,7 +1186,9 @@ window.__ModuleLoader__.load({
                 ? sameOverrides(baseline.current[key], withoutRetired)
                 : key === ORCHESTRATOR_KEY
                   ? sameOrchestrator(baseline.current[key], server[key])
-                  : baseline.current[key] === server[key]
+                  : key === FEATURES_KEY
+                    ? sameFeatures(baseline.current[key], server[key])
+                    : baseline.current[key] === server[key]
               if (!beforeSame) changed.push(key)
             }
           }
@@ -969,14 +1244,15 @@ window.__ModuleLoader__.load({
         setSaving(true)
         setStatus({ kind: 'busy', text: t('保存中…') })
         // 只提交用户改动过的字段，空串也是有效改动；未编辑字段遵循最新服务端值。
-        // modelOverrides 与 orchestrator 均为整份对象字段，按同样方式提交。
-        const ops = [...FIELDS.map((field) => field.key), OVERRIDES_KEY, ORCHESTRATOR_KEY]
+        // modelOverrides / orchestrator / features 均为整份对象字段，按同样方式提交。
+        const ops = [...FIELDS.map((field) => field.key), OVERRIDES_KEY, ORCHESTRATOR_KEY, FEATURES_KEY]
           .filter((key) => dirty.current.has(key))
           .map((key) => {
             const field = FIELDS.find((entry) => entry.key === key)
             const value = key === ORCHESTRATOR_KEY
               ? canonicalOrchestrator(draftRef.current[key])
               : key === OVERRIDES_KEY ? mergeOverrides(baseline.current[key], draftRef.current[key], dirty.current.touchedIds, dirty.current.retiredDiscarded !== true)
+              : key === FEATURES_KEY ? canonicalFeatures(draftRef.current[key])
               : field?.lines ? String(draftRef.current[key] ?? '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean) : draftRef.current[key]
             return { op: 'set', path: [key], value }
           })
@@ -1033,6 +1309,7 @@ window.__ModuleLoader__.load({
 
       // 目录条目 + 已配置但目录里暂时没有的 ID：正在编辑的映射不能因为目录刷新而消失。
       const rows = modelRows(models, draft[OVERRIDES_KEY], effectiveProxyMode)
+      const aistudioRows = aistudioModelRows(aistudioModels, draft[OVERRIDES_KEY])
       const editingDisabled = loading || saving || !view || !writable
       const connectionSettingsDirty = dirtyKeys.some(key => key === 'proxyUrl' || key === 'proxyBypass')
       const discardDraft = () => {
@@ -1080,7 +1357,7 @@ window.__ModuleLoader__.load({
             dirtyKeys.length ? h('button', { type: 'button', disabled: loading || saving, onClick: discardDraft, style: { ...ACTION, minHeight: '30px', padding: '4px 10px' } }, t('撤销')) : null,
             h('span', { role: 'status', 'aria-live': 'polite', style: { fontSize: '12px', opacity: .72 } }, dirtyKeys.length ? t('{count} 项未保存', { count: dirtyKeys.length }) : loading ? t('正在读取…') : readonly ? t('只读设置') : ''),
             h('button', { type: 'button', title: t('重新读取配置并保留草稿'), disabled: loading || saving, onClick: () => reload(), style: { ...ACTION, minHeight: '30px', padding: '4px 9px', borderColor: 'transparent', background: 'transparent', opacity: .72, marginLeft: 'auto' } }, t(loading ? '刷新中…' : '刷新'))),
-          conflicts.length ? h('p', { role: 'alert', style: { margin: 0, fontSize: '12px', lineHeight: 1.5, color: 'var(--agy-warn-text, #ca8a04)' } }, t('以下内容已在其他位置更新，已保留你的输入：') + conflicts.map((key) => t(key === OVERRIDES_KEY ? OVERRIDES_LABEL : key === ORCHESTRATOR_KEY ? ORCHESTRATOR_LABEL : FIELDS.find((field) => field.key === key)?.label ?? key)).join(t('、'))) : null,
+          conflicts.length ? h('p', { role: 'alert', style: { margin: 0, fontSize: '12px', lineHeight: 1.5, color: 'var(--agy-warn-text, #ca8a04)' } }, t('以下内容已在其他位置更新，已保留你的输入：') + conflicts.map((key) => t(key === OVERRIDES_KEY ? OVERRIDES_LABEL : key === ORCHESTRATOR_KEY ? ORCHESTRATOR_LABEL : key === FEATURES_KEY ? FEATURES_LABEL : FIELDS.find((field) => field.key === key)?.label ?? key)).join(t('、'))) : null,
           h(StatusNotice, { status }))),
 
         connectionSettingsDirty ? h(StatusNotice, { status: { kind: 'busy', text: t('请先保存网络设置，再连接或登录。') } }) : null,
@@ -1088,6 +1365,8 @@ window.__ModuleLoader__.load({
         h('div', { role: 'tablist', 'aria-label': t('设置分页'), className: 'agy-tabs' },
           pageButton('connection', t('连接')),
           pageButton('models', t('模型')),
+          pageButton('aistudio', t('AI Studio')),
+          pageButton('vertex', 'Vertex AI'),
           pageButton('quota', t('额度')),
           pageButton('advanced', t('高级'))),
 
@@ -1128,6 +1407,31 @@ window.__ModuleLoader__.load({
             })(),
             modelMessage ? h('p', { role: 'status', style: { fontSize: '11.5px', lineHeight: 1.5, opacity: .66, margin: '6px 0 0', overflowWrap: 'anywhere' } }, t(modelMessage)) : null)),
 
+        h('div', { id: 'agy-settings-page-aistudio', role: 'tabpanel', style: pageStyle('aistudio') },
+          h('section', { 'aria-label': t('AI Studio') },
+            h(SectionHeading, { title: t('AI Studio') }),
+            h('div', { style: PANEL },
+              h(SettingsFields, { ...fieldProps, fields: fieldsFor('aistudio') }),
+              h('p', { style: { margin: '8px 0 0', fontSize: '11.5px', lineHeight: 1.5, opacity: .66 } }, t('AI Studio key 走你自己的 GCP 计费，与 agy 订阅额度无关。')))),
+          h(AistudioCredentialPanels, { active: settingsPage === 'aistudio', control: props.aistudioControl,
+            credentialRef: savedAistudioRef,
+            status: aistudioKeyStatus, disabled: editingDisabled || !props.aistudioControl, onSave: saveAistudioKey }),
+          h('section', { 'aria-label': t('AI Studio 模型') },
+            h(SectionHeading, { title: t('AI Studio 模型'),
+              action: h('button', { type: 'button', title: t('刷新 AI Studio 模型目录'), 'aria-label': t('刷新 AI Studio 模型目录'), 'aria-busy': aistudioModelBusy || undefined, style: { ...ACTION, minHeight: '26px', padding: '3px 10px', flex: '0 0 auto', whiteSpace: 'nowrap' }, disabled: aistudioModelBusy || !props.aistudioControl, onClick: () => pullAistudioModels(true) }, t(aistudioModelBusy ? '正在刷新…' : '刷新')) }),
+            h(ModelOverrideList, { rows: aistudioRows, overrides: draft[OVERRIDES_KEY], disabled: editingDisabled, onEdit: editOverride, showEffort: false,
+              emptyHint: '暂无模型。请先配置 API key，再刷新目录。', hiddenWarning: '全部隐藏后，AI Studio 将从模型选择器消失。' }),
+            aistudioModelMessage ? h('p', { role: 'status', style: { fontSize: '11.5px', lineHeight: 1.5, opacity: .66, margin: '6px 0 0', overflowWrap: 'anywhere' } }, t(aistudioModelMessage)) : null)),
+
+        h('div', { id: 'agy-settings-page-vertex', role: 'tabpanel', style: pageStyle('vertex') },
+          h('section', { 'aria-label': 'Vertex AI' },
+            h(SectionHeading, { title: 'Vertex AI', action: settingsPage === 'vertex' ? h('a', { href: 'https://docs.cloud.google.com/vertex-ai/generative-ai/docs/start/gcp-auth', target: '_blank', rel: 'noopener noreferrer', style: ACTION }, t('配置 ADC')) : null }),
+            h('div', { style: PANEL }, h(SettingsFields, { ...fieldProps, fields: fieldsFor('vertex') }))),
+          h('section', { 'aria-label': t('Vertex AI 模型') },
+            h(SectionHeading, { title: t('Vertex AI 模型'), description: t('来自上方配置；保存时不发送模型请求。') }),
+            h(ModelOverrideList, { rows: vertexModelRows(draft.vertexModels), overrides: draft[OVERRIDES_KEY], disabled: editingDisabled, onEdit: editOverride, showEffort: false,
+              emptyHint: '填写 Gemini 发布商模型 ID 后，这里会显示可编辑的模型。', hiddenWarning: '全部隐藏后，Vertex AI 将从模型选择器消失。' }))),
+
         h('div', { id: 'agy-settings-page-quota', role: 'tabpanel', style: pageStyle('quota') },
           h(SettingsQuotaPanel, { readQuota: props.readQuota, source: effectiveProxyMode ? PROXY_PROVIDER : PROVIDER,
             accountRevision: effectiveProxyMode ? previousProxyAccount.current?.revision : undefined,
@@ -1144,6 +1448,7 @@ window.__ModuleLoader__.load({
             h('div', { style: PANEL },
               h(SettingsFields, { ...fieldProps, fields: fieldsFor('general') }))) : null,
           h(OrchestratorSection, { value: draft[ORCHESTRATOR_KEY], dirty: dirtyKeys.includes(ORCHESTRATOR_KEY), disabled: editingDisabled, onEdit: editOrchestrator }),
+          h(FeatureSection, { value: draft[FEATURES_KEY], disabled: editingDisabled, onEdit: editFeature }),
           h(SettingsGroup, { title: t('网络与 CLI'), fields: fieldsFor('network'), fieldProps, open: effectiveProxyMode }),
           !effectiveProxyMode ? h(SettingsGroup, { title: t('会话与进程'), fields: fieldsFor('advanced'), fieldProps }) : null,
           !effectiveProxyMode ? h(PlainConfigDisclosure, { labels: PLAIN_FIELD_LABELS }) : null,
@@ -1579,6 +1884,23 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /** AI Studio 控制读取器：remote.agyAistudio 由 Host 的 AI Studio 行注册（目录 / 手动 key / 掩码状态）。 */
+    function makeAistudioControlReader(scope) {
+      return async (method, request) => {
+        if (!['models', 'setKey', 'keyStatus', 'usage'].includes(method)) throw new Error(t('不支持的 AI Studio 操作'))
+        const deadline = Date.now() + 20_000
+        for (;;) {
+          const service = scope.get('remote.agyAistudio')
+          if (typeof service?.[method] === 'function') {
+            // 目录发现可能含冷启动；超时由 Host 管理，客户端不另设更短总期限（与 models 同口径）。
+            return method === 'models' ? await service[method](request) : await withTimeout(service[method](request), 60_000, t('AI Studio 操作超时，请重试'))
+          }
+          if (Date.now() >= deadline) throw new Error(t('AI Studio 服务未就绪：请确认已启用本插件的 AI Studio 路由组件（antigravity-aistudio-router）'))
+          await new Promise((resolve) => setTimeout(resolve, 500))
+        }
+      }
+    }
+
     /**
      * 客户端侧的额度 remote 声明。
      *
@@ -1593,6 +1915,7 @@ window.__ModuleLoader__.load({
     const AGY_QUOTA_PACKAGE = 'dsh-bundle-antigravity-host'
     const AGY_QUOTA_SERVICE = 'agyQuota'
     const AGY_PROXY_ACCOUNT_SERVICE = 'agyProxyAccount'
+    const AGY_AISTUDIO_SERVICE = 'agyAistudio'
 
     function strictCodec(typeSymbol, parse) {
       const schema = { parse }
@@ -1682,6 +2005,97 @@ window.__ModuleLoader__.load({
       ],
     }
 
+    // ---- AI Studio remote 解析器（与 Host src/aistudio/remote.ts 逐字段对齐）----
+    function parseAistudioModelsRequest(value) {
+      if (value === undefined || value === null) return undefined
+      if (typeof value !== 'object' || Array.isArray(value)) throw new Error(t('AI Studio 目录请求格式无效'))
+      if (value.force !== undefined && typeof value.force !== 'boolean') throw new Error(t('AI Studio 目录请求 force 无效'))
+      return value.force === undefined ? {} : { force: value.force }
+    }
+    function parseAistudioSetKeyRequest(value) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(t('AI Studio key 请求格式无效'))
+      if (typeof value.value !== 'string' || !value.value.trim()) throw new Error(t('AI Studio key 不能为空'))
+      return { value: value.value.trim() }
+    }
+    function parseAistudioKeyStatusRequest(value) {
+      if (value === undefined || value === null) return undefined
+      if (typeof value !== 'object' || Array.isArray(value)) throw new Error(t('AI Studio key 状态请求格式无效'))
+      return undefined
+    }
+    function parseAistudioModelsResult(value) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(t('AI Studio 目录返回格式无效'))
+      if (!['ok', 'error'].includes(value.status) || !Array.isArray(value.models)) throw new Error(t('AI Studio 目录返回格式无效'))
+      return value
+    }
+    function parseAistudioKeyResult(value) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(t('AI Studio key 返回格式无效'))
+      if (!['ok', 'error'].includes(value.status)) throw new Error(t('AI Studio key 返回格式无效'))
+      if (value.message !== undefined && typeof value.message !== 'string') throw new Error(t('AI Studio key 返回格式无效'))
+      return value
+    }
+    function parseAistudioKeyStatusResult(value) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(t('AI Studio key 状态返回格式无效'))
+      if (!['ok', 'error'].includes(value.status) || typeof value.configured !== 'boolean' || typeof value.writable !== 'boolean') throw new Error(t('AI Studio key 状态返回格式无效'))
+      for (const field of ['source', 'masked', 'message']) {
+        if (value[field] !== undefined && typeof value[field] !== 'string') throw new Error(t('AI Studio key 状态返回格式无效'))
+      }
+      return value
+    }
+
+    function parseAistudioUsageResult(value) {
+      const record = x => x !== null && typeof x === 'object' && !Array.isArray(x)
+      const count = x => Number.isSafeInteger(x) && x >= 0
+      const counts = x => record(x) && count(x.requests) && count(x.reportedRequests)
+        && x.reportedRequests <= x.requests && (x.reportedRequests === 0 ? x.inputTokens === null : count(x.inputTokens))
+      const model = x => x === null || (typeof x === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,255}$/.test(x))
+      const invalid = () => new Error(t('AI Studio 用量返回格式无效'))
+      if (!record(value)) throw invalid()
+      if (value.status === 'unconfigured' || value.status === 'error') return { status: value.status }
+      if (value.status !== 'ok' || typeof value.pacificDay !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value.pacificDay)
+        || !counts(value.minute) || !counts(value.today) || typeof value.minuteTruncated !== 'boolean'
+        || !Array.isArray(value.models) || value.models.length > 130 || !value.models.every(x => record(x) && model(x.model) && counts(x.minute) && counts(x.today))) throw invalid()
+      const last = value.last429
+      if (last !== undefined && (!record(last) || !model(last.model) || typeof last.at !== 'string' || !Number.isFinite(Date.parse(last.at))
+        || (last.source !== 'http' && last.source !== 'sse') || (last.retryAfterMs !== undefined && !count(last.retryAfterMs))
+        || (last.quotaFailure !== undefined && last.quotaFailure !== true))) throw invalid()
+      return value
+    }
+
+    /** AI Studio 设置页控制 remote 声明（service 名 agyAistudio，与 agyQuota 并列合并进同一 $mount）。 */
+    const AGY_AISTUDIO_REMOTE = {
+      package: AGY_QUOTA_PACKAGE,
+      descriptors: [
+        {
+          id: `${AGY_QUOTA_PACKAGE}#${AGY_AISTUDIO_SERVICE}/models`,
+          service: AGY_AISTUDIO_SERVICE, namespace: AGY_AISTUDIO_SERVICE, method: 'models',
+          invocation: { kind: 'direct' },
+          parameters: [{ name: 'request', wire: 'request', source: 'json', acceptsUndefined: true, codec: strictCodec(`${AGY_QUOTA_PACKAGE}#AgYAistudioModelsRequest`, parseAistudioModelsRequest) }],
+          result: strictCodec(`${AGY_QUOTA_PACKAGE}#AgYAistudioModelsResult`, parseAistudioModelsResult),
+        },
+        {
+          id: `${AGY_QUOTA_PACKAGE}#${AGY_AISTUDIO_SERVICE}/setKey`,
+          service: AGY_AISTUDIO_SERVICE, namespace: AGY_AISTUDIO_SERVICE, method: 'setKey',
+          invocation: { kind: 'direct' },
+          parameters: [{ name: 'request', wire: 'request', source: 'json', codec: strictCodec(`${AGY_QUOTA_PACKAGE}#AgYAistudioSetKeyRequest`, parseAistudioSetKeyRequest) }],
+          result: strictCodec(`${AGY_QUOTA_PACKAGE}#AgYAistudioKeyResult`, parseAistudioKeyResult),
+        },
+        {
+          id: `${AGY_QUOTA_PACKAGE}#${AGY_AISTUDIO_SERVICE}/keyStatus`,
+          service: AGY_AISTUDIO_SERVICE, namespace: AGY_AISTUDIO_SERVICE, method: 'keyStatus',
+          invocation: { kind: 'direct' },
+          parameters: [{ name: 'request', wire: 'request', source: 'json', acceptsUndefined: true, codec: strictCodec(`${AGY_QUOTA_PACKAGE}#AgYAistudioKeyStatusRequest`, parseAistudioKeyStatusRequest) }],
+          result: strictCodec(`${AGY_QUOTA_PACKAGE}#AgYAistudioKeyStatusResult`, parseAistudioKeyStatusResult),
+        },
+        {
+          id: `${AGY_QUOTA_PACKAGE}#${AGY_AISTUDIO_SERVICE}/usage`,
+          service: AGY_AISTUDIO_SERVICE, namespace: AGY_AISTUDIO_SERVICE, method: 'usage',
+          invocation: { kind: 'direct' },
+          parameters: [{ name: 'request', wire: 'request', source: 'json', acceptsUndefined: true, codec: strictCodec(`${AGY_QUOTA_PACKAGE}#AgYAistudioUsageRequest`, parseAistudioKeyStatusRequest) }],
+          result: strictCodec(`${AGY_QUOTA_PACKAGE}#AgYAistudioUsageResult`, parseAistudioUsageResult),
+        },
+      ],
+    }
+
     return {
       name: 'dsh-bundle-antigravity-host',
       // remote.settings / remote.llm 必须逐个声明：remote 各命名空间是独立服务，
@@ -1721,12 +2135,13 @@ window.__ModuleLoader__.load({
         const readQuota = makeQuotaReader(ctx)
         const control = makeControlReader(ctx)
         const proxyControl = makeProxyControlReader(ctx)
+        const aistudioControl = makeAistudioControlReader(ctx)
         // 挂载本包贡献的 remote（幂等，随 fiber 一起 dispose）。挂载失败不影响其它卡片：
         // 药丸会自行超时并显示「额度服务未就绪」的原因。
         try {
           const mounted = ctx.remote.$mount({
             package: AGY_QUOTA_PACKAGE,
-            descriptors: [...AGY_QUOTA_REMOTE.descriptors, ...AGY_PROXY_REMOTE.descriptors],
+            descriptors: [...AGY_QUOTA_REMOTE.descriptors, ...AGY_PROXY_REMOTE.descriptors, ...AGY_AISTUDIO_REMOTE.descriptors],
           })
           ctx.effect(() => mounted, 'antigravity-acp: mount quota remote')
         } catch (error) {
@@ -1741,7 +2156,7 @@ window.__ModuleLoader__.load({
                   id: 'antigravity-acp',
                   order: 42,
                   label: () => 'Antigravity ACP',
-                  inject: () => ({ remote: ctx.remote, control, proxyControl, readQuota }),
+                  inject: () => ({ remote: ctx.remote, control, proxyControl, readQuota, aistudioControl }),
                 },
                 AntigravitySettingsCard,
               ),

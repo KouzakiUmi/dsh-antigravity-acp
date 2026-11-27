@@ -2,7 +2,7 @@
 
 [返回主页](../README.md) · [使用与排障](reference.md) · [开发与验证](development.md)
 
-以下对应 **0.1.38**，以 [`src/settings.ts`](https://github.com/KouzakiUmi/dsh-antigravity-acp/blob/main/src/settings.ts) 的 Config 为准。字段均位于 `llm-antigravity-acp` 插件配置根级，不需要额外包装一层对象。设置页提供即时（volatile）字段与模型控制；`proxyBypass` 不提供界面控制项，并发 / 二进制 / 超时等普通配置在普通配置编辑器里修改。
+主设置以 [`src/settings.ts`](https://github.com/KouzakiUmi/dsh-antigravity-acp/blob/main/src/settings.ts) 的 Config 为准。[下方配置清单](#配置清单)的字段位于 `llm-antigravity-acp` 插件配置根级。设置页提供即时（volatile）字段与模型控制；`proxyBypass` 不提供界面控制项，并发 / 二进制 / 超时等在普通配置编辑器里修改。[Colab 的配置](#colab-工具组件)单独写在其组件行。
 
 ## 配置清单
 
@@ -25,6 +25,7 @@
 | `bridgeParkSettleMs` | `50` | 并发 MCP 工具调用聚合窗口（毫秒）；不是工具执行超时。 |
 | `modelOverrides` | `{}` | 按模型 ID 的目录设置，键是 DSH 选择器里的模型 ID：`enabled`（默认 `true`）决定是否出现在选择器，`effort` 是该模型未选思考强度时的默认档位，`name` 覆盖显示名，`target` 把该 ID 映射到官方模型 ID。只作用于目录中已存在的条目，不新增自造模型。官方公告即将下线的家族在未配置时默认 `enabled: false`，在此显式设为 `true` 可重新启用；官方下线日已过的家族不再出现在设置页模型列表，其配置键随下一次保存移除。 |
 | `orchestrator` | `{}` | 编排模式（`antigravity-orchestrator`）配置，整份对象字段：`enabled`（默认 `true`）、`plannerModel`（三选一：`gemini-4-neon` / `gemini-4-argon` / `claude-opus-5-5`，默认后者）、`plannerEffort`（默认 `medium`）、`executorModel`（两选一：`gemini-4-hydrogen` / `claude-sonnet-5-5`，默认前者）、`executorEffort`（默认 `medium`）、`maxPlansPerTurn`（默认 `2`，范围 1–4）、`plannerTimeoutMs`（显式设置才生效；代理侧默认 20000，ACP 侧未设置时用 120000）、`showPlan`（默认 `false`）。档位按目标模型的实际可选集合收敛（Opus / Sonnet 只有 low/medium/high，Hydrogen 另有 xhigh），非法值退回 medium 或默认模型。只有 planner 与配置的 executor 都已在当前目录可见时，`antigravity-orchestrator` 才会出现在选择器里。 |
+| `features` | `{}` | 附属功能模块的逐项开关（即时生效，保存即挂载 / 卸载，无需重载宿主），整份字典字段：键是功能 id，值为是否启用，默认全关。当前登记 `image-gen`（图像生成，仅代理模式兼容）：开启后注册 `agy_image_generate` 工具，模型调用即用代理账户的 Gemini 图像模型生成图片，预览图落到对话、原始文件保留生成格式。设置页「高级」页的「附属功能」区按 `src/features/specs.ts` 的规格表渲染；当前生成模式不在某功能的兼容模式内时，即使开关打开也不挂载。功能模块与核心 ACP / 代理生成链路解耦，经注入的宿主能力面（工具注册、附件写入、代理线传输）通信；规格与实现不一致会在加载期抛错阻断装载。 |
 | `proxyUrl` | 未设置 | 显式出网代理；留空继承 Host 代理环境，Host 也未配置才直连。代理模式支持 HTTP/HTTPS CONNECT；ACP 模式另支持 SOCKS5、SOCKS5H。 |
 | `proxyBypass` | 未设置 | 兼容既有配置的逗号分隔排除列表，支持域名匹配，不支持 CIDR；始终合并 localhost、127.0.0.1、::1。设置页不提供此控制项。 |
 | `reuseSessions` | `true` | 复用同一个 ACP 会话：同一 DSH 对话的后续回合只发送**新增消息**，不再每轮 `session/new` 并重放全部历史。历史被压缩、回退或编辑，模型/思考强度变化，工具目录变化，或 MCP 桥被其他对话接管时自动重建。关闭后回到旧的「每轮新会话 + 全量重放」。 |
@@ -34,6 +35,12 @@
 | `idleRecycleMs` | `300000` | 保留进程的最长空闲时间（毫秒），超时回收释放内存；`0` 表示不设上限。适用于聊天、预热及目录发现结束；等待工具和取消排空不算空闲。5 分钟是插件资源策略，不代表上游缓存寿命。 |
 | `proxyMode` | `false` | 代理模式开关（即时生效，保存即切换，无需重载）。开启后生成改由本 bundle 的代理路由 `antigravity-proxy` 直连上游：插件自持登录态（先导入官方 CLI 登录态，缺失时 loopback OAuth），以 agy CLI 线身份请求 Cloud Code Assist；同时注销官方 ACP 路由 `antigravity-acp`。关闭恢复 ACP 模式。两模式互斥；额度药丸跟随当前模式取对应账户。图片输入需宿主附件服务在场：单图 4MP / 1MB 请求版本、整请求 12MB 内联预算，超预算按最旧优先协商 offload；附件服务缺席时报 `UNSUPPORTED_MODALITY`。 |
 | `cliQuotaEnabled` | `false` | 是否允许额度取数调用本机官方 `agy` CLI（即时生效）。默认关闭：任何模式都不 spawn `agy`，套餐额度走内置直连，AI Credits 不查询。开启后 ACP 模式运行 `agy -p /usage` 与 `agy -p /credits`；代理模式套餐额度仍用代理账户，只有 AI Credits 调用 `agy -p /credits`。需要本机已安装并登录官方 CLI。 |
+| `aistudioEnabled` | `false` | AI Studio 独立 provider 开关（即时生效，保存即注册 / 注销 `aistudio` 路由）。开启后用 Gemini API key 直连 `generativelanguage.googleapis.com/v1beta`，与 ACP / 代理两条互斥链路**并存**（服务不同的 Gemini 模型，不参与模式仲裁）。模型目录实时发现（`GET /v1beta/models`，过滤支持 `generateContent` 的文本模型并排除音乐 / TTS / 图像 / 视频等非聊天模态），目录键带 `aistudio-` 前缀；默认仅 Gemini 4 系开启、其余默认关可显式启用，模型表启用项置顶。key 未配置时即使开关打开也不注册可用模型（报 AUTH 可读态）。首期支持文本流式、工具调用、多轮 history、思考块；图片 / 视频延后。 |
+| `aistudioCredentialRef` | `AISTUDIO_API_KEY` | AI Studio API key 的凭据引用名（即时生效，POSIX 环境变量名）。设置只存引用名，真实值经宿主 `credentials` 接缝按操作解析（`ctx.credentials.resolve`），不进设置明文 / 日志 / 客户端响应；鉴权用 `x-goog-api-key` 请求头，key 不进 URL。需宿主装载凭据 provider（如 `dsh-credentials-local`）并把 key 存为该引用名对应的凭据。引用名变化即刷新目录。设置页「AI Studio」Tab 提供手动 key 输入（密码框 + 「保存 key」），经 `agyAistudio.setKey` 写入宿主 credentials（只写不回显），状态只显示掩码预览。 |
+| `vertexEnabled` | `false` | 标准 Vertex AI 独立路由开关；与其他路由并存。 |
+| `vertexProject` | 空 | Google Cloud 项目 ID 或编号。项目需启用 Vertex AI API，ADC 身份需有预测权限。 |
+| `vertexLocation` | `global` | 模型所在位置：`global`、`us`、`eu` 或如 `us-central1` 的区域。根据模型可用性和数据驻留要求填写。 |
+| `vertexModels` | `[]` | 显式列入目录的 Gemini 发布商模型 ID。设置页每行一个；`modelOverrides` 使用 `vertex-ai-` 前缀。保存配置不发生成请求。 |
 
 示例（不包含代理密码或账号材料）：
 
@@ -49,6 +56,17 @@
   "proxyUrl": "http://127.0.0.1:7890"
 }
 ```
+
+### Colab 工具组件
+
+在 DSH「插件」页找到同一个包下的 `antigravity-colab`，按需启用（默认关闭）。两个字段在该组件行的普通配置编辑器里修改，不在 Antigravity 设置页：
+
+| 字段 | 默认值 | 用途 |
+|---|---|---|
+| `executable` | 空 | 已安装的 Google Colab CLI 0.8.0 的绝对路径。 |
+| `session` | 空 | 一个现有 CLI 会话的精确名称。留空时仅查询 Compute Units。 |
+
+详见 [Colab 工具使用说明](colab.md)。
 
 ### 会话复用与恢复
 
@@ -138,7 +156,7 @@ ACP 官方 agent 在同一会话内会保留上下文（2026-10-23 真机验证�
 
 ## 设置页可以做什么
 
-页面分为「连接 / 模型 / 额度 / 高级」。连接页只显示当前模式所需的账户与操作；额度独立手动查询；高级页按网络 / CLI、ACP 启动、连接池、超时、会话进程与诊断分组展开。模型页使用紧凑列表，支持搜索、启停筛选和筛选结果批量启用 / 隐藏；完整 ID、输入能力、显示名与官方映射在单条详情中编辑。代理模式不显示 ACP 专属控制项；代理排除列表不显示。
+页面分为「连接 / 模型 / 额度 / 高级」。连接页只显示当前模式所需的账户与操作；额度独立手动查询；高级页按编排、附属功能、网络 / CLI、会话进程与诊断分组展开。模型页使用紧凑列表，支持搜索、启停筛选和筛选结果批量启用 / 隐藏；完整 ID、输入能力、显示名与官方映射在单条详情中编辑。代理模式不显示 ACP 专属控制项；代理排除列表不显示。
 
 模型改动合并成一份 `modelOverrides` 在保存时提交；清空显示名或映射等于移除该字段，不会留下空壳配置。已经保存但当前目录没有的 ID 仍保留并标注「不在目录」，可搜索后继续修改或清除；属于已知家族（退役表家族、编排预设的 planner / executor 家族、插件合成条目 `antigravity-orchestrator`）时显示内置名称，其余显示原始 ID。只补当前链路的键：代理模式补带 `antigravity-` 前缀的键，ACP 模式补裸 ID，另一链路的键留在配置里，切回时再出现。官方公告即将下线的家族（见 `src/adapter/model-retirement.ts`）在设置页带「即将下线」徽章并默认关闭，打开开关后随 `modelOverrides` 保存显式启用；下线日期与迁移建议以官方模型菜单为准。官方下线日（本地日历日）已过的家族从列表移出，它在 `modelOverrides` 里残留的键在打开设置页时记为未保存项（模型页注明是哪个家族），点「保存」后删除，「撤销」可放弃；只读设置下不产生这类待保存项。保存只删已退役家族的键，未编辑的其它键保持服务端最新值。
 
