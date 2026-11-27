@@ -12,6 +12,25 @@ function record(value: unknown): Record<string, unknown> | undefined {
     : undefined
 }
 
+/** Eight-hex-digit disambiguator appended by the official CLI when re-registering an MCP server with the same name in one process. */
+const SERVER_DISAMBIGUATOR = /^[0-9a-f]{8}$/
+
+/**
+ * Match the CLI's MCP tool namespace, accepting only tools registered in the current session:
+ * `mcp_<server>_<tool>` or disambiguated `mcp_<server>_<8hex>_<tool>`.
+ * Any other segment fails so foreign servers or unregistered tools never enter the private bridge.
+ */
+function matchesCliToolName(serverName: string, toolName: string, name: string): boolean {
+  const exact = `mcp_${serverName}_${toolName}`
+  if (name === exact) return true
+  const prefix = `mcp_${serverName}_`
+  const suffix = `_${toolName}`
+  if (name.length <= prefix.length + suffix.length) return false
+  if (!name.startsWith(prefix) || !name.endsWith(suffix)) return false
+  const middle = name.slice(prefix.length, name.length - suffix.length)
+  return SERVER_DISAMBIGUATOR.test(middle)
+}
+
 export function parsePermissionHandoff(
   request: RequestPermissionRequest,
   context: { sessionId: string; serverName: string; tools: readonly ToolSchema[] },
@@ -24,14 +43,26 @@ export function parsePermissionHandoff(
   // server.py 从实际工具名生成固定的 "Run <name>?" 标题。会话已关闭内置工具，
   // 因此这里可用当前目录精确匹配该形式，不从任意描述中猜测工具名。
   const wrappedMcp = meta?.is_mcp_tool_call === true
+  // CLI 1.5.15+ uses a namespaced name and a title without the legacy question mark.
+  // The server name may carry an eight-hexadecimal disambiguator; require the name and
+  // title to describe the same currently registered tool exactly.
+  const cliTool = wrappedMcp ? undefined : context.tools.find((item) => {
+    const name = request.toolCall.name
+    return typeof name === 'string'
+      && matchesCliToolName(context.serverName, item.name, name)
+      && request.toolCall.title === `Run ${name}`
+  })
   const tool = wrappedMcp
     ? mcp?.server === context.serverName ? context.tools.find((item) => item.name === mcp?.tool) : undefined
-    : context.tools.find((item) => request.toolCall.title === `Run ${item.name}?`
+    : cliTool ?? context.tools.find((item) => request.toolCall.title === `Run ${item.name}?`
       || request.toolCall.title === `Run ${context.serverName}_${item.name}?`)
   if (!tool) return undefined
   // 明确的原生名称仍拒绝；kind 只是展示分类，不决定是否属于私有桥。
   const name = request.toolCall.name
-  if (name != null && name !== 'call_mcp_tool' && name !== tool.name) return undefined
+  if (!cliTool && name != null && name !== 'call_mcp_tool' && name !== tool.name) return undefined
+  // CLI toolSummary is display text, not tool arguments. Actual execution still
+  // requires a matching authenticated MCP tools/call and DSH authorization.
+  if (cliTool) return { name: tool.name, arguments: '{}' }
   if (!wrappedMcp) return { name: tool.name, arguments: JSON.stringify(input) }
 
   // 权限提示里的参数只供诊断，不用于执行，不应因包装差异阻断已识别的桥路由。

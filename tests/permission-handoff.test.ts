@@ -57,6 +57,71 @@ describe('ACP 私有 MCP 权限路由解析（依赖会话禁用内置工具）'
     expect(parsePermissionHandoff(value, context)).toEqual({ name: 'read', arguments: '{"path":"a.txt"}' })
   })
 
+  it('recognizes CLI 1.5.15+ registered names without treating toolSummary as arguments', () => {
+    const value = request()
+    delete value.toolCall._meta
+    value.toolCall.name = 'mcp_dsh-tools_read'
+    value.toolCall.title = 'Run mcp_dsh-tools_read'
+    value.toolCall.rawInput = { toolSummary: 'Read a file', path: 'untrusted.txt' }
+    expect(parsePermissionHandoff(value, context)).toEqual({ name: 'read', arguments: '{}' })
+    value.sessionId = 'foreign'
+    expect(parsePermissionHandoff(value, context)).toBeUndefined()
+  })
+
+  it.each([
+    ['mcp_external_read', 'Run mcp_external_read'],
+    ['mcp_dsh-tools_unknown', 'Run mcp_dsh-tools_unknown'],
+    ['mcp_dsh-tools_read', 'Run mcp_dsh-tools_read arbitrary text'],
+    ['run_command', 'Run mcp_dsh-tools_read'],
+    [undefined, 'Run mcp_dsh-tools_read'],
+    ['mcp_dsh-tools_read', 'Run read?'],
+  ])('rejects CLI name/title mismatch %s / %s', (name, title) => {
+    const value = request()
+    delete value.toolCall._meta
+    value.toolCall.name = name
+    value.toolCall.title = title
+    expect(parsePermissionHandoff(value, context)).toBeUndefined()
+  })
+
+  it('does not replace foreign MCP metadata with CLI name matching', () => {
+    const value = request()
+    value.toolCall.name = 'mcp_dsh-tools_read'
+    value.toolCall.title = 'Run mcp_dsh-tools_read'
+    value.toolCall._meta = { is_mcp_tool_call: true, mcp: { server: 'external', tool: 'read' } }
+    expect(parsePermissionHandoff(value, context)).toBeUndefined()
+  })
+
+  it('recognizes a disambiguated CLI server name without treating toolSummary as arguments', () => {
+    const value = request()
+    delete value.toolCall._meta
+    value.toolCall.name = 'mcp_dsh-tools_a4a4b434_read'
+    value.toolCall.title = 'Run mcp_dsh-tools_a4a4b434_read'
+    value.toolCall.rawInput = { toolSummary: 'Read a file', path: 'untrusted.txt' }
+    expect(parsePermissionHandoff(value, context)).toEqual({ name: 'read', arguments: '{}' })
+  })
+
+  it.each([
+    ['mcp_dsh-tools_a4a4b43_read'], // seven hex digits
+    ['mcp_dsh-tools_a4a4b4341_read'], // nine hex digits
+    ['mcp_dsh-tools_ZZZZZZZZ_read'], // not hexadecimal
+    ['mcp_dsh-tools_a4a4b434_unknown'], // tool not registered
+    ['mcp_other-tools_a4a4b434_read'], // other server
+  ])('rejects disambiguated name that is not an exact registered tool: %s', (name) => {
+    const value = request()
+    delete value.toolCall._meta
+    value.toolCall.name = name
+    value.toolCall.title = `Run ${name}`
+    expect(parsePermissionHandoff(value, context)).toBeUndefined()
+  })
+
+  it('requires title to match the disambiguated name exactly', () => {
+    const value = request()
+    delete value.toolCall._meta
+    value.toolCall.name = 'mcp_dsh-tools_a4a4b434_read'
+    value.toolCall.title = 'Run mcp_dsh-tools_read'
+    expect(parsePermissionHandoff(value, context)).toBeUndefined()
+  })
+
   it('eager 标题必须精确命中目录，外部 MCP 元数据不能退回标题匹配', () => {
     const value = request()
     value.toolCall.title = 'Run read?'
