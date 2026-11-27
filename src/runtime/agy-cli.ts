@@ -105,11 +105,11 @@ export type AgyReasoningEffort = (typeof AGY_REASONING_EFFORTS)[number]
  */
 export type AgyModelTier = AgyReasoningEffort | 'xhigh'
 
-/** 显示名映射（档位标签与思考强度菜单同名）。 */
+/** Display name mapping (aligned with proxy mode and DSH built-in adapters: Low / Medium / High). */
 export const AGY_REASONING_EFFORT_NAMES: Record<AgyReasoningEffort, string> = {
-  low: '低',
-  medium: '中',
-  high: '高',
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High',
 }
 
 /**

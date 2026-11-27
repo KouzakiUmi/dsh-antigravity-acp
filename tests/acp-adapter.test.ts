@@ -784,12 +784,12 @@ describe('模型目录来自 ACP 会话配置', () => {
     expect(models.map((model) => model.id)).toEqual(['gemini-3-pro'])
   })
 
-  it('resolveModel 声明思考强度菜单（低/中/高），默认档位 medium', async () => {
+  it('resolveModel declares reasoning effort menu (Low/Medium/High) with default medium', async () => {
     const harness = createHarness()
     const resolved = await harness.adapter.resolveModel(AGY_PROVIDER_ID, 'claude-opus-5-5')
     expect(resolved.reasoning?.efforts.map((effort) => String(effort.id))).toEqual(['low', 'medium', 'high'])
     expect(String(resolved.reasoning?.defaultEffort)).toBe('medium')
-    expect(resolved.reasoning?.efforts.map((effort) => effort.name)).toEqual(['低', '中', '高'])
+    expect(resolved.reasoning?.efforts.map((effort) => effort.name)).toEqual(['Low', 'Medium', 'High'])
   })
 
   it('思考强度路由：选 high 就落到 claude-opus-5-5-high', async () => {
