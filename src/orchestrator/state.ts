@@ -9,8 +9,8 @@ function initialState(): OrchestratorState {
   return { stage: 'idle', plansThisTurn: 0 }
 }
 
-export function orchestratorSessionKey(sessionId?: string): string {
-  return sessionId !== undefined && sessionId.length > 0 ? sessionId : 'anonymous'
+export function orchestratorSessionKey(sessionId?: string): string | undefined {
+  return sessionId || undefined
 }
 
 export class OrchestratorStore {
@@ -27,6 +27,7 @@ export class OrchestratorStore {
 
   get(sessionId?: string): OrchestratorState {
     const key = orchestratorSessionKey(sessionId)
+    if (key === undefined) return initialState()
     const existing = this.entries.get(key)
     if (existing === undefined) return initialState()
     // 刷新 LRU 位置
@@ -40,8 +41,9 @@ export class OrchestratorStore {
     updater: Partial<OrchestratorState> | ((prev: OrchestratorState) => OrchestratorState),
   ): OrchestratorState {
     const key = orchestratorSessionKey(sessionId)
-    const prev = this.entries.get(key) ?? initialState()
+    const prev = (key === undefined ? undefined : this.entries.get(key)) ?? initialState()
     const next = typeof updater === 'function' ? updater(prev) : { ...prev, ...updater }
+    if (key === undefined) return next
     if (this.entries.has(key)) this.entries.delete(key)
     this.entries.set(key, next)
     while (this.entries.size > this.maxEntries) {
@@ -61,7 +63,8 @@ export class OrchestratorStore {
   }
 
   delete(sessionId?: string): boolean {
-    return this.entries.delete(orchestratorSessionKey(sessionId))
+    const key = orchestratorSessionKey(sessionId)
+    return key !== undefined && this.entries.delete(key)
   }
 
   dispose(): void {

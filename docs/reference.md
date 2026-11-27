@@ -2,7 +2,7 @@
 
 [返回主页](../README.md) · [配置](configuration.md) · [更新记录](changelog.md) · [开发与验证](development.md)
 
-本文对应 `dsh-bundle-antigravity-host` **0.1.54**。
+本文对应 `dsh-bundle-antigravity-host` **0.1.55**。需要 DSH Core `0.2.2-rc.5` 起的 `0.2.2` 发布线。
 
 ## 安装与更新
 
@@ -13,7 +13,7 @@
 dsh plugin --profile web add dsh-bundle-antigravity-host
 
 # 需要固定版本时
-dsh plugin --profile web add dsh-bundle-antigravity-host@0.1.54
+dsh plugin --profile web add dsh-bundle-antigravity-host@0.1.55
 ```
 
 更新时通过目标插件管理器选择本包的目标版本，或使用目标 CLI 支持的单包更新方式；先核对该入口的 `plugin --help`。不要用不限定包名的批量更新命令替代一次单插件更新。
@@ -23,7 +23,7 @@ dsh plugin --profile web add dsh-bundle-antigravity-host@0.1.54
 在源码仓库完成构建并打包后，也可安装本地 tarball：
 
 ```console
-dsh plugin --profile web add ./dsh-bundle-antigravity-host-0.1.54.tgz
+dsh plugin --profile web add ./dsh-bundle-antigravity-host-0.1.55.tgz
 ```
 
 文件名以实际打包结果为准；构建与打包步骤见[开发说明](development.md#构建与本地打包)。本仓库现有发布工作流发布到 npm，**不生成 GitHub Release tarball**，因此没有可用的 `releases/latest/download/...` 安装入口。
@@ -45,7 +45,7 @@ dsh plugin --profile web add ./dsh-bundle-antigravity-host-0.1.54.tgz
 ### AI Studio、Vertex AI 与 Colab
 
 - **AI Studio**：用量面板显示此 Host 交给 HTTP 客户端的生成尝试、上游报告的输入 token 和最近限流。窗口为最近一分钟和太平洋时间当天，Host 重启后清空；项目级速率限制见 [AI Studio](https://aistudio.google.com/rate-limit)。
-- **Vertex AI**：在运行 DSH 的主机准备 [Google Cloud CLI 与 ADC](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/start/gcp-auth)，再填写项目、区域与 [Gemini 模型 ID](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/learn/locations)。插件不启动登录，生成请求走配置的项目。标准按量模式的 `429` 可能是共享容量拥堵。当前走标准 Vertex AI 端点，不支持 Express key。
+- **Vertex AI**：在运行 DSH 的主机准备 [Google Cloud CLI 与 ADC](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/start/gcp-auth)，在设置中启用 Vertex AI。项目、区域留空可继承[宿主环境变量](configuration.md#配置清单)。保存后点「拉取模型」，从 [Google Model Garden 的发布商目录](https://docs.cloud.google.com/gemini-enterprise-agent-platform/reference/rest/v1beta1/publishers.models/list)读取 Gemini 聊天模型，检查新增条目后再次保存。目录读取需要项目允许 ADC 使用 Vertex AI API（含 `serviceusage.services.use`）；拉取不运行推理。实际生成可用性随项目与[区域](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/learn/locations)而变化，也可以直接手填模型 ID。当前走标准 Vertex AI 端点，不支持 Express key。
 - **Colab**：用同包的 [`antigravity-colab` 工具组件](colab.md)查询 Compute Units 或经审批执行 Python / Notebook。在 DSH 插件页单独启停，默认关闭，不需要切换或启用任何 Antigravity 模式。
 
 ### Antigravity 的连接操作

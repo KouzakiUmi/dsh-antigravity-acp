@@ -9,6 +9,7 @@
  * 纯 Gemini 家族，无代理线的 Claude/GPT 家族分支。
  */
 import type { Message, ReplayEnvelope } from '@deepseek-ai/dsh-llm'
+import { safeGeminiWireCallId } from '../adapter/gemini-payload.js'
 import { AISTUDIO_PROVIDER_ID } from './endpoints.js'
 
 export const AISTUDIO_REPLAY_VERSION = 1 as const
@@ -20,6 +21,7 @@ export type AistudioReplayBlockKind = 'text' | 'reasoning' | 'tool-call'
 export interface AistudioReplayBlock {
   readonly kind: AistudioReplayBlockKind
   readonly signature?: string
+  readonly wireCallId?: string
 }
 
 export interface AistudioReplayState extends ReplayEnvelope {
@@ -41,7 +43,7 @@ export function createAistudioReplayState(
 ): AistudioReplayState {
   const boundedBlocks = blocks.slice(0, MAX_BLOCKS).map((block) => {
     const signature = safeSignature(block.signature)
-    return { kind: block.kind, ...(signature === undefined ? {} : { signature }) }
+    return replayBlock(block.kind, signature, block.wireCallId)
   })
   const boundedFinish = safeFinish(finish)
   return {
@@ -85,7 +87,7 @@ export function compatibleAistudioReplayState(
     const signature = typeof item.signature === 'string' && item.signature.length > 0 && item.signature.length <= AISTUDIO_MAX_SIGNATURE_LENGTH && !hasControl(item.signature)
       ? item.signature
       : undefined
-    blocks.push({ kind, ...(signature === undefined ? {} : { signature }) })
+    blocks.push(replayBlock(kind, signature, item.wireCallId))
   }
   if (blockKinds !== undefined && (blocks.length !== blockKinds.length || blocks.some((block, index) => block.kind !== blockKinds[index]))) return undefined
   const finish = safeFinish(typeof value.response.finish === 'string' ? value.response.finish : undefined)
@@ -102,6 +104,11 @@ export function compatibleAistudioReplayState(
     },
     blocks,
   }
+}
+
+function replayBlock(kind: AistudioReplayBlockKind, signature: string | undefined, rawId: unknown): AistudioReplayBlock {
+  const wireCallId = kind === 'tool-call' ? safeGeminiWireCallId(rawId) : undefined
+  return { kind, ...(signature === undefined ? {} : { signature }), ...(wireCallId === undefined ? {} : { wireCallId }) }
 }
 
 function safeSignature(value: string | undefined): string | undefined {

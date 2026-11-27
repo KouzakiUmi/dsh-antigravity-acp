@@ -12,6 +12,9 @@ import type { GenerateOptions, PreparedAdapterCall, StreamChunk } from '@deepsee
  */
 export type AdapterRequestOptions = GenerateOptions<string>
 
+/** Pool mode guard applies before dispatch, not to an ACP prompt already in flight. */
+export type AcpRequestOptions = AdapterRequestOptions & { admissionSignal?: AbortSignal }
+
 /** 回合归属判定只需要请求的会话身份与用途。 */
 export type AdapterRequestOwner = Pick<AdapterRequestOptions, 'sessionId' | 'purpose'>
 

@@ -29,6 +29,13 @@ export interface CliResult {
 
 export type CliRunner = (request: CliRequest) => Promise<CliResult>
 
+/** Collected tails can begin mid-line. Do not parse or display that fragment. */
+export function completeStdout({ stdout, truncated }: CliResult): string {
+  if (!truncated) return stdout
+  const firstNewline = stdout.indexOf('\n')
+  return firstNewline === -1 ? '' : stdout.slice(firstNewline + 1)
+}
+
 function readStdout(handle: SubprocessHandle) {
   const output = handle.collected.stdout?.readFrom(0)
   const text = Buffer.from(output?.text ?? '').subarray(0, OUTPUT_BYTES).toString('utf8')

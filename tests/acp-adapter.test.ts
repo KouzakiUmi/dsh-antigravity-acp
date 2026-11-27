@@ -388,6 +388,24 @@ describe('模型目录来自 ACP 会话配置', () => {
     expect(follower.agent.requests).toEqual([])
   })
 
+  it('已进入 worker 的请求在图片准备期间切模式不会发送 prompt', async () => {
+    const data = Uint8Array.of(137, 80, 78, 71)
+    const ref = { attachmentId: 'sha256:fixture', mediaType: 'image/png', bytes: data.length, width: 1, height: 1 } as ImageAttachmentRef
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const readImage = vi.fn(async () => { await gate; return { ref, data } })
+    const harness = createHarness({ readImage, imageCapability: true })
+    const mode = new AbortController()
+    const pending = collect(harness.adapter.stream({ ...baseOptions({ messages: [createUserMessage({ content: [{ type: 'image', attachment: ref }], source: { kind: 'user' } })] }), admissionSignal: mode.signal }))
+    try {
+      await vi.waitFor(() => expect(readImage).toHaveBeenCalled())
+      mode.abort(new Error('mode switched'))
+    } finally { release() }
+    await expect(pending).rejects.toThrow('mode switched')
+    expect(harness.agent.requestsFor('session/prompt')).toEqual([])
+    expect(harness.adapter.busy).toBe(false)
+  })
+
   it('工具图像结果在原 prompt 中以 MCP image 回填', async () => {
     const data = Uint8Array.from([137, 80, 78, 71])
     const ref = { attachmentId: 'sha256:tool', mediaType: 'image/png', bytes: data.length, width: 1, height: 1 } as ImageAttachmentRef
@@ -2077,7 +2095,12 @@ describe('ACP 私有 MCP 权限与原 prompt 续轮', () => {
     const pending = ['a', 'b', 'c'].map((path) => client.callTool({ name: 'read_file', arguments: { path } }))
     const calls = (await first).filter((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call')
     expect(calls).toHaveLength(3)
-    const entries = calls.map((call, index) => ({ callId: toolCallIdOf(call), path: ['a', 'b', 'c'][index]!, result: `result-${index}` }))
+    const entries = calls.map((call) => {
+      if (call.type !== 'block-end' || call.block.type !== 'tool-call') throw new Error('Expected tool call')
+      const { path } = JSON.parse(call.block.arguments) as { path: string }
+      return { callId: toolCallIdOf(call), path, result: `result-${path}` }
+    })
+    expect(entries.map(({ path }) => path).sort()).toEqual(['a', 'b', 'c'])
     const messages = [
       ...baseOptions().messages,
       createAssistantMessage({
@@ -2093,7 +2116,7 @@ describe('ACP 私有 MCP 权限与原 prompt 续轮', () => {
       })),
     ]
     const second = collect(harness.adapter.stream(baseOptions({ tools: TOOLS, messages })))
-    expect((await Promise.all(pending)).map(toolResultText)).toEqual(['result-0', 'result-1', 'result-2'])
+    expect((await Promise.all(pending)).map(toolResultText)).toEqual(['result-a', 'result-b', 'result-c'])
     await harness.agent.callClient('session/request_permission', permission(SESSION_1, 'next-batch'))
     const nextPending = client.callTool({ name: 'read_file', arguments: { path: 'a.txt' } })
     const nextCalls = (await second).filter((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call')

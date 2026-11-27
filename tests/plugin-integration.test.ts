@@ -173,6 +173,30 @@ afterEach(async () => {
 })
 
 describe('apply wiring with real pool and SettingsControl', () => {
+  it('Vertex 的已保存项目、区域优先，清空后从 Host 环境回退', () => {
+    vi.stubEnv('GOOGLE_CLOUD_PROJECT', 'environment-project')
+    vi.stubEnv('GOOGLE_CLOUD_LOCATION', 'us-central1')
+    vi.stubEnv('VERTEXAI_PROJECT', 'other-project')
+    vi.stubEnv('VERTEXAI_LOCATION', 'eu')
+    const instance = harness()
+    const config = Config({ proxyMode: true, vertexProject: 'fixture-project', vertexLocation: 'global' })
+    const blanks = Config({})
+    apply(instance.ctx, config)
+    const settings = instance.ctx.antigravityVertexSettings ?? instance.ctx.get('antigravityVertexSettings')
+    expect([settings.project(), settings.location()]).toEqual(['fixture-project', 'global'])
+    for (const key of ['vertexProject', 'vertexLocation'] as const) {
+      const before = config[key]
+      const after = blanks[key]
+      if (!isVolatile(before) || !isVolatile(after)) throw new Error('Expected live Vertex setting')
+      updateVolatile(before, after)
+    }
+    instance.updateSettings([['vertexProject'], ['vertexLocation']])
+    expect([settings.project(), settings.location()]).toEqual(['environment-project', 'us-central1'])
+    vi.stubEnv('GOOGLE_CLOUD_PROJECT', '')
+    vi.stubEnv('GOOGLE_CLOUD_LOCATION', '')
+    expect([settings.project(), settings.location()]).toEqual(['other-project', 'eu'])
+  })
+
   it('代理 OAuth 显式继承宿主环境代理，与原生请求使用同一解析规则', () => {
     vi.stubEnv('https_proxy', 'http://ambient:7890')
     vi.stubEnv('HTTPS_PROXY', 'http://ambient:7890')
@@ -291,7 +315,7 @@ describe('apply wiring with real pool and SettingsControl', () => {
     apply(instance.ctx, {})
     const control = instance.control()
     expect((await control.models(true)).status).toBe('ok')
-    expect(external.workers[0]!.discoverModels).toHaveBeenLastCalledWith(undefined, false)
+    expect(external.workers[0]!.discoverModels).toHaveBeenLastCalledWith(instance.registered().modeSignal(), false)
     expect(control.account().state).toBe('idle')
     expect(control.account('login').state).toBe('connecting')
     await flush()

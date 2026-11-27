@@ -325,4 +325,14 @@ describe('prompts & OrchestratorStore', () => {
     store.dispose()
     expect(store.size).toBe(0)
   })
+
+  it('无会话 ID 的请求不写入会话计划，也不借用同名会话', () => {
+    const store = new OrchestratorStore()
+    store.update('anonymous', { stage: 'executing', plansThisTurn: 2 })
+    store.update(undefined, { stage: 'planning', plansThisTurn: 1 })
+    store.update('', { stage: 'executing', plansThisTurn: 3 })
+    expect(store.get(undefined)).toEqual({ stage: 'idle', plansThisTurn: 0 })
+    expect(store.get('anonymous').plansThisTurn).toBe(2)
+    expect(store.size).toBe(1)
+  })
 })

@@ -38,9 +38,9 @@
 | `aistudioEnabled` | `false` | AI Studio 独立 provider 开关（即时生效，保存即注册 / 注销 `aistudio` 路由）。开启后用 Gemini API key 直连 `generativelanguage.googleapis.com/v1beta`，与 ACP / 代理两条互斥链路**并存**（服务不同的 Gemini 模型，不参与模式仲裁）。模型目录实时发现（`GET /v1beta/models`，过滤支持 `generateContent` 的文本模型并排除音乐 / TTS / 图像 / 视频等非聊天模态），目录键带 `aistudio-` 前缀；默认仅 Gemini 4 系开启、其余默认关可显式启用，模型表启用项置顶。key 未配置时即使开关打开也不注册可用模型（报 AUTH 可读态）。首期支持文本流式、工具调用、多轮 history、思考块；图片 / 视频延后。 |
 | `aistudioCredentialRef` | `AISTUDIO_API_KEY` | AI Studio API key 的凭据引用名（即时生效，POSIX 环境变量名）。设置只存引用名，真实值经宿主 `credentials` 接缝按操作解析（`ctx.credentials.resolve`），不进设置明文 / 日志 / 客户端响应；鉴权用 `x-goog-api-key` 请求头，key 不进 URL。需宿主装载凭据 provider（如 `dsh-credentials-local`）并把 key 存为该引用名对应的凭据。引用名变化即刷新目录。设置页「AI Studio」Tab 提供手动 key 输入（密码框 + 「保存 key」），经 `agyAistudio.setKey` 写入宿主 credentials（只写不回显），状态只显示掩码预览。 |
 | `vertexEnabled` | `false` | 标准 Vertex AI 独立路由开关；与其他路由并存。 |
-| `vertexProject` | 空 | Google Cloud 项目 ID 或编号。项目需启用 Vertex AI API，ADC 身份需有预测权限。 |
-| `vertexLocation` | `global` | 模型所在位置：`global`、`us`、`eu` 或如 `us-central1` 的区域。根据模型可用性和数据驻留要求填写。 |
-| `vertexModels` | `[]` | 显式列入目录的 Gemini 发布商模型 ID。设置页每行一个；`modelOverrides` 使用 `vertex-ai-` 前缀。保存配置不发生成请求。 |
+| `vertexProject` | 空 | Google Cloud 项目 ID 或编号。留空按顺序读取 DSH Host 环境变量 `GOOGLE_CLOUD_PROJECT`、`VERTEXAI_PROJECT`。项目需启用 Vertex AI API，ADC 身份需有预测权限。 |
+| `vertexLocation` | 空 | 生成位置：`global`、`us`、`eu` 或如 `us-central1`。留空按顺序读取 `GOOGLE_CLOUD_LOCATION`、`VERTEXAI_LOCATION`，均为空才使用 `global`。已有显式配置优先。 |
+| `vertexModels` | `[]` | 设置中启用的 Gemini 发布商模型 ID，每行一个。「拉取模型」从 Google 的发布商目录读取，用新 ID 补充草稿，保存后进入选择器。手填条目保留，`modelOverrides` 使用 `vertex-ai-` 前缀。 |
 
 示例（不包含代理密码或账号材料）：
 
@@ -105,7 +105,7 @@ ACP 官方 agent 在同一会话内会保留上下文（2026-10-23 真机验证�
 
 ### 代理模式（默认关闭）
 
-在「运行模式」中勾选并保存 `proxyMode` 后，宿主行立即撤下 `antigravity-acp`，第二组件 `antigravity-proxy-router` 就绪时注册 `antigravity-proxy`；关闭时恢复 ACP。代理组件未启用、卸载或注册失败时 ACP 仍保持停用，并在设置页解释原因。ACP 登录、预热、目录发现和二进制预读均不会运行。目录与额度按请求模式取数；未保存的开关只表示草稿。切换后需要在会话中选择新模式下的模型。
+在「运行模式」中勾选并保存 `proxyMode` 后，宿主行立即撤下 `antigravity-acp`，第二组件 `antigravity-proxy-router` 就绪时注册 `antigravity-proxy`；关闭时恢复 ACP。代理组件未启用、卸载或注册失败时 ACP 仍保持停用。开启代理会取消未派发的 ACP 请求、启动准备、目录刷新和二进制预读；已发出的 prompt 不主动取消。目录与额度按当前模式取数，切换后在会话中重新选模型。
 
 - **登录态**：代理账户独立于 ACP 登录。连接时优先只读导入 `~/.gemini/antigravity-cli/antigravity-oauth-token`，过期则先换发；失效登录态不会被报告为连接成功。没有可用登录态时返回 PKCE 授权链接，请点击完成浏览器登录（回调 `http://localhost:51121/oauth-callback`，只绑 127.0.0.1）。连接还会只读检测上游已有项目，未返回项目时显示具体原因，检测完成后才显示已连接。副本落在缓存目录 `proxy-account.json`（原子写、尽力 0600），官方文件保持只读。
 - **无需安装 CLI**：点击「连接代理账户 → 打开 Google 授权页」，在运行 DSH 的同一台电脑上授权。插件自行处理回调、换码、项目检测及保存；账户需已有 Antigravity 使用权限。页面分别显示准备、等待授权和完成阶段，以及对应失败原因。

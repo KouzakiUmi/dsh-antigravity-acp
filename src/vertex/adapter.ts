@@ -8,6 +8,8 @@ import { ProxyTransportError, readProxyText } from '../proxy/transport.js'
 import { llmError } from '../runtime/llm-error.js'
 import { ProxyConfigError } from '../runtime/proxy-env.js'
 import { listConfiguredVertexModels } from './catalog.js'
+import { discoverVertexModels } from './discovery.js'
+import { resolveVertexScope } from './environment.js'
 import { isVertexPublisherModel, validVertexScope, vertexStreamUrl, VERTEX_LABEL, VERTEX_PROVIDER_ID } from './endpoints.js'
 import type { VertexTarget } from './endpoints.js'
 import { vertexReplayBlocks, vertexReplayState } from './replay.js'
@@ -33,9 +35,9 @@ export class VertexAdapter extends LlmAdapter {
   constructor(private readonly options: VertexAdapterOptions) { super() }
 
   /** A scope transition invalidates prior selections, even if settings later return to the original scope. */
-  syncScope(): void {
+  syncScope(scope = this.scope()): void {
     const settings = this.options.settings
-    const key = JSON.stringify([settings.enabled(), settings.project().trim(), settings.location().trim()])
+    const key = JSON.stringify([settings.enabled(), scope.project, scope.location])
     if (key === this.identity || this.disposed) return
     this.generation.abort()
     this.generation = new AbortController()
@@ -56,6 +58,25 @@ export class VertexAdapter extends LlmAdapter {
     return this.catalog().filter(entry => entry.enabled && isVertexPublisherModel(entry.upstreamId))
   }
 
+  /** Explicit refresh only; Model Garden candidates never auto-register in the model selector. */
+  async discoverModels(): Promise<readonly string[]> {
+    const { scope, generation } = this.activeScope()
+    const checkScope = () => {
+      this.syncScope()
+      if (generation.aborted) throw llmError('Vertex AI 配置已变更，模型目录请求已取消', 'CANCELLED')
+    }
+    try {
+      const token = await this.options.token(generation)
+      checkScope()
+      const models = await discoverVertexModels({ project: scope.project, token, signal: generation, fetch: this.options.fetch, checkScope })
+      checkScope()
+      return models
+    } catch (error) {
+      checkScope()
+      throw vertexError(error)
+    }
+  }
+
   override async resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
     return this.select(provider, model).model
   }
@@ -71,7 +92,15 @@ export class VertexAdapter extends LlmAdapter {
 
   private scope() {
     const { settings } = this.options
-    return { project: settings.project().trim(), location: settings.location().trim() }
+    return resolveVertexScope(settings.project(), settings.location())
+  }
+
+  private activeScope() {
+    const scope = this.scope()
+    this.syncScope(scope)
+    if (this.disposed || !this.options.settings.enabled()) throw llmError('Vertex AI 路由未启用', 'NO_ADAPTER')
+    if (!validVertexScope(scope)) throw llmError('请配置有效的 Vertex AI 项目和区域', 'INVALID_ARGS')
+    return { scope, generation: this.generation.signal }
   }
 
   private catalog() {
@@ -81,17 +110,14 @@ export class VertexAdapter extends LlmAdapter {
 
   private select(provider: string, id: string): Selection {
     this.providerInfo(provider)
-    this.syncScope()
-    if (this.disposed || !this.options.settings.enabled()) throw llmError('Vertex AI 路由未启用', 'NO_ADAPTER')
-    const scope = this.scope()
-    if (!validVertexScope(scope)) throw llmError('请配置有效的 Vertex AI 项目和区域', 'INVALID_ARGS')
+    const { scope, generation } = this.activeScope()
     const entry = this.catalog().find(item => item.id === id)
     if (entry === undefined || !isVertexPublisherModel(entry.upstreamId)) throw llmError('Vertex AI 模型未配置或 Google publisher 模型 ID 无效', 'INVALID_MODEL')
     const model: LlmResolvedModelInfo = {
       provider, id, name: entry.name, inputModalities: ['text'],
       ...(entry.contextWindow === undefined ? {} : { context: { contextWindow: entry.contextWindow } }),
     }
-    return { target: { ...scope, model: id, wireModel: entry.upstreamId }, model, generation: this.generation.signal }
+    return { target: { ...scope, model: id, wireModel: entry.upstreamId }, model, generation }
   }
 
   private async *streamSelection(options: AdapterRequestOptions, { target, generation }: Selection): AsyncGenerator<StreamChunk> {
@@ -107,6 +133,11 @@ export class VertexAdapter extends LlmAdapter {
       this.syncScope()
       if (signal.aborted) { yield finishChunk('aborted', 'CANCELLED'); return }
       const response = await this.post(vertexStreamUrl(target), token, request, transport, requestSignal)
+      if (requestSignal.aborted) {
+        void response.body?.cancel().catch(() => undefined)
+        signal.throwIfAborted()
+        throw llmError('等待 Vertex AI 响应超时', 'TIMEOUT')
+      }
       if (!response.ok) throw await statusError(response, requestSignal)
       yield* streamResponse(response, requestSignal, target)
     } catch (error) {
@@ -145,7 +176,11 @@ async function* streamResponse(response: Response, signal: AbortSignal, target: 
     return
   }
   const reason = mapFinishReason(finish)
-  if (reason === 'error') { yield finishChunk('error', finish ?? 'UPSTREAM'); return }
+  if (reason === 'error') {
+    const known = new Set(['SAFETY', 'BLOCKLIST', 'ERROR', 'RECITATION', 'PROHIBITED_CONTENT', 'SPII', 'MALFORMED_FUNCTION_CALL', 'UNEXPECTED_TOOL_CALL', 'OTHER'])
+    yield finishChunk('error', finish !== undefined && known.has(finish) ? finish : 'UPSTREAM')
+    return
+  }
   if (states.length === 0) { yield finishChunk('error', 'EMPTY_RESPONSE'); return }
   if (finish === undefined && !sawDone) throw llmError('Vertex AI 响应流在完成标记之前结束', 'TRANSPORT')
   yield finishChunk(reason === 'stop' && states.some(state => state.kind === 'tool-call') ? 'tool-calls' : reason,

@@ -23,6 +23,7 @@ function mount(ctx: Context): void {
   }
   const fetch = createLiveProxiedFetch(readProxy)
   const adapter = new VertexAdapter({ settings, fetch, token: signal => readVertexAccessToken(subprocess, signal, readProxy()) })
+  ctx.provide('antigravityVertexCatalog', { models: () => adapter.discoverModels() })
   let unregister: (() => void) | undefined
   const refresh = () => {
     adapter.syncScope()

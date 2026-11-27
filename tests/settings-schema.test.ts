@@ -43,7 +43,7 @@ describe('live settings schema and runtime references', () => {
   it('Vertex 默认关闭并通过即时引用更新项目、区域和模型列表', () => {
     const parsed = Config({})
     const config = liveHostConfig(parsed)
-    expect(config).toMatchObject({ vertexEnabled: false, vertexProject: '', vertexLocation: 'global', vertexModels: [] })
+    expect(config).toMatchObject({ vertexEnabled: false, vertexProject: '', vertexLocation: '', vertexModels: [] })
     const next = Config({ vertexEnabled: true, vertexProject: 'test-project', vertexLocation: 'us-central1', vertexModels: ['gemini-4-hydrogen'] })
     for (const key of ['vertexEnabled', 'vertexProject', 'vertexLocation', 'vertexModels'] as const) {
       const beforeRef = parsed[key]

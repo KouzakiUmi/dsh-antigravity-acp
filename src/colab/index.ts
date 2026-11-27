@@ -8,7 +8,7 @@ import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type { ApprovalService } from '@deepseek-ai/dsh-user-approval'
 import { collectArtifacts, parseExecution, prepareExecution, pythonOutcome } from './execute.js'
 import { IMAGE_OUTPUT, NOTEBOOK_INPUT } from './notebook.js'
-import { ColabRunError, createCliRunner, type CliRunner } from './runner.js'
+import { ColabRunError, completeStdout, createCliRunner, type CliRunner } from './runner.js'
 import { parseUsage } from './usage.js'
 
 export const name = 'antigravity-colab'
@@ -25,7 +25,7 @@ export type Config = ReturnType<typeof Config>
 export interface ToolServices {
   runner: CliRunner
   approval: () => Pick<ApprovalService, 'request'> | undefined
-  attachments: () => Pick<AttachmentStore, 'saveFile'> | undefined
+  attachments: () => Pick<AttachmentStore, 'saveFileStream'> | undefined
   onCleanupFailure?: () => void
 }
 
@@ -101,8 +101,7 @@ export function createTools(config: Config, services: ToolServices) {
       if (!args || typeof args !== 'object' || Array.isArray(args) || Reflect.ownKeys(args).length) throw new Error('colab_usage takes no arguments.')
       return runExclusive(exec, (signal) => withCli(signal, async (dir) => {
         const result = await services.runner({ executable, cwd: dir, args: ['--auth=adc', 'usage'], budgetMs: 15_000, signal })
-        // A retained tail can start partway into a truncated line.
-        return parseUsage(result.truncated ? result.stdout.slice(result.stdout.indexOf('\n') + 1) : result.stdout)
+        return parseUsage(completeStdout(result))
       }))
     },
   }

@@ -3,7 +3,7 @@ import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { AttachmentStore, FileAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { imageName, IMAGE_OUTPUT, NOTEBOOK_INPUT, NOTEBOOK_OUTPUT, notebookParts, readArtifact, readNotebook } from './notebook.js'
-import type { CliResult } from './runner.js'
+import { completeStdout, type CliResult } from './runner.js'
 
 const CODE_LIMIT = 32 * 1024
 export type ExecutionInput = { code: string } | { notebook: string; parts: string[] }
@@ -25,16 +25,21 @@ export async function prepareExecution(input: ExecutionInput, dir: string, cwd: 
   if ('code' in input) {
     // Compile inside the remote kernel (including syntax errors), preserving globals across calls.
     // A nonce lets us distinguish an observed completion from CLI exit 0 alone.
-    const marker = `__DSH_COLAB_${randomBytes(16).toString('hex')}__`
+    const nonce = randomBytes(16).toString('hex')
+    const marker = `__DSH_COLAB_${nonce}__`
+    const builtin = `_dsh_b_${nonce}`
     const code = Buffer.from(input.code).toString('base64')
     const stdin = [
+      `import builtins as ${builtin}`,
       'try:',
-      `    exec(compile(__import__('base64').b64decode('${code}').decode('utf-8'), '<colab_execute>', 'exec'), globals())`,
-      'except BaseException:',
-      `    __import__('builtins').print('\\n${marker}error')`,
+      `    ${builtin}.exec(${builtin}.compile(${builtin}.__import__('base64').b64decode('${code}').decode('utf-8'), '<colab_execute>', 'exec'), ${builtin}.globals())`,
+      `except ${builtin}.BaseException:`,
+      `    ${builtin}.print('\\n${marker}error')`,
       '    raise',
       'else:',
-      `    __import__('builtins').print('\\n${marker}ok')`,
+      `    ${builtin}.print('\\n${marker}ok')`,
+      'finally:',
+      `    del ${builtin}`,
       '',
     ].join('\n')
     return { stdin, marker }
@@ -46,9 +51,10 @@ export async function prepareExecution(input: ExecutionInput, dir: string, cwd: 
 
 export function pythonOutcome(result: CliResult, marker: string) {
   const suffix = new RegExp(`(?:^|\\r?\\n)${marker}(ok|error)\\r?\\n?$`)
-  const captured = suffix.exec(result.stdout)
+  const stdout = completeStdout(result)
+  const captured = suffix.exec(stdout)
   const status: ExecutionStatus = captured?.[1] === 'ok' ? 'completed' : captured?.[1] === 'error' ? 'python-error' : 'unverified'
-  return { status, stdout: result.stdout.replace(suffix, '') }
+  return { status, stdout: stdout.replace(suffix, '') }
 }
 
 function object(value: unknown): value is Record<string, unknown> {
@@ -58,27 +64,39 @@ function object(value: unknown): value is Record<string, unknown> {
 function notebookStatus(data: Buffer): ExecutionStatus {
   const nb: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(data))
   if (!object(nb) || nb.nbformat !== 4 || !Array.isArray(nb.cells)) throw new Error('Invalid Notebook artifact.')
-  for (const cell of nb.cells) {
-    if (object(cell) && cell.cell_type === 'code' && Array.isArray(cell.outputs) &&
-        cell.outputs.some((output) => object(output) && output.output_type === 'error')) return 'python-error'
-  }
-  return 'completed'
+  const codeCells = nb.cells.filter((cell) => {
+    if (!object(cell) || !['code', 'markdown', 'raw'].includes(String(cell.cell_type))) throw new Error('Invalid Notebook cell.')
+    return cell.cell_type === 'code'
+  })
+  const outputs = codeCells.flatMap((cell) => {
+    if (!Array.isArray(cell.outputs)) throw new Error('Invalid Notebook outputs.')
+    return cell.outputs
+  })
+  return outputs.some((output) => object(output) && output.output_type === 'error') ? 'python-error' : 'completed'
 }
 
-export async function collectArtifacts(dir: string, notebook: boolean, attachments: Pick<AttachmentStore, 'saveFile'> | undefined, signal: AbortSignal) {
+async function* chunks(data: Uint8Array, signal: AbortSignal) {
+  const size = 64 * 1024
+  for (let offset = 0; offset < data.length; offset += size) {
+    signal.throwIfAborted()
+    yield data.subarray(offset, offset + size)
+  }
+}
+
+export async function collectArtifacts(dir: string, notebook: boolean, attachments: Pick<AttachmentStore, 'saveFileStream'> | undefined, signal: AbortSignal) {
   const artifacts: Artifacts = {}
   let status: ExecutionStatus = 'unverified'
   let artifactIssue = false
   for (const filename of notebook ? [NOTEBOOK_OUTPUT, IMAGE_OUTPUT] : [IMAGE_OUTPUT]) {
     try {
-      const data = await readArtifact(dir, filename, signal)
-      if (!data) continue
       const isNotebook = filename === NOTEBOOK_OUTPUT
+      const data = await readArtifact(dir, filename, signal)
+      if (!data) { if (isNotebook) artifactIssue = true; continue }
       if (isNotebook) status = notebookStatus(data)
       const name = isNotebook ? 'colab-output.ipynb' : imageName(data)
       signal.throwIfAborted()
       if (!attachments || !name) { artifactIssue = true; continue }
-      artifacts[isNotebook ? 'notebook' : 'image'] = await attachments.saveFile({ data, name })
+      artifacts[isNotebook ? 'notebook' : 'image'] = await attachments.saveFileStream({ data: chunks(data, signal), name, signal })
     } catch {
       signal.throwIfAborted()
       artifactIssue = true

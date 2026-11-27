@@ -20,7 +20,7 @@
 | [`src/client.js`](https://github.com/KouzakiUmi/dsh-antigravity-acp/blob/main/src/client.js) | 惰性 CommonJS 客户端、设置卡片与额度药丸；无 Node 原生导入。构建时由 [`scripts/client-bundle.mjs`](https://github.com/KouzakiUmi/dsh-antigravity-acp/blob/main/scripts/client-bundle.mjs) 把 `@include` 的 [`src/client-i18n/`](https://github.com/KouzakiUmi/dsh-antigravity-acp/tree/main/src/client-i18n) 片段内联成单文件 |
 | [`src/client-i18n/`](https://github.com/KouzakiUmi/dsh-antigravity-acp/tree/main/src/client-i18n) | 客户端界面 i18n：`core.js`（`t()` / `msg()` 与语言判定）、`en-ui.js`（界面英文字典）、`en-host.js`（Host 固定状态文本的英文字典）；键是中文原文，缺译回落中文。新增文案必须同步字典，`tests/client-i18n.test.ts` 会拦截缺项与占位符不一致 |
 | [`src/settings.ts`](https://github.com/KouzakiUmi/dsh-antigravity-acp/blob/main/src/settings.ts) | 完整 Config 与默认值 |
-| [`src/vertex/`](../src/vertex/) | 标准 Vertex AI：ADC、显式目录、按项目与区域路由、replay 校验 |
+| [`src/vertex/`](../src/vertex/) | 标准 Vertex AI：ADC、宿主环境变量回退、发布商目录读取、按项目与区域路由、replay 校验 |
 | [`src/adapter/gemini-payload.ts`](../src/adapter/gemini-payload.ts) | AI Studio 与 Vertex AI 共用的标准 Gemini REST 请求构造 |
 | [`src/colab/`](../src/colab/) | 可单独启停的 Colab Host 组件，使用 DSH 审批、受管子进程和附件服务；同包导出 `./colab` |
 | [`cordis.patch.yml`](../cordis.patch.yml) | 仅插入本插件，不抢占默认模型 |
@@ -34,9 +34,9 @@ npm 包名为 `dsh-bundle-antigravity-host`，provider ID 为 `antigravity-acp` 
 
 | 依赖 / 协议 | 当前基准 | 核验边界 |
 |---|---|---|
-| DSH `dsh-llm` / `dsh-subprocess` / `dsh-typert-protocol` | 开发依赖 `0.2.2-rc.3` | 本地类型、调用链与测试；不是全部 peer 范围实机认证 |
-| `dsh-attachment` | 运行依赖 `0.2.2-rc.3` | 提供代理图片处理的纯函数；宿主附件服务仍按能力注入 |
-| `dsh-credentials` | 运行依赖 `0.2.2-rc.3` | 提供 AI Studio 凭据引用校验；密钥由宿主 credentials 服务管理 |
+| DSH `dsh-llm` / `dsh-subprocess` / `dsh-typert-protocol` | 宿主 peer；开发基准 `0.2.2-rc.5` | 共享宿主模块；工作区同版运行类型检查和测试 |
+| `dsh-attachment` | 宿主 peer；开发基准 `0.2.2-rc.5` | 提供代理图片尺寸计算；附件服务仍按功能注入 |
+| `dsh-credentials` | 宿主 peer；开发基准 `0.2.2-rc.5` | 提供 AI Studio 凭据引用校验；密钥由宿主凭据服务管理 |
 | Cordis | 开发依赖 `4.1.0` | 生命周期与注入契约 |
 | ACP SDK / wire protocol | SDK `1.4.0` / wire **v1** | 两者不是同一版本；v2 / RFD 草案不能替代 v1 |
 | 默认官方 ACP server | `1.5.2` | 与 SDK 分别设置；1.5.2 仅离线核对全平台发行布局与解压体积，协议行为与厂商 `_meta.antigravity` 扩展的实测基准仍为 1.4.0，不自动适用于任意上游版本 |
@@ -45,7 +45,7 @@ npm 包名为 `dsh-bundle-antigravity-host`，provider ID 为 `antigravity-acp` 
 | undici | `8.12.3` | 本包直接依赖，HTTP / SOCKS 代理；SOCKS5 可能输出实验性 API 警告 |
 | React / test renderer | `18.3.1` | Client 使用宿主 React；renderer 是测试开发依赖，不是生产私带的 UI 运行时 |
 
-三个 `dsh-*` peer 当前均声明 `>=0.2.0-rc.1 <0.2.1-0 || >=0.2.1-0 <0.3.0-0 || >=0.2.2-0 <0.3.0-0`，Cordis peer 为 `~4.1.0`，与运行依赖的 Cordis 要求一致。末段是 semver prerelease 语义的必需补写：`-0` 界标只放行同版本组的 prerelease，不外推到更高 patch（`>=0.2.1-0` 拒绝 `0.2.2-rc.x`）；实测整体放宽为 `>=0.2.0-0 <0.3.0-0` 同样拒绝 `0.2.2-rc.3`。宽范围只表达 npm 安装准入，不能推导全部版本通过运行验证，也不替代 DSH loader 自身的装载条件。CLI、Desktop 壳与实际 Core 的版本应分别核对。
+五个 `dsh-*` peer 使用 `>=0.2.2-rc.5 <0.2.3-0`，Cordis 使用 `~4.1.0`。npm 校验实际解析到的 peer；DSH 用 Core 自身的版本校验 `dsh-*` 范围。`<0.2.3-0` 排除下一补丁的预发布版。类型与测试所用的 DSH 包也固定为同一基准，锁文件测试会检查间接依赖，桌面探针会检查编译产物使用宿主模块。更新锁文件后用 Linux 目标的 `npm ci --dry-run --ignore-scripts` 复检可选平台依赖。
 
 ## 构建与本地打包
 
@@ -77,6 +77,7 @@ ELECTRON_RUN_AS_NODE=1 "$DSH_NODE_EXECUTABLE" scripts/check-desktop-compat.cjs
 | 验证项 | 状态与范围 |
 |---|---|
 | TypeScript | `npm run typecheck` 通过 |
+| 0.1.55 核心依赖与隔离回归 | Core `0.2.2-rc.5`：全量回归覆盖模式切换的排队、启动与实际派发边界、额度往返、代理账户绑定、AI Studio / Vertex 配置变化和 Colab 产物。Desktop 2.0.24-next 的实际解析表提供五个 DSH peer，隔离探针使用宿主模块装载全部 Host 入口。未改动本机 Profile。 |
 | 0.1.54：AI Studio 本地用量 / Vertex AI / Colab | `npm run check`：68 个测试文件，1129 项通过、1 项跳过。覆盖凭据切换时的用量、掩码与目录隔离，HTTP/SSE 429、Vertex 流式工具回填，以及 Colab 固定 argv、审批、Notebook 副本和退出边界。Desktop 2.0.24-next / Core 0.2.2-rc.5 的隔离组件探针校验了默认关闭声明、Colab 工具注册及卸载不影响已有模型路由。真实项目、Colab 账号、Notebook 远程执行与桌面 GUI 尚未验收。 |
 | macOS 钥匙串登录态（#23） | 2026-11-26 Windows / 系统 Node：57 个文件 / 975 项通过、1 项跳过。`tests/cli-login.test.ts` 锁定 `go-keyring-base64:` 解码（含原样 JSON 与坏值降级）、`expiry_date` 毫秒→ISO、`security find-generic-password` 只读 argv 与非 0 退出 / spawn 抛错降级；`tests/credentials.test.ts` 覆盖文件优先 → 钥匙串 → 旧版 `oauth_creds.json` 候选链、既有凭据可用时不读钥匙串、吊销后改用钥匙串、三源换发失败顺序与全缺席降级文案；`tests/agent-link.test.ts` 锁定 `AGY_ACP_FORCE_FILE_STORAGE=1` 注入（父环境覆盖无效）与首个 `session/new` 36 秒冷启动在握手档下成功、后续会话回普通档、显式 `timeoutMs` 优先；`tests/quota.test.ts` / `tests/snapshot-store.test.ts` 覆盖额度取数与快照身份的钥匙串兜底同序。全部为注入依赖的合成测试：真实 macOS 钥匙串读取、`AGY_ACP_FORCE_FILE_STORAGE` 对官方二进制的实际效果与 macOS 冷启动整链均未实机验证 |
 | 隔离回归 | 2026-11-22 使用系统 Node 24：48 个文件 / 865 项通过（契约基准 Core `0.2.2-rc.3` / Cordis `4.1.0`），包含旧宿主错误回退、目录停用项与档位、Schema 字段优先、已保存项目额度回退、会话表 LRU 容量与 429 限流文案，以及解压守卫常量对官方分发包实测体积的下限回归 |
@@ -152,7 +153,7 @@ node scripts/preview-ui.mjs
 
 1. 核对版本、锁文件、变更范围、文档与测试；确保目标版本未发布。
 2. 提交并推送到目标分支，确认远端 SHA 与已验证内容一致。
-3. 手动在对应 ref 运行工作流。现有任务使用 GitHub-hosted Ubuntu、Node 24，执行 `npm ci --ignore-scripts`、`npm run check`，再 `npm publish --provenance --access public`。
+3. 手动在与包版本同名的 `v<version>` 标签运行工作流。任务在 GitHub-hosted Ubuntu / Node 24 校验标签与版本一致，执行 `npm ci --ignore-scripts`、`npm run check`，并通过 `npm pack --dry-run --ignore-scripts --json | node scripts/check-npm-pack.mjs` 校验打包清单，再 `npm publish --provenance --access public`。
 4. 观察这一次运行的 SHA、检查结果与 publish 步骤。失败时先判断是否已经产生远端副作用，不盲目重跑同一版本。
 5. 在 registry 核对版本、dist-tag、tarball、仓库来源和 provenance；仅 workflow 返回成功还不足以宣称用户已装上该版本。
 

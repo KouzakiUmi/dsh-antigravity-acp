@@ -131,6 +131,26 @@ describe('代理模式流式工具与签名', () => {
     expect(credential.mock.calls.map(call => call[1])).toEqual([undefined, { forceRefresh: true }])
   })
 
+  it('流内 403 明确报告停用时不换发或重试', async () => {
+    const credential = vi.fn(async () => ({ accessToken: 'synthetic', source: 'login' as const, updatedAt: 'x' }))
+    const request = vi.fn(async () => new Response('data: {"error":{"code":403,"status":"PERMISSION_DENIED","message":"This service has been disabled in this account"}}\n\n'))
+    const instance = new AntigravityProxyAdapter({ credential: { credential }, transport: { request } })
+    await expect(collect(instance.stream(options))).rejects.toMatchObject({ code: 'AGY_ACCOUNT_SUSPENDED' })
+    expect(request).toHaveBeenCalledTimes(1)
+    expect(credential).toHaveBeenCalledTimes(1)
+  })
+
+  it('已派发的普通模型请求不对另一账户重放', async () => {
+    const credential = vi.fn(async (_signal?: AbortSignal, refresh?: { forceRefresh?: boolean }) => ({
+      accessToken: refresh?.forceRefresh ? 'new-fixture' : 'old-fixture', source: 'login' as const, updatedAt: 'x',
+    }))
+    const request = vi.fn(async () => new Response('data: {"error":{"status":"UNAUTHENTICATED"}}\n\n'))
+    const instance = new AntigravityProxyAdapter({ credential: { credential }, transport: { request } })
+    await expect(collect(instance.stream(options))).rejects.toMatchObject({ code: 'CANCELLED' })
+    expect(credential).toHaveBeenCalledTimes(2)
+    expect(request).toHaveBeenCalledTimes(1)
+  })
+
   it('MALFORMED_FUNCTION_CALL 未出块时有界重试一次并成功', async () => {
     const request = vi.fn()
       .mockResolvedValueOnce(new Response(`data: ${JSON.stringify(event([], 'MALFORMED_FUNCTION_CALL'))}\n\n`))

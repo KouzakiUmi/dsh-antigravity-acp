@@ -30,20 +30,26 @@ export const inject = ['llm']
 export function apply(ctx: Context): void {
   // credentials 是可选依赖：缺席时 key 解析返回 undefined（adapter 报 AUTH 可读态）。
   let credentials: CredentialProvider | undefined
+  const credentialChanges = new Set<() => void>()
   ctx.inject(['credentials'], (scope) => {
     const service = scope.get('credentials') as CredentialProvider | undefined
     credentials = service
-    scope.effect(() => () => { if (credentials === service) credentials = undefined })
+    scope.effect(() => () => {
+      if (credentials !== service) return
+      credentials = undefined
+      credentialChanges.forEach(notify => notify())
+    })
+    credentialChanges.forEach(notify => notify())
   })
   // 弱等待宿主行的设置总线：宿主行未装载时本行不注册路由（默认关闭语义）。
   ctx.inject(['antigravityAistudioSettings'], (scope) => {
     const bus = scope.get('antigravityAistudioSettings') as AistudioSettingsBus | undefined
     if (!bus) return
-    mountAistudioRouter(scope, bus, () => credentials)
+    mountAistudioRouter(scope, bus, () => credentials, credentialChanges)
   })
 }
 
-function mountAistudioRouter(ctx: Context, bus: AistudioSettingsBus, readCredentials: () => CredentialProvider | undefined): void {
+function mountAistudioRouter(ctx: Context, bus: AistudioSettingsBus, readCredentials: () => CredentialProvider | undefined, credentialChanges: Set<() => void>): void {
   // AI Studio 出网与官方进程同一套代理设置；标准 Google REST，不需要 agy 线身份
   // 伪装或固定头序，普通代理感知 fetch 即可（不经 wire-identity 端点白名单）。
   const fetch = createLiveProxiedFetch(() => {
@@ -92,34 +98,46 @@ function mountAistudioRouter(ctx: Context, bus: AistudioSettingsBus, readCredent
     if (want && registration === undefined) {
       registration = ctx.llm.registerAdapter([AISTUDIO_PROVIDER_ID], adapter)
       ctx.logger?.info?.('antigravity-aistudio: AI Studio 路由已注册')
-      try { ctx.emit('llm/adapters-updated') } catch { /* 观察者不能否决目录更新 */ }
     } else if (!want && registration !== undefined) {
       registration()
       registration = undefined
-      adapter.invalidateModelCatalog()
       ctx.logger?.info?.('antigravity-aistudio: AI Studio 路由已注销')
-      try { ctx.emit('llm/adapters-updated') } catch { /* 同上 */ }
     }
   }
 
   // 初始状态 + 后续切换都走同一条幂等路径；开关或引用名变化都刷新目录。
-  syncRegistration(bus.enabled())
-  let lastRef = bus.credentialRef()
-  const unsubscribe = bus.subscribe(() => {
-    const ref = bus.credentialRef()
-    if (ref !== lastRef) { lastRef = ref; adapter.invalidateCredential() }
-    else adapter.invalidateModelCatalog()
-    try { syncRegistration(bus.enabled()) } catch (error) {
-      ctx.logger?.warn?.(`antigravity-aistudio: 路由注册失败：${error instanceof Error ? error.message : String(error)}`)
-    }
-  })
-
   ctx.effect(function* () {
+    const notifyModels = () => {
+      if (registration !== undefined) {
+        try { ctx.emit('llm/models-updated', AISTUDIO_PROVIDER_ID) } catch { /* 观察者不能否决刷新 */ }
+      }
+    }
+    const credentialChanged = () => { adapter.invalidateOperations(); notifyModels() }
+    credentialChanges.add(credentialChanged)
+    const offCredential = ctx.on('credentials/reference-updated', ref => {
+      if (ref === bus.credentialRef()) credentialChanged()
+    })
+    let lastRef = bus.credentialRef()
+    const unsubscribe = bus.subscribe(() => {
+      const ref = bus.credentialRef()
+      if (ref !== lastRef) { lastRef = ref; adapter.invalidateOperations() }
+      if (!bus.enabled()) adapter.invalidateOperations()
+      const before = registration
+      try {
+        syncRegistration(bus.enabled())
+        if (registration === before) notifyModels()
+      } catch { ctx.logger?.warn?.('antigravity-aistudio: 路由注册失败') }
+    })
     yield () => {
       unsubscribe()
-      adapter.invalidateCredential()
-      if (registration !== undefined) { registration(); registration = undefined }
-      void fetch.close()
+      offCredential()
+      credentialChanges.delete(credentialChanged)
+      adapter.dispose()
+      try { registration?.() } finally {
+        registration = undefined
+        void fetch.close().catch(() => ctx.logger?.warn?.('antigravity-aistudio: 代理连接回收失败'))
+      }
     }
+    syncRegistration(bus.enabled())
   }, 'antigravity-aistudio 路由生命周期清理')
 }

@@ -18,7 +18,7 @@
 
 ---
 
-> **0.1.54 · 扩展 Google 接入**：新增 AI Studio 直连和本地用量、标准 Vertex AI 路由，以及可在插件页单独启停的 Colab 工具。ACP 仍是默认模式。[完整更新记录](docs/changelog.md#0154--2026-11-28)
+> **0.1.55 · 核心依赖与切换修复**：核心模块改由 DSH Core `0.2.2-rc.5` 同一发布线提供，修复模式、凭据和项目切换后的旧请求与旧目录，并完善 Colab 的产物与取消处理。[完整更新记录](docs/changelog.md#0155--2026-11-28)
 
 ## 快速开始
 
@@ -43,7 +43,7 @@ dsh plugin --profile web add dsh-bundle-antigravity-host
 | **Antigravity ACP（默认）** | 设置 → 连接 / 登录 ACP | Antigravity 官方登录态 |
 | **Antigravity 代理** | 设置 → 运行模式 | 独立连接的 Google 代理账户；开启后停用 ACP |
 | **Google AI Studio** | 设置 → AI Studio | Gemini API key；此 Host 的用量和限流单独显示，项目总量见 AI Studio 看板 |
-| **Vertex AI** | 设置 → Vertex AI | Google Cloud 项目、区域和 ADC；支持文本流式和工具回填 |
+| **Vertex AI** | 设置 → Vertex AI | 项目、区域可继承宿主环境变量；用 ADC 拉取 Gemini 模型，支持文本流式和工具回填 |
 | **Google Colab** | 插件 → Google Colab | [官方 Colab CLI 与已有 ADC](docs/colab.md)；可查 Compute Units，经审批在指定的现有运行时执行 Python / Notebook |
 
 AI Studio 和 Vertex AI 可与 ACP 或代理模式并用。Colab 随同一个包安装，默认关闭，不注册模型；关闭它只会移除 Colab 工具。
@@ -121,15 +121,15 @@ flowchart LR
 | 项目 | 当前声明 / 证据 |
 |---|---|
 | Node.js | `>=22.19` |
-| DSH Core peer 范围 | `>=0.2.0-rc.1 <0.2.1-0 \|\| >=0.2.1-0 <0.3.0-0 \|\| >=0.2.2-0 <0.3.0-0`，适用于所声明的三个 `dsh-*` peer；npm 与 DSH 分别检查准入 |
+| 当前源码的 DSH Core peer 范围 | `>=0.2.2-rc.5 <0.2.3-0`；运行期使用宿主的 LLM、子进程、Typert、附件和凭据模块 |
 | Cordis peer 范围 | `~4.1.0` |
-| 开发契约基准 | `dsh-llm` / `dsh-subprocess` / `dsh-typert-protocol` / `dsh-attachment` **0.2.2-rc.3**，Cordis **4.1.0**（与实机内嵌版本一致，类型检查在该基准下运行） |
+| 开发契约基准 | DSH Core **0.2.2-rc.5**、Cordis **4.1.0** |
 | 上游协议 | ACP **v1**；SDK **1.4.0** 与默认 server **1.5.2** 是两个独立版本 |
 | 0.1.54 本地验证 | 类型检查、68 个测试文件（1129 项通过、1 项跳过）和构建。 |
 | 桌面组件验证 | DSH NEXT **2.0.24-next** / Core **0.2.2-rc.5**：隔离验证了模型路由并存、Typert 注册与清理、Colab 工具注册和停用，以及无审批渠道时拒绝执行。 |
 | 待实机验收 | 完整 Desktop GUI、真实 Vertex AI 生成、Colab 账号余额和 Notebook 执行。已有 AI Studio 上游验证见[技术记录](docs/aistudio-provider-design.md#11-真实-key-探针核实结论2026-11-27)。 |
 
-宿主附件服务是可选依赖，缺少时仍可文本聊天。npm 对照已解析的依赖版本检查 peer；本包未声明 `engines.dsh`，DSH 对照自身 Core 版本检查 `dsh-*` peer，并让预发布版本参与范围匹配。路由、服务与客户端装载另行验证。[完整声明与验证方法](docs/development.md)
+插件复用宿主的核心模块，不私装固定的旧版本。附件和凭据**服务**仍按功能使用：没有附件服务时可文本聊天，没有凭据服务时 AI Studio 无法读取 API key。[完整声明与验证方法](docs/development.md)
 
 ## 文档导航
 

@@ -98,10 +98,11 @@ function mountProxyRouter(
     }
   }
 
-  // 初始状态 + 后续切换都走同一条幂等路径。
-  syncRegistration(bus.current())
   const unsubscribe = bus.subscribe((mode) => {
-    try { syncRegistration(mode) } catch (error) {
+    try {
+      syncRegistration(mode)
+      if (mode && registration !== undefined) bus.setRouterReady(true)
+    } catch (error) {
       bus.setRouterReady(false)
       ctx.logger?.warn?.(`antigravity-proxy: 路由注册失败，ACP 保持停用：${error instanceof Error ? error.message : String(error)}`)
     }
@@ -111,7 +112,7 @@ function mountProxyRouter(
     try { ctx.emit('llm/adapters-updated') } catch { /* 观察者不能否决目录更新 */ }
   })
   try {
-    // 先取得代理路由，再允许宿主撤下 ACP，注册失败不能留下空路由。
+    // 已请求代理时先注册路由；ACP 不依赖此处的就绪状态。
     syncRegistration(bus.requested())
     bus.setRouterReady(true)
   } catch (error) {

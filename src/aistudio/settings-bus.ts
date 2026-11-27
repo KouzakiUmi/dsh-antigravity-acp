@@ -24,7 +24,7 @@ export function createAistudioSettingsBus(read: {
   credentialRef(): string | undefined
   modelSettings(): Pick<AntigravityHostConfig, 'modelOverrides'>
   proxySettings(): { url?: string; bypass?: string }
-}): AistudioSettingsBus & { notify(): void } {
+}): AistudioSettingsBus & { notify(force?: boolean): void } {
   const listeners = new Set<() => void>()
   const ref = (): string => {
     const value = read.credentialRef()?.trim()
@@ -32,10 +32,10 @@ export function createAistudioSettingsBus(read: {
   }
   let lastEnabled = read.enabled() === true
   let lastRef = ref()
-  const notify = (): void => {
+  const notify = (force = false): void => {
     const nextEnabled = read.enabled() === true
     const nextRef = ref()
-    if (nextEnabled === lastEnabled && nextRef === lastRef) return
+    if (!force && nextEnabled === lastEnabled && nextRef === lastRef) return
     lastEnabled = nextEnabled
     lastRef = nextRef
     for (const listener of [...listeners]) listener()

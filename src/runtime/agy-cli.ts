@@ -29,6 +29,7 @@ export interface CliRunResult {
 export interface CliRunRequest {
   argv: readonly string[]
   timeoutMs?: number
+  signal?: AbortSignal
 }
 
 export type CliRun = (request: CliRunRequest) => Promise<CliRunResult>
@@ -301,8 +302,10 @@ function usageFailure(updatedAt: string, error: unknown): QuotaSnapshot {
 }
 
 /** 跑一次官方 CLI 的模型清单（只读列表，无模型回合）。 */
-export async function fetchAgyModels(run: CliRun, cliPath: string): Promise<Array<{ id: string; name: string }>> {
-  const result = await run({ argv: [cliPath, 'models'], timeoutMs: AGY_CLI_TIMEOUT_MS })
+export async function fetchAgyModels(run: CliRun, cliPath: string, signal?: AbortSignal): Promise<Array<{ id: string; name: string }>> {
+  signal?.throwIfAborted()
+  const result = await run({ argv: [cliPath, 'models'], timeoutMs: AGY_CLI_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) })
+  signal?.throwIfAborted()
   if (result.exitCode !== 0) {
     throw new AgyCliError('cli-failed', `agy models 退出码 ${result.exitCode}：${result.stderr.slice(-300)}`)
   }
@@ -326,7 +329,8 @@ export function createSubprocessCliRun(
   subprocess: SubprocessRuntime,
   proxy?: ProxySettings | undefined,
 ): CliRun {
-  return async ({ argv, timeoutMs }) => {
+  return async ({ argv, timeoutMs, signal }) => {
+    signal?.throwIfAborted()
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), timeoutMs ?? AGY_CLI_TIMEOUT_MS)
     try {
@@ -342,7 +346,7 @@ export function createSubprocessCliRun(
           stderr: { maxBytes: 32 * 1024 },
         },
         graceMs: 5_000,
-        signal: controller.signal,
+        signal: signal === undefined ? controller.signal : AbortSignal.any([controller.signal, signal]),
       })
       const outcome = await handle.done
       return {

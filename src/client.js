@@ -38,7 +38,7 @@ window.__ModuleLoader__.load({
       { key: 'aistudioCredentialRef', group: 'aistudio', label: msg('AI Studio 凭据引用名'), placeholder: 'AISTUDIO_API_KEY', hint: msg('环境变量名；真实值经宿主凭据接缝解析，不存入设置。') },
       { key: 'vertexEnabled', group: 'vertex', checkbox: true, label: msg('使用 Vertex AI'), hint: msg('独立模型路由，使用宿主已有的 Google 应用默认凭据（ADC）。') },
       { key: 'vertexProject', group: 'vertex', label: msg('Google Cloud 项目'), placeholder: 'example-project' },
-      { key: 'vertexLocation', group: 'vertex', label: msg('Vertex AI 区域'), defaultValue: 'global', placeholder: 'global' },
+      { key: 'vertexLocation', group: 'vertex', label: msg('Vertex AI 区域'), placeholder: 'global' },
       { key: 'vertexModels', group: 'vertex', lines: true, label: msg('Gemini 发布商模型 ID'), placeholder: 'gemini-4-hydrogen', hint: msg('每行一个模型 ID。模型须在所选项目与区域可用。') },
       { key: 'cliQuotaEnabled', group: 'quota', checkbox: true, label: msg('使用 agy CLI 补充额度'), hint: msg('默认不启动 agy；开启后才读取 AI Credits。') },
       { key: 'autoWarmup', group: 'general', checkbox: true, defaultChecked: true, acpOnly: true, label: msg('启动时自动预热'), hint: msg('不发送消息；下次启用插件时生效。') },
@@ -401,9 +401,17 @@ window.__ModuleLoader__.load({
       return rows
     }
 
+    function vertexModelLines(value) {
+      return [...new Set(String(value ?? '').split(/\r?\n/).map(id => id.trim()).filter(Boolean))]
+    }
+
     function vertexModelRows(value) {
-      const ids = new Set(String(value ?? '').split(/\r?\n/).map(id => id.trim()).filter(id => VERTEX_MODEL_PATTERN.test(id)))
-      return [...ids].map(name => ({ id: VERTEX_MODEL_PREFIX + name, name, inputModalities: ['text'], inCatalog: true }))
+      return vertexModelLines(value).filter(id => VERTEX_MODEL_PATTERN.test(id))
+        .map(name => ({ id: VERTEX_MODEL_PREFIX + name, name, inputModalities: ['text'], inCatalog: true }))
+    }
+
+    function vertexScope(settings) {
+      return JSON.stringify({ project: (settings.vertexProject ?? '').trim(), location: (settings.vertexLocation ?? '').trim() })
     }
 
     function unwrap(result) {
@@ -810,6 +818,42 @@ window.__ModuleLoader__.load({
         active ? h(AistudioUsagePanel, { key: `${credentialRef}:${change.revision}`, control, credentialChanging: change.busy }) : null)
     }
 
+    function VertexCatalogAction({ readModels, disabled, scopeDirty, scope, mergeModels }) {
+      const [state, setState] = React.useState({ busy: false })
+      const active = React.useRef(false)
+      const pending = React.useRef(false)
+      React.useEffect(() => {
+        active.current = true
+        return () => { active.current = false }
+      }, [])
+      const pull = async () => {
+        if (!readModels || disabled || scopeDirty || pending.current) return
+        pending.current = true
+        setState({ busy: true, text: t('正在拉取 Vertex AI 模型…') })
+        try {
+          const value = parseVertexModelsResult(unwrap(await readModels(JSON.parse(scope))))
+          if (!active.current) return
+          if (value.status === 'error') {
+            setState({ busy: false, text: t(value.message) })
+            return
+          }
+          const ids = [...new Set(value.ids.map(id => id.trim()).filter(id => VERTEX_MODEL_PATTERN.test(id)))]
+          const added = ids.length ? mergeModels(scope, ids) : undefined
+          setState({ busy: false, text: ids.length === 0 ? t('发布商目录未返回 Gemini 模型。')
+            : added === undefined ? undefined
+            : added ? t('已将 {count} 个模型添加到草稿。', { count: added }) : t('目录中的模型已在草稿中。') })
+        } catch {
+          if (active.current) setState({ busy: false, text: t('Vertex AI 目录读取失败，请重试。') })
+        } finally { pending.current = false }
+      }
+      return h(React.Fragment ?? 'div', null,
+        h(SectionHeading, { title: t('Vertex AI 模型'), description: t('读取 Google 发布商目录不发送生成请求。模型实际可用性随项目和区域变化。'),
+          action: h('button', { type: 'button', style: ACTION, 'aria-busy': state.busy || undefined,
+            disabled: !readModels || disabled || scopeDirty || state.busy, onClick: pull }, t('拉取模型')) }),
+        scopeDirty || state.text ? h('p', { role: 'status', style: { margin: '0 0 8px', overflowWrap: 'anywhere' } },
+          scopeDirty ? t('请先保存 Vertex AI 项目和区域，再拉取模型。') : state.text) : null)
+    }
+
     /** 代理账户面板：授权 URL 只在显式连接后显示。 */
     function ProxyAccountPanel({ control, disabled, connectDisabled, onAccountChanged }) {
       const [snapshot, setSnapshot] = React.useState(undefined)
@@ -895,10 +939,11 @@ window.__ModuleLoader__.load({
       const accountVersion = React.useRef(0)
       const polling = React.useRef(false)
       const manualModelPull = React.useRef(false)
-      const pullModels = React.useCallback(async (force = false) => {
-        if (!props.control || manualModelPull.current) return
-        if (force) manualModelPull.current = true
+      const pullModels = React.useCallback(async (force = false, reset = false) => {
+        if (!props.control || (!reset && manualModelPull.current)) return
         const version = ++modelVersion.current
+        manualModelPull.current = force ? version : false
+        if (reset) setModels([])
         setModelBusy(true)
         if (force) setModelMessage(t('正在拉取模型目录…'))
         try {
@@ -908,26 +953,26 @@ window.__ModuleLoader__.load({
           setModelMessage(value.status === 'error' ? t(value.message) : '')
         } catch (error) { if (alive.current && version === modelVersion.current) setModelMessage(error instanceof Error ? error.message : String(error)) }
         finally {
-          if (force) manualModelPull.current = false
+          if (manualModelPull.current === version) manualModelPull.current = false
           if (alive.current && version === modelVersion.current) setModelBusy(false)
         }
       }, [props.control])
       const accountAction = React.useCallback(async (action = 'status') => {
         if (!props.control) return
         if (action === 'status' && polling.current) return
-        polling.current = true
         const version = ++accountVersion.current
+        polling.current = version
         try {
           const value = unwrap(await props.control('account', { action }))
           if (alive.current && version === accountVersion.current) setAccount(value)
         } catch (error) { if (alive.current && version === accountVersion.current) setAccount({ state: 'error', message: error instanceof Error ? error.message : String(error) }) }
-        finally { polling.current = false }
+        finally { if (polling.current === version) polling.current = false }
       }, [props.control])
       React.useEffect(() => {
         alive.current = true
         void accountAction('status')
         void pullModels(false)
-        return () => { alive.current = false; ++modelVersion.current; ++accountVersion.current }
+        return () => { alive.current = false; ++modelVersion.current; ++accountVersion.current; manualModelPull.current = false; polling.current = false }
       }, [accountAction, pullModels])
       React.useEffect(() => {
         const timer = setInterval(() => {
@@ -959,7 +1004,11 @@ window.__ModuleLoader__.load({
       draftRef.current = draft
       const effectiveProxyMode = account?.generationMode ? account.generationMode.requested === 'proxy' : savedProxyMode
       const activeModeRef = React.useRef(effectiveProxyMode)
-      activeModeRef.current = effectiveProxyMode
+      React.useEffect(() => {
+        if (activeModeRef.current === effectiveProxyMode) return
+        activeModeRef.current = effectiveProxyMode
+        void pullModels(true, true)
+      }, [effectiveProxyMode, pullModels])
       React.useEffect(() => { props.readQuota?.observeMode?.(effectiveProxyMode ? PROXY_PROVIDER : PROVIDER) }, [effectiveProxyMode, props.readQuota])
       // ---- AI Studio Tab：独立目录 / 手动 key 写入 / 掩码状态 ----
       const [aistudioCatalog, setAistudioCatalog] = React.useState(undefined)
@@ -1003,9 +1052,14 @@ window.__ModuleLoader__.load({
         if (!props.aistudioControl) throw new Error(t('AI Studio 控制服务不可用：请确认 Host 与 Client 版本一致。'))
         const result = unwrap(await props.aistudioControl('setKey', { value }))
         if (result.status === 'error') throw new Error(t(result.message ?? 'API key 保存失败。'))
-        await pullAistudioKeyStatus()
+        if (!alive.current || aistudioScope.current !== scope) return
+        ++scope.models
+        ++scope.key
+        setAistudioCatalog(undefined)
+        setAistudioKeyStatus(undefined)
         void pullAistudioModels(true)
-      }, [props.aistudioControl, pullAistudioKeyStatus, pullAistudioModels])
+        await pullAistudioKeyStatus()
+      }, [props.aistudioControl, scope, pullAistudioKeyStatus, pullAistudioModels])
       React.useEffect(() => {
         setAistudioModelMessage('')
         setAistudioModelBusy(false)
@@ -1032,7 +1086,7 @@ window.__ModuleLoader__.load({
           if (current && alive.current && Array.isArray(providers)) setRegistered(providers.some((row) => row?.id === (effectiveProxyMode ? PROXY_PROVIDER : PROVIDER)))
         }).catch(() => { if (current && alive.current) setRegistered(false) })
         return () => { current = false }
-      }, [effectiveProxyMode, remote])
+      }, [effectiveProxyMode, account?.generationMode?.proxyRouterReady, remote])
 
       const editField = React.useCallback((key, value) => {
         if (savingRef.current) return
@@ -1044,6 +1098,16 @@ window.__ModuleLoader__.load({
         setConflicts((previous) => previous.filter((field) => field !== key))
         setDraft(next)
       }, [])
+
+      const mergeVertexModels = (scope, ids) => {
+        if (!alive.current || savingRef.current || vertexScope(baseline.current) !== scope
+          || dirty.current.has('vertexProject') || dirty.current.has('vertexLocation')) return undefined
+        const existing = vertexModelLines(draftRef.current.vertexModels)
+        const merged = [...new Set([...existing, ...ids])]
+        const added = merged.length - existing.length
+        if (added) editField('vertexModels', merged.join('\n'))
+        return added
+      }
 
       /**
        * 单条模型设置：合并成整份 modelOverrides 再交给通用编辑路径，
@@ -1134,12 +1198,7 @@ window.__ModuleLoader__.load({
             return
           }
           setLoading(true)
-          const described = Promise.resolve(remote.settings.describe()).then(unwrap)
-          const providers = Promise.resolve(remote.llm?.listProviders?.())
-            .then((value) => unwrap(value))
-            .catch(() => [])
-            .then((rows) => (Array.isArray(rows) ? rows : []))
-          const [settings, rows] = await Promise.all([described, providers])
+          const settings = unwrap(await remote.settings.describe())
           if (!alive.current || version !== settingsVersion.current) return
           const namespaces = Array.isArray(settings?.namespaces) ? settings.namespaces : []
           // 只按精确 namespace 匹配：按字段回退会命中别人的配置，而保存用的
@@ -1147,7 +1206,6 @@ window.__ModuleLoader__.load({
           const found = namespaces.find((item) => item?.ns === ENTRY_ID)
           setView(found ?? null)
           const current = found?.value && typeof found.value === 'object' ? found.value : {}
-          const activeProvider = activeModeRef.current ? PROXY_PROVIDER : PROVIDER
           setSavedProxyMode(current.proxyMode === true)
           const server = Object.fromEntries(FIELDS.map((field) => [field.key, field.checkbox
             ? (field.defaultChecked ? current[field.key] !== false : current[field.key] === true)
@@ -1215,7 +1273,6 @@ window.__ModuleLoader__.load({
           setDirtyKeys([...dirty.current])
           setConflicts((previous) => [...new Set([...previous.filter((key) => dirty.current.has(key)), ...changed])])
           setWritable(settings?.writable === true)
-          setRegistered(rows.some((row) => row?.id === activeProvider))
           if (!found) setStatus({ kind: 'error', text: t('宿主尚未提供 Antigravity ACP 的可编辑设置。请确认 Host 与 Client 插件版本一致，并重新加载插件后刷新配置。') })
           else if (!preserveStatus) setStatus(null)
         } catch (cause) {
@@ -1311,6 +1368,8 @@ window.__ModuleLoader__.load({
       const rows = modelRows(models, draft[OVERRIDES_KEY], effectiveProxyMode)
       const aistudioRows = aistudioModelRows(aistudioModels, draft[OVERRIDES_KEY])
       const editingDisabled = loading || saving || !view || !writable
+      const savedVertexScope = vertexScope(baseline.current)
+      const vertexScopeDirty = dirtyKeys.includes('vertexProject') || dirtyKeys.includes('vertexLocation')
       const connectionSettingsDirty = dirtyKeys.some(key => key === 'proxyUrl' || key === 'proxyBypass')
       const discardDraft = () => {
         if (savingRef.current) return
@@ -1415,7 +1474,7 @@ window.__ModuleLoader__.load({
               h('p', { style: { margin: '8px 0 0', fontSize: '11.5px', lineHeight: 1.5, opacity: .66 } }, t('AI Studio key 走你自己的 GCP 计费，与 agy 订阅额度无关。')))),
           h(AistudioCredentialPanels, { active: settingsPage === 'aistudio', control: props.aistudioControl,
             credentialRef: savedAistudioRef,
-            status: aistudioKeyStatus, disabled: editingDisabled || !props.aistudioControl, onSave: saveAistudioKey }),
+            status: aistudioKeyStatus, disabled: editingDisabled || !props.aistudioControl || dirtyKeys.includes('aistudioCredentialRef'), onSave: saveAistudioKey }),
           h('section', { 'aria-label': t('AI Studio 模型') },
             h(SectionHeading, { title: t('AI Studio 模型'),
               action: h('button', { type: 'button', title: t('刷新 AI Studio 模型目录'), 'aria-label': t('刷新 AI Studio 模型目录'), 'aria-busy': aistudioModelBusy || undefined, style: { ...ACTION, minHeight: '26px', padding: '3px 10px', flex: '0 0 auto', whiteSpace: 'nowrap' }, disabled: aistudioModelBusy || !props.aistudioControl, onClick: () => pullAistudioModels(true) }, t(aistudioModelBusy ? '正在刷新…' : '刷新')) }),
@@ -1426,9 +1485,11 @@ window.__ModuleLoader__.load({
         h('div', { id: 'agy-settings-page-vertex', role: 'tabpanel', style: pageStyle('vertex') },
           h('section', { 'aria-label': 'Vertex AI' },
             h(SectionHeading, { title: 'Vertex AI', action: settingsPage === 'vertex' ? h('a', { href: 'https://docs.cloud.google.com/vertex-ai/generative-ai/docs/start/gcp-auth', target: '_blank', rel: 'noopener noreferrer', style: ACTION }, t('配置 ADC')) : null }),
-            h('div', { style: PANEL }, h(SettingsFields, { ...fieldProps, fields: fieldsFor('vertex') }))),
+             h('div', { style: PANEL }, h(SettingsFields, { ...fieldProps, fields: fieldsFor('vertex') }),
+               h('p', { style: { margin: '8px 0 0', overflowWrap: 'anywhere' } }, t('留空时使用宿主环境变量：项目依次读取 GOOGLE_CLOUD_PROJECT、VERTEXAI_PROJECT；区域依次读取 GOOGLE_CLOUD_LOCATION、VERTEXAI_LOCATION，最后使用 global。')))),
           h('section', { 'aria-label': t('Vertex AI 模型') },
-            h(SectionHeading, { title: t('Vertex AI 模型'), description: t('来自上方配置；保存时不发送模型请求。') }),
+             h(VertexCatalogAction, { key: `${savedVertexScope}:${vertexScopeDirty}`, readModels: props.readVertexModels,
+               scope: savedVertexScope, scopeDirty: vertexScopeDirty, disabled: editingDisabled, mergeModels: mergeVertexModels }),
             h(ModelOverrideList, { rows: vertexModelRows(draft.vertexModels), overrides: draft[OVERRIDES_KEY], disabled: editingDisabled, onEdit: editOverride, showEffort: false,
               emptyHint: '填写 Gemini 发布商模型 ID 后，这里会显示可编辑的模型。', hiddenWarning: '全部隐藏后，Vertex AI 将从模型选择器消失。' }))),
 
@@ -2096,6 +2157,34 @@ window.__ModuleLoader__.load({
       ],
     }
 
+    function parseVertexModelsResult(value) {
+      if (value?.status === 'ok' && Array.isArray(value.ids) && value.ids.length <= 512 && value.ids.every(id => typeof id === 'string')) return { status: 'ok', ids: value.ids }
+      if (value?.status === 'error' && typeof value.message === 'string') return { status: 'error', message: value.message }
+      throw new Error(t('Vertex AI 目录读取失败，请重试。'))
+    }
+
+    function parseVertexModelsRequest(value) {
+      if (typeof value?.project !== 'string' || typeof value?.location !== 'string' || value.project.length > 128 || value.location.length > 128) {
+        throw new TypeError('Invalid AgYVertexModelsRequest')
+      }
+      return { project: value.project.trim(), location: value.location.trim() }
+    }
+
+    const AGY_VERTEX_MODELS = {
+      id: `${AGY_QUOTA_PACKAGE}#agyVertex/models`,
+      service: 'agyVertex', namespace: 'agyVertex', method: 'models',
+      invocation: { kind: 'direct' }, parameters: [{ name: 'scope', wire: 'scope', source: 'json', codec: strictCodec(`${AGY_QUOTA_PACKAGE}#AgYVertexModelsRequest`, parseVertexModelsRequest) }],
+      result: strictCodec(`${AGY_QUOTA_PACKAGE}#AgYVertexModelsResult`, parseVertexModelsResult),
+    }
+
+    function makeVertexModelsReader(ctx) {
+      return async (scope) => {
+        const service = ctx.get('remote.agyVertex')
+        if (typeof service?.models !== 'function') return { status: 'error', message: t('Vertex AI 目录服务未就绪。') }
+        return await withTimeout(service.models(scope), 60_000, t('Vertex AI 目录读取失败，请重试。'))
+      }
+    }
+
     return {
       name: 'dsh-bundle-antigravity-host',
       // remote.settings / remote.llm 必须逐个声明：remote 各命名空间是独立服务，
@@ -2136,12 +2225,13 @@ window.__ModuleLoader__.load({
         const control = makeControlReader(ctx)
         const proxyControl = makeProxyControlReader(ctx)
         const aistudioControl = makeAistudioControlReader(ctx)
+        const readVertexModels = makeVertexModelsReader(ctx)
         // 挂载本包贡献的 remote（幂等，随 fiber 一起 dispose）。挂载失败不影响其它卡片：
         // 药丸会自行超时并显示「额度服务未就绪」的原因。
         try {
           const mounted = ctx.remote.$mount({
             package: AGY_QUOTA_PACKAGE,
-            descriptors: [...AGY_QUOTA_REMOTE.descriptors, ...AGY_PROXY_REMOTE.descriptors, ...AGY_AISTUDIO_REMOTE.descriptors],
+            descriptors: [...AGY_QUOTA_REMOTE.descriptors, ...AGY_PROXY_REMOTE.descriptors, ...AGY_AISTUDIO_REMOTE.descriptors, AGY_VERTEX_MODELS],
           })
           ctx.effect(() => mounted, 'antigravity-acp: mount quota remote')
         } catch (error) {
@@ -2156,7 +2246,7 @@ window.__ModuleLoader__.load({
                   id: 'antigravity-acp',
                   order: 42,
                   label: () => 'Antigravity ACP',
-                  inject: () => ({ remote: ctx.remote, control, proxyControl, readQuota, aistudioControl }),
+                  inject: () => ({ remote: ctx.remote, control, proxyControl, readQuota, aistudioControl, readVertexModels }),
                 },
                 AntigravitySettingsCard,
               ),

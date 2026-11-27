@@ -32,7 +32,7 @@ const usagePreview = { status: 'ok', pacificDay: '2026-10-22', minuteTruncated: 
     { model: 'gemini-4-argon', minute: { requests: 2, inputTokens: 2560, reportedRequests: 2 }, today: { requests: 6, inputTokens: 9800, reportedRequests: 6 } },
     { model: 'gemini-3.8-flash', minute: { requests: 1, inputTokens: null, reportedRequests: 0 }, today: { requests: 2, inputTokens: 0, reportedRequests: 1 } },
   ], last429: { at: '2026-10-22T10:02:30.000Z', source: 'http', model: 'gemini-3.8-flash', retryAfterMs: 30_000 } }
-const isolatedStates = { AistudioCredentialPanels: [undefined], AistudioUsagePanel: [usagePreview, false] }
+const isolatedStates = { AistudioCredentialPanels: [undefined], AistudioUsagePanel: [usagePreview, false], VertexCatalogAction: [undefined] }
 let localStates
 let localIndex
 const previewAistudioControl = () => {}
@@ -128,5 +128,5 @@ const vertexSettings = render('antigravity-acp', {
   0: { state: 'idle' }, 1: models, 4: { revision: 1 }, 5: true, 8: false, 9: true, 14: 'vertex',
   6: { vertexEnabled: true, vertexProject: 'example-project', vertexLocation: 'global',
     vertexModels: 'gemini-4-hydrogen\ngemini-4-neon', modelOverrides: { 'vertex-ai-gemini-4-neon': { enabled: false } } },
-}, { remote: {}, control() {} })
+}, { remote: {}, control() {}, readVertexModels: async () => ({ status: 'ok', ids: ['gemini-4-hydrogen', 'gemini-4-neon'] }) })
 export { quota, models, aistudioModels, settings, proxySettings, proxyLoginSettings, aistudioSettings, vertexSettings, pill, render, escape, injectedStyles }

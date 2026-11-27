@@ -7,9 +7,7 @@
  * `dsh-app-boot` 自身的版本，按 `includePrerelease: true` 匹配；不通过即
  * `incompatible-version` 拒绝安装。
  *
- * 0.1.10 曾把三个 `dsh-*` peer 写成逐 alpha 枚举（止于 `0.2.1-alpha.3`），宿主升到
- * `0.2.1-alpha.4` 后就被判为不兼容。这里把「必须写成覆盖 0.2.x 整个 alphas 段的宽范围」
- * 固化成断言，避免同一个坑再踩一次。
+ * 同一发布线使用连续范围，但不接受早于实际开发基准的核心。
  */
 import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
@@ -20,6 +18,8 @@ const root = join(fileURLToPath(new URL('.', import.meta.url)), '..')
 const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as {
   name: string
   version: string
+  dependencies: Record<string, string>
+  devDependencies: Record<string, string>
   peerDependencies?: Record<string, string>
   dsh?: { client?: { inject?: string[]; platform?: string } }
 }
@@ -96,22 +96,35 @@ function satisfies(version: string, range: string): boolean {
 
 describe('宿主兼容性声明', () => {
   const peers = Object.entries(manifest.peerDependencies ?? {}).filter(([name]) => isHostCheckedPeer(name))
+  const coreBaseline = manifest.devDependencies['@deepseek-ai/dsh-llm']!
 
-  it('至少声明了本包真正依赖的宿主服务（dsh-llm / dsh-subprocess / dsh-typert-protocol）', () => {
+  it('核心运行模块由宿主提供，不是插件私带的生产依赖', () => {
     const names = peers.map(([name]) => name)
-    expect(names).toContain('@deepseek-ai/dsh-llm')
-    expect(names).toContain('@deepseek-ai/dsh-subprocess')
-    expect(names).toContain('@deepseek-ai/dsh-typert-protocol')
+    expect(names).toEqual(expect.arrayContaining(['dsh-attachment', 'dsh-credentials', 'dsh-llm', 'dsh-subprocess', 'dsh-typert-protocol'].map(name => `@deepseek-ai/${name}`)))
+    expect(Object.keys(manifest.dependencies).filter(isHostCheckedPeer)).toEqual([])
+    for (const name of names) expect(manifest.devDependencies[name], name).toBe(coreBaseline)
   })
 
-  it('每个受校验 peer 都覆盖 0.2.x 的整个 alpha 段（不得逐 alpha 枚举）', () => {
+  it('覆盖已对齐的 Core 与同一发布线，不接受旧核心和下一补丁预发布', () => {
     for (const [name, range] of peers) {
-      for (const version of ['0.2.1-alpha.4', '0.2.1-alpha.9', '0.2.1-alpha.10', '0.2.1', '0.2.2']) {
+      for (const version of [coreBaseline, '0.2.2-rc.6', '0.2.2']) {
         expect(satisfies(version, range), `${name} 应满足 ${version}`).toBe(true)
       }
-      for (const version of ['0.3.0-0', '0.3.0', '1.0.0']) {
+      for (const version of ['0.2.1', '0.2.2-rc.3', '0.2.2-rc.4', '0.2.3-alpha.2', '0.3.0']) {
         expect(satisfies(version, range), `${name} 不应满足 ${version}`).toBe(false)
       }
+    }
+  })
+
+  it('锁文件里所有 DSH 核心包属于同一版本（包括传递依赖）', () => {
+    const lock = JSON.parse(readFileSync(join(root, 'package-lock.json'), 'utf8')) as {
+      packages: Record<string, { version: string; dev?: boolean; peer?: boolean }>
+    }
+    const core = Object.entries(lock.packages).filter(([name]) => /(?:^|\/)node_modules\/@deepseek-ai\/dsh(?:-[^/]+)?$/.test(name))
+    expect(core.length).toBeGreaterThan(peers.length)
+    for (const [path, pkg] of core) {
+      expect(pkg.version, path).toBe(coreBaseline)
+      expect(pkg.dev === true || pkg.peer === true, path).toBe(true)
     }
   })
 
@@ -127,9 +140,8 @@ describe('宿主兼容性声明', () => {
     // 0.1.10 实际使用的枚举写法。
     const historical = '0.2.0-rc.2 || 0.2.1-alpha.1 || 0.2.1-alpha.2 || 0.2.1-alpha.3'
     expect(historical).toMatch(/\|\|\s*\d/) // 会被「不应使用 || 枚举精确版本」击中
-    // 收窄到 0.2.0 线的区间写法。
-    const narrowed = '>=0.2.0-rc.1 <0.2.1-0'
-    expect(satisfies('0.2.1-alpha.4', narrowed)).toBe(false) // 会被「覆盖 0.2.x alpha 段」击中
+    // 旧的宽范围会放行本版已经不使用的 rc.3。
+    expect(satisfies('0.2.2-rc.3', '>=0.2.2-0 <0.3.0-0')).toBe(true)
   })
 
   it('客户端注入清单覆盖本包实际用到的客户端包', () => {

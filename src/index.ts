@@ -60,6 +60,8 @@ import { createProxyModeBus } from './proxy/mode-bus.js'
 import type { ProxyModeBus } from './proxy/mode-bus.js'
 import { createAistudioSettingsBus } from './aistudio/settings-bus.js'
 import type { VertexSettingsBus } from './vertex/settings-bus.js'
+import { resolveVertexScope } from './vertex/environment.js'
+import { AgYVertexService } from './vertex/remote.js'
 import { fetchProxyQuotaSnapshot } from './proxy/quota-source.js'
 import { createProxyTransport } from './proxy/transport.js'
 import type { ProxyModelCatalog } from './proxy/adapter.js'
@@ -550,30 +552,37 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
    */
   let cliModelRows: readonly { id: string; name: string }[] | undefined
   let cliDiskRead = false
-  let cliRefresh: Promise<void> | undefined
+  let cliRefresh: { mode: AbortSignal; promise: Promise<void> } | undefined
   let cliRefreshDone = false
   const loadCliModels = async (force = false): Promise<readonly { id: string; name: string }[]> => {
+    const mode = adapter.modeSignal()
+    mode.throwIfAborted()
     const cliPath = findCli()
     if (force && !cliPath) throw new Error('未找到官方 agy CLI，无法拉取模型；请先安装并登录官方 CLI')
     if (!cliDiskRead) {
-      cliDiskRead = true
       const cached = await readCachedCatalog({ cacheDir, acpVersion, fileName: 'cli-models.json' })
+      mode.throwIfAborted()
+      cliDiskRead = true
       if (cached) cliModelRows = cached.map((row) => ({ id: row.id, name: row.name }))
     }
-    if (cliPath && cliRefresh === undefined && (force || !cliRefreshDone)) {
-      cliRefresh = (async () => {
-        const models = await fetchAgyModels(cliRun, cliPath)
+    if (cliPath && cliRefresh?.mode !== mode && (force || !cliRefreshDone)) {
+      const promise = (async () => {
+        const models = await fetchAgyModels(cliRun, cliPath, mode)
+        mode.throwIfAborted()
         if (models.length === 0) return
         await writeCachedCatalog({ cacheDir, acpVersion, fileName: 'cli-models.json', models })
+        mode.throwIfAborted()
         cliModelRows = models
         catalogChanged()
       })().finally(() => {
-        cliRefresh = undefined
-        cliRefreshDone = true
+        if (cliRefresh?.mode === mode) cliRefresh = undefined
+        if (!mode.aborted) cliRefreshDone = true
       })
-      void cliRefresh.catch(() => ctx.logger?.warn?.('antigravity-acp: 模型目录刷新失败，保留已有目录'))
+      cliRefresh = { mode, promise }
+      void promise.catch(() => { if (!mode.aborted) ctx.logger?.warn?.('antigravity-acp: 模型目录刷新失败，保留已有目录') })
     }
-    if (force) await cliRefresh
+    if (force) await cliRefresh?.promise
+    mode.throwIfAborted()
     return cliModelRows ?? []
   }
 
@@ -587,7 +596,7 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
   let metadata: AdapterMetadata | undefined
   // Serialize startup/credential preparation, not inference. This avoids competing OAuth imports.
   let startupBarrier: Promise<unknown> = Promise.resolve()
-  const adapter = new PooledAcpAdapter(() => {
+  const adapter: PooledAcpAdapter = new PooledAcpAdapter(() => {
     const lifecycle = new AcpLifecycle()
     const active: ActiveAcpRuntime = { lifecycle }
     const workerIndex = workers.length
@@ -596,9 +605,11 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
       // handler 对象由 adapter 构造时创建且身份稳定：AgentLink 只在构造时取一次
       // handlers，后续回合只更换 adapter 内部的当前回合。
       getLink: (handlers, signal, purpose) => {
+        const mode = adapter.modeSignal()
+        const startup = signal === undefined ? mode : AbortSignal.any([signal, mode])
         const launch = startupBarrier.catch(() => undefined).then(() => {
-          signal?.throwIfAborted()
-          return ensureAcpRuntime(ctx, { ...config }, handlers, active, { signal, fetchImpl: pluginFetch, allowInteractiveAuth: purpose !== 'warmup' && workerIndex === 0 })
+          startup.throwIfAborted()
+          return ensureAcpRuntime(ctx, { ...config }, handlers, active, { signal: startup, fetchImpl: pluginFetch, allowInteractiveAuth: purpose !== 'warmup' && workerIndex === 0 })
         })
         startupBarrier = launch.then(() => undefined, () => undefined)
         return launch
@@ -740,6 +751,7 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
   // 关闭时 replace 回来）；代理路由的注册/注销由代理行订阅同一总线完成。
   let acpRoutesHeld = true
   const syncModeRoutes = (proxyMode: boolean): void => {
+    adapter.setEnabled(!proxyMode)
     if (proxyMode && acpRoutesHeld) {
       registration.replace([])
       acpRoutesHeld = false
@@ -771,10 +783,14 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
   })
   const unprovideAistudio = ctx.provide('antigravityAistudioSettings', aistudioBus)
   const unsubscribeAistudio = ctx.on('loader/volatile-update', (paths) => {
-    if (!paths.some(([key]) => key === 'aistudioEnabled' || key === 'aistudioCredentialRef')) return
-    aistudioBus.notify()
+    const modelsChanged = paths.some(([key]) => key === 'modelOverrides')
+    if (modelsChanged || paths.some(([key]) => key === 'aistudioEnabled' || key === 'aistudioCredentialRef')) aistudioBus.notify(modelsChanged)
   })
   const disposeVertexSettings = provideVertexSettings(ctx, config)
+  ctx.plugin(AgYVertexService, {
+    catalog: () => ctx.get('antigravityVertexCatalog') as Context['antigravityVertexCatalog'],
+    savedScope: () => ({ project: config.vertexProject?.trim() ?? '', location: config.vertexLocation?.trim() ?? '' }),
+  })
 
   // 额度监控：套餐额度取数服务 + Typert remote（供浏览器端药丸读取）。
   // 默认不调用本机 agy：ACP 模式走 Cloud Code Assist HTTP，代理模式走代理账户。
@@ -803,7 +819,7 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
     onScopeChange: (tick) => {
       const offMode = modeBus.subscribe(tick)
       const offAccount = proxyAccount.subscribe(() => { if (modeBus.current()) tick() })
-      const offSettings = ctx.on('loader/volatile-update', paths => { if (paths.some(([key]) => key === 'cliQuotaEnabled' || key === 'agyCliPath' || key === 'proxyUrl')) tick() })
+      const offSettings = ctx.on('loader/volatile-update', paths => { if (paths.some(([key]) => key === 'cliQuotaEnabled' || key === 'agyCliPath' || key === 'proxyUrl' || key === 'proxyBypass')) tick() })
       return () => { offMode(); offAccount(); offSettings() }
     },
     // 取数打点：浏览器侧无法写宿主日志，这条是「药丸有没有真的发请求、结果如何」的唯一现场。
@@ -862,15 +878,16 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
     }
   }, 'antigravity-acp 生命周期清理')
   if (config.autoWarmup === true && config.proxyMode !== true) control.account('warmup')
-  else if (config.autoWarmup === false && config.proxyMode !== true) void prefetchAgentBinary(config, ctx)
+  else if (config.autoWarmup === false && config.proxyMode !== true) void prefetchAgentBinary(config, ctx, adapter.modeSignal())
 }
 
 function provideVertexSettings(ctx: Context, config: AntigravityHostConfig): () => void {
   const listeners = new Set<() => void>()
+  const scope = () => resolveVertexScope(config.vertexProject, config.vertexLocation)
   const bus: VertexSettingsBus = {
     enabled: () => config.vertexEnabled === true,
-    project: () => config.vertexProject?.trim() ?? '',
-    location: () => config.vertexLocation?.trim() || 'global',
+    project: () => scope().project,
+    location: () => scope().location,
     models: () => config.vertexModels ?? [],
     modelSettings: () => ({ modelOverrides: config.modelOverrides }),
     proxySettings: () => ({ proxyUrl: config.proxyUrl, proxyBypass: config.proxyBypass }),
@@ -892,12 +909,13 @@ function provideVertexSettings(ctx: Context, config: AntigravityHostConfig): () 
  * 预读已缓存的官方 exe（约 200MB）进系统文件缓存：冷启动时磁盘首次读取可达数十秒
  * （实测 52 秒，热启动约 10 秒）。只读、不下载、不 spawn，失败静默。
  */
-async function prefetchAgentBinary(config: AntigravityHostConfig, ctx: Context): Promise<void> {
+async function prefetchAgentBinary(config: AntigravityHostConfig, ctx: Context, signal: AbortSignal): Promise<void> {
   try {
-    const resolution = await ensureAgentBinary({ binaryPath: config.binaryPath, autoDownload: false, version: config.acpVersion })
+    const resolution = await ensureAgentBinary({ binaryPath: config.binaryPath, autoDownload: false, version: config.acpVersion, signal })
+    signal.throwIfAborted()
     const started = Date.now()
     let bytes = 0
-    for await (const chunk of createReadStream(resolution.executablePath)) bytes += (chunk as Buffer).length
+    for await (const chunk of createReadStream(resolution.executablePath, { signal })) bytes += (chunk as Buffer).length
     ctx.logger?.info?.(`antigravity-acp: 已预读官方二进制 ${Math.round(bytes / 1048576)}MB，用时 ${Date.now() - started}ms`)
   } catch {
     // 未下载或不可读时无需预读；真正启动时会给出明确错误。

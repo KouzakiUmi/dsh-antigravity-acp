@@ -22,19 +22,31 @@ async function main() {
     return pathToFileURL(path.join(dir, readManifest(dir).main)).href
   }
   const peers = new Set(Object.keys(manifest.peerDependencies))
+  const coreImports = new Set()
   const semver = require(path.join(modules, 'semver'))
+  const { createRuntimeResolution, evaluatePluginCompatibility, getDshRuntimeVersion } = await import(host('@deepseek-ai/dsh-app-boot'))
+  const runtime = getDshRuntimeVersion()
+  assert.equal(evaluatePluginCompatibility(manifest, {}, runtime), undefined)
+  assert(evaluatePluginCompatibility(manifest, {}, '0.2.2-rc.3'), 'The previous core baseline must be rejected')
+  // Verify the actual installation's resolution table before exercising the entries in isolation.
+  const { entries } = await createRuntimeResolution({ installAnchor: path.join(installDir, 'package.json') })
+  const runtimePackages = new Map(entries.map(entry => [entry.name, entry]))
   for (const [name, range] of Object.entries(manifest.peerDependencies)) {
     const version = readManifest(path.join(modules, name)).version
     assert(semver.satisfies(version, range), `${name}@${version} fails the npm peer range ${range}`)
-    if (name.startsWith('@deepseek-ai/dsh-')) {
-      const runtime = readManifest(path.join(modules, '@deepseek-ai/dsh-app-boot')).version
-      assert(semver.satisfies(runtime, range, { includePrerelease: true }), `${name} peer range rejects DSH ${runtime}`)
-    }
+    assert.equal(runtimePackages.get(name)?.version, version, `${name} is not provided at the expected version by the host`)
   }
-  // Bind only the plugin's peer imports to the installed packages; other imports use the project lockfile.
+  // Core imports must resolve to the installed packages, never the checkout's test copies.
   registerHooks({
     resolve(specifier, context, next) {
-      return next(context.parentURL?.startsWith(dist) && peers.has(specifier) ? host(specifier) : specifier, context)
+      if (context.parentURL?.startsWith(dist)) {
+        if (specifier.startsWith('@deepseek-ai/dsh-')) {
+          assert(peers.has(specifier), `${specifier} must be a shared host peer`)
+          coreImports.add(specifier)
+        }
+        if (peers.has(specifier)) return next(host(specifier), context)
+      }
+      return next(specifier, context)
     },
   })
   const [{ Context }, { default: Llm, LlmError }, { default: Typert }, bundle, router, studio, vertex, { llmError }] = await Promise.all([
@@ -52,6 +64,9 @@ async function main() {
     import('dsh-bundle-antigravity-host/colab'),
   ])
   const colabPatch = fs.readFileSync(path.join(rootDir, 'cordis.patch.yml'), 'utf8')
+  for (const name of ['dsh-attachment', 'dsh-credentials', 'dsh-llm', 'dsh-typert-protocol']) {
+    assert(coreImports.has(`@deepseek-ai/${name}`), `${name} was not exercised as a host import`)
+  }
   assert.match(colabPatch, /- id: antigravity-colab\s+name: dsh-bundle-antigravity-host\/colab\s+disabled: true\s+inject: \[tools, subprocess\]/)
   assert.equal(colab.name, 'antigravity-colab')
   const scratch = fs.mkdtempDisposableSync(path.join(fs.realpathSync(tmpdir()), 'dsh-agy-compat-'))
@@ -81,6 +96,10 @@ async function main() {
     const providers = () => ctx.llm.listProviders().map(({ id }) => id)
     assert.deepEqual(providers(), ['antigravity-proxy'])
     assert.equal(ctx.typert.listPackages().filter(({ package: name }) => name === manifest.name).length, 1)
+    const vertexService = ctx.get('agyVertex')
+    const vertexScope = { project: config.vertexProject, location: config.vertexLocation }
+    assert.equal(typeof vertexService?.models, 'function')
+    assert.equal((await vertexService.models(vertexScope)).status, 'error')
 
     config.vertexEnabled = true
     config.aistudioEnabled = true
@@ -118,12 +137,14 @@ async function main() {
     config.aistudioEnabled = false
     ctx.emit('loader/volatile-update', [['vertexEnabled'], ['aistudioEnabled']])
     assert.deepEqual(providers(), ['antigravity-proxy'])
+    assert.equal((await vertexService.models(vertexScope)).status, 'error')
     config.vertexEnabled = true
     ctx.emit('loader/volatile-update', [['vertexEnabled']])
     assert.deepEqual(new Set(providers()), new Set(['antigravity-proxy', 'vertex-ai']))
     await vertexFiber.dispose()
     vertexFiber = undefined
     assert.deepEqual(providers(), ['antigravity-proxy'])
+    assert.equal(ctx.get('antigravityVertexCatalog'), undefined)
 
     await routerFiber.dispose()
     routerFiber = undefined

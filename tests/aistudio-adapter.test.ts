@@ -32,6 +32,38 @@ async function collect(stream: AsyncIterable<StreamChunk>) {
   return chunks
 }
 
+describe('AI Studio 热切换', () => {
+  it('外部轮换后已准备请求不会用新 key 发送', async () => {
+    let key = 'fixture-original'
+    const fetch = vi.fn<typeof globalThis.fetch>().mockImplementation(async () => Response.json({ models: defaultModels }))
+    const adapter = new AistudioAdapter({ credential: async () => key, fetch })
+    const prepared = await adapter.prepareCall(AISTUDIO_PROVIDER_ID, model)
+    key = 'fixture-replacement'
+    expect(await collect(prepared.stream(options))).toMatchObject([{ type: 'finish', reason: { kind: 'aborted' } }])
+    expect(fetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('凭据刷新时终止旧目录分页且不访问下一页', async () => {
+    let finish!: (response: Response) => void
+    const fetch = vi.fn<typeof globalThis.fetch>().mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+    const adapter = new AistudioAdapter({ credential: async () => 'fixture-original', fetch })
+    const directory = adapter.discoverModels(true)
+    const expected = expect(directory).rejects.toMatchObject({ code: 'CANCELLED' })
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1))
+    adapter.invalidateOperations()
+    expect(fetch.mock.calls[0]?.[1]?.signal?.aborted).toBe(true)
+    finish(Response.json({ models: defaultModels, nextPageToken: 'fixture-next' }))
+    await expected
+    expect(fetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('模型映射不借用原模型容量', async () => {
+    const { adapter } = makeAdapter({ readSettings: () => ({ modelOverrides: { [model]: { target: 'models/gemini-unlisted' } } }) })
+    expect(await adapter.resolveModel(AISTUDIO_PROVIDER_ID, model)).not.toHaveProperty('context')
+    expect((await adapter.discoverModels())[0]).not.toHaveProperty('maxOutputTokens')
+  })
+})
+
 describe('AI Studio 流式生成', () => {
   it('标准 Gemini 直挂 candidates 解析为文本块并以 stop 结束', async () => {
     const { adapter } = makeAdapter({ events: [event([{ text: 'Hello' }]), event([{ text: ' world' }], 'STOP')] })
@@ -94,7 +126,7 @@ describe('AI Studio 流式生成', () => {
     // 弥合集成探针手动重建与宿主实际组装的缺口：把真实 adapter 流喂进宿主 BlockAssembler，
     // 用其 blocks()/replayState 重建助手消息再续轮。宿主正常路径保留全部块（含空 text），
     // replay 信封按块数量对齐保留；max-tokens 时块与 replay 同步裁剪。锁定全链路签名不丢。
-    const { adapter, calls } = makeAdapter({ events: [event([{ functionCall: { name: 'weather', args: { city: 'Paris' } }, thoughtSignature: 'sig-host' }, { text: '' }], 'STOP')] })
+    const { adapter, calls } = makeAdapter({ events: [event([{ functionCall: { id: 'fixture-wire', name: 'weather', args: { city: 'Paris' } }, thoughtSignature: 'sig-host' }, { text: '' }], 'STOP')] })
     const assembler = new BlockAssembler()
     for await (const chunk of adapter.stream(options)) assembler.push(chunk)
     const hostBlocks = assembler.blocks()
@@ -108,7 +140,8 @@ describe('AI Studio 流式生成', () => {
     await collect(adapter.stream({ ...options, messages: [createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } }), assistant, result] }))
     const body = JSON.parse(String(calls.at(-1)?.init?.body)) as { contents: { parts: { functionCall?: unknown; thoughtSignature?: string }[] }[] }
     const modelParts = body.contents.find(content => content.parts.some(part => part.functionCall !== undefined))
-    expect(modelParts?.parts[0]).toMatchObject({ functionCall: { name: 'weather', args: { city: 'Paris' } }, thoughtSignature: 'sig-host' })
+    expect(modelParts?.parts[0]).toMatchObject({ functionCall: { id: 'fixture-wire', name: 'weather', args: { city: 'Paris' } }, thoughtSignature: 'sig-host' })
+    expect(body.contents.at(-1)).toMatchObject({ parts: [{ functionResponse: { id: 'fixture-wire', name: 'weather' } }] })
   })
 
   it('usageMetadata 产出 usage 块', async () => {

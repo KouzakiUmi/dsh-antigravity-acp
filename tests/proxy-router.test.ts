@@ -108,6 +108,23 @@ describe('代理行：路由随模式注册与注销', () => {
     for (const cleanup of cleanups.reverse()) cleanup()
   })
 
+  it('一次注册失败后重新开启可恢复路由和就绪状态', () => {
+    let mode = false
+    const bus = createProxyModeBus({ mode: () => mode, proxySettings: () => ({}) })
+    const { ctx, llm, cleanups } = fakeCtx(bus, fakeAuth())
+    applyProxyRow(ctx, {})
+    try {
+      llm.registerAdapter.mockImplementationOnce(() => { throw new Error('fixture registration failure') })
+      mode = true; bus.notify()
+      expect(bus.routerReady()).toBe(false)
+      expect(llm.registrations).toHaveLength(0)
+      mode = false; bus.notify()
+      mode = true; bus.notify()
+      expect(llm.registrations[0]?.providers).toEqual(['antigravity-proxy'])
+      expect(bus.routerReady()).toBe(true)
+    } finally { for (const cleanup of cleanups.reverse()) cleanup() }
+  })
+
   it('宿主行缺席（服务未 provide）时代理行安静地不注册', () => {
     const llm = { registerAdapter: vi.fn(), registrations: [] }
     const ctx = {

@@ -122,7 +122,8 @@ describe('AgYAistudioService 经 Cordis Proxy 调用', () => {
   })
 
   it('keyStatus 未配置时 configured:false；凭据缺席报 error', async () => {
-    const unconfigured = await openHost({ credentials: () => ({ describe: async () => ({ configured: false, writable: true }) }) as unknown as CredentialProvider })
+    const emptyCredentials = { describe: async () => ({ configured: false, writable: true }) } as unknown as CredentialProvider
+    const unconfigured = await openHost({ credentials: () => emptyCredentials })
     expect(await unconfigured.service.keyStatus()).toEqual({ status: 'ok', configured: false, writable: true })
     await unconfigured.close()
 

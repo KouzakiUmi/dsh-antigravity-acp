@@ -34,6 +34,9 @@ it('delays registration for dependencies, refreshes live models and cleans up wh
     const subprocess = await ctx.plugin(NoProcess)
     await vi.waitFor(() => expect(listeners.size).toBe(1))
     expect(ctx.llm.listProviders()).toEqual([])
+    const catalog = ctx.get('antigravityVertexCatalog')
+    if (catalog === undefined) throw new Error('Vertex catalog service did not mount')
+    await expect(catalog.models()).rejects.toMatchObject({ code: 'NO_ADAPTER' })
     enabled = true; listeners.forEach(notify => notify())
     expect(ctx.llm.listProviders().map(p => p.id)).toEqual(['vertex-ai'])
     models = ['gemini-4-neon']; listeners.forEach(notify => notify())
@@ -47,6 +50,7 @@ it('delays registration for dependencies, refreshes live models and cleans up wh
     await host.dispose()
     await vi.waitFor(() => expect(listeners.size).toBe(0))
     expect(ctx.llm.listProviders()).toEqual([])
+    expect(ctx.get('antigravityVertexCatalog')).toBeUndefined()
     await subprocess.dispose()
   } finally { await ctx.fiber.dispose() }
 })

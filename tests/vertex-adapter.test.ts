@@ -106,6 +106,17 @@ describe('Vertex AI standard Gemini stream', () => {
     expect(fetch).not.toHaveBeenCalled()
   })
 
+  it('does not read a late response after a scope transition', async () => {
+    const { adapter, state, fetch } = fixture()
+    const cancel = vi.fn()
+    fetch.mockImplementationOnce(async () => {
+      state.project = 'changed-project'; adapter.syncScope()
+      return new Response(new ReadableStream({ cancel }))
+    })
+    expect(await collect(adapter.stream(prompt))).toMatchObject([{ type: 'finish', reason: { kind: 'aborted' } }])
+    expect(cancel).toHaveBeenCalledOnce()
+  })
+
   it.each([[401, 'AUTH'], [403, 'FORBIDDEN'], [404, 'INVALID_MODEL'], [429, 'RATE_LIMIT'], [503, 'UPSTREAM']])('maps HTTP %i to %s and never retries/falls back', async (status, code) => {
     const { adapter, fetch } = fixture()
     fetch.mockResolvedValueOnce(new Response('fixture-token must not surface', { status }))

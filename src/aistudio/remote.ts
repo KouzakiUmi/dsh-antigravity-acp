@@ -64,7 +64,7 @@ function parseModelsRequest(value: unknown): AgYAistudioModelsRequest | undefine
 function parseSetKeyRequest(value: unknown): AgYAistudioSetKeyRequest {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('Invalid AgYAistudioSetKeyRequest')
   const raw = (value as Record<string, unknown>).value
-  if (typeof raw !== 'string' || raw.trim().length === 0) throw new TypeError('Invalid AgYAistudioSetKeyRequest.value')
+  if (typeof raw !== 'string' || !/^[\x21-\x7e]{1,4096}$/u.test(raw.trim())) throw new TypeError('Invalid AgYAistudioSetKeyRequest.value')
   return { value: raw.trim() }
 }
 
@@ -253,6 +253,9 @@ export class AgYAistudioService extends TypertRemoteService {
     }
     try {
       const info = await service.describe(credentialRef(ref))
+      if (service !== this._credentials() || ref !== this._credentialRef()) {
+        return { status: 'error', configured: false, writable: false, message: 'AI Studio 凭据设置已变更' }
+      }
       return {
         status: 'ok',
         configured: info.configured,

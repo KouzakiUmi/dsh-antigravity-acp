@@ -436,16 +436,15 @@ export class AntigravityProxyAdapter extends LlmAdapter {
       return
     }
 
-    const generation = initialGeneration.catalog === undefined
-      ? { ...initialGeneration, catalog: await this.readLiveCatalog(signal) }
-      : initialGeneration
+    const catalog = initialGeneration.catalog ?? await this.readLiveCatalog(signal)
+    const generation = { ...initialGeneration, catalog }
     if (signal?.aborted) { yield finishChunk('aborted', 'CANCELLED'); return }
 
     const plannerEffort = normalizeReasoningEffort(options.reasoningEffort) ?? orch.plannerEffort
     const executorEffort = orch.executorEffort
     const resolved = resolveProxyOrchestrator(
       orch,
-      generation.catalog?.data,
+      catalog.data,
       this.definitions,
       plannerEffort,
       executorEffort,
@@ -455,7 +454,8 @@ export class AntigravityProxyAdapter extends LlmAdapter {
     }
 
     const sessionId = options.sessionId === undefined ? undefined : String(options.sessionId)
-    const storedState = this.orchestrators.get(sessionId)
+    const stateKey = sessionId === undefined ? undefined : JSON.stringify([catalog.key, sessionId])
+    const storedState = this.orchestrators.get(stateKey)
     const currentTurnKey = computeTurnKey(options.messages, sessionId)
     const effectiveState = storedState.turnKey !== undefined && currentTurnKey !== undefined && currentTurnKey !== storedState.turnKey
       ? { ...storedState, plansThisTurn: 0 }
@@ -474,13 +474,13 @@ export class AntigravityProxyAdapter extends LlmAdapter {
     let emittedShowPlan = false
 
     if (decision.plan) {
-      const result = await this.runPlanner(options, resolved.planner, goal, evidence, storedState.plan, orch, resolved.planner.effort)
+      const result = await this.runPlanner(options, resolved.planner, { goal, evidence, priorPlan: storedState.plan, orch, catalogKey: catalog.key })
       if (signal?.aborted) { yield finishChunk('aborted', 'CANCELLED'); return }
       plannerUsage = result.usage
       if (result.plan !== undefined) {
         activePlan = result.plan
         const nextPlansThisTurn = (decision.reason === 'new-goal' ? 0 : effectiveState.plansThisTurn) + 1
-        this.orchestrators.update(sessionId, (prev) => ({
+        this.orchestrators.update(stateKey, (prev) => ({
           ...prev,
           plan: result.plan,
           stage: 'executing',
@@ -539,12 +539,8 @@ export class AntigravityProxyAdapter extends LlmAdapter {
 
   private async runPlanner(
     options: AdapterRequestOptions,
-    plannerEndpoint: { readonly familyId: string; readonly wire: string },
-    goal: string,
-    evidence: readonly string[],
-    priorPlan: OrchestratorPlan | undefined,
-    orch: OrchestratorSettings,
-    plannerEffort = orch.plannerEffort,
+    plannerEndpoint: { readonly familyId: string; readonly wire: string; readonly effort: string },
+    { goal, evidence, priorPlan, orch, catalogKey }: { goal: string; evidence: readonly string[]; priorPlan: OrchestratorPlan | undefined; orch: OrchestratorSettings; catalogKey: string },
   ): Promise<{ plan?: OrchestratorPlan; usage?: TokenUsage }> {
     const signal = options.signal
     const timeoutSignal = AbortSignal.timeout(orch.plannerTimeoutMs)
@@ -563,7 +559,7 @@ export class AntigravityProxyAdapter extends LlmAdapter {
     const plannerOptions: AdapterRequestOptions = {
       provider: PROXY_PROVIDER_ID,
       model: plannerEndpoint.familyId,
-      reasoningEffort: ReasoningEffortId(plannerEffort),
+      reasoningEffort: ReasoningEffortId(plannerEndpoint.effort),
       messages: [...buildPlannerMessages(goal, evidence, priorPlan)],
       system: plannerSystem,
       tools: [],
@@ -577,7 +573,9 @@ export class AntigravityProxyAdapter extends LlmAdapter {
       for (;;) {
         const credential = await this.readCredential(plannerSignal, refreshNext)
         refreshNext = false
-        if (credential === undefined) throw new LlmError('代理模式需要登录：请在设置页连接代理账户', 'AUTH')
+        if (credential === undefined || credentialCatalogKey(credential) !== catalogKey) {
+          throw llmError('代理模式账户已切换，请重新选择模型', 'CANCELLED')
+        }
         const payload = await buildProxyGeneratePayload(
           plannerOptions,
           credential,
@@ -633,6 +631,8 @@ export class AntigravityProxyAdapter extends LlmAdapter {
           if (sse.data.trim() === '[DONE]') break
           const event = parseProxyProviderEvent(sse.data)
           if (event.error !== undefined) {
+            const suspended = suspendedErrorFor(event.error.message ?? '', event.error.status)
+            if (suspended !== undefined) throw suspended
             if ((event.error.status === 401 || isAuthenticationCode(event.error.code) || event.error.status === 403 || event.error.code?.toUpperCase() === 'PERMISSION_DENIED')
               && !refreshed && !plannerSignal.aborted && collectedText.length === 0) {
               refreshed = true
@@ -659,6 +659,7 @@ export class AntigravityProxyAdapter extends LlmAdapter {
       }
     } catch (error) {
       if (signal?.aborted) return {}
+      if (error instanceof LlmError && ['CANCELLED', 'AGY_ACCOUNT_SUSPENDED'].includes(error.code)) throw error
       this.options.log?.warn('antigravity-proxy: 编排 planner 失败，降级直接执行', error)
       return { ...(usage === undefined ? {} : { usage }) }
     }
@@ -684,13 +685,16 @@ export class AntigravityProxyAdapter extends LlmAdapter {
     let refreshNext = false
     let networkRetries = 0
     let malformedRetries = 0
+    let accountKey = generation.catalog?.key
     for (;;) {
       const credential = await this.readCredential(signal, refreshNext)
       refreshNext = false
       if (credential === undefined) throw new LlmError('代理模式需要登录：请在设置页连接代理账户', 'AUTH')
-      if (generation.catalog !== undefined && credentialCatalogKey(credential) !== generation.catalog.key) {
+      const key = credentialCatalogKey(credential)
+      if (accountKey !== undefined && key !== accountKey) {
         throw llmError('代理模式账户已切换，请重新选择模型', 'CANCELLED')
       }
+      accountKey = key
       let payload: Awaited<ReturnType<typeof buildProxyGeneratePayload>>
       try {
         payload = await buildProxyGeneratePayload(options, credential, this.sessions, Date.now(), attachments, signal, wireModel)
@@ -829,6 +833,8 @@ export class AntigravityProxyAdapter extends LlmAdapter {
       hasEmitted,
       label: '代理模式',
       onAuthError: (error) => {
+        const suspended = suspendedErrorFor(error.message ?? '', error.status ?? 403)
+        if (suspended !== undefined) throw suspended
         if (error.status === 401 || isAuthenticationCode(error.code)) {
           throw new ProxyTransportError('authentication', '代理模式凭据被上游拒绝', { status: error.status ?? 401 })
         }

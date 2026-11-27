@@ -10,8 +10,10 @@ function pick(text: string, pattern: RegExp, integer = false): number | null {
     return value === undefined ? [] : [Number(value)]
   })
   const value = matches[0]
-  return matches.length === 1 && value !== undefined && Number.isFinite(value) &&
-    (!integer || Number.isSafeInteger(value)) ? value : null
+  if (matches.length !== 1 || value === undefined || !Number.isFinite(value) ||
+      (integer && !Number.isSafeInteger(value))) return null
+  // Python rounds small negative values to "-0.00"; DSH's lossless JSON rejects -0.
+  return value === 0 ? 0 : value
 }
 
 /** Colab CLI v0.8.0 renders three independent labeled lines. */

@@ -32,6 +32,6 @@ session: notebook-lab
 
 每次执行均须通过一次性 DSH 审批。审批提示包括配置的会话名、Compute Units 消耗及 CLI 历史记录；审批渠道不可用、会话策略禁用审批、拒绝或取消时不调用 CLI。DSH 会记录工具调用和结果，Colab CLI 会记录已执行代码、输出和相关元数据。提交前移除密钥等敏感数据。代码运行在已有内核的状态中，可能改变该运行时。
 
-Notebook 执行需要 DSH 附件服务。组件在私有临时目录中执行清除旧单元格输出的副本，原文件不会被覆盖。执行后的 Notebook 和 CLI 最后保存的 PNG/JPEG 图（如有）由支持文件写入的 DSH 附件后端返回，每件最多 8 MiB。`artifactIssue: true` 表示产物读取或保存有问题；它与远端执行状态分开。Python 文本结果返回 stdout 尾部。`completed` 表示观察到正常完成，`python-error` 表示观察到 Python 异常，`unverified` 表示没有观察到完成标记或有效的 Notebook 产物。CLI 退出码为零时，仍可能有 Python 异常。
+Notebook 执行需要 DSH 附件服务。组件在私有临时目录中执行清除旧单元格输出的副本，原文件不会被覆盖。执行后的 Notebook 和 CLI 最后保存的 PNG/JPEG 图（如有）由支持流式写入的 DSH 附件后端返回，每件最多 8 MiB。`artifactIssue: true` 表示应有产物缺失、无效或保存失败；它与远端执行状态分开。Python 文本结果返回 stdout 尾部，截断时不返回不完整的首行。`completed` 表示观察到正常完成，`python-error` 表示观察到 Python 异常，`unverified` 表示没有观察到完成标记或有效的 Notebook 产物。CLI 退出码为零时，仍可能有 Python 异常。
 
 组件同一时间只处理一项工具调用。本地 CLI 版本检查、用量查询和执行的时限分别是 8、15 和 120 秒；执行另有 90 秒的内核无响应时限。取消或超时会终止本地 CLI，远端代码可能仍在运行。确认本地进程退出后清理临时文件；无法确认时保留临时目录，重新启用前先检查本地 CLI 是否退出。产物和文本限制适用于 DSH 接收的数据，CLI 自身在结束前仍可能累计内核输出。

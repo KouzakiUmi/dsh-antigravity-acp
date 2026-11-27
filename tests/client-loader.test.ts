@@ -841,6 +841,7 @@ describe('额度药丸：remote 客户端挂载', () => {
       'dsh-bundle-antigravity-host#agyAistudio/setKey',
       'dsh-bundle-antigravity-host#agyAistudio/keyStatus',
       'dsh-bundle-antigravity-host#agyAistudio/usage',
+      'dsh-bundle-antigravity-host#agyVertex/models',
     ])
     expect(call.package).toBe('dsh-bundle-antigravity-host')
     expect(call.descriptors?.[0]?.id).toBe('dsh-bundle-antigravity-host#agyQuota/read')

@@ -264,7 +264,7 @@ export const Config = Schema.object({
   aistudioEnabled: Schema.boolean().default(false).volatile().description('AI Studio 独立 provider（默认关闭）：开启后用 Gemini API key 直连 generativelanguage.googleapis.com，注册 aistudio 路由；与 ACP / 代理模式并存，key 未配置时不注册'),
   aistudioCredentialRef: Schema.string().default('AISTUDIO_API_KEY').volatile().description('AI Studio API key 的凭据引用名（环境变量名，默认 AISTUDIO_API_KEY）；真实值经宿主凭据接缝解析，设置只存引用名'),
   vertexEnabled: Schema.boolean().default(false).volatile().description('启用标准 Vertex AI 独立模型路由；使用 Google 应用默认凭据'),
-  vertexProject: Schema.string().default('').volatile().description('Vertex AI 的 Google Cloud 项目 ID 或项目编号'),
-  vertexLocation: Schema.string().default('global').volatile().description('Vertex AI 的模型区域，如 global 或 us-central1'),
-  vertexModels: Schema.array(Schema.string()).default([]).volatile().description('显式列入 Vertex AI 模型选择器的 Gemini 发布商模型 ID'),
+  vertexProject: Schema.string().default('').volatile().description('Google Cloud 项目 ID 或编号，留空读取宿主环境变量'),
+  vertexLocation: Schema.string().default('').volatile().description('模型区域，留空读取宿主环境变量，未配置时使用 global'),
+  vertexModels: Schema.array(Schema.string()).default([]).volatile().description('Vertex AI 模型选择器中的 Gemini 发布商模型 ID，可从设置页拉取或手动添加'),
 })

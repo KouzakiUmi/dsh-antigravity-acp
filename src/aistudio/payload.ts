@@ -16,7 +16,7 @@ export function buildAistudioPayload(options: AdapterRequestOptions, wireModel: 
         const entry = replay.blocks[index++]!
         const inline = block as typeof block & { signature?: unknown; thoughtSignature?: unknown }
         const signature = safeGeminiSignature(inline.signature) ?? safeGeminiSignature(inline.thoughtSignature)
-        return [signature === undefined ? entry : { kind: entry.kind, signature }]
+        return [signature === undefined ? entry : { ...entry, signature }]
       })
     },
   })

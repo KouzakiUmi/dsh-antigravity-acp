@@ -10,7 +10,7 @@
 2. **代理模式（默认关闭，`proxyMode`）**：插件自持 OAuth 登录态，以 agy CLI 线身份直连 Cloud Code Assist（`antigravity-proxy` 路由），不 spawn 官方进程；开启时 ACP 路由注销，关闭时恢复。
 3. **AI Studio（默认关闭，`aistudioEnabled`）**：用户自备 Gemini API key 直连 `generativelanguage.googleapis.com/v1beta`（`aistudio` 路由），与 ACP / 代理**并存**（服务不同模型，不参与互斥仲裁）；key 经宿主 credentials 接缝按引用名解析，不存设置明文。
 
-4. **Vertex AI（默认关闭，`vertexEnabled`）**：配置项目、区域和 Gemini 发布商模型 ID，用宿主已有 Google ADC 直连标准 Vertex AI（`vertex-ai` 路由）。
+4. **Vertex AI（默认关闭，`vertexEnabled`）**：配置或继承项目、区域，用宿主已有 Google ADC 拉取 Gemini 发布商模型并直连标准 Vertex AI（`vertex-ai` 路由）。
 
 同一个 Host + Web Client bundle 包含上述四行和 [Colab 工具组件](docs/colab.md)。`antigravity-colab` 默认关闭，可在 DSH 插件页单独启停，不参与模型路由或设置总线。
 
@@ -78,8 +78,9 @@ npm 包名 `dsh-bundle-antigravity-host`、provider ID `antigravity-acp` / `anti
 - 客户端 [`src/client.js`](src/client.js) 不得导入 Node 原生模块；`remote.settings` / `remote.llm` 必须逐个声明注入。一个包只注册一次 Host Typert contribution、只执行一次客户端 `$mount`，合并 `agyQuota`、`agyProxyAccount` 与 `agyAistudio` 描述符；宿主拒绝重复 package-face / Remote package 身份。
 - 行为改动后同步更新 `docs/changelog.md`、`docs/configuration.md`、`docs/reference.md` 与 `docs/development.md` 的验证矩阵，并核对 `scripts/preview-kit.mjs` 的离线预览夹具。
 - client 用例涉及退役判定（官方下线日与本地日历日比较）时用 `vi.setSystemTime` 固定时钟，时间用本地构造（`new Date(2026, 10, 26, 12)`）而非带偏移的 ISO 字符串，使断言在任意进程时区下成立；`afterEach` 以 `vi.useRealTimers()` 恢复：client 在 vm 上下文里执行，默认有自己的内建 `Date`，两个 client 测试加载器已把测试进程的 `Date` 传入上下文。`scripts/preview-kit.mjs` 按序号硬编码 hook 状态，卡片组件内新增或调整 hook 顺序会使离线预览错位，改动后重新生成预览核对。
-- 验证入口：`npm run typecheck`、`npm test`、`npm run build`（`npm run check` 顺序执行三者）。
-- Vertex AI 存放于 [`src/vertex/`](src/vertex/)，经 `antigravityVertexSettings` 接收即时配置；模型键用 `vertex-ai-` 前缀，目录由显式 ID 构成，不发生成请求验证。与 AI Studio 共用标准 [Gemini 请求构造](src/adapter/gemini-payload.ts)，各自校验 replay 来源；三条 Gemini HTTP 路由共享 SSE 组装层。
+- 验证入口：`npm run typecheck`、`npm test`、`npm run build`（`npm run check` 顺序执行三者）。DSH 核心模块的运行时导入使用宿主 peer，不加入生产 `dependencies`；开发和测试用同一套 Core 版本。依赖更新还需复检 Linux 目标的 npm 锁文件。
+- Vertex AI 存放于 [`src/vertex/`](src/vertex/)，经 `antigravityVertexSettings` 接收即时配置；项目与区域留空先读宿主 `GOOGLE_CLOUD_*`，再读 `VERTEXAI_*`，区域最后兜底 `global`。`agyVertex.models` 合并进已有 Typert contribution，用同一 ADC 分页读取 Model Garden 发布商目录；用户拉取后把候选合并到模型草稿，保存才进入 `vertex-ai-` 选择器，手填条目保留。目录读取不发推理，与实际生成区域可用性分开。与 AI Studio 共用标准 [Gemini 请求构造](src/adapter/gemini-payload.ts)，各自校验 replay 来源；三条 Gemini HTTP 路由共享 SSE 组装层。
 - AI Studio 本地计量只在 [Host 内存](src/aistudio/usage.ts) 保留，每个真实凭据隔离。网络边界为交给 HTTP 客户端的生成尝试，token 来自上游响应；`agyAistudio.usage` 读取本地快照。
 - Colab 由 `dsh-bundle-antigravity-host/colab` 导出，patch 行 `antigravity-colab` 声明 `disabled: true`。`executable` / `session` 只属于该组件行的普通配置。一次性 DSH 审批先于 Notebook 读取和 CLI 调用；固定参数锁定已配置的命名会话。Notebook 临时副本、附件与本地过程退出分别处理。
+- 模式切换使排队、已准备但未派发的 ACP 请求与预读失效；已开始的 prompt 不因切换被主动打断。代理编排与生成重试绑定对应账户，编排没有会话 ID 时不保存计划。额度刷新用单调作用域代际拒绝往返切换前的结果。
 - 待验收：Vertex AI 已授权项目生成与真实桌面 GUI；Colab 真实账号余额、审批交互与命名运行时执行。

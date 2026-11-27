@@ -2,7 +2,7 @@ import { mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
-import type { FileAttachmentRef } from '@deepseek-ai/dsh-attachment'
+import type { FileAttachmentRef, SaveFileStreamAttachment } from '@deepseek-ai/dsh-attachment'
 import type { SubprocessHandle, SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess'
 import { assertSupportedJsonSchema, type ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type { ApprovalOutcome } from '@deepseek-ai/dsh-user-approval'
@@ -10,6 +10,7 @@ import { createTools } from '../src/colab/index.js'
 import { parseUsage } from '../src/colab/usage.js'
 import { ColabRunError, createCliRunner, OUTPUT_BYTES, type CliRequest } from '../src/colab/runner.js'
 import { readNotebook } from '../src/colab/notebook.js'
+import { collectArtifacts, prepareExecution, pythonOutcome } from '../src/colab/execute.js'
 
 const executable = join(tmpdir(), 'fake-colab')
 const config = { executable, session: 'notebook-lab' }
@@ -25,15 +26,18 @@ function context(cwd?: string, signal = new AbortController().signal): ToolRunCo
 function fixtures(outcome: ApprovalOutcome | undefined = 'allowed-once') {
   const request = vi.fn(async (): Promise<ApprovalOutcome> => outcome ?? 'unavailable')
   const approval = { request }
-  const saveFile = vi.fn(async ({ data, name }: { data: Uint8Array; name: string }) =>
-    ({ attachmentId: 'opaque', bytes: data.byteLength, name }) as FileAttachmentRef)
+  const saveFileStream = vi.fn(async ({ data, name }: SaveFileStreamAttachment) => {
+    let bytes = 0
+    for await (const chunk of data) bytes += chunk.byteLength
+    return { attachmentId: 'opaque', bytes, name } as FileAttachmentRef
+  })
   const runner = vi.fn(async (call: CliRequest) => {
     if (call.args[1] === 'version') return { stdout: 'Version: 0.8.0\n', truncated: false }
     if (call.args[1] === 'usage') return { stdout: usageText, truncated: false }
     const marker = call.stdin?.match(/__DSH_COLAB_[0-9a-f]+__/)?.[0]
     return { stdout: marker ? `answer=42\n[Image saved to: /private/temp]\nAuthorization: secret\n${marker}ok\n` : '', truncated: false }
   })
-  return { request, saveFile, runner, tools: createTools(config, { runner, approval: () => approval, attachments: () => ({ saveFile }) }) }
+  return { request, saveFileStream, runner, tools: createTools(config, { runner, approval: () => approval, attachments: () => ({ saveFileStream }) }) }
 }
 
 describe('Colab usage and approval', () => {
@@ -47,6 +51,7 @@ describe('Colab usage and approval', () => {
 
   it('parses exact tagged labels and distinguishes zero from missing or invalid fields', async () => {
     expect(parseUsage(usageText)).toEqual({ balanceCu: 123.4, rateCuPerHour: 0, activeAssignments: 2 })
+    expect(parseUsage('Current balance: -0.00 compute units\nUsage rate: -0.00/hr')).toEqual({ balanceCu: 0, rateCuPerHour: 0, activeAssignments: null })
     expect(parseUsage('Current balance: N/A compute units\nActive assignments: 0')).toEqual({ balanceCu: null, rateCuPerHour: null, activeAssignments: 0 })
     expect(parseUsage(`${usageText}Active assignments: 5`)).toMatchObject({ activeAssignments: null })
     const f = fixtures()
@@ -101,9 +106,38 @@ describe('Colab usage and approval', () => {
     await expect(f.tools.usage.execute({}, context())).rejects.toThrow('requires Google Colab CLI 0.8.0')
     expect(f.runner).toHaveBeenCalledTimes(1)
   })
+  it('treats a lone line in truncated usage output as unknown', async () => {
+    const f = fixtures()
+    f.runner.mockResolvedValueOnce({ stdout: 'Version: 0.8.0', truncated: false })
+      .mockResolvedValueOnce({ stdout: 'Active assignments: 2', truncated: true })
+    await expect(f.tools.usage.execute({}, context())).resolves.toMatchObject({ activeAssignments: null })
+  })
 })
 
 describe('Colab execution contracts', () => {
+  it('keeps wrapper helpers independent of notebook variables', async () => {
+    const { stdin } = await prepareExecution({ code: 'compile = 3' }, '', undefined, context().signal)
+    expect(stdin).toMatch(/\b(_dsh_b_[0-9a-f]+)\.exec\(\1\.compile\(/)
+  })
+
+  it('does not expose a partial first line of truncated Python output', () => {
+    const marker = '__DSH_COLAB_fixture__'
+    expect(pythonOutcome({ stdout: `incomplete\nresult=42\n${marker}ok\n`, truncated: true }, marker))
+      .toEqual({ status: 'completed', stdout: 'result=42' })
+  })
+
+  it('reports missing and malformed Notebook artifacts without claiming completion', async () => {
+    const work = await mkdtemp(join(await realpath(tmpdir()), 'test-colab-artifact-'))
+    const { saveFileStream } = fixtures()
+    try {
+      const collect = () => collectArtifacts(work, true, { saveFileStream }, context().signal)
+      await expect(collect()).resolves.toEqual({ artifacts: [], status: 'unverified', artifactIssue: true })
+      await writeFile(join(work, 'input_output.ipynb'), JSON.stringify({ ...nb, cells: [null] }))
+      await expect(collect()).resolves.toEqual({ artifacts: [], status: 'unverified', artifactIssue: true })
+      expect(saveFileStream).not.toHaveBeenCalled()
+    } finally { await rm(work, { force: true, recursive: true }) }
+  })
+
   it('never accepts runtime, flags, absolute paths, traversal, or both input modes', async () => {
     const f = fixtures()
     for (const args of [{ code: 'print(1)', session: 'other' }, { notebook: '--session=other', code: 'x' },
@@ -159,9 +193,32 @@ describe('Colab execution contracts', () => {
       const output = await f.tools.execute.execute({ notebook: 'nested/space name.ipynb' }, context(work))
       expect(output).toMatchObject({ status: 'python-error', stdout: '', artifacts: [{ name: 'colab-output.ipynb' }] })
       expect(await readFile(original, 'utf8')).toBe(originalText)
-      expect(f.saveFile).toHaveBeenCalledTimes(1)
+      expect(f.saveFileStream).toHaveBeenCalledTimes(1)
       await expect(stat(f.runner.mock.calls[1]![0].cwd)).rejects.toMatchObject({ code: 'ENOENT' })
     } finally { await rm(work, { force: true, recursive: true }) }
+  })
+
+  it('forwards component unload to in-flight artifact storage and drains before disposal', async () => {
+    const f = fixtures()
+    f.runner.mockResolvedValueOnce({ stdout: 'Version: 0.8.0', truncated: false }).mockImplementationOnce(async (call) => {
+      await writeFile(join(call.cwd, 'colab-plot'), Buffer.from('89504e470d0a1a0a', 'hex'))
+      return { stdout: '', truncated: false }
+    })
+    let started!: (signal: AbortSignal) => void
+    const pending = new Promise<AbortSignal>((resolve) => { started = resolve })
+    f.saveFileStream.mockImplementationOnce(async ({ signal }) => {
+      if (!signal) throw new Error('Attachment cancellation signal missing.')
+      return new Promise((_, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+        started(signal)
+      })
+    })
+    const stopped = expect(f.tools.execute.execute({ code: 'print(1)' }, context())).rejects.toThrow('Colab component unloaded')
+    const signal = await pending
+    await f.tools.dispose()
+    expect(signal.aborted).toBe(true)
+    await stopped
+    await expect(stat(f.runner.mock.calls[1]![0].cwd)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
   it('rejects a workspace path traversing an external directory link', async () => {
