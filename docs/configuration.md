@@ -15,7 +15,7 @@
 | `binaryPath` | 未设置 | 本地官方 ACP server 入口，优先级最高；指定但不存在会报错，不静默换来源。 |
 | `autoDownload` | `true` | 无本地覆盖和有效缓存时从官方域名下载。 |
 | `extraArgs` | `[]` | 额外启动参数；不要传入会改变协议、工具隔离或认证边界的参数并假定仍兼容。 |
-| `acpVersion` | `"1.5.2"` | 自动下载与缓存目标版本；不是 ACP wire protocol 版本。更换版本需重新验证厂商扩展与发行布局。 |
+| `acpVersion` | `"1.5.2"` | 自动下载与缓存目标版本；不是 ACP wire protocol 版本。新版 MCP 权限提示兼容无需更改此配置；更换下载版本需重新验证厂商扩展与发行布局。 |
 | `requestTimeoutMs` | `30000` | 普通 ACP 请求超时（毫秒），覆盖 stdin 写入与响应等待。首个 `session/new` 除外——它走 `handshakeTimeoutMs` 档（见下）。 |
 | `handshakeTimeoutMs` | `120000` | ACP `initialize` 握手与首个 `session/new` 的上限（毫秒）。官方 PyInstaller 进程冷启动实测约 52 秒、热启动约 10 秒，旧默认 15 秒会使冷启动登录超时；官方 1.5.2 冷启动到 `session/new` 返回实测约 36 秒（#23），超过普通请求默认 30 秒，故首个建会话同用此档。建过会话后 `session/new` 回到 `requestTimeoutMs`；调用方显式 `timeoutMs`（如标题、压缩、planner）始终优先。 |
 | `authTimeoutMs` | `300000` | 交互式 `authenticate` 等待上限（毫秒），独立于普通请求超时。 |
