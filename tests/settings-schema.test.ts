@@ -1,6 +1,7 @@
 import { isVolatile, updateVolatile } from '@deepseek-ai/cosmokit'
 import { describe, expect, it } from 'vitest'
 import { Config, LIVE_SETTING_KEYS, liveHostConfig } from '../src/settings.js'
+import type { ModelOverride } from '../src/settings.js'
 
 describe('live settings schema and runtime references', () => {
   it('宿主提交即时引用后可读取下一次操作配置，同时保持已捕获快照不变', () => {
@@ -72,5 +73,44 @@ describe('live settings schema and runtime references', () => {
     // 配置可能来自手写 JSON，档位拼错必须在装载期失败，不能静默退回默认档位。
     const mistyped = { modelOverrides: { 'gemini-3-pro': { effort: 'max' } } } as unknown as Parameters<typeof Config>[0]
     expect(() => Config(mistyped)).toThrow()
+  })
+
+  it('逐模型生成配置随 volatile 对象更新，保留缺省、零温度、空 stop 与两个独立档位', () => {
+    const parsed = Config({ modelOverrides: { 'aistudio-neon': { enabled: true } } })
+    const config = liveHostConfig(parsed)
+    const before = config.modelOverrides
+    const changed: ModelOverride = {
+      contextWindow: 10_000_000,
+      maxTokens: 1_000_000,
+      temperature: 0,
+      stop: [' a ', '\nEND'],
+      supportsImage: false,
+      effort: 'low',
+      reasoningEffort: 'xhigh',
+    }
+    const next = Config({ modelOverrides: { 'aistudio-neon': changed, 'vertex-ai-other': { stop: [], reasoningEffort: 'minimal' } } })
+    updateVolatile(parsed.modelOverrides, next.modelOverrides)
+    expect(before).toEqual({ 'aistudio-neon': { enabled: true } })
+    expect(config.modelOverrides).toEqual({ 'aistudio-neon': changed, 'vertex-ai-other': { stop: [], reasoningEffort: 'minimal' } })
+  })
+
+  it.each([
+    { contextWindow: 0 }, { contextWindow: 1 }, { contextWindow: 10_000_001 }, { contextWindow: 1.5 },
+    { maxTokens: -1 }, { maxTokens: 1_000_001 }, { maxTokens: '100' },
+    { temperature: -0.1 }, { temperature: 2.1 }, { temperature: Infinity }, { temperature: NaN },
+    { stop: [''] }, { stop: [' \n'] }, { stop: ['x'.repeat(257)] }, { stop: Array(6).fill('ok') }, { stop: [null] },
+    { supportsImage: 'false' }, { reasoningEffort: 'max' }, { effort: 'xhigh' },
+  ])('配置 schema 拒绝越界或非法的逐模型字段：%o', (row) => {
+    const input = { modelOverrides: { sample: row } } as unknown as Parameters<typeof Config>[0]
+    expect(() => Config(input)).toThrow()
+  })
+
+  it('规划超时缺省交给链路，显式 20000 毫秒经 volatile 存取保留', () => {
+    const parsed = Config({ orchestrator: { showPlan: true } })
+    const config = liveHostConfig(parsed)
+    expect(liveHostConfig(Config({})).orchestrator).not.toHaveProperty('plannerTimeoutMs')
+    expect(config.orchestrator).not.toHaveProperty('plannerTimeoutMs')
+    updateVolatile(parsed.orchestrator, Config({ orchestrator: { plannerTimeoutMs: 20_000 } }).orchestrator)
+    expect(config.orchestrator?.plannerTimeoutMs).toBe(20_000)
   })
 })

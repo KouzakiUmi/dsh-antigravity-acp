@@ -1,6 +1,7 @@
 export {
   ORCHESTRATOR_MODEL_ID,
   ORCHESTRATOR_MODEL_NAME,
+  ORCHESTRATOR_LEGACY_EFFORTS,
   ORCHESTRATOR_PLANNER_MODELS,
   ORCHESTRATOR_EXECUTOR_MODELS,
   ORCHESTRATOR_EXECUTOR_MODEL,
@@ -19,7 +20,7 @@ export type {
 } from './types.js'
 
 export { parsePlan, renderPlanForExecutor } from './plan-schema.js'
-export { shouldPlan, computeTurnKey } from './triggers.js'
+export { shouldPlan, computeTurnKey, latestToolResultId } from './triggers.js'
 export type { ShouldPlanInput, ShouldPlanReason, ShouldPlanResult } from './triggers.js'
 export {
   PLANNER_SYSTEM_SUFFIX,

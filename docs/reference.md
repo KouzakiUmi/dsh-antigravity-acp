@@ -163,6 +163,7 @@ ACP fs / terminal 与未知原生权限请求始终拒绝并记录，但不因�
 - 端点与发现：直连 `generativelanguage.googleapis.com/v1beta`，生成走 `POST /models/{model}:streamGenerateContent?alt=sse`，目录走 `GET /v1beta/models` 实时发现（过滤支持 `generateContent` 的文本模型、排除图像模型，容量取 `inputTokenLimit` / `outputTokenLimit`，不做 curated allowlist）。标准 Google REST，不需要 agy 线身份伪装或固定头序；出网用普通代理感知 fetch，与官方进程同一套 `proxyUrl` / `proxyBypass` 设置。
 - 能力范围（首期）：文本流式生成、工具调用回填、多轮 history、思考块渲染、模型目录隐藏 / 显示名设置（专属 AI Studio Tab 模型表，复用 `modelOverrides`，键带 `aistudio-` 前缀，不泄漏进 ACP / 代理二元模型编辑器）。默认启用口径「只开 4」（仅 Gemini 4 系默认进选择器，其余默认关可显式启用），模型表启用置顶；音乐 / TTS / 图像 / 视频等非聊天模态在发现层过滤，其单独调用接口另立任务。图片输入 / 图像生成 / 视频延后；图片块请求报 `UNSUPPORTED_MODALITY`。
 - 协议：AI Studio 与 Vertex AI 共用标准 Gemini 请求构造，和代理模式共用流式组装。多轮续聊经 `aistudio` 的 replay 信封按块对齐回填签名。
+- 参数与兼容性：两路的模型行均可展开「参数」，查看实际映射型号的能力并保存逐模型默认值。Neon / Hydrogen 默认 `high`，AI Studio Gemini API 另有 `xhigh`；Vertex REST v1 使用 `low / medium / high`。Argon 使用 `low / medium / high`，默认 `medium`。Gemini 4 不发送自定义温度，两路当前均接收文本输入。
 - 用量与计费：AI Studio key 使用所属项目的计费设置，与 agy 订阅额度分开。面板记录此 Host 发出的生成尝试、收到的输入 token 与最近一次 HTTP / SSE `429`；项目速率限制和总用量从官方页面读取。`429` 不自动重试。
 - 上游契约（真实 key 探针核实）：`x-goog-api-key` 头鉴权生效（发现与生成均 200，key 不进 URL）；`GET /v1beta/models` 返回 `name`/`displayName`/`inputTokenLimit`/`outputTokenLimit`/`supportedGenerationMethods`；生成 SSE 为裸 `{candidates,usageMetadata,modelVersion,responseId}`、CRLF（`\r\n\r\n`）分隔，思考与工具部分携带 `thoughtSignature`，共享解析层原生处理。
 - 模型可用性随 key 而异：目录会列出对当前 key 不可生成的模型（如 `gemini-2.5-flash` 对新用户停用，生成返回 404 并推荐 `gemini-3.8-flash`）。选择这类模型时 adapter 报可读的 404 上游原话；插件不做逐模型探测过滤，改选目录中可用的模型即可。

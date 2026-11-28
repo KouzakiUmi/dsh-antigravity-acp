@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
-import { BlockAssembler, createAssistantMessage, createToolResultMessage } from '@deepseek-ai/dsh-llm'
+import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
+import { BlockAssembler, createAssistantMessage, createToolResultMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { AdapterRequestOptions } from '../src/adapter/request-options.js'
 import type { ModelOverride } from '../src/settings.js'
@@ -145,4 +146,80 @@ describe('Vertex AI standard Gemini stream', () => {
     await expect(adapter.resolveModel(provider, 'vertex-ai-gemini-4-image')).rejects.toMatchObject({ code: 'INVALID_MODEL' })
     expect(token).not.toHaveBeenCalled(); expect(fetch).not.toHaveBeenCalled()
   })
+
+  it('advertises audited Gemini 4 defaults and sends standard Vertex generation controls', async () => {
+    const { adapter, state, fetch } = fixture()
+    state.overrides = { [model]: { temperature: 0.7 } }
+    const [row] = await adapter.listModels(provider)
+    expect(row).toMatchObject({ inputModalities: ['text'], contextWindowSource: 'audited', maxOutputTokens: 65_536,
+      compat: { protocol: 'google-generate-content', inputModalities: ['text'], reasoningEfforts: ['low', 'medium', 'high'],
+        upstreamReasoningEffort: 'high', temperature: false, maxStopSequences: 5, protocolMaxOutputTokens: 65_536 } })
+    expect(row).not.toHaveProperty('controls')
+    const prepared = await adapter.prepareCall(provider, model)
+    expect(prepared.model).toMatchObject({ context: { contextWindow: 1_048_576 }, defaultMaxTokens: 65_536,
+      reasoning: { defaultEffort: 'high' } })
+    await collect(prepared.stream(prompt))
+    expect(sentConfig(fetch)).toEqual({ maxOutputTokens: 65_536, thinkingConfig: { thinkingLevel: 'HIGH', includeThoughts: true } })
+  })
+
+  it('prepares the mapped wire and snapshots its defaults instead of re-reading settings during dispatch', async () => {
+    const { adapter, state, fetch } = fixture()
+    state.overrides = { [model]: { target: 'gemini-4-argon', contextWindow: 12_000, maxTokens: 2048, stop: ['END'] } }
+    expect(listConfiguredVertexModels(state.models, state.overrides)[0]).toMatchObject({ upstreamId: 'gemini-4-argon',
+      contextWindow: 1_048_576, contextWindowSource: 'audited', maxOutputTokens: 65_536, defaultMaxTokens: 2048,
+      compat: { protocolMaxOutputTokens: 65_536, upstreamContextWindow: 1_048_576, upstreamReasoningEffort: 'medium' } })
+    const prepared = await adapter.prepareCall(provider, model)
+    expect(prepared.model).toMatchObject({ context: { contextWindow: 12_000 }, defaultMaxTokens: 2048,
+      reasoning: { defaultEffort: 'medium' } })
+    state.overrides = { [model]: { target: 'gemini-x-preview' } }
+    await collect(prepared.stream(prompt))
+    expect(String(fetch.mock.lastCall?.[0])).toContain('/models/gemini-4-argon:streamGenerateContent')
+    expect(sentConfig(fetch)).toEqual({ maxOutputTokens: 2048, stopSequences: ['END'],
+      thinkingConfig: { thinkingLevel: 'MEDIUM', includeThoughts: true } })
+    const unknown = await adapter.resolveModel(provider, model)
+    expect(unknown.context).toBeUndefined()
+    expect(unknown.defaultMaxTokens).toBeUndefined()
+    expect(unknown.reasoning).toBeUndefined()
+    const unknownRow = listConfiguredVertexModels(state.models, state.overrides)[0]
+    expect(unknownRow?.compat).not.toHaveProperty('upstreamContextWindow')
+    expect(unknownRow?.compat).not.toHaveProperty('protocolMaxOutputTokens')
+  })
+
+  it('applies explicit compatible controls and rejects unsupported effort before obtaining ADC', async () => {
+    const { adapter, state, fetch, token } = fixture()
+    state.overrides = { [model]: { target: 'gemini-4-neon', reasoningEffort: 'medium', maxTokens: 1200, stop: ['END'] } }
+    const prepared = await adapter.prepareCall(provider, model)
+    expect(prepared.model.reasoning?.defaultEffort).toBe('medium')
+    await expect(collect(prepared.stream({ ...prompt, reasoningEffort: ReasoningEffortId('xhigh') })))
+      .rejects.toMatchObject({ code: 'UNSUPPORTED_REASONING_EFFORT' })
+    expect(token).not.toHaveBeenCalled(); expect(fetch).not.toHaveBeenCalled()
+    await collect(prepared.stream({ ...prompt, reasoningEffort: ReasoningEffortId('low'), maxTokens: 2000, stop: [] }))
+    expect(sentConfig(fetch)).toEqual({ maxOutputTokens: 2000, thinkingConfig: { thinkingLevel: 'LOW', includeThoughts: true } })
+  })
+
+  it('preserves Flash-Lite audited capacity when mapped and does not send guessed thinking levels', async () => {
+    const { adapter, state, fetch } = fixture()
+    state.overrides = { [model]: { target: 'gemini-3.5-flash-lite' } }
+    const prepared = await adapter.prepareCall(provider, model)
+    expect(prepared.model).toMatchObject({ context: { contextWindow: 1_048_576 }, defaultMaxTokens: 65_536 })
+    expect(prepared.model.reasoning).toBeUndefined()
+    await collect(prepared.stream(prompt))
+    expect(String(fetch.mock.lastCall?.[0])).toContain('/models/gemini-3.5-flash-lite:streamGenerateContent')
+    expect(sentConfig(fetch)).toEqual({ maxOutputTokens: 65_536 })
+  })
+
+  it('rejects images and out-of-range generation options before obtaining ADC', async () => {
+    const { adapter, fetch, token } = fixture()
+    const prepared = await adapter.prepareCall(provider, model)
+    const attachment = { attachmentId: 'fixture-image', width: 1, height: 1, mediaType: 'image/png', bytes: 3 } as ImageAttachmentRef
+    await expect(collect(prepared.stream({ ...prompt, messages: [{ role: 'user', content: [{ type: 'image', attachment }] }] })))
+      .rejects.toMatchObject({ code: 'UNSUPPORTED_MODALITY' })
+    await expect(collect(prepared.stream({ ...prompt, maxTokens: 65_537 }))).rejects.toMatchObject({ code: 'INVALID_ARGS' })
+    expect(token).not.toHaveBeenCalled(); expect(fetch).not.toHaveBeenCalled()
+  })
 })
+
+function sentConfig(fetch: ReturnType<typeof fixture>['fetch']): unknown {
+  const body = JSON.parse(String(fetch.mock.lastCall?.[1]?.body)) as { generationConfig?: unknown }
+  return body.generationConfig
+}

@@ -6,6 +6,7 @@
  * 代理模式误用，反之亦然。
  */
 import type { Message, ReplayEnvelope, ToolSchema } from '@deepseek-ai/dsh-llm'
+import { ORCHESTRATOR_MODEL_ID } from '../orchestrator/types.js'
 
 export const PROXY_REPLAY_VERSION = 1 as const
 export const PROXY_PROVIDER_ID = 'antigravity-proxy' as const
@@ -71,41 +72,51 @@ export function compatibleProxyReplayState(
   model: string,
   blockKinds?: readonly ReplayBlockKind[],
   wireModel?: string,
+  legacyExecutorModel?: string,
 ): ProxyReplayState | undefined {
   if (message.role !== 'assistant') return undefined
-  const provenance = isRecord(message.source) ? (message.source as Record<string, unknown>) : undefined
+  const provenance = isRecord(message.source) ? message.source : undefined
   if (provenance !== undefined && provenance.kind === 'model' && (provenance.provider !== PROXY_PROVIDER_ID || provenance.model !== model)) return undefined
-  const value = isRecord(provenance?.replayState)
-    ? provenance.replayState
-    : isRecord((message as unknown as Record<string, unknown>).replayState)
-      ? (message as unknown as Record<string, unknown>).replayState
-      : undefined
+  const orchestrated = model === ORCHESTRATOR_MODEL_ID
+  const sourceReplay = isRecord(provenance?.replayState) ? provenance.replayState : undefined
+  // 编排的公开 ID 不足以识别签名来源：必须有宿主模型来源、嵌套信封、确切 wire 和块序列。
+  if (orchestrated && (provenance?.kind !== 'model' || sourceReplay === undefined
+    || wireModel === undefined || blockKinds === undefined)) return undefined
+  const value = sourceReplay ?? (message as Message & { replayState?: unknown }).replayState
   if (!isRecord(value) || !isRecord(value.response) || !Array.isArray(value.blocks)) return undefined
-  const family = value.response.family
-  if (value.response.version !== PROXY_REPLAY_VERSION
-    || value.response.provider !== PROXY_PROVIDER_ID
-    || value.response.model !== model
-    || (wireModel !== undefined && value.response.wireModel !== undefined && value.response.wireModel !== wireModel)
+  const response = value.response
+  const family = response.family
+  // 旧编排把 executor 家族写进信封；只在它恰好是当前 executor 且上述证据俱全时接受。
+  const legacyModelMatches = orchestrated && legacyExecutorModel !== undefined && response.model === legacyExecutorModel
+  const firstBlock: unknown = value.blocks[0]
+  // showPlan 最多在 executor 的有界信封前加一个无签名文本块。
+  const hasPlanPrefix = orchestrated && isRecord(firstBlock) && firstBlock.kind === 'text' && firstBlock.signature === undefined
+  if (response.version !== PROXY_REPLAY_VERSION
+    || response.provider !== PROXY_PROVIDER_ID
+    || (response.model !== model && !legacyModelMatches)
+    || (wireModel !== undefined && (orchestrated || response.wireModel !== undefined) && response.wireModel !== wireModel)
+    || (orchestrated && wireModel !== undefined && family !== proxyModelFamily(wireModel))
     || !isFamily(family)
-    || value.blocks.length > MAX_BLOCKS) return undefined
+    || value.blocks.length > MAX_BLOCKS + (hasPlanPrefix ? 1 : 0)) return undefined
   const blocks: ProxyReplayBlock[] = []
   for (const item of value.blocks) {
-    if (!isRecord(item) || typeof item.kind !== 'string') continue
-    const kind = item.kind as ReplayBlockKind
-    const signature = typeof item.signature === 'string' && safeSignature(item.signature) !== undefined ? item.signature : undefined
+    // 不能跳过无效条目；过滤后长度偶然一致会掩盖块错位。
+    if (!isRecord(item) || (item.kind !== 'text' && item.kind !== 'reasoning' && item.kind !== 'tool-call')) return undefined
+    const kind = item.kind
+    const signature = safeSignature(item.signature)
     blocks.push({ kind, ...(signature === undefined ? {} : { signature }) })
   }
   if (blockKinds !== undefined
     && (blocks.length !== blockKinds.length || blocks.some((block, index) => block.kind !== blockKinds[index]))) return undefined
-  const finish = value.response.finish === undefined ? undefined : safeFinish(value.response.finish)
-  if (value.response.finish !== undefined && finish === undefined) return undefined
+  const finish = response.finish === undefined ? undefined : safeFinish(response.finish)
+  if (response.finish !== undefined && finish === undefined) return undefined
   return {
     response: {
       version: PROXY_REPLAY_VERSION,
       provider: PROXY_PROVIDER_ID,
       model,
       family,
-      ...(typeof value.response.wireModel === 'string' ? { wireModel: value.response.wireModel } : {}),
+      ...(typeof response.wireModel === 'string' ? { wireModel: response.wireModel } : {}),
       ...(finish === undefined ? {} : { finish }),
     },
     blocks,

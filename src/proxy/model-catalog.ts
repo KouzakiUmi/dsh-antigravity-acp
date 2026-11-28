@@ -1,6 +1,7 @@
 /** Parse the account's live catalog and intersect it with the pinned proxy definitions. */
 import { getAgyNativeModel } from '@cortexkit/antigravity-auth-core'
 import type { getPublicModelDefinitions } from '@cortexkit/antigravity-auth-core'
+import { LlmError } from '@deepseek-ai/dsh-llm'
 import type { LlmModelInfo } from '@deepseek-ai/dsh-llm'
 import { isNonChatModel } from '../adapter/model-catalog-policy.js'
 import { modelDisplayName } from '../adapter/model-settings.js'
@@ -133,21 +134,21 @@ function invalidCatalog() {
   return llmError('代理模式模型目录不符合预期结构', 'PROTOCOL_DRIFT')
 }
 
-export interface ProxyOrchestratorEndpoint {
+type OrchestratorCapacity = Pick<ModelCapacity, 'contextWindow' | 'maxOutputTokens'>
+
+export interface ProxyOrchestratorEndpoint extends OrchestratorCapacity {
   readonly familyId: string
   readonly wire: string
-  readonly effort: ModelEffort
-  readonly availableEfforts: readonly ModelEffort[]
-  readonly contextWindow?: number
-  readonly maxOutputTokens?: number
-  readonly supportsImagesFallback: boolean
+  readonly effort?: ModelEffort | 'xhigh'
+  readonly availableEfforts: readonly (ModelEffort | 'xhigh')[]
+  /** Common bound across all advertised tiers, or just the exact wire for a fixed target. */
+  readonly sharedCapacity: OrchestratorCapacity
+  readonly supportsImages: boolean
 }
 
-export interface ResolvedProxyOrchestrator {
+export interface ResolvedProxyOrchestrator extends OrchestratorCapacity {
   readonly planner: ProxyOrchestratorEndpoint
   readonly executor: ProxyOrchestratorEndpoint
-  readonly contextWindow?: number
-  readonly maxOutputTokens?: number
 }
 
 export function toProxyFamilyId(model: string): string {
@@ -155,68 +156,91 @@ export function toProxyFamilyId(model: string): string {
   return trimmed.startsWith('antigravity-') ? trimmed : `antigravity-${trimmed}`
 }
 
-/**
- * 解析编排端点：从 live 目录读取该家族实际可用档位集合并收敛期望档位，
- * 若期望档位不在 live 集合内则收敛到 `medium` 或最近可用档位。
- */
+type ProxyDefinitions = ReturnType<typeof getPublicModelDefinitions>
+
+export function isNonChatProxyWire(wire: string, definitions: ProxyDefinitions): boolean {
+  return isNonChatModel(wire) || Object.values(definitions).some(def => !isProxyChatDefinition(def) && resolveProxyWireModel(def.id) === wire)
+}
+
+export function proxyDefinitionForWire(wire: string, definitions: ProxyDefinitions): ProxyDefinitions[string] | undefined {
+  return Object.values(definitions).find(def => isProxyChatDefinition(def)
+    && [undefined, ...PROXY_MODEL_EFFORTS].some(tier => resolveProxyWireModel(def.id, tier) === wire))
+}
+
+/** A target pins the observed wire; without one, converge to an observed tier. */
 export function resolveProxyOrchestratorEndpoint(
   model: string,
-  effort: ModelEffort,
+  effort: ModelEffort | 'xhigh',
   catalog: LiveProxyCatalog | undefined,
-  definitions: ReturnType<typeof getPublicModelDefinitions>,
+  definitions: ProxyDefinitions,
+  modelSettings?: ReadonlyMap<string, ModelSetting>,
 ): ProxyOrchestratorEndpoint | undefined {
   if (catalog === undefined) return undefined
   const familyId = toProxyFamilyId(model)
-  if (isLiveGeminiFamily(familyId)) {
-    const observed = catalog.models.get(familyId)
-    if (observed?.liveGemini === undefined) return undefined
-    const variants = observed.liveGemini.variants
-    const availableEfforts = PROXY_MODEL_EFFORTS.filter((candidate) => {
-      const w = variants.get(candidate)
-      return w !== undefined && catalog.wire.has(w)
-    })
-    const converged = convergeOrchestratorEffort(effort, availableEfforts) as ModelEffort | undefined
-    if (converged === undefined) return undefined
-    const wire = variants.get(converged)
-    if (wire === undefined) return undefined
-    const liveWire = catalog.wire.get(wire)
-    if (liveWire === undefined) return undefined
-    return {
-      familyId,
-      wire,
-      effort: converged,
-      availableEfforts,
-      ...(liveWire.contextWindow === undefined ? {} : { contextWindow: liveWire.contextWindow }),
-      ...(liveWire.maxOutputTokens === undefined ? {} : { maxOutputTokens: liveWire.maxOutputTokens }),
-      supportsImagesFallback: false,
-    }
-  }
-  const definition = definitions[familyId]
-  if (definition === undefined || !isProxyChatDefinition(definition)) return undefined
   const observed = catalog.models.get(familyId)
-  const definitionEfforts = PROXY_MODEL_EFFORTS.filter((candidate) => catalog.wire.has(resolveProxyWireModel(familyId, candidate)))
-  const availableEfforts = observed && observed.efforts.length > 0
-    ? observed.efforts.filter((candidate) => catalog.wire.has(resolveProxyWireModel(familyId, candidate)))
-    : definitionEfforts
-  const converged = convergeOrchestratorEffort(effort, availableEfforts) as ModelEffort | undefined
-  if (converged === undefined) return undefined
-  const wire = resolveProxyWireModel(familyId, converged)
-  if (isNonChatModel(wire) || Object.values(definitions).some(def => !isProxyChatDefinition(def) && resolveProxyWireModel(def.id) === wire)) {
-    return undefined
+  if (observed === undefined) return undefined
+  const definition = definitions[familyId]
+  if (observed.liveGemini === undefined && (definition === undefined || !isProxyChatDefinition(definition))) return undefined
+
+  const target = modelSettings?.get(familyId)?.target
+  if (target !== undefined) {
+    if (!safeModelId(target) || isNonChatProxyWire(target, definitions)) {
+      throw llmError(`编排模型 ${familyId} 的映射不是有效的文本模型`, 'INVALID_MODEL')
+    }
+    const liveWire = catalog.wire.get(target)
+    if (liveWire === undefined) {
+      throw llmError(`编排模型 ${familyId} 的映射目标不在当前目录`, 'INVALID_MODEL')
+    }
+    const routed = proxyDefinitionForWire(target, definitions)
+    const targetEffort = mappedWireEffort(target, catalog, routed)
+    const { supportsImages, ...capacity } = wireCapabilities(target, liveWire, routed)
+    return { familyId, wire: target, ...(targetEffort === undefined ? {} : { effort: targetEffort }),
+      availableEfforts: [], ...capacity, sharedCapacity: capacity, supportsImages }
   }
-  const liveWire = catalog.wire.get(wire)
-  if (liveWire === undefined) return undefined
+
+  const tiers: readonly (ModelEffort | 'xhigh')[] = observed.liveGemini !== undefined
+    ? [...PROXY_MODEL_EFFORTS, 'xhigh'] : observed.efforts.length > 0 ? observed.efforts : PROXY_MODEL_EFFORTS
+  const candidates = tiers
+    .flatMap(tier => {
+      const wire = observed.liveGemini === undefined
+        ? resolveProxyWireModel(familyId, tier) : observed.liveGemini.variants.get(tier)
+      if (wire === undefined || isNonChatProxyWire(wire, definitions)) return []
+      const liveWire = catalog.wire.get(wire)
+      return liveWire === undefined ? [] : [{ wire, effort: tier, ...wireCapabilities(wire, liveWire, definition) }]
+    })
+  const availableEfforts = candidates.map(candidate => candidate.effort)
+  const effectiveEffort = convergeOrchestratorEffort(effort, availableEfforts)
+  const selected = candidates.find(candidate => candidate.effort === effectiveEffort)
+  if (selected === undefined) return undefined
+  return { familyId, ...selected, availableEfforts, sharedCapacity: commonCapacity(candidates) }
+}
+
+function mappedWireEffort(wire: string, catalog: LiveProxyCatalog, definition?: ProxyDefinitions[string]): ModelEffort | undefined {
+  return PROXY_MODEL_EFFORTS.find(tier => definition !== undefined
+    ? resolveProxyWireModel(definition.id, tier) === wire
+      && PROXY_MODEL_EFFORTS.some(other => resolveProxyWireModel(definition.id, other) !== wire)
+    : Array.from(catalog.models.values()).some(row => row.liveGemini?.variants.get(tier) === wire))
+}
+
+function wireCapabilities(wire: string, liveWire: LiveWireModel, definition?: ProxyDefinitions[string]) {
   const native = getAgyNativeModel(wire)
-  const contextWindow = liveWire.contextWindow ?? native?.maxTokens ?? definition.limit.context
-  const maxOutputTokens = liveWire.maxOutputTokens ?? native?.maxOutputTokens ?? definition.limit.output
   return {
-    familyId,
-    wire,
-    effort: converged,
-    availableEfforts,
+    contextWindow: liveWire.contextWindow ?? native?.maxTokens ?? definition?.limit.context,
+    maxOutputTokens: liveWire.maxOutputTokens ?? native?.maxOutputTokens ?? definition?.limit.output,
+    supportsImages: liveWire.supportsImages ?? (definition?.modalities.input.includes('image') === true),
+  }
+}
+
+function commonCapacity(models: readonly OrchestratorCapacity[]): OrchestratorCapacity {
+  const minimum = (key: keyof OrchestratorCapacity) => {
+    const values = models.map(model => model[key]).filter(value => value !== undefined)
+    return values.length > 0 && values.length === models.length ? Math.min(...values) : undefined
+  }
+  const contextWindow = minimum('contextWindow')
+  const maxOutputTokens = minimum('maxOutputTokens')
+  return {
     ...(contextWindow === undefined ? {} : { contextWindow }),
     ...(maxOutputTokens === undefined ? {} : { maxOutputTokens }),
-    supportsImagesFallback: definition.modalities.input.includes('image'),
   }
 }
 
@@ -224,25 +248,16 @@ export function resolveProxyOrchestrator(
   settings: OrchestratorSettings,
   catalog: LiveProxyCatalog | undefined,
   definitions: ReturnType<typeof getPublicModelDefinitions>,
-  plannerEffort: ModelEffort = settings.plannerEffort,
+  plannerEffort: ModelEffort | 'xhigh' = settings.plannerEffort,
   executorEffort: ModelEffort = settings.executorEffort,
+  modelSettings?: ReadonlyMap<string, ModelSetting>,
 ): ResolvedProxyOrchestrator | undefined {
   if (!settings.enabled) return undefined
-  const planner = resolveProxyOrchestratorEndpoint(settings.plannerModel, plannerEffort, catalog, definitions)
-  const executor = resolveProxyOrchestratorEndpoint(settings.executorModel, executorEffort, catalog, definitions)
+  const planner = resolveProxyOrchestratorEndpoint(settings.plannerModel, plannerEffort, catalog, definitions, modelSettings)
+  const executor = resolveProxyOrchestratorEndpoint(settings.executorModel, executorEffort, catalog, definitions, modelSettings)
   if (planner === undefined || executor === undefined) return undefined
-  const contextWindow = planner.contextWindow !== undefined && executor.contextWindow !== undefined
-    ? Math.min(planner.contextWindow, executor.contextWindow)
-    : undefined
-  const maxOutputTokens = planner.maxOutputTokens !== undefined && executor.maxOutputTokens !== undefined
-    ? Math.min(planner.maxOutputTokens, executor.maxOutputTokens)
-    : undefined
-  return {
-    planner,
-    executor,
-    ...(contextWindow === undefined ? {} : { contextWindow }),
-    ...(maxOutputTokens === undefined ? {} : { maxOutputTokens }),
-  }
+  // Planner effort can change on each request; the executor remains on its configured wire.
+  return { planner, executor, ...commonCapacity([planner.sharedCapacity, executor]) }
 }
 
 /**
@@ -255,20 +270,24 @@ export function synthesizeProxyOrchestratorModel(options: {
   definitions: ReturnType<typeof getPublicModelDefinitions>
   attachmentsAvailable: boolean
   modelSettings?: ReadonlyMap<string, ModelSetting>
-  plannerEffort?: ModelEffort
+  plannerEffort?: ModelEffort | 'xhigh'
   executorEffort?: ModelEffort
+  resolved?: ResolvedProxyOrchestrator
 }): (LlmModelInfo & ModelCapacity) | undefined {
-  const resolved = resolveProxyOrchestrator(
-    options.settings,
-    options.catalog,
-    options.definitions,
-    options.plannerEffort ?? options.settings.plannerEffort,
-    options.executorEffort ?? options.settings.executorEffort,
-  )
+  if (!options.settings.enabled) return undefined
+  let resolved = options.resolved
+  if (resolved === undefined) {
+    try {
+      resolved = resolveProxyOrchestrator(
+        options.settings, options.catalog, options.definitions, options.plannerEffort, options.executorEffort, options.modelSettings,
+      )
+    } catch (error) {
+      if (error instanceof LlmError && error.code === 'INVALID_MODEL') return undefined
+      throw error
+    }
+  }
   if (resolved === undefined) return undefined
-  const liveExecutor = options.catalog.wire.get(resolved.executor.wire)
-  const acceptsImages = options.attachmentsAvailable
-    && (liveExecutor?.supportsImages ?? resolved.executor.supportsImagesFallback)
+  const acceptsImages = options.attachmentsAvailable && resolved.executor.supportsImages
   const name = options.modelSettings !== undefined
     ? modelDisplayName(options.modelSettings, ORCHESTRATOR_MODEL_ID, ORCHESTRATOR_MODEL_NAME)
     : ORCHESTRATOR_MODEL_NAME

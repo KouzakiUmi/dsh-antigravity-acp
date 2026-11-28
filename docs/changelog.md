@@ -4,8 +4,11 @@
 
 记录源码与发布内容，不将本地构建、npm 发布和本机升级混为同一状态。日期采用 Asia/Hong_Kong。更早历史见 [Git 提交记录](https://github.com/KouzakiUmi/dsh-antigravity-acp/commits/main/)。
 
-## 未发布
+## 0.1.57 · 2026-11-28
 
+- **代理模式**：开关前显示 Google 服务条款和账号暂停或终止风险，并提供官方条款链接。
+- **AI Studio / Vertex AI**：模型行新增「参数」与兼容性信息，可保存上下文预算、默认输出上限、停止序列，以及型号支持的思考深度或温度；会话显式选择优先。
+- **代理 / ACP 编排**：修复规划超时降级、工具续轮签名、重复输入与失败预算、映射容量一致性，以及 ACP 换连接后的计划和预算。关闭编排后，已选中的旧会话直接走执行器。
 - **ACP 私有 MCP 桥**：注册名由 `dsh-tools` 缩为 `dsh`，[#26](https://github.com/KouzakiUmi/dsh-antigravity-acp/issues/26) 报告中的拼接工具名由 65 字符降为 59；原工具名与 schema 不变。升级后旧的带工具会话按 DSH 历史重建，不继续载入按旧桥名缓存的 schema。
 - **界面语言**：插件设置和额度药丸跟随 DSH 的语言设置，切换语言时保留未保存的模型设置；支持简体中文，其他语言显示英文。原生模型选择器的 ACP 思考档位与代理模式统一为 `Low / Medium / High`，档位 ID 不变。见 [PR #27](https://github.com/KouzakiUmi/dsh-antigravity-acp/pull/27)。
 - **ACP 工具调用**：识别 Antigravity CLI 1.5.15+ 的 MCP 权限提示格式，兼容服务器名带 8 位小写十六进制后缀的写法。权限提示中的工具摘要不参与参数预检或执行；实际参数仍由私有 MCP 桥转交 DSH。见 [PR #28](https://github.com/KouzakiUmi/dsh-antigravity-acp/pull/28)。

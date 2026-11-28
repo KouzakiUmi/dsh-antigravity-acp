@@ -58,6 +58,7 @@ import type { ModelOverride, OrchestratorConfig } from '../settings.js'
 import {
   ORCHESTRATOR_MODEL_ID,
   ORCHESTRATOR_MODEL_NAME,
+  ORCHESTRATOR_LEGACY_EFFORTS,
   OrchestratorStore,
   PLANNER_SYSTEM_SUFFIX,
   buildExecutorSystem,
@@ -65,6 +66,7 @@ import {
   computeTurnKey,
   convergeOrchestratorEffort,
   extractGoalAndEvidence,
+  latestToolResultId,
   normalizeOrchestratorSettings,
   parsePlan,
   renderPlanForExecutor,
@@ -177,6 +179,7 @@ export interface AntigravityAcpAdapterOptions {
   sessionStore?: SessionMapStore
   /** 编排模式配置（`antigravity-orchestrator`）。 */
   orchestrator?: OrchestratorConfig
+  orchestratorStore?: OrchestratorStore
   /** Capture live preferences only between ACP turns, never during tool continuation. */
   readSettings?: () => Pick<AntigravityAcpAdapterOptions, 'modelOverrides' | 'reuseSessions' | 'resumeSessions' | 'keepProcessAfterCancel' | 'cancelGraceMs' | 'idleRecycleMs' | 'sessionStore' | 'orchestrator' | 'promptByteBudget' | 'toolCatalogByteBudget'>
   /** 历史被字节预算裁剪时的事件回调（issue #16）；宿主据此向 UI 暴露裁剪事实。 */
@@ -312,7 +315,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   /** 用户模型设置的只读快照；每次读取设置时整体替换。 */
   #modelSettings: ReadonlyMap<string, ModelSetting> = new Map()
   #orchestratorConfig: OrchestratorConfig | undefined
-  readonly #orchestrators = new OrchestratorStore()
+  readonly #orchestrators: OrchestratorStore
   /** 按 DSH 会话隔离的独立 planner ACP 会话缓存（最多 64 条，按 link 与 cwd 失效）。 */
   readonly #plannerSessions = new Map<string, PlannerSessionEntry>()
   /** 正在运行中的 planner 通知采集器；绝不借用 chat 的 #turn。 */
@@ -410,6 +413,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
 
   constructor(options: AntigravityAcpAdapterOptions) {
     super()
+    this.#orchestrators = options.orchestratorStore ?? new OrchestratorStore()
     this.#lifecycle = options.lifecycle
     this.#getLink = options.getLink
     this.#recycleLink = options.recycleLink
@@ -452,7 +456,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       this.#releaseTurnSubscription()
       this.#dropAllSessions('adapter 卸载')
       this.#dropAllPlannerSessions()
-      this.#orchestrators.dispose()
+      if (options.orchestratorStore === undefined) this.#orchestrators.dispose()
       this.#plannerCollector = undefined
       for (const [turn, link] of this.#ephemeral) this.#closeSession(link, turn.sessionId)
       this.#ephemeral.clear()
@@ -929,6 +933,11 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     throwIfAborted(signal)
     if (model === ORCHESTRATOR_MODEL_ID) {
       const orch = this.#orchestratorSettingsSnapshot()
+      if (!orch.enabled) {
+        const info = await this.resolveModel(provider, acpOrchestratorFamily(orch.executorModel), signal)
+        return { ...info, id: model, name: modelDisplayName(this.#modelSettingsSnapshot(), model, ORCHESTRATOR_MODEL_NAME),
+          reasoning: { efforts: ORCHESTRATOR_LEGACY_EFFORTS.map(effort => ({ id: ReasoningEffortId(effort), name: effort[0]!.toUpperCase() + effort.slice(1) })) } }
+      }
       const observedFamilies = await withAbort(this.#observedAcpFamilies(provider), signal)
       throwIfAborted(signal)
       const orchContext = this.#orchestratorContextWindow(orch)
@@ -1503,7 +1512,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
    */
   async *#streamOrchestrated(options: AcpRequestOptions): AsyncGenerator<StreamChunk> {
     const orch = this.#orchestratorSettingsSnapshot()
-    if (!orch.enabled) {
+    if (!orch.enabled || options.purpose !== undefined) {
       const executorOptions: AdapterRequestOptions = {
         ...options,
         model: acpOrchestratorFamily(orch.executorModel),
@@ -1514,15 +1523,12 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     }
 
     const sessionId = options.sessionId === undefined ? undefined : String(options.sessionId)
-    const storedState = this.#orchestrators.get(sessionId)
     const currentTurnKey = computeTurnKey(options.messages, sessionId)
-    const effectiveState = storedState.turnKey !== undefined && currentTurnKey !== undefined && currentTurnKey !== storedState.turnKey
-      ? { ...storedState, plansThisTurn: 0 }
-      : storedState
+    const storedState = this.#orchestrators.forTurn(sessionId, currentTurnKey)
     const { goal, evidence } = extractGoalAndEvidence(options.messages)
     const decision = shouldPlan({
       messages: options.messages,
-      state: effectiveState,
+      state: storedState,
       goal,
       settings: orch,
       ...(sessionId === undefined ? {} : { sessionId }),
@@ -1534,6 +1540,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     let emittedShowPlan = false
 
     if (decision.plan) {
+      const attempt = this.#orchestrators.reservePlan(sessionId, latestToolResultId(options.messages))
       const result = await this.#runAcpPlanner(options, orch, requestedPlannerEffort, goal, evidence, storedState.plan, sessionId)
       options.admissionSignal?.throwIfAborted()
       if (options.signal?.aborted) {
@@ -1544,17 +1551,10 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         return
       }
       plannerUsage = result.usage
+      this.#orchestrators.finishPlan(sessionId, attempt, result.plan)
       if (result.plan !== undefined) {
         activePlan = result.plan
-        const nextPlansThisTurn = (decision.reason === 'new-goal' ? 0 : effectiveState.plansThisTurn) + 1
-        this.#orchestrators.update(sessionId, (prev) => ({
-          ...prev,
-          plan: result.plan,
-          stage: 'executing',
-          plansThisTurn: nextPlansThisTurn,
-          ...(currentTurnKey === undefined ? {} : { turnKey: currentTurnKey }),
-        }))
-        if (orch.showPlan) {
+        if (orch.showPlan && result.plan !== storedState.plan) {
           const planText = renderPlanForExecutor(result.plan)
           const planBlock: ContentBlock = { type: 'text', text: planText }
           this.#leadingEmittedBlock = planBlock
@@ -1613,6 +1613,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     const combinedSignal = callerSignal
       ? AbortSignal.any([callerSignal, timeoutController.signal])
       : timeoutController.signal
+    const setupSignal = options.admissionSignal === undefined ? combinedSignal : AbortSignal.any([combinedSignal, options.admissionSignal])
 
     const key = sessionKey || undefined
     let entry: PlannerSessionEntry | undefined
@@ -1622,12 +1623,12 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     let sessionIdForPrompt: string | undefined
 
     try {
-      await withAbort(this.#settleRecycle(), combinedSignal)
+      await withAbort(this.#settleRecycle(), setupSignal)
       if (this.#disposed) return {}
-      const link = await this.#getLink(this.#handlers, combinedSignal)
+      const link = await this.#getLink(this.#handlers, setupSignal)
       linkForPrompt = link
       this.#observeCapabilities(link)
-      throwIfAborted(combinedSignal)
+      throwIfAborted(setupSignal)
 
       // 复用前提：同一链路且尚未关闭且 cwd 一致
       const cached = key === undefined ? undefined : this.#plannerSessions.get(key)
@@ -1644,8 +1645,8 @@ export class AntigravityAcpAdapter extends LlmAdapter {
           cwd: this.#cwd,
           mcpServers: [],
           _meta: { antigravity: { enabledTools: [], eagerMcpServers: [] } },
-        }, { signal: combinedSignal, timeoutMs: orch.plannerTimeoutMs })
-        throwIfAborted(combinedSignal)
+        }, { signal: setupSignal, timeoutMs: orch.plannerTimeoutMs })
+        throwIfAborted(setupSignal)
         if (created.configOptions) this.observeSessionConfigOptions(created.configOptions, created.sessionId)
         entry = {
           sessionId: created.sessionId,
@@ -1659,32 +1660,23 @@ export class AntigravityAcpAdapter extends LlmAdapter {
 
       // 写配置顺序：先写 model（基于 planner 会话自己的 configOptions，显式带档位或同步 thought_level），
       // 再按回执重读 thought_level / mode 并写入。
-      await withAbort(this.#foldCatalog(AGY_PROVIDER_ID), combinedSignal)
-      throwIfAborted(combinedSignal)
+      await withAbort(this.#foldCatalog(AGY_PROVIDER_ID), setupSignal)
+      throwIfAborted(setupSignal)
       const plannerFamily = acpOrchestratorFamily(orch.plannerModel)
-      const plannerTiers = this.#familyTiers.get(plannerFamily)
-      const initialThoughtSel = findThoughtLevelSelector(entry.configOptions)
-      const initialEfforts = plannerTiers !== undefined && plannerTiers.size > 0
-        ? [...plannerTiers]
-        : initialThoughtSel && initialThoughtSel.options.length > 0
-          ? initialThoughtSel.options.map((opt) => opt.value)
-          : [...AGY_REASONING_EFFORTS]
-      const initialConverged = convergeOrchestratorEffort(plannerEffort, initialEfforts) ?? plannerEffort
-      const plannerRoute = plannerTiers !== undefined && plannerTiers.size > 0
-        ? routeTieredModelId(plannerFamily, (AGY_REASONING_EFFORTS.find((e) => e === initialConverged) ?? DEFAULT_AGY_REASONING_EFFORT), plannerTiers)
-        : `${plannerFamily}-${initialConverged}`
-
       const modelSel = findModelSelector(entry.configOptions)
       if (!modelSel) {
         throw llmError('ACP planner 会话未声明 model 配置选项', AGY_ADAPTER_ERROR.NO_MODEL_SELECTOR)
       }
+      const available = AGY_REASONING_EFFORTS.filter(effort => modelSel.options.some(option => option.value === `${plannerFamily}-${effort}`))
+      const selectedTier = convergeOrchestratorEffort(plannerEffort, available)
+      const plannerRoute = selectedTier === undefined ? plannerFamily : `${plannerFamily}-${selectedTier}`
       if (modelSel.currentValue !== plannerRoute) {
         const modelResp = await link.setConfigOption({
           sessionId: entry.sessionId,
           configId: modelSel.configId,
           value: plannerRoute,
-        }, { signal: combinedSignal, timeoutMs: orch.plannerTimeoutMs })
-        throwIfAborted(combinedSignal)
+        }, { signal: setupSignal, timeoutMs: orch.plannerTimeoutMs })
+        throwIfAborted(setupSignal)
         if (modelResp.configOptions.length > 0) entry.configOptions = modelResp.configOptions
       }
 
@@ -1696,21 +1688,33 @@ export class AntigravityAcpAdapter extends LlmAdapter {
             sessionId: entry.sessionId,
             configId: thoughtSel.configId,
             value: convergedThought,
-          }, { signal: combinedSignal, timeoutMs: orch.plannerTimeoutMs })
-          throwIfAborted(combinedSignal)
+          }, { signal: setupSignal, timeoutMs: orch.plannerTimeoutMs })
+          throwIfAborted(setupSignal)
           if (thoughtResp.configOptions.length > 0) entry.configOptions = thoughtResp.configOptions
         }
       }
 
       const modeSel = findModeSelector(entry.configOptions)
-      if (modeSel && modeSel.options.some((opt) => opt.value === 'plan') && modeSel.currentValue !== 'plan') {
+      if (!modeSel || !modeSel.options.some((opt) => opt.value === 'plan')) {
+        this.#log?.warn('antigravity-acp: planner 会话未声明 plan 模式，降级直接执行')
+        this.#closeSession(link, entry.sessionId)
+        if (key !== undefined) this.#plannerSessions.delete(key)
+        return {}
+      }
+      if (modeSel.currentValue !== 'plan') {
         const modeResp = await link.setConfigOption({
           sessionId: entry.sessionId,
           configId: modeSel.configId,
           value: 'plan',
-        }, { signal: combinedSignal, timeoutMs: orch.plannerTimeoutMs })
-        throwIfAborted(combinedSignal)
+        }, { signal: setupSignal, timeoutMs: orch.plannerTimeoutMs })
+        throwIfAborted(setupSignal)
         if (modeResp.configOptions.length > 0) entry.configOptions = modeResp.configOptions
+        if (findModeSelector(entry.configOptions)?.currentValue !== 'plan') {
+          this.#log?.warn('antigravity-acp: planner 会话未确认 plan 模式，降级直接执行')
+          this.#closeSession(link, entry.sessionId)
+          if (key !== undefined) this.#plannerSessions.delete(key)
+          return {}
+        }
       }
 
       const plannerMessages = buildPlannerMessages(goal, evidence, priorPlan)
@@ -1719,7 +1723,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         .join('\n\n')
       const baseSystem = [
         ...(typeof options.system === 'string' && options.system.trim() ? [options.system] : []),
-        ...options.messages.flatMap((msg) => msg.role === 'system'
+        ...options.messages.flatMap((msg) => msg.role === 'system' || msg.role === 'developer'
           ? msg.content.flatMap((b) => b.type === 'text' && b.text.trim() ? [b.text] : [])
           : []),
       ].join('\n\n')
@@ -1791,6 +1795,10 @@ export class AntigravityAcpAdapter extends LlmAdapter {
 
       plannerUsage = mapUsage(promptResponse.usage)
       if (callerSignal?.aborted) return {}
+      if (promptResponse.stopReason !== 'end_turn') {
+        this.#log?.warn('antigravity-acp: 编排 planner 未正常结束，降级直接执行')
+        return { ...(plannerUsage === undefined ? {} : { usage: plannerUsage }) }
+      }
 
       const plan = parsePlan(collectedText, priorPlan)
       if (plan === undefined) {

@@ -37,8 +37,12 @@ export interface OrchestratorState {
   stage: OrchestratorStage
   plansThisTurn: number
   turnKey?: string
+  lastPlannedToolResult?: string | null
   lastError?: string
 }
+
+/** A disabled legacy route accepts saved planner choices; dispatch still pins the configured executor. */
+export const ORCHESTRATOR_LEGACY_EFFORTS = ['low', 'medium', 'high', 'xhigh'] as const
 
 export interface OrchestratorSettings {
   enabled: boolean

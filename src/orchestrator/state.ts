@@ -55,11 +55,27 @@ export class OrchestratorStore {
   }
 
   resetTurn(sessionId?: string, turnKey?: string): OrchestratorState {
-    return this.update(sessionId, (prev) => ({
-      ...prev,
-      plansThisTurn: 0,
+    return this.update(sessionId, () => ({
+      ...initialState(),
       ...(turnKey === undefined ? {} : { turnKey }),
     }))
+  }
+
+  /** 一轮只消费自己的预算和计划；新用户消息不会沿用上一轮计划。 */
+  forTurn(sessionId: string | undefined, turnKey: string | undefined): OrchestratorState {
+    const current = this.get(sessionId)
+    return current.turnKey === turnKey ? current : this.resetTurn(sessionId, turnKey)
+  }
+
+  /** 预留一次规划尝试，失败也计入预算。较晚的回包不可覆盖更新的尝试。 */
+  reservePlan(sessionId: string | undefined, lastPlannedToolResult?: string): OrchestratorState {
+    return this.update(sessionId, (prev) => ({ ...prev, stage: 'planning', plansThisTurn: prev.plansThisTurn + 1, lastPlannedToolResult: lastPlannedToolResult ?? null }))
+  }
+
+  finishPlan(sessionId: string | undefined, attempt: OrchestratorState, plan?: OrchestratorState['plan']): void {
+    const key = orchestratorSessionKey(sessionId)
+    if (key === undefined || this.entries.get(key) !== attempt) return
+    this.update(key, { stage: 'executing', ...(plan === undefined ? {} : { plan }) })
   }
 
   delete(sessionId?: string): boolean {

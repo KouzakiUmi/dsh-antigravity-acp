@@ -6,7 +6,7 @@
  * 等审计变换；本模块只负责消息映射与有界化：
  * - system / developer 文本 → `systemInstruction.parts`；
  * - assistant → role `model`，tool 结果 → `functionResponse`；
- * - thoughtSignature 优先取块自带值，其次取 replay 元数据，functionCall 缺签名时
+ * - 编排的 thoughtSignature 只取已校验的 replay 元数据；普通模型兼容块自带值。functionCall 缺签名时
  *   补官方 sentinel（`skip_thought_signature_validator`），Claude 家族仅首个 call 带签名；
  * - 图片经宿主附件服务有界读取后转 `inlineData`（见 image.ts）；附件服务缺席时
  *   报 `UNSUPPORTED_MODALITY` 而不是静默丢弃；上游返回媒体输出仍按协议漂移拒绝。
@@ -31,6 +31,7 @@ import { llmError } from '../runtime/llm-error.js'
 import type { ContentBlock, RequestMessage, TokenUsage } from '@deepseek-ai/dsh-llm'
 import type { AdapterRequestOptions } from '../adapter/request-options.js'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
+import { ORCHESTRATOR_MODEL_ID } from '../orchestrator/types.js'
 import { buildProxyFunctionDeclarations, compatibleProxyReplayState, proxyModelFamily, PROXY_MAX_SIGNATURE_LENGTH } from './replay.js'
 import type { ProxyReplayBlock, ReplayBlockKind } from './replay.js'
 import { projectProxyOffloadedImages, readProxyImage, requiredProxyImageOffload } from './image.js'
@@ -95,8 +96,10 @@ export async function buildProxyGeneratePayload(
   attachments?: ProxyAttachmentReader,
   signal?: AbortSignal,
   wireModelOverride?: string,
+  replayModel = options.model,
 ): Promise<ProxyGeneratePayload> {
   const wireModel = wireModelOverride ?? resolveProxyWireModel(options.model, options.reasoningEffort)
+  const route = { model: replayModel, executorModel: options.model, wireModel }
   const toolNames = new Map<string, ToolCallState>()
   const sentImageBytes = new Map<string, number>()
   // 已 offload 的图片先投影成占位文本：模型看到「未发送像素」的说明而不是静默丢失。
@@ -104,7 +107,7 @@ export async function buildProxyGeneratePayload(
   const contents: Record<string, unknown>[] = []
   for (const message of history) {
     if (message.role === 'system' || message.role === 'developer') continue
-    contents.push(await mapMessage(message, options.model, toolNames, attachments, signal, sentImageBytes, wireModel))
+    contents.push(await mapMessage(message, route, toolNames, attachments, signal, sentImageBytes))
   }
   const request: Record<string, unknown> = { contents: groupClaudeFunctionResponses(contents, wireModel) }
   const systemParts = [
@@ -327,17 +330,16 @@ function requireToolCallId(value: unknown): string {
 
 async function mapMessage(
   message: RequestMessage,
-  model: string,
+  { model, executorModel, wireModel }: { model: string; executorModel: string; wireModel: string },
   toolNames: Map<string, ToolCallState>,
   attachments: ProxyAttachmentReader | undefined,
   signal: AbortSignal | undefined,
   sentImageBytes: Map<string, number>,
-  wireModel: string,
 ): Promise<Record<string, unknown>> {
   if (message.role === 'assistant') expirePendingToolCalls(toolNames)
   const parts: Record<string, unknown>[] = []
   const kinds = contentKinds(message.content)
-  const replay = message.role === 'assistant' ? compatibleProxyReplayState(message, model, kinds, wireModel) : undefined
+  const replay = message.role === 'assistant' ? compatibleProxyReplayState(message, model, kinds, wireModel, executorModel) : undefined
   const replayBlocks = replay?.blocks ?? []
   const isClaude = proxyModelFamily(wireModel) === 'claude'
   let replayIndex = 0
@@ -360,9 +362,9 @@ async function mapMessage(
     const replayKind: ReplayBlockKind | undefined = block.type === 'text' || block.type === 'reasoning' || block.type === 'tool-call' ? block.type : undefined
     const replayBlock = replayKind === undefined ? undefined : replayBlocks[replayIndex++]
     const replaySignature = replayBlock !== undefined && replayBlock.kind === replayKind ? replayBlock.signature : undefined
-    const blockSignature = (block as unknown as { signature?: string; thoughtSignature?: string }).signature
-      ?? (block as unknown as { signature?: string; thoughtSignature?: string }).thoughtSignature
-      ?? replaySignature
+    const legacyBlock = block as typeof block & { signature?: string; thoughtSignature?: string }
+    const blockSignature = model === ORCHESTRATOR_MODEL_ID ? replaySignature
+      : legacyBlock.signature ?? legacyBlock.thoughtSignature ?? replaySignature
     if (block.type === 'text') {
       if (emittedToolResponse) continue
       if (block.text.length === 0 && message.content.length > 1) continue

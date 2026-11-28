@@ -4,6 +4,11 @@
  */
 import Schema from '@deepseek-ai/schemastery'
 import type { Volatile } from '@deepseek-ai/cordis'
+import {
+  GEMINI_REASONING_EFFORTS, MAX_MODEL_CONTEXT_WINDOW, MAX_MODEL_OUTPUT_TOKENS,
+  MAX_MODEL_STOP_LENGTH, MAX_MODEL_STOP_SEQUENCES, MAX_MODEL_TEMPERATURE,
+} from './adapter/model-settings.js'
+import type { GeminiReasoningEffort } from './adapter/model-settings.js'
 import { DEFAULT_ACP_SERVER_VERSION } from './runtime/binary.js'
 
 /** 单个模型目录条目上的用户设置；键是 DSH 模型选择器里的模型 ID。 */
@@ -16,6 +21,16 @@ export interface ModelOverride {
   name?: string
   /** 映射到官方模型 ID，原样写入 ACP 会话，优先于家族 + 档位路由。 */
   target?: string
+  /** 用户覆盖的上下文窗口（token）。 */
+  contextWindow?: number
+  /** 默认最大输出 token 数。 */
+  maxTokens?: number
+  temperature?: number
+  stop?: string[]
+  /** 图片输入能力配置；实际输入仍取决于路由的附件处理能力。 */
+  supportsImage?: boolean
+  /** 标准 Gemini 请求的默认思考档位，与路由的 effort 独立。 */
+  reasoningEffort?: GeminiReasoningEffort
 }
 
 export interface AntigravityHostConfig {
@@ -59,8 +74,7 @@ export interface AntigravityHostConfig {
   /** 并发 MCP tools/call 的聚合窗口（毫秒），决定同一轮携带多少 tool-call block。 */
   bridgeParkSettleMs?: number
   /**
-   * 按模型 ID 的目录设置：是否出现在 DSH 模型选择器、默认思考档位、显示名、
-   * 官方模型 ID 映射。只作用于目录中已存在的条目，不新增自造模型。
+   * 按模型 ID 的目录与生成设置，只作用于已登记的模型。
    */
   modelOverrides?: Record<string, ModelOverride>
   /**
@@ -205,6 +219,18 @@ const ModelOverrideSchema = Schema.object({
   effort: Schema.union(MODEL_EFFORTS).description('默认思考档位：low / medium / high'),
   name: Schema.string().description('显示名覆盖'),
   target: Schema.string().description('映射到的官方模型 ID，优先于家族 + 档位路由'),
+  contextWindow: Schema.natural().min(2).max(MAX_MODEL_CONTEXT_WINDOW).description('上下文窗口覆盖值（token）'),
+  maxTokens: Schema.natural().min(1).max(MAX_MODEL_OUTPUT_TOKENS).description('默认最大输出 token 数'),
+  temperature: Schema.transform(Schema.number().min(0).max(MAX_MODEL_TEMPERATURE), value => {
+    // Schemastery 的 min/max 不会拒绝 NaN；本字段也可由调用方用 JS 对象提供。
+    if (Number.isNaN(value)) throw new TypeError('temperature 必须是有限数值')
+    return value
+  }, true).description('默认温度（0–2）'),
+  // 外层 union 保持缺省；Schema.array 本身会为缺失的字段填入空数组。
+  stop: Schema.union([Schema.array(Schema.string().max(MAX_MODEL_STOP_LENGTH).pattern(/\S/u).required()).max(MAX_MODEL_STOP_SEQUENCES)])
+    .description('默认停止序列（最多 5 条，每条包含非空白字符）'),
+  supportsImage: Schema.boolean().description('图片输入能力配置；实际输入取决于路由的附件处理能力'),
+  reasoningEffort: Schema.union(GEMINI_REASONING_EFFORTS).description('标准 Gemini 请求的默认思考档位'),
 })
 
 const ORCHESTRATOR_PLANNER_MODELS = ['gemini-4-neon', 'gemini-4-argon', 'claude-opus-5-5'] as const
@@ -217,7 +243,7 @@ const OrchestratorSchema = Schema.object({
   executorModel: Schema.union(ORCHESTRATOR_EXECUTOR_MODELS).default('gemini-4-hydrogen').description('执行阶段模型：gemini-4-hydrogen / claude-sonnet-5-5'),
   executorEffort: Schema.union(MODEL_EFFORTS).default('medium').description('执行阶段思考档位：low / medium / high'),
   maxPlansPerTurn: Schema.natural().min(1).max(4).default(2).description('单回合最多规划次数（1–4）'),
-  plannerTimeoutMs: Schema.natural().min(5000).max(300_000).default(20_000).description('单次规划请求超时（毫秒，5000–300000）'),
+  plannerTimeoutMs: Schema.natural().min(5000).max(300_000).description('单次规划请求超时（毫秒，5000–300000；省略时 ACP 120000、代理 20000）'),
   showPlan: Schema.boolean().default(false).description('在对话中显示计划文本块'),
 })
 
@@ -237,7 +263,7 @@ export const Config = Schema.object({
   promptByteBudget: Schema.natural().min(16_000).max(191_000).default(176_000).description('单次 ACP prompt 的 UTF-8 字节预算（16000–191000）；超限时先裁剪最旧历史并在药丸提示。上游硬上限 192001 字节，中文等多字节字符按实际字节计'),
   toolCatalogByteBudget: Schema.natural().max(60_000).default(55_000).description('MCP 工具目录 JSON 字节预算（0–60000，默认 55000）；官方 agent 对超约 60KB 的目录会丢弃工具，超预算时从最长描述裁剪以保全部工具可见，名称与参数不变。0 禁用裁剪'),
   bridgeParkSettleMs: Schema.natural().default(50).description('并发 MCP tools/call 的聚合窗口（毫秒）'),
-  modelOverrides: Schema.dict(ModelOverrideSchema).default({}).volatile().description('按模型 ID 的目录设置（是否显示、默认思考档位、显示名、官方模型 ID 映射）；只作用于目录中已存在的模型') as Schema<
+  modelOverrides: Schema.dict(ModelOverrideSchema).default({}).volatile().description('按模型 ID 的目录与生成设置，只作用于已登记的模型') as Schema<
     Record<string, ModelOverride>,
     Record<string, ModelOverride>,
     'volatile-defined'

@@ -7,6 +7,7 @@ import Llm, {
   createAssistantMessage,
   createToolResultMessage,
   createUserMessage,
+  ReasoningEffortId,
   ToolCallId,
 } from '@deepseek-ai/dsh-llm'
 import type { StreamChunk, ToolSchema } from '@deepseek-ai/dsh-llm'
@@ -419,7 +420,13 @@ describe('ACP 编排目录合成与配置校验', () => {
     await harness.adapter.discoverModels()
     expect((await harness.adapter.listModels(AGY_PROVIDER_ID)).some((m) => m.id === ORCHESTRATOR_MODEL_ID)).toBe(false)
 
-    const streaming = collect(harness.adapter.stream(baseOptions()))
+    const ctx = new Context()
+    const fiber = ctx.plugin(Llm)
+    teardowns.push(async () => { await fiber.dispose() })
+    await fiber.inertia
+    ctx.llm.registerAdapter([AGY_PROVIDER_ID], harness.adapter)
+    const { purpose: _purpose, ...options } = baseOptions({ reasoningEffort: ReasoningEffortId('high') })
+    const streaming = collect(ctx.llm.stream(options))
     await waitForRequest(harness.agent, 'session/prompt')
     const promptReq = harness.agent.requestsFor('session/prompt')[0]!
     await harness.agent.notify('session/update', {
@@ -435,6 +442,44 @@ describe('ACP 编排目录合成与配置校验', () => {
 })
 
 describe('ACP 编排 planner 会话顺序、隔离、取消、超时与 usage 合并', () => {
+  it('先切裸 planner 模型，再按该模型回执选择档位；非正常结束不注入计划', async () => {
+    const config = structuredClone(ORCH_CONFIG_OPTIONS)
+    const model = config[0] as Extract<SessionConfigOption, { type: 'select' }>
+    model.options = [
+      { value: 'claude-opus-5-5', name: 'Opus' }, { value: 'gemini-4-argon-medium', name: 'Argon' },
+      { value: 'gemini-4-hydrogen-medium', name: 'Hydrogen' },
+    ]
+    config.push({ id: 'thought_level', type: 'select', name: 'Thought level', category: 'thought_level', currentValue: 'low',
+      options: [{ value: 'low', name: 'Low' }] })
+    const harness = createHarness({ configOptions: config })
+    harness.agent.on('session/set_config_option', params => {
+      const sid = String(params.sessionId)
+      const options = structuredClone(harness.sessionConfigs.get(sid) ?? config)
+      for (const option of options) {
+        if (option.type !== 'select') continue
+        if (option.id === params.configId) option.currentValue = String(params.value)
+        if (option.id === 'thought_level' && params.value === 'claude-opus-5-5') {
+          option.currentValue = 'medium'
+          option.options = [{ value: 'medium', name: 'Medium' }, { value: 'high', name: 'High' }]
+        }
+      }
+      harness.sessionConfigs.set(sid, options)
+      return { configOptions: options }
+    })
+    const stream = collect(harness.adapter.stream(baseOptions({ reasoningEffort: ReasoningEffortId('high') })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    const sid = harness.agent.requestsFor('session/prompt')[0]!.params.sessionId
+    expect(harness.agent.requestsFor('session/set_config_option').filter(r => r.params.sessionId === sid).map(r => r.params.value))
+      .toEqual(['claude-opus-5-5', 'high', 'plan'])
+    await harness.agent.notify('session/update', { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text: '<plan>{"goal":"g","steps":[{"title":"rejected-plan-fixture"}]}</plan>' } } })
+    await harness.agent.reply('session/prompt', { stopReason: 'refusal' }, 0)
+    await waitForRequest(harness.agent, 'session/prompt', 2)
+    expect(JSON.stringify(harness.agent.requestsFor('session/prompt')[1]!.params.prompt)).not.toContain('rejected-plan-fixture')
+    await harness.agent.reply('session/prompt', { stopReason: 'end_turn' }, 1)
+    await stream
+  })
+
   it('planner 按 new → set model → set mode(plan) → prompt 顺序，mcpServers 为空，忽略辅助通知，合并两阶段 usage 且排除 usage_update', async () => {
     const harness = createHarness({
       cwd: 'D:\\repo\\demo',

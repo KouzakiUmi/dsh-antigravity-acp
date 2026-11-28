@@ -1,5 +1,5 @@
 /**
- * 模型目录的用户设置：显示开关、默认思考档位、显示名覆盖与官方模型 ID 映射。
+ * 模型目录和生成请求的逐模型用户设置。
  *
  * 设计边界（与 ACP v1 契约对齐）：
  * - 目录条目只来自会话 `configOptions` 与官方 CLI 的只读清单，用户设置**不新增**
@@ -13,7 +13,6 @@
  *
  * 本模块只有纯函数，无 IO。
  */
-import type { ModelOverride } from '../settings.js'
 import { isRetiringModel } from './model-retirement.js'
 import { catalogDisplayName, defaultChatModelEnabled } from './model-catalog-policy.js'
 
@@ -21,7 +20,7 @@ function defaultEnabledFor(id: string): boolean {
   return defaultChatModelEnabled(id) && !isRetiringModel(id)
 }
 
-/** Read-only capacity shown in model settings; never submitted as an override. */
+/** 目录观测或审计得到的容量，与用户覆盖分开。 */
 export interface ModelCapacity {
   contextWindow?: number
   maxOutputTokens?: number
@@ -33,8 +32,34 @@ export interface ModelCapacity {
 export type ModelEffort = 'low' | 'medium' | 'high'
 const EFFORTS: readonly ModelEffort[] = ['low', 'medium', 'high']
 
+/** 标准 Gemini 请求档位，独立于 ACP / agy 的路由档位。 */
+export const GEMINI_REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh'] as const
+export type GeminiReasoningEffort = typeof GEMINI_REASONING_EFFORTS[number]
+
+export const MAX_MODEL_CONTEXT_WINDOW = 10_000_000
+export const MAX_MODEL_OUTPUT_TOKENS = 1_000_000
+export const MAX_MODEL_TEMPERATURE = 2
+export const MAX_MODEL_STOP_SEQUENCES = 5
+export const MAX_MODEL_STOP_LENGTH = 256
+
 function isEffort(value: unknown): value is ModelEffort {
   return typeof value === 'string' && (EFFORTS as readonly string[]).includes(value)
+}
+
+function isGeminiReasoningEffort(value: unknown): value is GeminiReasoningEffort {
+  return typeof value === 'string' && (GEMINI_REASONING_EFFORTS as readonly string[]).includes(value)
+}
+
+function positiveInteger(value: unknown, max: number): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1 && value <= max
+}
+
+function normalizeStop(value: unknown): string[] | undefined {
+  if (!Array.isArray(value) || value.length > MAX_MODEL_STOP_SEQUENCES) return undefined
+  const stops: unknown[] = Array.from(value)
+  return stops.every((stop): stop is string => typeof stop === 'string' && /\S/u.test(stop) && stop.length <= MAX_MODEL_STOP_LENGTH)
+    ? stops
+    : undefined
 }
 
 function text(value: unknown): string {
@@ -46,6 +71,12 @@ export interface ModelSetting {
   effort?: ModelEffort
   name?: string
   target?: string
+  contextWindow?: number
+  maxTokens?: number
+  temperature?: number
+  stop?: string[]
+  supportsImage?: boolean
+  reasoningEffort?: GeminiReasoningEffort
 }
 
 /**
@@ -58,9 +89,11 @@ export function normalizeModelSettings(input: unknown, defaultEnabled?: (id: str
   for (const [rawId, row] of Object.entries(input as Record<string, unknown>)) {
     const id = text(rawId)
     if (!id || !row || typeof row !== 'object' || Array.isArray(row)) continue
-    const record = row as ModelOverride
+    const record = row as Record<string, unknown>
     const name = text(record.name)
     const target = text(record.target)
+    const { contextWindow, maxTokens, temperature, supportsImage, reasoningEffort } = record
+    const stop = normalizeStop(record.stop)
     // 仅显式布尔值覆盖目录默认。改名和映射不会顺带启用旧版。
     const enabled = typeof record.enabled === 'boolean' ? record.enabled : (defaultEnabled ?? defaultEnabledFor)(id)
     settings.set(id, {
@@ -68,6 +101,12 @@ export function normalizeModelSettings(input: unknown, defaultEnabled?: (id: str
       ...(isEffort(record.effort) ? { effort: record.effort } : {}),
       ...(name === '' ? {} : { name }),
       ...(target === '' ? {} : { target }),
+      ...(positiveInteger(contextWindow, MAX_MODEL_CONTEXT_WINDOW) && contextWindow >= 2 ? { contextWindow } : {}),
+      ...(positiveInteger(maxTokens, MAX_MODEL_OUTPUT_TOKENS) ? { maxTokens } : {}),
+      ...(typeof temperature === 'number' && temperature >= 0 && temperature <= MAX_MODEL_TEMPERATURE ? { temperature } : {}),
+      ...(stop === undefined ? {} : { stop }),
+      ...(typeof supportsImage === 'boolean' ? { supportsImage } : {}),
+      ...(isGeminiReasoningEffort(reasoningEffort) ? { reasoningEffort } : {}),
     })
   }
   return settings

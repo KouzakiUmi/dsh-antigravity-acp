@@ -136,6 +136,9 @@ function modelControl(renderer: ReactTestRenderer, kind: 'enabled' | 'effort' | 
   return renderer.root.findByProps({ name: `model-${kind}-${id}` })
 }
 function renderedText(renderer: ReactTestRenderer): string { return JSON.stringify(renderer.toJSON()) }
+function oauthLinks(renderer: ReactTestRenderer): ReactTestInstance[] {
+  return renderer.root.findAllByType('a').filter(node => node.props.href?.startsWith('https://accounts.google.com/'))
+}
 
 it('设置与额度药丸跟随 DSH 语言，不因浏览器语言或界面切换丢失草稿', async () => {
   let snapshot = { active: 'zh' }
@@ -350,6 +353,16 @@ describe('quota pill with real React state and effects', () => {
 })
 
 describe('settings card with real React state and effects', () => {
+  it('在关闭默认的代理模式开关前显示条款和账号停用风险', async () => {
+    const { renderer } = await mount(transport(document({ proxyMode: false })).remote, controlWith())
+    expect(fieldInput(renderer, 'proxyMode').props.checked).toBe(false)
+    const elements = renderer.root.findAll(node => typeof node.type === 'string')
+    const warning = elements.findIndex(node => node.props.role === 'note' && node.props['aria-labelledby'] === 'agy-proxy-risk-title')
+    expect(warning).toBeGreaterThanOrEqual(0)
+    expect(warning).toBeLessThan(elements.indexOf(fieldInput(renderer, 'proxyMode')))
+    expect(elements[warning]!.findByType('a').props.href).toBe('https://antigravity.google/terms')
+    expect(renderedText(renderer)).toContain('可能暂停或终止你的 Antigravity 和／或 Gemini CLI 账号')
+  })
   it('页签支持方向键、首尾跳转及与面板互相标注', async () => {
     const service = transport()
     const { renderer } = await mount(service.remote)
@@ -448,7 +461,8 @@ describe('settings card with real React state and effects', () => {
     const { renderer, intervals } = await mount(service.remote, controlWith(), proxyControl)
     expect(renderedText(renderer)).toContain('无需 agy CLI')
     await act(async () => { await button(renderer, '连接代理账户').props.onClick() })
-    const link = renderer.root.findByType('a')
+    expect(oauthLinks(renderer)).toHaveLength(1)
+    const link = oauthLinks(renderer)[0]!
     expect(link.children.join('')).toBe('打开 Google 授权页')
     expect(link.props.rel).toContain('noopener')
     const calls = proxyControl.mock.calls.length
@@ -457,7 +471,7 @@ describe('settings card with real React state and effects', () => {
     expect(proxyControl.mock.calls.length).toBeGreaterThan(calls)
     expect(renderedText(renderer)).toContain('正在完成登录')
     expect(renderedText(renderer)).toContain('授权已收到，正在检测项目')
-    expect(renderer.root.findAllByType('a')).toHaveLength(0)
+    expect(oauthLinks(renderer)).toHaveLength(0)
     expect(button(renderer, '取消登录').props.disabled).toBe(false)
   })
 
@@ -541,14 +555,14 @@ describe('settings card with real React state and effects', () => {
         : { status: 'error', models: [], message: '代理账户尚未连接' })
     const { renderer, intervals } = await mount(service.remote, control, proxyControl)
     await act(async () => { await button(renderer, '连接代理账户').props.onClick() })
-    expect(renderer.root.findAllByType('a')).toHaveLength(1)
+    expect(oauthLinks(renderer)).toHaveLength(1)
     const pulls = control.mock.calls.filter(([method]) => method === 'models').length
     snapshot = { phase: 'signed-in', message: '代理账户已就绪', revision: 2 }
     await act(async () => { for (const timer of intervals.values()) if (timer.delay === 3000) timer.callback() })
     expect(control.mock.calls.filter(([method]) => method === 'models').length).toBeGreaterThan(pulls)
     expect(renderedText(renderer)).toContain('Gemini Neon')
     expect(renderedText(renderer)).not.toContain('等待浏览器授权')
-    expect(renderer.root.findAllByType('a')).toHaveLength(0)
+    expect(oauthLinks(renderer)).toHaveLength(0)
     await act(async () => { await button(renderer, '退出登录').props.onClick() })
     expect(renderedText(renderer)).not.toContain('Gemini Neon')
     expect(renderedText(renderer)).toContain('代理账户尚未连接')
@@ -567,7 +581,7 @@ describe('settings card with real React state and effects', () => {
     await act(async () => { for (const timer of intervals.values()) if (timer.delay === 3000) timer.callback() })
     expect(renderedText(renderer)).toContain('上游项目初始化失败，请重新连接')
     expect(renderedText(renderer)).not.toContain('等待浏览器授权')
-    expect(renderer.root.findAllByType('a')).toHaveLength(0)
+    expect(oauthLinks(renderer)).toHaveLength(0)
   })
 
   it('连接请求尚未返回时可以取消，迟到授权结果不恢复登录界面', async () => {
@@ -586,7 +600,7 @@ describe('settings card with real React state and effects', () => {
       pending.resolve({ snapshot: { phase: 'pending-login', message: '等待授权', revision: 0 }, authorizationUrl: 'https://accounts.google.com/stale' })
       await login
     })
-    expect(renderer.root.findAllByType('a')).toHaveLength(0)
+    expect(oauthLinks(renderer)).toHaveLength(0)
     expect(button(renderer, '连接代理账户').props.disabled).toBe(false)
     expect(renderedText(renderer)).not.toContain('等待授权')
   })
@@ -1327,6 +1341,31 @@ describe('settings card with real React state and effects', () => {
     expect(aistudioControl).toHaveBeenCalledWith('setKey', { value: 'AIzaSyNEWKEY123' })
   })
 
+  it('原生 Google 参数区分两条线路；保存独立覆盖并展示兼容信息', async () => {
+    const ai = 'aistudio-gemini-4-hydrogen'
+    const vertex = 'vertex-ai-gemini-4-hydrogen'
+    const service = transport(document({ aistudioEnabled: true, vertexEnabled: true, vertexModels: ['gemini-4-hydrogen'] }))
+    const aistudio = vi.fn(async (method: string) => method === 'models' ? { status: 'ok', models: [
+      { id: ai, name: 'Hydrogen', inputModalities: ['text'], compat: { wireModel: 'gemini-4-hydrogen', protocolMaxOutputTokens: 32000 } },
+    ] } : { status: 'ok', configured: true })
+    const { renderer } = await mount(service.remote, controlWith(), undefined, undefined, aistudio)
+    await act(async () => { button(renderer, 'AI Studio').props.onClick() })
+    const field = (name: string, id: string) => renderer.root.find(node => typeof node.type === 'string' && node.props.name === `model-${name}-${id}`)
+    expect(renderedText(renderer)).toContain('Google GenerateContent')
+    expect(field('maxTokens', ai).props.max).toBe(32000)
+    expect(field('reasoningEffort', ai).findAllByType('option').map(option => option.props.value)).toContain('xhigh')
+    expect(field('reasoningEffort', vertex).findAllByType('option').map(option => option.props.value)).not.toContain('xhigh')
+    await act(async () => {
+      field('reasoningEffort', ai).props.onChange({ target: { value: 'xhigh' } })
+      field('maxTokens', vertex).props.onChange({ target: { value: '2048' } })
+      field('stop', vertex).props.onBlur({ target: { value: 'done\nend' } })
+    })
+    await act(async () => { await button(renderer, '保存').props.onClick() })
+    expect(service.mutate.mock.calls[0]![1]).toEqual([{ op: 'set', path: ['modelOverrides'], value: {
+      [ai]: { reasoningEffort: 'xhigh' }, [vertex]: { maxTokens: 2048, stop: ['done', 'end'] },
+    } }])
+  })
+
   it('Vertex AI 使用独立目录，将模型列表和逐模型设置一同保存', async () => {
     const id = 'vertex-ai-gemini-4-hydrogen'
     const service = transport(document({ vertexEnabled: true, vertexProject: 'example-project', vertexLocation: 'global',
@@ -1646,7 +1685,7 @@ describe('settings card with real React state and effects', () => {
   })
 
   it('编排分组渲染 7 个可编辑控件，Executor 可在 Hydrogen / Sonnet 间选择，作为单个顶层对象字段提交且保留 plannerTimeoutMs', async () => {
-    const service = transport(document({ orchestrator: { plannerTimeoutMs: 45000, executorModel: 'legacy-executor' } }))
+    const service = transport(document({ orchestrator: { plannerTimeoutMs: 20000, executorModel: 'legacy-executor' } }))
     const { renderer } = await mount(service.remote)
     expect(fieldInput(renderer, 'orchestratorEnabled').props.checked).toBe(true)
     const plannerSelect = fieldInput(renderer, 'orchestratorPlannerModel')
@@ -1695,7 +1734,7 @@ describe('settings card with real React state and effects', () => {
         executorModel: 'claude-sonnet-5-5',
         executorEffort: 'high',
         maxPlansPerTurn: 4,
-        plannerTimeoutMs: 45000,
+         plannerTimeoutMs: 20000,
         showPlan: true,
       },
     }], 1)

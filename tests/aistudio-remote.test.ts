@@ -14,7 +14,11 @@ import type { AistudioAdapter } from '../src/aistudio/adapter.js'
 import type { AistudioUsageResult } from '../src/aistudio/usage.js'
 
 const CATALOG = [
-  { id: 'aistudio-gemini-3.8-flash', name: 'Gemini 3.8 Flash', inputModalities: ['text'], contextWindow: 1048576, maxOutputTokens: 65536, contextWindowSource: 'upstream' },
+  { id: 'aistudio-gemini-4-neon', name: 'Gemini 4 Neon', inputModalities: ['text'], contextWindow: 1048576, maxOutputTokens: 90_000, contextWindowSource: 'observed',
+    compat: { protocol: 'google-generate-content', wireModel: 'gemini-4-neon', inputModalities: ['text'], tools: true, temperature: false,
+      stopSequences: true, maxStopSequences: 5, reasoningEfforts: ['low', 'medium', 'high', 'xhigh'], protocolMaxOutputTokens: 65_536 },
+    credential: 'not-part-of-the-remote-contract',
+  },
   { id: 'aistudio-gemini-3-pro', name: 'Gemini 3 Pro', inputModalities: ['text'] },
 ]
 
@@ -45,9 +49,11 @@ describe('AgYAistudioService 经 Cordis Proxy 调用', () => {
     try {
       const result = await service.models({ force: true })
       expect(result.status).toBe('ok')
-      expect(result.models.map(model => model.id)).toEqual(['aistudio-gemini-3.8-flash', 'aistudio-gemini-3-pro'])
+      expect(result.models.map(model => model.id)).toEqual(['aistudio-gemini-4-neon', 'aistudio-gemini-3-pro'])
       expect(discoverModels).toHaveBeenCalledWith(true)
-      expect(result.models[0]).toMatchObject({ name: 'Gemini 3.8 Flash', contextWindow: 1048576, maxOutputTokens: 65536, inputModalities: ['text'], contextWindowSource: 'upstream' })
+      expect(result.models[0]).toMatchObject({ name: 'Gemini 4 Neon', contextWindow: 1048576, maxOutputTokens: 90_000,
+        inputModalities: ['text'], contextWindowSource: 'observed', compat: CATALOG[0]?.compat })
+      expect(result.models[0]).not.toHaveProperty('credential')
       // 无容量的条目不臆造字段。
       expect(result.models[1]).toEqual({ id: 'aistudio-gemini-3-pro', name: 'Gemini 3 Pro', inputModalities: ['text'] })
     } finally { await close() }

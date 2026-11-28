@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
-import { BlockAssembler, createAssistantMessage, createToolResultMessage, createUserMessage, ToolCallId } from '@deepseek-ai/dsh-llm'
+import { BlockAssembler, createAssistantMessage, createToolResultMessage, createUserMessage, ReasoningEffortId, ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { AdapterRequestOptions } from '../src/adapter/request-options.js'
 import { AistudioAdapter } from '../src/aistudio/adapter.js'
 import { AISTUDIO_PROVIDER_ID } from '../src/aistudio/endpoints.js'
@@ -71,6 +71,16 @@ describe('AI Studio 热切换', () => {
     expect(fetch).toHaveBeenCalledTimes(1)
   })
 
+  it('外部移除 key 后取消已准备请求，不派发旧模型控件', async () => {
+    let key: string | undefined = 'fixture-original'
+    const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValueOnce(Response.json({ models: defaultModels }))
+    const adapter = new AistudioAdapter({ credential: async () => key, fetch })
+    const prepared = await adapter.prepareCall(AISTUDIO_PROVIDER_ID, model)
+    key = undefined
+    expect(await collect(prepared.stream(options))).toMatchObject([{ type: 'finish', reason: { kind: 'aborted' } }])
+    expect(fetch).toHaveBeenCalledTimes(1)
+  })
+
   it('凭据刷新时终止旧目录分页且不访问下一页', async () => {
     let finish!: (response: Response) => void
     const fetch = vi.fn<typeof globalThis.fetch>().mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
@@ -85,10 +95,86 @@ describe('AI Studio 热切换', () => {
     expect(fetch).toHaveBeenCalledTimes(1)
   })
 
+  it('准备过程中切换凭据，取消来自旧目录的模型容量及控件', async () => {
+    let finish!: (response: Response) => void
+    const fetch = vi.fn<typeof globalThis.fetch>().mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+    const adapter = new AistudioAdapter({ credential: async () => 'fixture-original', fetch })
+    const prepared = adapter.prepareCall(AISTUDIO_PROVIDER_ID, model)
+    const expected = expect(prepared).rejects.toMatchObject({ code: 'CANCELLED' })
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce())
+    adapter.invalidateCredential('fixture-replacement')
+    finish(Response.json({ models: defaultModels }))
+    await expected
+    expect(fetch).toHaveBeenCalledOnce()
+  })
+
   it('模型映射不借用原模型容量', async () => {
     const { adapter } = makeAdapter({ readSettings: () => ({ modelOverrides: { [model]: { target: 'models/gemini-unlisted' } } }) })
     expect(await adapter.resolveModel(AISTUDIO_PROVIDER_ID, model)).not.toHaveProperty('context')
     expect((await adapter.discoverModels())[0]).not.toHaveProperty('maxOutputTokens')
+  })
+})
+
+describe('AI Studio 逐模型控制', () => {
+  it('准备与派发使用同一目标和默认值，后续请求读取新设置', async () => {
+    const models = [...defaultModels,
+      { name: 'models/gemini-4-neon', supportedGenerationMethods: ['generateContent'], inputTokenLimit: 200_000, outputTokenLimit: 90_000 },
+      { name: 'models/gemini-4-argon', supportedGenerationMethods: ['generateContent'] },
+    ]
+    const stop = ['old-end']
+    const overrides: Record<string, ModelOverride> = { [model]: {
+      target: 'models/gemini-4-neon', reasoningEffort: 'xhigh', temperature: 0.2, stop, contextWindow: 120_000, maxTokens: 4096,
+    } }
+    const { adapter, calls } = makeAdapter({ models, events: [event([{ text: 'ok' }], 'STOP')], readSettings: () => ({ modelOverrides: overrides }) })
+    const prepared = await adapter.prepareCall(AISTUDIO_PROVIDER_ID, model)
+    expect(prepared.model).toMatchObject({
+      context: { contextWindow: 120_000 }, defaultMaxTokens: 4096,
+      reasoning: { defaultEffort: 'xhigh', efforts: ['low', 'medium', 'high', 'xhigh'].map(id => ({ id })) },
+    })
+    expect((await adapter.discoverModels()).find(row => row.id === model)).toMatchObject({
+      contextWindow: 200_000, contextWindowSource: 'observed', maxOutputTokens: 90_000,
+      compat: { protocol: 'google-generate-content', wireModel: 'gemini-4-neon', temperature: false, maxStopSequences: 5,
+        reasoningEfforts: ['low', 'medium', 'high', 'xhigh'], protocolMaxOutputTokens: 65_536, upstreamContextWindow: 200_000 },
+    })
+
+    stop.push('mutated-after-prepare')
+    overrides[model] = { target: 'gemini-4-argon', maxTokens: 2048, reasoningEffort: 'low' }
+    await collect(prepared.stream(options))
+    await collect(adapter.stream(options))
+    const writes = calls.filter(call => call.init?.method === 'POST')
+    expect(writes.map(call => call.url)).toEqual([expect.stringContaining('/gemini-4-neon:'), expect.stringContaining('/gemini-4-argon:')])
+    expect(writes.map(call => JSON.parse(String(call.init?.body)).generationConfig)).toEqual([
+      { maxOutputTokens: 4096, stopSequences: ['old-end'], thinkingConfig: { thinkingLevel: 'XHIGH', includeThoughts: true } },
+      { maxOutputTokens: 2048, thinkingConfig: { thinkingLevel: 'LOW', includeThoughts: true } },
+    ])
+  })
+
+  it('请求显式值优先，空 stop 清除默认值，未声明的档位在本地拒绝', async () => {
+    const { adapter, calls } = makeAdapter({ events: [event([{ text: 'ok' }], 'STOP')], readSettings: () => ({ modelOverrides: {
+      [model]: { maxTokens: 4096, temperature: 1, stop: ['configured'] },
+      'aistudio-gemini-4-argon': { reasoningEffort: 'high' },
+    } }) })
+    await collect(adapter.stream({ ...options, maxTokens: 1024, temperature: 0, stop: [] }))
+    await collect(adapter.stream({ ...options, model: 'aistudio-gemini-4-argon', reasoningEffort: ReasoningEffortId('low') }))
+    expect(calls.map(call => JSON.parse(String(call.init?.body)).generationConfig)).toEqual([
+      { maxOutputTokens: 1024, temperature: 0 },
+      { maxOutputTokens: 65_536, thinkingConfig: { thinkingLevel: 'LOW', includeThoughts: true } },
+    ])
+    await expect(collect(adapter.stream({ ...options, model: 'aistudio-gemini-4-argon', reasoningEffort: ReasoningEffortId('xhigh') })))
+      .rejects.toMatchObject({ code: 'UNSUPPORTED_REASONING_EFFORT' })
+    expect(calls).toHaveLength(2)
+  })
+
+  it('目录外未知映射不借用原条目的能力、容量或温度支持', async () => {
+    const { adapter, calls } = makeAdapter({ events: [event([{ text: 'ok' }], 'STOP')], readSettings: () => ({ modelOverrides: {
+      [model]: { target: 'gemini-unlisted', reasoningEffort: 'xhigh', temperature: 1 },
+    } }) })
+    const prepared = await adapter.prepareCall(AISTUDIO_PROVIDER_ID, model)
+    expect(prepared.model).not.toHaveProperty('reasoning')
+    expect(prepared.model).not.toHaveProperty('defaultMaxTokens')
+    expect((await adapter.discoverModels())[0]?.compat).toMatchObject({ reasoningEfforts: [], temperature: false })
+    await collect(prepared.stream(options))
+    expect(JSON.parse(String(calls.at(-1)?.init?.body))).not.toHaveProperty('generationConfig')
   })
 })
 

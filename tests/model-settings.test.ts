@@ -20,6 +20,34 @@ describe('模型目录用户设置', () => {
     }
   })
 
+  it('保留逐模型生成配置并复制 stop，旧路由 effort 不受 Gemini reasoningEffort 影响', () => {
+    const stop = [' a ', '\nEND']
+    const settings = normalizeModelSettings({
+      'aistudio-neon': { contextWindow: 10_000_000, maxTokens: 1_000_000, temperature: 0, stop, supportsImage: false, reasoningEffort: 'xhigh', effort: 'low' },
+      'vertex-ai-other': { contextWindow: 2, maxTokens: 1, temperature: 2, stop: [], supportsImage: true, reasoningEffort: 'minimal' },
+    }, () => false)
+    stop[0] = 'changed'
+    expect(modelSettingFor(settings, 'aistudio-neon')).toEqual({
+      enabled: false, contextWindow: 10_000_000, maxTokens: 1_000_000, temperature: 0, stop: [' a ', '\nEND'],
+      supportsImage: false, reasoningEffort: 'xhigh', effort: 'low',
+    })
+    expect(modelSettingFor(settings, 'vertex-ai-other')).toEqual({
+      enabled: false, contextWindow: 2, maxTokens: 1, temperature: 2, stop: [], supportsImage: true, reasoningEffort: 'minimal',
+    })
+    expect(resolveModelTarget({ settings, model: 'aistudio-neon', route: tier => `auto:${tier}` })).toBe('auto:low')
+  })
+
+  it.each([
+    { contextWindow: 0 }, { contextWindow: 1 }, { contextWindow: 10_000_001 }, { contextWindow: 1.5 },
+    { maxTokens: -1 }, { maxTokens: 1_000_001 }, { maxTokens: '100' },
+    { temperature: -0.1 }, { temperature: 2.1 }, { temperature: NaN },
+    { stop: [''] }, { stop: [' \n'] }, { stop: ['x'.repeat(257)] }, { stop: Array(6).fill('ok') }, { stop: [null] },
+    { supportsImage: 'false' }, { reasoningEffort: 'max' }, { effort: 'xhigh' },
+  ])('运行时只丢弃非法逐模型字段，保留同条目的合法字段：%o', (row) => {
+    const settings = normalizeModelSettings({ sample: { ...row, name: '保留' } }, () => false)
+    expect(modelSettingFor(settings, 'sample')).toEqual({ enabled: false, name: '保留' })
+  })
+
   it('未配置的普通模型默认启用，停用项不列入选择器但设置仍可读', () => {
     const settings = normalizeModelSettings({ hidden: { enabled: false, name: '隐藏' } })
     expect(modelVisible(settings, 'unknown-model')).toBe(true)

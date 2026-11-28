@@ -106,6 +106,8 @@ ACP 官方 agent 在同一会话内会保留上下文（2026-10-23 真机验证�
 
 ### 代理模式（默认关闭）
 
+**账号停用风险：** 代理模式使用 Antigravity OAuth 从第三方客户端直连 Google。[Google Antigravity 服务条款](https://antigravity.google/terms)禁止此类访问，并规定可能暂停或终止 Antigravity 和／或 Gemini CLI 账号。[Magpie #5478](https://github.com/yetone/magpie/issues/5478)报告两个 Google AI Pro 账号收到条款违规停用通知；[Magpie 随后退役了直连路径](https://github.com/yetone/magpie/commit/9cd5f3652150f6e51454e611517014d688b0dde4)。建议保持关闭，改用 AI Studio 或 Vertex AI 的官方 API。
+
 在「运行模式」中勾选并保存 `proxyMode` 后，宿主行立即撤下 `antigravity-acp`，第二组件 `antigravity-proxy-router` 就绪时注册 `antigravity-proxy`；关闭时恢复 ACP。代理组件未启用、卸载或注册失败时 ACP 仍保持停用。开启代理会取消未派发的 ACP 请求、启动准备、目录刷新和二进制预读；已发出的 prompt 不主动取消。目录与额度按当前模式取数，切换后在会话中重新选模型。
 
 - **登录态**：代理账户独立于 ACP 登录。连接时优先只读导入 `~/.gemini/antigravity-cli/antigravity-oauth-token`，过期则先换发；失效登录态不会被报告为连接成功。没有可用登录态时返回 PKCE 授权链接，请点击完成浏览器登录（回调 `http://localhost:51121/oauth-callback`，只绑 127.0.0.1）。连接还会只读检测上游已有项目，未返回项目时显示具体原因，检测完成后才显示已连接。副本落在缓存目录 `proxy-account.json`（原子写、尽力 0600），官方文件保持只读。
@@ -162,6 +164,8 @@ ACP 官方 agent 在同一会话内会保留上下文（2026-10-23 真机验证�
 页面分为「连接 / 模型 / 额度 / 高级」。连接页只显示当前模式所需的账户与操作；额度独立手动查询；高级页按编排、附属功能、网络 / CLI、会话进程与诊断分组展开。模型页使用紧凑列表，支持搜索、启停筛选和筛选结果批量启用 / 隐藏；完整 ID、输入能力、显示名与官方映射在单条详情中编辑。代理模式不显示 ACP 专属控制项；代理排除列表不显示。
 
 四条模型列表都将**启用项放在前面**，显示整理后的型号和单独的模型 ID。Gemini 1–3.x 等旧版默认关闭；AI Studio 和 Vertex AI 默认只开 Gemini 4，ACP / 代理保留 Claude 等其他聊天模型的原有默认设置。可手动启用仍在目录里的旧版。图片生成、语音、音乐、视频和向量嵌入等专用型号不出现在聊天列表。
+
+AI Studio 与 Vertex AI 在模型行的「参数」中显示实际映射模型的 Google GenerateContent 兼容性，文本输入和工具调用，以及已知的上游上下文和输出上限。可设置本地上下文预算、默认输出上限、最多 5 条停止序列，以及当前型号开放的思考深度或温度。保存沿用页面顶部的「保存」；「恢复参数默认」不更改名称、显示开关或模型映射。单次会话请求传入的输出、思考、温度或停止序列优先于对应默认值。
 
 模型改动合并成一份 `modelOverrides` 保存；清空显示名或映射等于移除该字段。已保存但当前目录缺失的聊天模型仍会标注「不在目录」，可搜索或编辑。ACP 和代理只补当前链路的键，另一链路的配置保留。Antigravity 家族的「即将下线」来自[官方下线记录](../src/adapter/model-retirement.ts)，与一般「旧版」分开。已过下线日的家族从列表移出，残留键随保存清理，可先撤销；未编辑的其他键保留。
 

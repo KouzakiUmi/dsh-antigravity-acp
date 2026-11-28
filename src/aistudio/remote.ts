@@ -74,12 +74,12 @@ function parseKeyStatusRequest(value: unknown): undefined {
   return undefined
 }
 
-function parseModelsResult(value: unknown): ModelSnapshot {
+function parseModelsResult(value: unknown): AgYAistudioModelsResult {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('Invalid AgYAistudioModelsResult')
   const record = value as Record<string, unknown>
   if (record.status !== 'ok' && record.status !== 'error') throw new TypeError('Invalid AgYAistudioModelsResult.status')
   if (!Array.isArray(record.models)) throw new TypeError('Invalid AgYAistudioModelsResult.models')
-  return value as ModelSnapshot
+  return value as AgYAistudioModelsResult
 }
 
 function parseKeyResult(value: unknown): AgYAistudioKeyResult {
@@ -164,9 +164,11 @@ export const AGY_AISTUDIO_INVOCATIONS: readonly InvocationDescriptor[] = [
 ]
 
 type CatalogRow = Awaited<ReturnType<AistudioAdapter['discoverModels']>>[number]
+type AistudioModelRow = ModelSnapshot['models'][number] & { compat?: CatalogRow['compat'] }
+export type AgYAistudioModelsResult = Omit<ModelSnapshot, 'models'> & { models: AistudioModelRow[] }
 
 /** 目录行投影：只保留设置页模型表所需字段（与 quota/control.ts ModelRow 同形）。 */
-function mapRow(row: CatalogRow): ModelSnapshot['models'][number] {
+function mapRow(row: CatalogRow): AistudioModelRow {
   return {
     id: row.id,
     name: row.name,
@@ -174,6 +176,7 @@ function mapRow(row: CatalogRow): ModelSnapshot['models'][number] {
     ...(row.contextWindow === undefined ? {} : { contextWindow: row.contextWindow }),
     ...(row.maxOutputTokens === undefined ? {} : { maxOutputTokens: row.maxOutputTokens }),
     ...(row.contextWindowSource === undefined ? {} : { contextWindowSource: row.contextWindowSource }),
+    ...(row.compat === undefined ? {} : { compat: row.compat }),
   }
 }
 
@@ -208,7 +211,7 @@ export class AgYAistudioService extends TypertRemoteService {
   }
 
   /** 实时发现目录；失败折叠成 status:'error' + 脱敏消息，不抛。 */
-  async models(request?: AgYAistudioModelsRequest): Promise<ModelSnapshot> {
+  async models(request?: AgYAistudioModelsRequest): Promise<AgYAistudioModelsResult> {
     const force = parseModelsRequest(request)?.force === true
     try {
       const rows = await this._adapter.discoverModels(force)

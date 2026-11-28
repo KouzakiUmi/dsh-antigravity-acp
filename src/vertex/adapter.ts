@@ -25,7 +25,8 @@ interface VertexAdapterOptions {
   fetch: typeof fetch
 }
 
-interface Selection { target: VertexTarget; model: LlmResolvedModelInfo; generation: AbortSignal }
+type VertexModel = ReturnType<typeof listConfiguredVertexModels>[number]
+interface Selection { target: VertexTarget; model: LlmResolvedModelInfo; controls: VertexModel['controls']; generation: AbortSignal }
 
 export class VertexAdapter extends LlmAdapter {
   private identity = ''
@@ -55,7 +56,7 @@ export class VertexAdapter extends LlmAdapter {
     this.providerInfo(provider)
     const { settings } = this.options
     if (this.disposed || !settings.enabled() || !validVertexScope(this.scope())) return []
-    return this.catalog().filter(entry => entry.enabled)
+    return this.catalog().filter(entry => entry.enabled).map(({ controls, resolvedContextWindow, ...entry }) => entry)
   }
 
   /** Explicit refresh only; Model Garden candidates never auto-register in the model selector. */
@@ -115,12 +116,14 @@ export class VertexAdapter extends LlmAdapter {
     if (entry === undefined) throw llmError('Vertex AI 模型未配置或映射的文本对话模型 ID 无效', 'INVALID_MODEL')
     const model: LlmResolvedModelInfo = {
       provider, id, name: entry.name, inputModalities: ['text'],
-      ...(entry.contextWindow === undefined ? {} : { context: { contextWindow: entry.contextWindow } }),
+      ...(entry.resolvedContextWindow === undefined ? {} : { context: { contextWindow: entry.resolvedContextWindow } }),
+      ...(entry.defaultMaxTokens === undefined ? {} : { defaultMaxTokens: entry.defaultMaxTokens }),
+      ...(entry.reasoning === undefined ? {} : { reasoning: entry.reasoning }),
     }
-    return { target: { ...scope, model: id, wireModel: entry.upstreamId }, model, generation }
+    return { target: { ...scope, model: id, wireModel: entry.upstreamId }, model, controls: entry.controls, generation }
   }
 
-  private async *streamSelection(options: AdapterRequestOptions, { target, generation }: Selection): AsyncGenerator<StreamChunk> {
+  private async *streamSelection(options: AdapterRequestOptions, { target, controls, generation }: Selection): AsyncGenerator<StreamChunk> {
     if (options.provider !== VERTEX_PROVIDER_ID || options.model !== target.model) throw llmError('Vertex AI 请求与已准备模型不匹配', 'INVALID_MODEL')
     this.syncScope()
     const signal = options.signal === undefined ? generation : AbortSignal.any([generation, options.signal])
@@ -128,7 +131,7 @@ export class VertexAdapter extends LlmAdapter {
     const requestSignal = AbortSignal.any([signal, transport.signal])
     try {
       if (signal.aborted) { yield finishChunk('aborted', 'CANCELLED'); return }
-      const request = buildGeminiPayload(options, { label: VERTEX_LABEL, replayBlocks: (message, kinds) => vertexReplayBlocks(message, kinds, target) })
+      const request = buildGeminiPayload(options, { label: VERTEX_LABEL, controls, replayBlocks: (message, kinds) => vertexReplayBlocks(message, kinds, target) })
       const token = await this.options.token(signal)
       this.syncScope()
       if (signal.aborted) { yield finishChunk('aborted', 'CANCELLED'); return }

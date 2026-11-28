@@ -73,6 +73,10 @@ export function parsePlan(text: string, previous?: OrchestratorPlan): Orchestrat
       }
     }
 
+    if (previous !== undefined && previous.goal === goal
+        && JSON.stringify(previous.steps) === JSON.stringify(steps)
+        && JSON.stringify(previous.handback) === JSON.stringify(handback)) return previous
+
     return {
       goal,
       steps,

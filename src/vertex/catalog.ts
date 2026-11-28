@@ -1,24 +1,20 @@
-import type { LlmModelInfo } from '@deepseek-ai/dsh-llm'
+import type { LlmModelInfo, LlmResolvedModelInfo } from '@deepseek-ai/dsh-llm'
 import type { ModelOverride } from '../settings.js'
+import { resolveGeminiControls } from '../adapter/gemini-model-controls.js'
 import { modelSettingFor, normalizeModelSettings } from '../adapter/model-settings.js'
 import { catalogDisplayName, defaultChatModelEnabled } from '../adapter/model-catalog-policy.js'
 import type { ModelCapacity } from '../adapter/model-settings.js'
 import { isVertexPublisherModel, VERTEX_MODEL_PREFIX, VERTEX_PROVIDER_ID } from './endpoints.js'
 
-interface VertexModel extends LlmModelInfo, ModelCapacity {
+type ResolvedControls = ReturnType<typeof resolveGeminiControls>
+
+interface VertexModel extends LlmModelInfo, ModelCapacity, Pick<LlmResolvedModelInfo, 'defaultMaxTokens' | 'reasoning'> {
   readonly upstreamId: string
   readonly enabled: boolean
+  readonly compat: ResolvedControls['compat']
+  readonly controls: ResolvedControls['controls']
+  readonly resolvedContextWindow?: number
 }
-
-const knownCapacity = { contextWindow: 1_048_576, maxOutputTokens: 65_536, contextWindowSource: 'audited' } as const
-const CAPACITIES = new Map<string, ModelCapacity>([
-  // https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/4-hydrogen
-  ['gemini-4-hydrogen', knownCapacity],
-  // https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/guides/gemini-4-neon
-  ['gemini-4-neon', knownCapacity],
-  // https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/3-5-flash-lite
-  ['gemini-3.5-flash-lite', knownCapacity],
-])
 
 /** Only explicitly configured Google publisher IDs; no discovery/permission probe. */
 export function listConfiguredVertexModels(models: readonly string[], overrides?: Record<string, ModelOverride>): VertexModel[] {
@@ -31,10 +27,18 @@ export function listConfiguredVertexModels(models: readonly string[], overrides?
     const setting = modelSettingFor(settings, id, defaultChatModelEnabled)
     const upstreamId = setting.target ?? publisherId
     if (!isVertexPublisherModel(upstreamId)) continue
+    const resolved = resolveGeminiControls(upstreamId, setting, undefined, 'vertex-v1')
     entries.set(publisherId, {
       provider: VERTEX_PROVIDER_ID, id, name: setting.name ?? catalogDisplayName(publisherId), upstreamId,
-      inputModalities: ['text'], enabled: setting.enabled,
-      ...CAPACITIES.get(upstreamId),
+      inputModalities: ['text'], enabled: setting.enabled, compat: resolved.compat, controls: resolved.controls,
+      ...(resolved.compat.upstreamContextWindow === undefined ? {} : {
+        contextWindow: resolved.compat.upstreamContextWindow,
+        contextWindowSource: 'audited',
+      }),
+      ...(resolved.contextWindow === undefined ? {} : { resolvedContextWindow: resolved.contextWindow }),
+      ...(resolved.compat.protocolMaxOutputTokens === undefined ? {} : { maxOutputTokens: resolved.compat.protocolMaxOutputTokens }),
+      ...(resolved.defaultMaxTokens === undefined ? {} : { defaultMaxTokens: resolved.defaultMaxTokens }),
+      ...(resolved.reasoning === undefined ? {} : { reasoning: resolved.reasoning }),
     })
   }
   return [...entries.values()]

@@ -33,25 +33,24 @@ function isRealUserMessage(message: RequestMessage): boolean {
   return kind === undefined || kind === 'user'
 }
 
-/**
- * 计算当前用户回合标识：`sessionId + ':' + 最后一条真实用户消息指纹`。
- */
+export function latestUserIndex(messages: readonly RequestMessage[]): number {
+  return messages.findLastIndex(isRealUserMessage)
+}
+
+/** 持久消息身份区分内容相同的两次发送，内容指纹仍可识别原消息被编辑。 */
 export function computeTurnKey(
   messages: readonly RequestMessage[],
   sessionId?: string,
 ): string | undefined {
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    const message = messages[i]!
-    if (isRealUserMessage(message)) {
-      return `${sessionId ?? 'anonymous'}:${messageFingerprint(message)}`
-    }
-  }
-  return undefined
+  const index = latestUserIndex(messages)
+  const message = messages[index]
+  if (message === undefined) return undefined
+  return JSON.stringify([sessionId ?? null, message.id ?? index, messageFingerprint(message)])
 }
 
-function resolveToolEntries(messages: readonly RequestMessage[]): Array<{ name?: string; isError: boolean }> {
+function resolveToolEntries(messages: readonly RequestMessage[]): Array<{ id: string; name?: string; isError: boolean }> {
   const callNames = new Map<string, string>()
-  const tools: Array<{ name?: string; isError: boolean }> = []
+  const tools: Array<{ id: string; name?: string; isError: boolean }> = []
   for (const message of messages) {
     if (message.role === 'assistant') {
       for (const block of message.content) {
@@ -63,10 +62,14 @@ function resolveToolEntries(messages: readonly RequestMessage[]): Array<{ name?:
       const explicitName = (message as { readonly name?: unknown }).name
       const name = callNames.get(message.toolCallId)
         ?? (typeof explicitName === 'string' && explicitName.length > 0 ? explicitName : undefined)
-      tools.push({ name, isError: message.isError === true })
+      tools.push({ id: message.id, name, isError: message.isError === true })
     }
   }
   return tools
+}
+
+export function latestToolResultId(messages: readonly RequestMessage[]): string | undefined {
+  return messages.slice(latestUserIndex(messages) + 1).findLast(message => message.role === 'tool')?.id
 }
 
 /**
@@ -92,9 +95,11 @@ export function shouldPlan(input: ShouldPlanInput): ShouldPlanResult {
     return { plan: true, reason: 'new-goal' }
   }
 
-  const toolEntries = resolveToolEntries(messages)
-  const lastTool = toolEntries.at(-1)
-  if (lastTool !== undefined && lastTool.isError) {
+  const toolEntries = resolveToolEntries(messages.slice(latestUserIndex(messages) + 1))
+  const handled = state.lastPlannedToolResult
+  const boundary = handled === undefined ? -1 : toolEntries.findIndex(entry => entry.id === handled)
+  const fresh = toolEntries.slice(boundary + 1)
+  if (fresh.at(-1)?.isError) {
     return { plan: true, reason: 'tool-error' }
   }
 
@@ -104,12 +109,14 @@ export function shouldPlan(input: ShouldPlanInput): ShouldPlanResult {
     if (!entry.name) continue
     if (entry.isError) {
       const next = (consecutiveErrors.get(entry.name) ?? 0) + 1
-      if (next >= 2) return { plan: true, reason: 'repeat-failure' }
+      if (next >= 2 && fresh.includes(entry)) return { plan: true, reason: 'repeat-failure' }
       consecutiveErrors.set(entry.name, next)
     } else {
       consecutiveErrors.set(entry.name, 0)
     }
   }
+
+  if (handled !== undefined ? fresh.some(entry => entry.isError) : false) return { plan: true, reason: 'tool-error' }
 
   return { plan: false, reason: 'continue' }
 }

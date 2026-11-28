@@ -128,7 +128,8 @@ describe('parsePlan & renderPlanForExecutor', () => {
     })
 
     const second = parsePlan(raw, first)
-    expect(second?.revision).toBe(2)
+    expect(second).toBe(first)
+    expect(parsePlan('<plan>{"goal":"new","steps":[{"title":"different"}]}</plan>', first)?.revision).toBe(2)
   })
 
   it('损坏 JSON、缺失 goal/steps 或空字符串返回 undefined；多块时取最后一个合法块', () => {
@@ -268,6 +269,47 @@ describe('shouldPlan 六分支与优先级', () => {
       settings: DEFAULT_ORCHESTRATOR_SETTINGS,
       sessionId: 's1',
     })).toEqual({ plan: false, reason: 'continue' })
+  })
+})
+
+describe('turn identity and attempt accounting', () => {
+  it('并行结果里的失败可触发一次，不会在追加成功结果后重复触发', () => {
+    const user = createUserMessage({ content: [{ type: 'text', text: 'work' }], source: { kind: 'user' } })
+    const result = (id: string, isError: boolean) => createToolResultMessage({ callId: ToolCallId(id), content: [], isError })
+    const plan = parsePlan('<plan>{"goal":"work","steps":[{"title":"Do"}]}</plan>')!
+    const messages = [user, result('fail', true), result('success', false)]
+    const state = { plan, turnKey: computeTurnKey(messages), stage: 'executing' as const, plansThisTurn: 1, lastPlannedToolResult: null }
+    const input = { messages, goal: 'work', settings: { ...DEFAULT_ORCHESTRATOR_SETTINGS, maxPlansPerTurn: 4 }, state }
+    expect(shouldPlan(input)).toEqual({ plan: true, reason: 'tool-error' })
+    expect(shouldPlan({ ...input, messages: [...messages, result('another-success', false)],
+      state: { ...state, lastPlannedToolResult: messages.at(-1)!.id } })).toEqual({ plan: false, reason: 'continue' })
+  })
+
+  it('相同文字的独立发送是新轮；仅看当前轮工具结果', () => {
+    const first = createUserMessage({ content: [{ type: 'text', text: 'same' }], source: { kind: 'user' } })
+    const second = createUserMessage({ content: first.content, source: { kind: 'user' } })
+    const result = createToolResultMessage({ callId: ToolCallId('old'), content: [], isError: true })
+    const history = [first, result, second]
+    const currentKey = computeTurnKey(history, 's1')
+    expect(currentKey).not.toBe(computeTurnKey([first], 's1'))
+    const plan = parsePlan('<plan>{"goal":"same","steps":[{"title":"Do"}]}</plan>')!
+    expect(shouldPlan({ messages: history, state: { plan, turnKey: currentKey, stage: 'executing', plansThisTurn: 1 },
+      goal: 'same', settings: DEFAULT_ORCHESTRATOR_SETTINGS, sessionId: 's1' })).toEqual({ plan: false, reason: 'continue' })
+  })
+
+  it('失败消耗预算，新轮清掉旧计划，迟到回包不覆盖新轮', () => {
+    const store = new OrchestratorStore()
+    const plan = parsePlan('<plan>{"goal":"first","steps":[{"title":"Do"}]}</plan>')!
+    store.forTurn('s1', 'first')
+    const first = store.reservePlan('s1')
+    store.finishPlan('s1', first, plan)
+    const second = store.reservePlan('s1')
+    store.finishPlan('s1', second)
+    expect(store.forTurn('s1', 'first')).toMatchObject({ plansThisTurn: 2, plan })
+    const stale = store.reservePlan('s1')
+    expect(store.forTurn('s1', 'second')).toEqual({ plansThisTurn: 0, turnKey: 'second', stage: 'idle' })
+    store.finishPlan('s1', stale, plan)
+    expect(store.get('s1').plan).toBeUndefined()
   })
 })
 

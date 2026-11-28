@@ -17,6 +17,8 @@ export const PLANNER_SYSTEM_SUFFIX = [
   '- Under "handback", list conditions where the executor must stop and ask/replan (e.g. missing requirements, repeated failures, ambiguous choices).',
 ].join('\n')
 
+import { latestUserIndex } from './triggers.js'
+
 function blocksToPlainText(blocks: readonly { type: string; text?: string }[]): string {
   return blocks
     .filter((block): block is { type: 'text'; text: string } => block.type === 'text' && typeof block.text === 'string')
@@ -32,19 +34,7 @@ export function extractGoalAndEvidence(messages: readonly RequestMessage[]): {
   goal: string
   evidence: readonly string[]
 } {
-  let goal = ''
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    const message = messages[i]!
-    if (message.role !== 'user') continue
-    const source = (message as { readonly source?: { readonly kind?: unknown } }).source
-    const kind = source && typeof source.kind === 'string' ? source.kind : undefined
-    if (kind !== undefined && kind !== 'user') continue
-    const text = blocksToPlainText(message.content)
-    if (text.length > 0) {
-      goal = text
-      break
-    }
-  }
+  const goal = blocksToPlainText(messages[latestUserIndex(messages)]?.content ?? [])
 
   const callNames = new Map<string, string>()
   const toolMessages: Array<{ toolCallId?: string; isError?: boolean; text: string }> = []

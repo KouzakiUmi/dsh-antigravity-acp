@@ -23,6 +23,7 @@
 | [`src/vertex/`](../src/vertex/) | 标准 Vertex AI：ADC、宿主环境变量回退、发布商目录读取、按项目与区域路由、replay 校验 |
 | [`model-catalog-policy.ts`](../src/adapter/model-catalog-policy.ts) | 四条路由共用的聊天型号过滤、代际默认和显示名整理，构建时注入独立客户端 |
 | [`src/adapter/gemini-payload.ts`](../src/adapter/gemini-payload.ts) | AI Studio 与 Vertex AI 共用的标准 Gemini REST 请求构造 |
+| [`src/adapter/gemini-control-policy.ts`](../src/adapter/gemini-control-policy.ts) | 已确认型号的参数能力表；Host 解析与客户端按同一 REST 版本取档位和容量 |
 | [`src/colab/`](../src/colab/) | 可单独启停的 Colab Host 组件，使用 DSH 审批、受管子进程和附件服务；同包导出 `./colab` |
 | [`cordis.patch.yml`](../cordis.patch.yml) | 仅插入本插件，不抢占默认模型 |
 | [`tests/`](https://github.com/KouzakiUmi/dsh-antigravity-acp/tree/main/tests/) | 假 ACP / MCP、隔离 runtime、真实 React renderer 与回归测试 |
@@ -87,6 +88,7 @@ ELECTRON_RUN_AS_NODE=1 "$DSH_NODE_EXECUTABLE" scripts/check-desktop-compat.cjs
 | 编排模式（代理链路） | 2026-11-25 系统 Node 24：`tests/orchestrator/orchestrator-core.test.ts` 覆盖设置规范化（含 executor 两值枚举与非法值回落）、计划解析与稳定渲染、`shouldPlan` 六分支、证据截断与状态 LRU；`tests/proxy/orchestrator-proxy.test.ts` 覆盖目录合成与依赖缺失报错、两阶段隔离、`showPlan` 块索引偏移与 replay 块、预算上限、失败降级、usage 合并与中止，并分别断言 executor 走 Hydrogen（默认/非法回落）与 Sonnet 5.5（显式配置，wire 带档位后缀）。均为合成依赖，不触真实上游与账户 |
 | 编排模式（ACP 链路） | 2026-11-25 同上：`tests/adapter/orchestrator-acp.test.ts` 10 项，覆盖目录合成、关闭直通、`new → set model → set mode → prompt` 顺序与空 `mcpServers`、辅助通知忽略、两阶段 usage 合并且 `usage_update` 不计费、`session/cancel` 只发目标 ID 与迟到通知屏蔽、120s 超时降级、正常 park / 规划失败 / 计划改变三组续轮断言，以及 executor 配置 Sonnet 5.5 时 chat 会话写入 `claude-sonnet-5-5-medium`、非法 `executorModel` 回落 Hydrogen。全部在 `FakeAcpAgent` + 真实 loopback MCP 桥下执行，未用真实官方二进制 |
 | 设置页编排分组 | 真实 React 18 renderer：7 个可编辑控件的默认值与整份 `orchestrator` 提交（含 executor 在 Hydrogen / Sonnet 间切换）、`plannerTimeoutMs` 透传保留、键序无关与写回默认值的规范化比较、非法 `executorModel` 回落、代理模式可见性、外部冲突合并与撤销、`maxPlansPerTurn` 5 种非法值拒绝 |
+| 原生 Google 参数与编排回归 | React 设置保存、真实 DSH runtime 合成流和假 ACP 连接验证：Google 两路档位差异、覆盖优先级与同一份映射；代理编排超时降级、映射容量、真实宿主来源的签名续轮和上限；共享编排状态区分相同文字的新回合，旧工具失败不会重复触发。新增参数尚未在真实 Google 项目推理或桌面 GUI 验收。 |
 | 真实官方二进制（编排） | 未验收：`mode=plan` 只在独立探针中确认过行为（官方 agent 仍执行内置只读命令、计划写在 brain 目录、无 `plan` 通知），尚未在真实 `agy-acp-server` 上跑完整 planner → executor 编排，也没有真实账号下的计划质量对照 |
 | 构建 | `npm run build` 通过 |
 | 代理响应预算 | 合成 HTTP 与 SSE 测试覆盖：多帧生成超过旧 8 MiB 后仍能完成；解码后超过 64 MiB 正确失败；非生成和非成功生成响应仍受 8 MiB 传输预算约束 |

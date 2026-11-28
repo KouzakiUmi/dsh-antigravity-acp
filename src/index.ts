@@ -22,6 +22,7 @@ import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { AntigravityAcpAdapter, AGY_PROVIDER_ID } from './adapter/antigravity-adapter.js'
 import type { AdapterMetadata } from './adapter/antigravity-adapter.js'
 import { PooledAcpAdapter } from './pool/pooled-adapter.js'
+import { OrchestratorStore } from './orchestrator/index.js'
 import { AgentLink, agentStreamFromSubprocess, AGY_CLIENT_INFO, AGY_LINK_ERROR, launchAcpAgent } from './protocol/agent-link.js'
 import type { AgentLinkHandlers } from './protocol/agent-link.js'
 import {
@@ -534,7 +535,7 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
   }
   ctx.on('loader/volatile-update', (paths) => {
     // 模型显示开关、默认档位与映射都会改变选择器与路由，需要通知宿主刷新目录。
-    if (paths.some(([key]) => key === 'modelOverrides')) catalogChanged()
+    if (paths.some(([key]) => key === 'modelOverrides' || key === 'orchestrator')) catalogChanged()
   })
   let attachmentStore: AttachmentStore | undefined
   // tools 服务是附属功能注册 DSH 工具的入口；软注入（核心 ACP 路径不依赖它），
@@ -593,6 +594,7 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
   // 历史裁剪事件（issue #16）：内存有界日志，经额度 read 附带给药丸展示。
   const historyNotices = new HistoryNoticeLog()
   const workers: AntigravityAcpAdapter[] = []
+  const orchestratorStore = new OrchestratorStore()
   let metadata: AdapterMetadata | undefined
   // Serialize startup/credential preparation, not inference. This avoids competing OAuth imports.
   let startupBarrier: Promise<unknown> = Promise.resolve()
@@ -602,6 +604,7 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
     const workerIndex = workers.length
     const worker = new AntigravityAcpAdapter({
       lifecycle,
+      orchestratorStore,
       // handler 对象由 adapter 构造时创建且身份稳定：AgentLink 只在构造时取一次
       // handlers，后续回合只更换 adapter 内部的当前回合。
       getLink: (handlers, signal, purpose) => {
@@ -869,6 +872,7 @@ export function apply(ctx: Context, input: AntigravityPluginConfig): void {
     yield async () => {
       try { await adapter.dispose() }
       finally {
+        orchestratorStore.dispose()
         try { await sessionStore?.close() }
         finally {
           try { await proxyAccount.dispose() }

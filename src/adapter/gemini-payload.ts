@@ -3,6 +3,7 @@ import type { AdapterRequestOptions } from './request-options.js'
 import { llmError } from '../runtime/llm-error.js'
 import { containsControl } from '../proxy/gemini-stream.js'
 import { buildProxyFunctionDeclarations } from '../proxy/replay.js'
+import { geminiGenerationConfig, type resolveGeminiControls } from './gemini-model-controls.js'
 
 export type GeminiReplayBlockKind = 'text' | 'reasoning' | 'tool-call'
 export interface GeminiReplayBlock { readonly kind: GeminiReplayBlockKind; readonly signature?: string; readonly wireCallId?: string }
@@ -10,6 +11,7 @@ export const GEMINI_MAX_SIGNATURE_LENGTH = 16 * 1024
 
 interface GeminiPayloadOptions {
   label: string
+  controls?: ReturnType<typeof resolveGeminiControls>['controls']
   /** The provider must establish provenance before giving the serializer any signatures. */
   replayBlocks?: (message: RequestMessage, kinds: readonly GeminiReplayBlockKind[]) => readonly GeminiReplayBlock[] | undefined
 }
@@ -37,10 +39,12 @@ export function buildGeminiPayload(options: AdapterRequestOptions, config: Gemin
       ? message.content.flatMap(block => block.type === 'text' && block.text.trim() ? [{ text: block.text }] : []) : []),
   ]
   if (systemParts.length > 0) request.systemInstruction = { parts: systemParts }
-  const generationConfig: Record<string, unknown> = {}
-  if (options.maxTokens !== undefined) generationConfig.maxOutputTokens = Math.floor(bounded(options.maxTokens, 1, 1_000_000, 'maxTokens', config.label))
-  if (options.temperature !== undefined) generationConfig.temperature = bounded(options.temperature, 0, 2, 'temperature', config.label)
-  if (options.stop !== undefined && options.stop.length > 0) generationConfig.stopSequences = options.stop.slice(0, 16).map(item => String(item).slice(0, 256))
+  const generationConfig: Record<string, unknown> = config.controls === undefined ? {} : geminiGenerationConfig(options, config.controls, config.label)
+  if (config.controls === undefined) {
+    if (options.maxTokens !== undefined) generationConfig.maxOutputTokens = Math.floor(bounded(options.maxTokens, 1, 1_000_000, 'maxTokens', config.label))
+    if (options.temperature !== undefined) generationConfig.temperature = bounded(options.temperature, 0, 2, 'temperature', config.label)
+    if (options.stop !== undefined && options.stop.length > 0) generationConfig.stopSequences = options.stop.slice(0, 5).map(item => String(item).slice(0, 256))
+  }
   if (Object.keys(generationConfig).length > 0) request.generationConfig = generationConfig
   if (options.tools !== undefined && options.tools.length > 0) {
     const declarations = buildProxyFunctionDeclarations(options.tools)

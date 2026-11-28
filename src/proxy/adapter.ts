@@ -60,12 +60,14 @@ import { llmError } from '../runtime/llm-error.js'
 import {
   ORCHESTRATOR_MODEL_ID,
   ORCHESTRATOR_MODEL_NAME,
+  ORCHESTRATOR_LEGACY_EFFORTS,
   OrchestratorStore,
   PLANNER_SYSTEM_SUFFIX,
   buildExecutorSystem,
   buildPlannerMessages,
   computeTurnKey,
   extractGoalAndEvidence,
+  latestToolResultId,
   normalizeOrchestratorSettings,
   parsePlan,
   renderPlanForExecutor,
@@ -78,10 +80,10 @@ import {
   parseLiveProxyCatalog,
   PROXY_MODEL_EFFORTS,
   resolveProxyOrchestrator,
+  resolveProxyOrchestratorEndpoint,
   synthesizeProxyOrchestratorModel,
-  toProxyFamilyId,
 } from './model-catalog.js'
-import type { LiveProxyCatalog, LiveProxyModel } from './model-catalog.js'
+import type { LiveProxyCatalog, LiveProxyModel, ProxyOrchestratorEndpoint } from './model-catalog.js'
 
 export { PROXY_PROVIDER_ID }
 
@@ -311,12 +313,22 @@ export class AntigravityProxyAdapter extends LlmAdapter {
 
   private resolveOrchestratorModel(generation: ProxyGeneration): LlmResolvedModelInfo {
     const orch = generation.orchestrator
+    if (!orch.enabled) {
+      const executor = this.resolveStandaloneExecutor(generation)
+      return { provider: PROXY_PROVIDER_ID, id: ORCHESTRATOR_MODEL_ID,
+        name: modelDisplayName(generation.settings, ORCHESTRATOR_MODEL_ID, ORCHESTRATOR_MODEL_NAME),
+        reasoning: { efforts: ORCHESTRATOR_LEGACY_EFFORTS.map(effort => ({ id: ReasoningEffortId(effort), name: effort[0]!.toUpperCase() + effort.slice(1) })) },
+        inputModalities: executor.supportsImages && generation.attachments !== undefined ? ['text', 'image'] : ['text'],
+        ...(executor.contextWindow === undefined ? {} : { context: { contextWindow: executor.contextWindow } }),
+        ...(executor.maxOutputTokens === undefined ? {} : { defaultMaxTokens: executor.maxOutputTokens }) }
+    }
     const resolved = resolveProxyOrchestrator(
       orch,
       generation.catalog?.data,
       this.definitions,
       orch.plannerEffort,
       orch.executorEffort,
+      generation.settings,
     )
     if (resolved === undefined || generation.catalog === undefined) {
       throw llmError('编排模式的 planner/executor 模型不在当前目录', 'INVALID_MODEL')
@@ -329,13 +341,12 @@ export class AntigravityProxyAdapter extends LlmAdapter {
       modelSettings: generation.settings,
       plannerEffort: orch.plannerEffort,
       executorEffort: orch.executorEffort,
+      resolved,
     })
     if (synthesized === undefined) {
       throw llmError('编排模式的 planner/executor 模型不在当前目录', 'INVALID_MODEL')
     }
-    const efforts = resolved.planner.availableEfforts.length > 0
-      ? resolved.planner.availableEfforts
-      : [resolved.planner.effort]
+    const efforts = resolved.planner.availableEfforts
     return {
       provider: PROXY_PROVIDER_ID,
       id: ORCHESTRATOR_MODEL_ID,
@@ -343,14 +354,22 @@ export class AntigravityProxyAdapter extends LlmAdapter {
       inputModalities: synthesized.inputModalities ?? ['text'],
       ...(synthesized.contextWindow === undefined ? {} : { context: { contextWindow: synthesized.contextWindow } }),
       ...(synthesized.maxOutputTokens === undefined ? {} : { defaultMaxTokens: synthesized.maxOutputTokens }),
-      reasoning: {
+      ...(efforts.length === 0 || resolved.planner.effort === undefined ? {} : { reasoning: {
         efforts: efforts.map((effort) => ({
           id: ReasoningEffortId(effort),
           name: effort[0]!.toUpperCase() + effort.slice(1),
         })),
         defaultEffort: ReasoningEffortId(resolved.planner.effort),
-      },
+      } }),
     }
+  }
+
+  private resolveStandaloneExecutor(generation: ProxyGeneration): ProxyOrchestratorEndpoint {
+    const orch = generation.orchestrator
+    const endpoint = resolveProxyOrchestratorEndpoint(orch.executorModel, orch.executorEffort, generation.catalog?.data,
+      this.definitions, generation.settings)
+    if (endpoint === undefined) throw llmError('编排模式的 executor 模型不在当前目录', 'INVALID_MODEL')
+    return endpoint
   }
 
   private resolveLiveGemini(model: string, generation: ProxyGeneration): LlmResolvedModelInfo {
@@ -429,24 +448,20 @@ export class AntigravityProxyAdapter extends LlmAdapter {
     const signal = options.signal
     if (signal?.aborted) { yield finishChunk('aborted', 'CANCELLED'); return }
     const orch = initialGeneration.orchestrator
-    if (!orch.enabled) {
-      const executorFamily = toProxyFamilyId(orch.executorModel)
-      const nextGeneration = isLiveGeminiFamily(executorFamily) && initialGeneration.catalog === undefined
-        ? { ...initialGeneration, catalog: await this.readLiveCatalog(signal) }
-        : initialGeneration
-      yield* this.streamInGeneration({
-        ...options,
-        model: executorFamily,
-        reasoningEffort: ReasoningEffortId(orch.executorEffort),
-      }, nextGeneration)
-      return
-    }
-
     const catalog = initialGeneration.catalog ?? await this.readLiveCatalog(signal)
     const generation = { ...initialGeneration, catalog }
     if (signal?.aborted) { yield finishChunk('aborted', 'CANCELLED'); return }
 
-    const plannerEffort = normalizeReasoningEffort(options.reasoningEffort) ?? orch.plannerEffort
+    if (!orch.enabled) {
+      const executor = this.resolveStandaloneExecutor(generation)
+      yield* this.streamInGeneration({ ...options, model: executor.familyId,
+        reasoningEffort: executor.effort === undefined ? undefined : ReasoningEffortId(executor.effort) },
+      generation, { replayModel: options.model, endpoint: executor })
+      return
+    }
+
+    const requestedEffort = options.reasoningEffort === 'xhigh' ? 'xhigh' : normalizeReasoningEffort(options.reasoningEffort)
+    const plannerEffort = requestedEffort ?? orch.plannerEffort
     const executorEffort = orch.executorEffort
     const resolved = resolveProxyOrchestrator(
       orch,
@@ -454,22 +469,32 @@ export class AntigravityProxyAdapter extends LlmAdapter {
       this.definitions,
       plannerEffort,
       executorEffort,
+      generation.settings,
     )
     if (resolved === undefined) {
       throw llmError('编排模式的 planner/executor 模型不在当前目录', 'INVALID_MODEL')
     }
+    if (options.reasoningEffort !== undefined && resolved.planner.availableEfforts.length === 0
+        && (resolved.planner.effort === undefined || requestedEffort !== resolved.planner.effort)) {
+      throw llmError('编排 planner 已固定到映射模型，不能选择其他思考档位', 'UNSUPPORTED_REASONING_EFFORT')
+    }
+    this.assertImageSupport(options, resolved.executor.supportsImages && generation.attachments !== undefined)
 
-    const sessionId = options.sessionId === undefined ? undefined : String(options.sessionId)
+    if (options.purpose !== undefined) {
+      yield* this.streamInGeneration({ ...options, model: resolved.executor.familyId,
+        reasoningEffort: resolved.executor.effort === undefined ? undefined : ReasoningEffortId(resolved.executor.effort) },
+      generation, { replayModel: options.model, endpoint: resolved.executor })
+      return
+    }
+
+    const sessionId = options.sessionId ? String(options.sessionId) : undefined
     const stateKey = sessionId === undefined ? undefined : JSON.stringify([catalog.key, sessionId])
-    const storedState = this.orchestrators.get(stateKey)
     const currentTurnKey = computeTurnKey(options.messages, sessionId)
-    const effectiveState = storedState.turnKey !== undefined && currentTurnKey !== undefined && currentTurnKey !== storedState.turnKey
-      ? { ...storedState, plansThisTurn: 0 }
-      : storedState
+    const storedState = this.orchestrators.forTurn(stateKey, currentTurnKey)
     const { goal, evidence } = extractGoalAndEvidence(options.messages)
     const decision = shouldPlan({
       messages: options.messages,
-      state: effectiveState,
+      state: storedState,
       goal,
       settings: orch,
       ...(sessionId === undefined ? {} : { sessionId }),
@@ -480,20 +505,14 @@ export class AntigravityProxyAdapter extends LlmAdapter {
     let emittedShowPlan = false
 
     if (decision.plan) {
+      const attempt = this.orchestrators.reservePlan(stateKey, latestToolResultId(options.messages))
       const result = await this.runPlanner(options, resolved.planner, { goal, evidence, priorPlan: storedState.plan, orch, catalogKey: catalog.key })
       if (signal?.aborted) { yield finishChunk('aborted', 'CANCELLED'); return }
       plannerUsage = result.usage
+      this.orchestrators.finishPlan(stateKey, attempt, result.plan)
       if (result.plan !== undefined) {
         activePlan = result.plan
-        const nextPlansThisTurn = (decision.reason === 'new-goal' ? 0 : effectiveState.plansThisTurn) + 1
-        this.orchestrators.update(stateKey, (prev) => ({
-          ...prev,
-          plan: result.plan,
-          stage: 'executing',
-          plansThisTurn: nextPlansThisTurn,
-          ...(currentTurnKey === undefined ? {} : { turnKey: currentTurnKey }),
-        }))
-        if (orch.showPlan) {
+        if (orch.showPlan && result.plan !== storedState.plan) {
           const planText = renderPlanForExecutor(result.plan)
           yield { type: 'block-start', index: 0, blockType: 'text' }
           yield { type: 'text-delta', index: 0, text: planText }
@@ -506,12 +525,12 @@ export class AntigravityProxyAdapter extends LlmAdapter {
     const executorOptions: AdapterRequestOptions = {
       ...options,
       model: resolved.executor.familyId,
-      reasoningEffort: ReasoningEffortId(resolved.executor.effort),
+      reasoningEffort: resolved.executor.effort === undefined ? undefined : ReasoningEffortId(resolved.executor.effort),
       ...(activePlan === undefined ? {} : { system: buildExecutorSystem(options.system, activePlan) }),
     }
 
     let mergedUsageEmitted = false
-    for await (const rawChunk of this.streamInGeneration(executorOptions, generation)) {
+    for await (const rawChunk of this.streamInGeneration(executorOptions, generation, { replayModel: options.model, endpoint: resolved.executor })) {
       const chunk = emittedShowPlan ? shiftChunkIndex(rawChunk, 1) : rawChunk
       if (chunk.type === 'usage') {
         const merged = mergeTokenUsage(plannerUsage, chunk.usage)
@@ -545,11 +564,14 @@ export class AntigravityProxyAdapter extends LlmAdapter {
 
   private async runPlanner(
     options: AdapterRequestOptions,
-    plannerEndpoint: { readonly familyId: string; readonly wire: string; readonly effort: string },
+    plannerEndpoint: ProxyOrchestratorEndpoint,
     { goal, evidence, priorPlan, orch, catalogKey }: { goal: string; evidence: readonly string[]; priorPlan: OrchestratorPlan | undefined; orch: OrchestratorSettings; catalogKey: string },
   ): Promise<{ plan?: OrchestratorPlan; usage?: TokenUsage }> {
     const signal = options.signal
-    const timeoutSignal = AbortSignal.timeout(orch.plannerTimeoutMs)
+    const timeout = new AbortController()
+    const timer = setTimeout(() => timeout.abort(new Error('planner timeout')), orch.plannerTimeoutMs)
+    timer.unref?.()
+    const timeoutSignal = timeout.signal
     const plannerSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal
 
     const baseSystemParts = [
@@ -565,7 +587,7 @@ export class AntigravityProxyAdapter extends LlmAdapter {
     const plannerOptions: AdapterRequestOptions = {
       provider: PROXY_PROVIDER_ID,
       model: plannerEndpoint.familyId,
-      reasoningEffort: ReasoningEffortId(plannerEndpoint.effort),
+      ...(plannerEndpoint.effort === undefined ? {} : { reasoningEffort: ReasoningEffortId(plannerEndpoint.effort) }),
       messages: [...buildPlannerMessages(goal, evidence, priorPlan)],
       system: plannerSystem,
       tools: [],
@@ -627,6 +649,8 @@ export class AntigravityProxyAdapter extends LlmAdapter {
 
         let collectedText = ''
         let retryAuth = false
+        let finish: string | undefined
+        let sawDone = false
         for await (const sse of iterateProxySse(response, {
           signal: plannerSignal,
           idleTimeoutMs: Math.min(PROXY_IDLE_TIMEOUT_MS, orch.plannerTimeoutMs),
@@ -634,7 +658,7 @@ export class AntigravityProxyAdapter extends LlmAdapter {
           maxBytes: PROXY_STREAM_RESPONSE_BYTES,
           maxFrameBytes: PROXY_FRAME_BYTES,
         })) {
-          if (sse.data.trim() === '[DONE]') break
+          if (sse.data.trim() === '[DONE]') { sawDone = true; break }
           const event = parseProxyProviderEvent(sse.data)
           if (event.error !== undefined) {
             const suspended = suspendedErrorFor(event.error.message ?? '', event.error.status)
@@ -649,12 +673,16 @@ export class AntigravityProxyAdapter extends LlmAdapter {
             throw llmError(`编排 planner 上游错误: ${event.error.message ?? event.error.code ?? String(event.error.status ?? 'unknown')}`, 'UPSTREAM')
           }
           if (event.usage !== undefined) usage = event.usage
+          finish = event.finish ?? finish
           for (const part of event.parts) {
             if (part.kind === 'text' && part.text) collectedText += part.text
           }
         }
         if (retryAuth) continue
         if (signal?.aborted) return {}
+        if (timeoutSignal.aborted || (finish === undefined ? !sawDone : mapFinishReason(finish) !== 'stop')) {
+          throw llmError('编排 planner 未正常结束', 'UPSTREAM')
+        }
 
         const plan = parsePlan(collectedText, priorPlan)
         if (plan === undefined) {
@@ -665,13 +693,25 @@ export class AntigravityProxyAdapter extends LlmAdapter {
       }
     } catch (error) {
       if (signal?.aborted) return {}
-      if (error instanceof LlmError && ['CANCELLED', 'AGY_ACCOUNT_SUSPENDED'].includes(error.code)) throw error
+      if (error instanceof LlmError && (error.code === 'AGY_ACCOUNT_SUSPENDED' || (error.code === 'CANCELLED' && !timeoutSignal.aborted))) throw error
       this.options.log?.warn('antigravity-proxy: 编排 planner 失败，降级直接执行', error)
       return { ...(usage === undefined ? {} : { usage }) }
+    } finally {
+      clearTimeout(timer)
     }
   }
 
-  private async *streamInGeneration(options: AdapterRequestOptions, generation: ProxyGeneration): AsyncIterable<StreamChunk> {
+  private assertImageSupport(options: AdapterRequestOptions, acceptsImage: boolean): void {
+    if (!acceptsImage && options.messages.some(message => message.content.some(block => block.type === 'image' && !block.offloaded))) {
+      throw llmError('所选代理模型或档位不支持图片输入，请切换到支持图片的档位或移除图片', 'UNSUPPORTED_MODALITY')
+    }
+  }
+
+  private async *streamInGeneration(
+    options: AdapterRequestOptions,
+    generation: ProxyGeneration,
+    { replayModel = options.model, endpoint }: { replayModel?: string; endpoint?: ProxyOrchestratorEndpoint } = {},
+  ): AsyncIterable<StreamChunk> {
     if (options.provider !== PROXY_PROVIDER_ID) throw new LlmError('代理模式 adapter 收到未知路由', 'NO_ADAPTER')
     const signal = options.signal
     const requested = this.definitions[options.model]
@@ -679,12 +719,11 @@ export class AntigravityProxyAdapter extends LlmAdapter {
       throw llmError('该模型不在代理模式审计文本快照内', 'INVALID_MODEL')
     }
     if (signal?.aborted) { yield finishChunk('aborted', 'CANCELLED'); return }
-    const wireModel = this.wireModel(options.model, options.reasoningEffort, generation)
+    const wireModel = endpoint?.wire ?? this.wireModel(options.model, options.reasoningEffort, generation)
     const routedDefinition = modelSettingFor(generation.settings, options.model).target === undefined ? requested : this.definitionForWireModel(wireModel)
-    const acceptsImage = this.acceptsImage(wireModel, generation, routedDefinition?.modalities.input.includes('image') === true)
-    if (!acceptsImage && options.messages.some(message => message.content.some(block => block.type === 'image' && !block.offloaded))) {
-      throw llmError('所选代理模型或档位不支持图片输入，请切换到支持图片的档位或移除图片', 'UNSUPPORTED_MODALITY')
-    }
+    const acceptsImage = endpoint ? endpoint.supportsImages && generation.attachments !== undefined
+      : this.acceptsImage(wireModel, generation, routedDefinition?.modalities.input.includes('image') === true)
+    this.assertImageSupport(options, acceptsImage)
     const attachments = acceptsImage ? generation.attachments : undefined
     const hasEmitted = { value: false }
     let refreshed = false
@@ -703,7 +742,7 @@ export class AntigravityProxyAdapter extends LlmAdapter {
       accountKey = key
       let payload: Awaited<ReturnType<typeof buildProxyGeneratePayload>>
       try {
-        payload = await buildProxyGeneratePayload(options, credential, this.sessions, Date.now(), attachments, signal, wireModel)
+        payload = await buildProxyGeneratePayload(options, credential, this.sessions, Date.now(), attachments, signal, wireModel, replayModel)
       } catch (error) {
         if (signal?.aborted) throw llmError('代理模式请求已取消', 'CANCELLED')
         // 图片准入与校验失败在 image.ts / payload.ts 里已经一律是 LlmError，这里
@@ -796,7 +835,7 @@ export class AntigravityProxyAdapter extends LlmAdapter {
         throw toLlmError(statusError)
       }
       try {
-        const completed = yield* this.streamResponse(response, options, hasEmitted, wireModel)
+        const completed = yield* this.streamResponse(response, options, hasEmitted, wireModel, replayModel)
         if (completed) completeProxyExecution(this.sessions, options)
         return
       } catch (error) {
@@ -825,7 +864,7 @@ export class AntigravityProxyAdapter extends LlmAdapter {
     }
   }
 
-  private async *streamResponse(response: Response, options: AdapterRequestOptions, hasEmitted: { value: boolean }, wireModel: string): AsyncGenerator<StreamChunk, boolean> {
+  private async *streamResponse(response: Response, options: AdapterRequestOptions, hasEmitted: { value: boolean }, wireModel: string, replayModel: string): AsyncGenerator<StreamChunk, boolean> {
     const { finish, eventError, states, sawDone } = yield* assembleGeminiStream(response, {
       ...(options.signal === undefined ? {} : { signal: options.signal }),
       sse: {
@@ -876,7 +915,7 @@ export class AntigravityProxyAdapter extends LlmAdapter {
     const replayBlocks: ProxyReplayBlock[] = states.map((state) => ({ kind: state.kind, ...(state.signature === undefined ? {} : { signature: state.signature }) }))
     const reason = mapFinishReason(finish)
     yield finishChunk(reason === 'stop' && states.some(state => state.kind === 'tool-call') ? 'tool-calls' : reason, finish ?? 'STOP', undefined,
-      createProxyReplayState(options.model, proxyModelFamily(wireModel), finish, replayBlocks, wireModel))
+      createProxyReplayState(replayModel, proxyModelFamily(wireModel), finish, replayBlocks, wireModel))
     return reason !== 'error'
   }
 

@@ -519,6 +519,57 @@ describe('代理模式 Orchestrator 两阶段执行、预算、降级与取消',
     expect(modelsSent.slice(-2)).toEqual(['claude-opus-5-5-medium', 'gemini-4-hydrogen-medium'])
   })
 
+  it('规划超时后由 executor 接手，失败占用预算且相同文字的新轮能重新规划', async () => {
+    vi.useFakeTimers()
+    try {
+      let reads = 0
+      const calls: string[] = []
+      const warn = vi.fn()
+      const adapter = new AntigravityProxyAdapter({
+        readSettings: () => ({ orchestrator: { maxPlansPerTurn: 1, plannerTimeoutMs: 5000 } }),
+        log: { info: vi.fn(), warn },
+        credential: { credential: async (signal) => {
+          if (++reads === 2) await new Promise<void>((_, reject) => signal!.addEventListener('abort', () => reject(signal!.reason), { once: true }))
+          return { accessToken: 'fixture', source: 'login', updatedAt: 'x' }
+        } },
+        transport: { request: async ({ url, body }) => {
+          if (url.includes('fetchAvailableModels')) return fullCatalogResponse()
+          const { model } = JSON.parse(String(body)) as { model: string }
+          calls.push(model)
+          return sse([textEvent(model.startsWith('claude') ? '<plan>{"goal":"g","steps":[{"title":"do"}]}</plan>' : 'done', 'STOP')])
+        } },
+      })
+      const user = createUserMessage({ content: [{ type: 'text', text: 'same text' }], source: { kind: 'user' } })
+      const options = { provider: PROXY_PROVIDER_ID, model: ORCHESTRATOR_MODEL_ID, sessionId: 'timeout' as never, messages: [user] }
+      const first = collect(adapter.stream(options))
+      await vi.advanceTimersByTimeAsync(5000)
+      expect((await first).at(-1)).toMatchObject({ reason: { kind: 'stop' } })
+      expect(warn).toHaveBeenCalledTimes(1)
+      await collect(adapter.stream(options))
+      expect(calls).toEqual(['gemini-4-hydrogen-medium', 'gemini-4-hydrogen-medium'])
+      await collect(adapter.stream({ ...options, messages: [user, createUserMessage({ content: user.content, source: { kind: 'user' } })] }))
+      expect(calls.slice(-2)).toEqual(['claude-opus-5-5-medium', 'gemini-4-hydrogen-medium'])
+    } finally { vi.useRealTimers() }
+  })
+
+  it.each([undefined, 'MAX_TOKENS', 'SAFETY'])('planner 未正常结束（%s）时不向 executor 注入计划', async (finish) => {
+    let executorSystem: unknown
+    const adapter = new AntigravityProxyAdapter({
+      credential: { credential: async () => ({ accessToken: 'fixture', source: 'login', updatedAt: 'x' }) },
+      transport: { request: async ({ url, body }) => {
+        if (url.includes('fetchAvailableModels')) return fullCatalogResponse()
+        const { model, request } = JSON.parse(String(body)) as { model: string; request: { systemInstruction?: unknown } }
+        if (model.startsWith('claude')) return sse([textEvent('<plan>{"goal":"g","steps":[{"title":"should not inject"}]}</plan>', finish)])
+        executorSystem = request.systemInstruction
+        return sse([textEvent('done', 'STOP')])
+      } },
+    })
+    const chunks = await collect(adapter.stream({ provider: PROXY_PROVIDER_ID, model: ORCHESTRATOR_MODEL_ID,
+      system: 'base', messages: [{ role: 'user', content: [{ type: 'text', text: 'fixture' }] }] }))
+    expect(chunks.at(-1)).toMatchObject({ reason: { kind: 'stop' } })
+    expect(JSON.stringify(executorSystem)).not.toContain('should not inject')
+  })
+
   it('options.signal 在 planner 阶段中止时返回 aborted finish 且不 emit usage', async () => {
     const controller = new AbortController()
     const request = vi.fn(async ({ url }: { url: string }) => {

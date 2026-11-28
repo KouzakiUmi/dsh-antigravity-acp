@@ -1,11 +1,13 @@
+import { resolveGeminiControls } from '../adapter/gemini-model-controls.js'
 import { buildGeminiPayload, safeGeminiSignature } from '../adapter/gemini-payload.js'
 import type { AdapterRequestOptions } from '../adapter/request-options.js'
 import { compatibleAistudioReplayState } from './replay.js'
 
 /** Gemini REST 生成体；签名只从兼容的 AI Studio 历史回放恢复。 */
-export function buildAistudioPayload(options: AdapterRequestOptions, wireModel: string): Record<string, unknown> {
+export function buildAistudioPayload(options: AdapterRequestOptions, wireModel: string, controls = resolveGeminiControls(wireModel, { enabled: true }).controls): Record<string, unknown> {
   return buildGeminiPayload(options, {
     label: 'AI Studio',
+    controls,
     replayBlocks(message, kinds) {
       if (message.role !== 'assistant') return undefined
       const replay = compatibleAistudioReplayState(message, options.model, kinds, wireModel)

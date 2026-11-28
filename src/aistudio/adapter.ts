@@ -26,17 +26,16 @@ import type {
   StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import type { AdapterPreparedCall, AdapterRequestOptions } from '../adapter/request-options.js'
-import { modelDisplayName, modelSettingFor, modelVisible, normalizeModelSettings } from '../adapter/model-settings.js'
-import type { ModelCapacity, ModelSetting } from '../adapter/model-settings.js'
+import { modelVisible, normalizeModelSettings } from '../adapter/model-settings.js'
 import { assembleGeminiStream, createGeminiBlockAssembler } from '../proxy/gemini-stream.js'
 import { ProxyTransportError, readProxyText } from '../proxy/transport.js'
 import { llmError } from '../runtime/llm-error.js'
 import type { ModelOverride } from '../settings.js'
 import { buildAistudioPayload } from './payload.js'
-import { parseAistudioModels } from './discovery.js'
-import type { AistudioModel } from './discovery.js'
+import { aistudioModelInfos, parseAistudioModels, resolveAistudioModelInfo, resolveAistudioSelection, selectAistudioModel } from './discovery.js'
+import type { AistudioCatalog, AistudioCatalogRow, AistudioModel, AistudioModelControls, AistudioSelection } from './discovery.js'
 import { createAistudioReplayState } from './replay.js'
-import { AISTUDIO_PROVIDER_ID, aistudioCatalogId, aistudioDefaultEnabled, aistudioModelsUrl, aistudioStreamUrl, aistudioWireModel, isAistudioChatModel } from './endpoints.js'
+import { AISTUDIO_PROVIDER_ID, aistudioDefaultEnabled, aistudioModelsUrl, aistudioStreamUrl } from './endpoints.js'
 import { inspectAistudioEvent, readAistudioError, redactAistudioError } from './response-observation.js'
 import { AistudioUsageStore } from './usage.js'
 import type { AistudioUsageResult } from './usage.js'
@@ -65,11 +64,12 @@ export interface AistudioAdapterOptions {
   log?: { warn: (message: string, error?: unknown) => void }
 }
 
+interface CredentialSnapshot { key: string; digest: string; epoch: number }
+type CredentialScope = Pick<CredentialSnapshot, 'digest' | 'epoch'>
+interface PreparedAistudioRoute extends CredentialScope { controls: AistudioModelControls['controls'] }
+
 export class AistudioAdapter extends LlmAdapter {
-  private catalog: Map<string, AistudioModel> | undefined
-  private nonChatIds = new Set<string>()
-  private catalogExpiresAt = 0
-  private catalogDigest: string | undefined
+  private catalog: AistudioCatalog | undefined
   private catalogVersion = 0
   private readonly usage = new AistudioUsageStore()
   private credentialVersion = 0
@@ -102,8 +102,6 @@ export class AistudioAdapter extends LlmAdapter {
   invalidateModelCatalog(): void {
     this.catalogVersion += 1
     this.catalog = undefined
-    this.nonChatIds.clear()
-    this.catalogExpiresAt = 0
   }
 
   invalidateCredential(key?: string): void {
@@ -146,47 +144,49 @@ export class AistudioAdapter extends LlmAdapter {
   override async listModels(provider: string, signal?: AbortSignal): Promise<readonly LlmModelInfo[]> {
     this.providerInfo(provider)
     const settings = this.settings()
-    const catalog = await this.readCatalogSafe(signal, false)
-    return this.modelInfos(catalog, settings).filter(model => modelVisible(settings, model.id, aistudioDefaultEnabled))
+    const catalog = await this.readCatalog(signal, false)
+    this.checkCatalogScope(catalog, signal)
+    return aistudioModelInfos(catalog, settings).filter(model => modelVisible(settings, model.id, aistudioDefaultEnabled))
   }
 
-  async discoverModels(force = false, signal?: AbortSignal): Promise<readonly (LlmModelInfo & ModelCapacity)[]> {
+  async discoverModels(force = false, signal?: AbortSignal): Promise<readonly AistudioCatalogRow[]> {
     const settings = this.settings()
     const catalog = await this.readCatalog(signal, force)
-    return this.modelInfos(catalog, settings)
+    this.checkCatalogScope(catalog, signal)
+    return aistudioModelInfos(catalog, settings)
   }
 
   override async resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
     this.providerInfo(provider)
     this.validateModelId(model)
     const settings = this.settings()
-    const catalog = await this.readCatalogSafe(signal, false)
-    return this.resolveInCatalog(model, settings, catalog)
+    const catalog = await this.readCatalog(signal, false)
+    this.checkCatalogScope(catalog, signal)
+    return resolveAistudioModelInfo(model, settings, catalog).info
   }
 
   override async prepareCall(provider: string, model: string, signal?: AbortSignal): Promise<AdapterPreparedCall> {
     this.providerInfo(provider)
     this.validateModelId(model)
     const settings = this.settings()
-    const catalog = await this.readCatalogSafe(signal, false)
-    const resolved = this.resolveInCatalog(model, settings, catalog)
-    const wireModel = this.wireModel(model, settings)
-    const epoch = this.credentialEpoch
-    const digest = this.catalogDigest
-    return { model: resolved, stream: options => {
+    const catalog = await this.readCatalog(signal, false)
+    this.checkCatalogScope(catalog, signal)
+    const { info, selection, controls } = resolveAistudioModelInfo(model, settings, catalog)
+    const { epoch, digest } = catalog
+    return { model: info, stream: options => {
       if (options.provider !== provider || options.model !== model) throw llmError('AI Studio 请求与已准备模型不匹配', 'INVALID_MODEL')
-      return this.streamCall(options, wireModel, { epoch, digest })
+      return this.streamCall(options, selection, { epoch, digest, controls })
     } }
   }
 
   override async *stream(options: AdapterRequestOptions): AsyncIterable<StreamChunk> {
     this.providerInfo(options.provider)
     this.validateModelId(options.model)
-    const wireModel = this.wireModel(options.model, this.settings())
-    yield* this.streamCall(options, wireModel)
+    const selection = selectAistudioModel(options.model, this.settings())
+    yield* this.streamCall(options, selection)
   }
 
-  private settings(): Map<string, ModelSetting> {
+  private settings() {
     return normalizeModelSettings(this.options.readSettings?.()?.modelOverrides, aistudioDefaultEnabled)
   }
 
@@ -194,51 +194,7 @@ export class AistudioAdapter extends LlmAdapter {
     if (typeof model !== 'string' || model.trim().length === 0 || model.length > 256) throw llmError('AI Studio 模型 id 无效', 'INVALID_MODEL')
   }
 
-  private wireModel(model: string, settings: Map<string, ModelSetting>): string {
-    const selected = aistudioWireModel(model)
-    const original = selected.startsWith('models/') ? selected.slice('models/'.length) : selected
-    if (!isAistudioChatModel(original)) throw llmError('AI Studio 仅支持文本对话模型', 'INVALID_MODEL')
-    const setting = modelSettingFor(settings, model, aistudioDefaultEnabled)
-    const wire = setting.target ?? original
-    const canonical = wire.startsWith('models/') ? wire.slice('models/'.length) : wire
-    if (!isAistudioChatModel(canonical)) throw llmError('AI Studio 模型映射必须是文本对话模型', 'INVALID_MODEL')
-    return canonical
-  }
-
-  private resolveInCatalog(model: string, settings: Map<string, ModelSetting>, catalog: Map<string, AistudioModel>): LlmResolvedModelInfo {
-    const entry = catalog.get(model)
-    if (entry === undefined) throw llmError('该模型不在 AI Studio 当前目录内', 'INVALID_MODEL')
-    const wire = this.wireModel(model, settings)
-    if (this.nonChatIds.has(entry.wireModel) || this.nonChatIds.has(wire)) throw llmError('AI Studio 目录显示该映射不支持文本生成', 'INVALID_MODEL')
-    const capacity = catalog.get(aistudioCatalogId(wire))
-    return {
-      provider: AISTUDIO_PROVIDER_ID,
-      id: model,
-      name: modelDisplayName(settings, model, entry.name),
-      inputModalities: ['text'],
-      ...(capacity?.contextWindow === undefined ? {} : { context: { contextWindow: capacity.contextWindow } }),
-      ...(capacity?.maxOutputTokens === undefined ? {} : { defaultMaxTokens: capacity.maxOutputTokens }),
-    }
-  }
-
-  private modelInfos(catalog: Map<string, AistudioModel>, settings: Map<string, ModelSetting>): (LlmModelInfo & ModelCapacity)[] {
-    return [...catalog.values()].flatMap(entry => {
-      let wire: string
-      try { wire = this.wireModel(entry.catalogId, settings) } catch { return [] }
-      if (this.nonChatIds.has(entry.wireModel) || this.nonChatIds.has(wire)) return []
-      const capacity = catalog.get(aistudioCatalogId(wire))
-      return [{
-        provider: AISTUDIO_PROVIDER_ID,
-        id: entry.catalogId,
-        name: modelDisplayName(settings, entry.catalogId, entry.name),
-        inputModalities: ['text'] as const,
-        ...(capacity?.contextWindow === undefined ? {} : { contextWindow: capacity.contextWindow, contextWindowSource: 'observed' as const }),
-        ...(capacity?.maxOutputTokens === undefined ? {} : { maxOutputTokens: capacity.maxOutputTokens }),
-      }]
-    })
-  }
-
-  private async readKey(signal?: AbortSignal): Promise<{ key: string; digest: string; epoch: number }> {
+  private async readKey(signal?: AbortSignal): Promise<CredentialSnapshot> {
     if (signal?.aborted || this.disposed) throw llmError('AI Studio 请求已取消', 'CANCELLED')
     const version = this.credentialVersion
     const sequence = ++this.readSequence
@@ -271,30 +227,45 @@ export class AistudioAdapter extends LlmAdapter {
     return { key, digest, epoch: this.credentialEpoch }
   }
 
-  private async readCatalogSafe(signal: AbortSignal | undefined, force: boolean): Promise<Map<string, AistudioModel>> {
+  private checkCatalogScope(scope: CredentialScope, signal?: AbortSignal): void {
+    if (signal?.aborted || this.disposed || scope.epoch !== this.credentialEpoch || scope.digest !== this.activeDigest) {
+      throw llmError('AI Studio 凭据或设置已变更', 'CANCELLED')
+    }
+  }
+
+  private catalogFor(scope: CredentialScope): AistudioCatalog | undefined {
+    return this.catalog?.epoch === scope.epoch && this.catalog.digest === scope.digest ? this.catalog : undefined
+  }
+
+  private async readCatalog(signal: AbortSignal | undefined, force: boolean): Promise<AistudioCatalog> {
+    const auth = await this.readKey(signal)
+    this.checkCatalogScope(auth, signal)
+    const cached = this.catalogFor(auth)
+    if (!force && cached !== undefined && Date.now() < cached.expiresAt) return cached
     try {
-      return await this.readCatalog(signal, force)
+      return await this.fetchCatalog(auth, signal)
     } catch (error) {
-      if (error instanceof LlmError && (error.code === 'AUTH' || error.code === 'CANCELLED')) throw error
-      if (this.catalog !== undefined && this.catalogDigest === this.activeDigest) {
+      this.checkCatalogScope(auth, signal)
+      const fallback = this.catalogFor(auth)
+      if (!force && fallback !== undefined && !(error instanceof LlmError && (error.code === 'AUTH' || error.code === 'CANCELLED'))) {
         this.options.log?.warn('antigravity-aistudio: 模型目录刷新失败，保留已观测目录', error)
-        return this.catalog
+        return fallback
       }
       throw error
     }
   }
 
-  private async readCatalog(signal?: AbortSignal, force = false): Promise<Map<string, AistudioModel>> {
-    const { key, digest, epoch } = await this.readKey(signal)
+  private async fetchCatalog(auth: CredentialSnapshot, signal?: AbortSignal): Promise<AistudioCatalog> {
+    const { key, digest, epoch } = auth
     const version = this.catalogVersion
     const deadline = AbortSignal.timeout(CATALOG_TIMEOUT_MS)
     const requestSignal = AbortSignal.any([this.credentialAbort.signal, deadline, ...(signal === undefined ? [] : [signal])])
     const check = () => {
-      if (signal?.aborted || epoch !== this.credentialEpoch || version !== this.catalogVersion) throw llmError('AI Studio 凭据或设置已变更', 'CANCELLED')
+      this.checkCatalogScope(auth, signal)
+      if (version !== this.catalogVersion) throw llmError('AI Studio 凭据或设置已变更', 'CANCELLED')
       if (deadline.aborted) throw llmError('AI Studio 模型目录请求超时', 'TIMEOUT')
     }
     check()
-    if (!force && this.catalogDigest === digest && this.catalog !== undefined && Date.now() < this.catalogExpiresAt) return this.catalog
     const models = new Map<string, AistudioModel>()
     const nonChatIds = new Set<string>()
     let pageToken: string | undefined
@@ -327,29 +298,26 @@ export class AistudioAdapter extends LlmAdapter {
       pages += 1
     } while (pageToken !== undefined && pages < MAX_CATALOG_PAGES && models.size < MAX_CATALOG_MODELS)
     check()
-    this.catalog = models
-    this.nonChatIds = nonChatIds
-    this.catalogDigest = digest
-    this.catalogExpiresAt = Date.now() + CATALOG_TTL_MS
-    return models
+    const catalog = { models, nonChatIds, digest, epoch, expiresAt: Date.now() + CATALOG_TTL_MS }
+    this.catalog = catalog
+    return catalog
   }
 
-  private async *streamCall(options: AdapterRequestOptions, wireModel: string, prepared?: { epoch: number; digest: string | undefined }): AsyncIterable<StreamChunk> {
+  private async *streamCall(options: AdapterRequestOptions, selection: AistudioSelection, prepared?: PreparedAistudioRoute): AsyncIterable<StreamChunk> {
     if (options.signal?.aborted || this.disposed || (prepared !== undefined && prepared.epoch !== this.credentialEpoch)) { yield finishChunk('aborted', 'CANCELLED'); return }
-    let auth: Awaited<ReturnType<AistudioAdapter['readKey']>>
+    let auth: CredentialSnapshot
     try { auth = await this.readKey(options.signal) } catch (error) {
-      if (options.signal?.aborted || (error instanceof LlmError && error.code === 'CANCELLED')) { yield finishChunk('aborted', 'CANCELLED'); return }
+      if (options.signal?.aborted || (prepared !== undefined && prepared.epoch !== this.credentialEpoch)
+        || (error instanceof LlmError && error.code === 'CANCELLED')) { yield finishChunk('aborted', 'CANCELLED'); return }
       throw error
     }
     const { key, digest, epoch } = auth
     if (epoch !== this.credentialEpoch || (prepared !== undefined && (prepared.epoch !== epoch || prepared.digest !== digest))) { yield finishChunk('aborted', 'CANCELLED'); return }
-    const selected = aistudioWireModel(options.model).replace(/^models\//u, '')
-    if (this.nonChatIds.has(wireModel) || this.nonChatIds.has(selected)) {
-      throw llmError('AI Studio 目录显示该模型不支持文本生成', 'INVALID_MODEL')
-    }
+    const { wireModel } = selection
+    const controls = prepared?.controls ?? resolveAistudioSelection(selection, this.catalogFor(auth)).controls
     const signal = AbortSignal.any([this.credentialAbort.signal, ...(options.signal === undefined ? [] : [options.signal])])
     const header = new AbortController()
-    const payload = buildAistudioPayload(options, wireModel)
+    const payload = buildAistudioPayload(options, wireModel, controls)
     const hasEmitted = { value: false }
     let attempt: ReturnType<AistudioUsageStore['start']>
     const onDispatch = () => {

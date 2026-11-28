@@ -142,6 +142,14 @@ window.__ModuleLoader__.load({
       if (name) result.name = name
       const target = typeof source.target === 'string' ? source.target.trim() : ''
       if (target) result.target = target
+      for (const [key, minimum, limit] of [['contextWindow', 2, 10000000], ['maxTokens', 1, 1000000]]) {
+        if (Number.isSafeInteger(source[key]) && source[key] >= minimum && source[key] <= limit) result[key] = source[key]
+      }
+      if (typeof source.temperature === 'number' && source.temperature >= 0 && source.temperature <= 2) result.temperature = source.temperature
+      if (GEMINI_LEVELS.includes(source.reasoningEffort)) result.reasoningEffort = source.reasoningEffort
+      if (Array.isArray(source.stop) && source.stop.length && source.stop.length <= 5
+          && source.stop.every(value => typeof value === 'string' && value.trim() && value.length <= 256)) result.stop = [...source.stop]
+      if (typeof source.supportsImage === 'boolean') result.supportsImage = source.supportsImage
       return result
     }
     /** 稳定序列化：键序不影响脏值判断。 */
@@ -292,7 +300,7 @@ window.__ModuleLoader__.load({
       if (EFFORT_IDS.has(source.plannerEffort) && source.plannerEffort !== ORCHESTRATOR_DEFAULTS.plannerEffort) result.plannerEffort = source.plannerEffort
       if (EFFORT_IDS.has(source.executorEffort) && source.executorEffort !== ORCHESTRATOR_DEFAULTS.executorEffort) result.executorEffort = source.executorEffort
       if (isValidOrchestratorMaxPlans(source.maxPlansPerTurn) && source.maxPlansPerTurn !== ORCHESTRATOR_DEFAULTS.maxPlansPerTurn) result.maxPlansPerTurn = source.maxPlansPerTurn
-      if (Number.isSafeInteger(source.plannerTimeoutMs) && source.plannerTimeoutMs >= 5000 && source.plannerTimeoutMs <= 300000 && source.plannerTimeoutMs !== ORCHESTRATOR_DEFAULTS.plannerTimeoutMs) {
+      if (Number.isSafeInteger(source.plannerTimeoutMs) && source.plannerTimeoutMs >= 5000 && source.plannerTimeoutMs <= 300000) {
         result.plannerTimeoutMs = source.plannerTimeoutMs
       }
       if (source.showPlan === true) result.showPlan = true
@@ -388,8 +396,8 @@ window.__ModuleLoader__.load({
      * 无退役家族补行。目录行来自实时发现；已配置但不在目录的 aistudio- 键补行。
      */
     function aistudioModelRows(models, overrides) {
-      const rows = models.filter(({ id }) => id.startsWith('aistudio-') && !isNonChatModel(id)).map(({ id, name, inputModalities, contextWindow, maxOutputTokens, contextWindowSource }) =>
-        ({ id, name, inputModalities, contextWindow, maxOutputTokens, contextWindowSource, inCatalog: true }))
+      const rows = models.filter(({ id }) => id.startsWith('aistudio-') && !isNonChatModel(id)).map(({ id, name, inputModalities, contextWindow, maxOutputTokens, contextWindowSource, compat }) =>
+        ({ id, name, inputModalities, contextWindow, maxOutputTokens, contextWindowSource, compat, inCatalog: true }))
       const known = new Set(rows.map((row) => row.id))
       for (const id of Object.keys(rawOverrides(overrides))) {
         if (!id.startsWith('aistudio-') || known.has(id) || isNonChatModel(id)) continue
@@ -405,6 +413,19 @@ window.__ModuleLoader__.load({
     function vertexModelRows(value) {
       return vertexModelLines(value).filter(id => VERTEX_MODEL_PATTERN.test(id) && !isNonChatModel(id))
         .map(name => ({ id: VERTEX_MODEL_PREFIX + name, name, inputModalities: ['text'], inCatalog: true }))
+    }
+
+    function geminiRowCapabilities(row, override) {
+      const vertex = row.id.startsWith(VERTEX_MODEL_PREFIX)
+      const original = row.id.slice(vertex ? VERTEX_MODEL_PREFIX.length : 'aistudio-'.length)
+      const wire = (override.target || original).replace(/^models\//, '')
+      if (vertex && !VERTEX_MODEL_PATTERN.test(override.target || original)) return { efforts: [], temperature: false }
+      const spec = geminiControlSpec(wire, vertex ? 'vertex-v1' : 'developer')
+      // A draft remap must not borrow the previous wire's observations.
+      const saved = !vertex && row.compat?.wireModel === wire ? row.compat : undefined
+      return { context: saved?.upstreamContextWindow ?? spec.contextWindow,
+        output: saved?.protocolMaxOutputTokens ?? spec.maxOutputTokens,
+        efforts: spec.efforts, defaultEffort: spec.defaultEffort, temperature: spec.temperature }
     }
 
     function vertexScope(settings) {
@@ -612,6 +633,65 @@ window.__ModuleLoader__.load({
         className: 'agy-model-retirement',
       }, retired ? t('已下线 {date}', { date: monthDay }) : t('即将下线 {date}', { date: monthDay }))
     }
+    function GeminiNumberField({ name, value, min, max, step, disabled, placeholder, inputStyle, onEdit }) {
+      const [text, setText] = React.useState(value === undefined ? '' : String(value))
+      const editing = React.useRef(false)
+      React.useEffect(() => {
+        if (!editing.current) setText(value === undefined ? '' : String(value))
+      }, [value])
+      return h('input', { name, type: 'number', min, max, step, disabled, value: text, placeholder, style: inputStyle,
+        onFocus: () => { editing.current = true },
+        onChange: (event) => {
+          const next = event.target.value
+          setText(next)
+          if (event.target.validity?.badInput) return
+          const number = next === '' ? undefined : Number(next)
+          if (number === undefined || (Number.isFinite(number) && (step === 'any' || Number.isInteger(number)) && number >= min && number <= max)) onEdit(number)
+        },
+        onBlur: () => { editing.current = false; setText(value === undefined ? '' : String(value)) },
+      })
+    }
+
+    function GeminiModelParams({ row, override, disabled, onEdit, inputId, inputStyle, labelStyle }) {
+      const caps = geminiRowCapabilities(row, override)
+      const patch = (next) => onEdit(row.id, next)
+      const textLabel = (key, label, child) => h('label', { key, style: { display: 'grid', gap: '4px', minWidth: 0 } },
+        h('span', { style: labelStyle }, t(label)), child)
+      const numberField = (key, label, min, max, step, placeholder) => textLabel(key, label,
+        h(GeminiNumberField, { name: `model-${key}-${row.id}`, min, max, step, disabled, value: override[key],
+          placeholder: placeholder ?? t('跟随官方'), inputStyle, onEdit: (number) => patch({ [key]: number }) }))
+      const context = override.contextWindow === undefined ? caps.context : Math.min(override.contextWindow, caps.context ?? override.contextWindow)
+      const outputLimit = Math.min(caps.output ?? 1000000, context === undefined ? 1000000 : Math.max(1, context - 1))
+      const effortLabels = { minimal: msg('极低'), low: msg('低'), medium: msg('中'), high: msg('高'), xhigh: msg('超高') }
+      return h('section', { 'aria-labelledby': inputId + '-compat', style: { display: 'grid', gap: '8px' } },
+        h('div', { id: inputId + '-compat', style: labelStyle }, t('兼容性'), ' · Google GenerateContent · ', t('仅文本输入'), ' · ', t('支持工具调用')),
+        h('div', { style: { ...labelStyle, display: 'flex', flexWrap: 'wrap', gap: '4px 12px' } },
+          Number.isSafeInteger(caps.context) ? h('span', null, t('上游上下文 {tokens} tokens', { tokens: caps.context })) : null,
+          Number.isSafeInteger(caps.output) ? h('span', null, t('上游输出上限 {tokens} tokens', { tokens: caps.output })) : null,
+          caps.defaultEffort ? h('span', null, t('上游思考默认：{level}', { level: t(effortLabels[caps.defaultEffort]) })) : null),
+        h('div', { style: { display: 'grid', gap: '8px', gridTemplateColumns: 'repeat(auto-fit, minmax(132px, 1fr))' } },
+          numberField('contextWindow', msg('本地上下文预算'), 2, caps.context ?? 10000000, 1, caps.context),
+          numberField('maxTokens', msg('默认输出上限'), 1, outputLimit, 1, caps.output ? outputLimit : undefined),
+          caps.temperature ? numberField('temperature', msg('默认温度'), 0, 2, 'any') : null,
+          caps.efforts.length ? textLabel('reasoningEffort', msg('默认思考深度'), h('select', { name: `model-reasoningEffort-${row.id}`, style: inputStyle,
+            disabled, value: caps.efforts.includes(override.reasoningEffort) ? override.reasoningEffort : '',
+            onChange: (event) => patch({ reasoningEffort: event.target.value || undefined }) },
+          h('option', { value: '' }, t('跟随官方')),
+          ...caps.efforts.map(level => h('option', { key: level, value: level }, t(effortLabels[level]))))) : null,
+          textLabel('stop', msg('默认停止序列（每行一条，最多 5 条）'), h('textarea', { key: JSON.stringify(override.stop ?? []), name: `model-stop-${row.id}`, disabled, style: inputStyle,
+            rows: 2, defaultValue: override.stop?.join('\n') ?? '',
+            onBlur: (event) => {
+              const stop = event.target.value.split(/\r?\n/).filter(value => value.trim())
+              if (stop.length > 5 || stop.some(value => value.length > 256)) {
+                event.target.value = override.stop?.join('\n') ?? ''
+                return
+              }
+              patch({ stop })
+            } }))),
+        h('button', { type: 'button', disabled, onClick: () => patch({ contextWindow: undefined, maxTokens: undefined,
+          temperature: undefined, reasoningEffort: undefined, stop: undefined }), style: { ...ACTION, justifySelf: 'start' } }, t('恢复参数默认')))
+    }
+
     function ModelOverrideRow({ row, override, disabled, onEdit, rememberFocus, showEffort = true }) {
       const retiring = row.retiring
       const enabled = override.enabled !== undefined ? override.enabled : defaultEnabledFor(row.id)
@@ -638,7 +718,7 @@ window.__ModuleLoader__.load({
             'aria-label': displayName, style: { accentColor: '#3b82f6' },
             onChange: (event) => { rememberFocus(event.currentTarget); onEdit(row.id, { enabled: event.target.checked }) } })),
         h('details', { style: { marginTop: '6px' } },
-          h('summary', { style: { ...SUMMARY, ...labelStyle, justifyContent: 'flex-start' } }, t('模型设置')),
+          h('summary', { style: { ...SUMMARY, ...labelStyle, justifyContent: 'flex-start' } }, t(showEffort ? '模型设置' : '参数')),
           h('div', { style: { display: 'grid', gap: '10px', marginTop: '8px', paddingLeft: '12px', borderLeft: '2px solid color-mix(in srgb, #3b82f6 55%, transparent)' } },
             h('div', { style: { display: 'grid', gap: '3px' } },
               h('span', { style: labelStyle }, t('模型 ID')),
@@ -658,7 +738,8 @@ window.__ModuleLoader__.load({
                 h('label', { htmlFor: inputId + '-target', style: labelStyle }, t('官方模型 ID')),
                 h('input', { id: inputId + '-target', name: 'model-target-' + row.id, type: 'text', disabled, value: override.target ?? '',
                   placeholder: t('留空自动路由'), onChange: (event) => onEdit(row.id, { target: event.target.value }), style: inputStyle }))),
-            h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '4px 12px', fontSize: '11px', opacity: .62 } },
+             !showEffort ? h(GeminiModelParams, { row, override, disabled, onEdit, inputId, inputStyle, labelStyle }) : null,
+             h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '4px 12px', fontSize: '11px', opacity: .62 } },
               h('span', null, t(row.inCatalog ? '当前目录' : '不在当前目录')),
               Array.isArray(row.inputModalities) && row.inputModalities.length
                 ? h('span', null, row.inputModalities.map((modality) => t(MODALITY_LABELS[modality] ?? modality)).join(' · ')) : null))))
@@ -1460,6 +1541,10 @@ window.__ModuleLoader__.load({
           h('section', { 'aria-label': t('运行模式') },
             h(SectionHeading, { title: t('运行模式') }),
             h('div', { style: PANEL },
+              h('div', { role: 'note', 'aria-labelledby': 'agy-proxy-risk-title', style: { marginBottom: '12px', lineHeight: 1.5, color: 'var(--agy-warn-text, CanvasText)' } },
+                h('strong', { id: 'agy-proxy-risk-title' }, t('代理模式：账号停用风险')),
+                h('p', { style: { margin: '4px 0' } }, t('代理模式使用 Antigravity OAuth 从第三方客户端直连 Google。Google 的条款禁止此类访问，可能暂停或终止你的 Antigravity 和／或 Gemini CLI 账号。建议保持关闭，改用 AI Studio 或 Vertex AI 的官方 API。')),
+                h('a', { href: 'https://antigravity.google/terms', target: '_blank', rel: 'noopener noreferrer', style: { color: 'inherit', textDecoration: 'underline' } }, t('查看 Google Antigravity 服务条款'))),
               h(SettingsFields, { ...fieldProps, fields: fieldsFor('mode') }),
               dirtyKeys.includes('proxyMode') ? h('p', { role: 'status', style: { margin: '8px 0 0', fontSize: '11.5px', color: 'var(--agy-warn-text, #ca8a04)' } }, t('保存后切换到{mode}', { mode: t(draft.proxyMode ? '代理模式' : 'ACP 模式') })) : null)),
           effectiveProxyMode
