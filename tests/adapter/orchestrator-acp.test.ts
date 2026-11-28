@@ -252,6 +252,7 @@ describe('ACP 编排目录合成与配置校验', () => {
     })
     const resolved = await fullHarness.adapter.resolveModel(AGY_PROVIDER_ID, ORCHESTRATOR_MODEL_ID)
     expect(resolved.reasoning?.efforts.map((e) => String(e.id))).toEqual(['low', 'medium', 'high'])
+    expect(resolved.reasoning?.efforts.map((e) => e.name)).toEqual(['Low', 'Medium', 'High'])
     expect(String(resolved.reasoning?.defaultEffort)).toBe('medium')
 
     plannerEffort = 'high'

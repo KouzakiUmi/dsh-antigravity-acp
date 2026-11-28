@@ -832,7 +832,7 @@ describe('模型目录来自 ACP 会话配置', () => {
     expect(models.map((model) => model.id)).toEqual(['gemini-3-pro'])
   })
 
-  it('resolveModel declares reasoning effort menu (Low/Medium/High) with default medium', async () => {
+  it('resolveModel 为原生菜单提供英文标签，默认档位仍为 medium', async () => {
     const harness = createHarness()
     const resolved = await harness.adapter.resolveModel(AGY_PROVIDER_ID, 'claude-opus-5-5')
     expect(resolved.reasoning?.efforts.map((effort) => String(effort.id))).toEqual(['low', 'medium', 'high'])

@@ -28,7 +28,7 @@ type SharedQuotaReader = ((force: boolean, source?: string) => Promise<unknown>)
   observeProxyAccount(snapshot: { phase: string; revision: number }): void
   observeMode(source: string): void
 }
-function loadCard(quotaRead?: () => Promise<unknown>, viewportWidth = 1200) {
+function loadCard(quotaRead?: () => Promise<unknown>, viewportWidth = 1200, locale?: { getSnapshot(): { active: string }; subscribe(listener: () => void): () => void }) {
   let registration: { factory(require: (id: string) => unknown): { apply(ctx: unknown): void } } | undefined
   const components = new Map<string, React.ComponentType<Record<string, unknown>>>()
   const injections = new Map<string, () => Record<string, unknown>>()
@@ -37,6 +37,7 @@ function loadCard(quotaRead?: () => Promise<unknown>, viewportWidth = 1200) {
   runInNewContext(buildClientSource(), {
     window: { __ModuleLoader__: { load: (value: typeof registration) => { registration = value } }, innerHeight: 800, addEventListener: () => {}, removeEventListener: () => {} },
     document: { documentElement: { clientWidth: viewportWidth }, addEventListener: () => {}, removeEventListener: () => {} },
+    navigator: locale ? { language: 'en-US' } : undefined,
     setInterval: (callback: () => void, delay: number) => { intervals.set(++timerId, { callback, delay }); return timerId },
     clearInterval: (id: number) => intervals.delete(id),
     setTimeout, clearTimeout,
@@ -53,6 +54,7 @@ function loadCard(quotaRead?: () => Promise<unknown>, viewportWidth = 1200) {
   }
   const ctx = {
     slots,
+    locale,
     remote: { $mount: () => () => {} },
     get: (name: string) => name === 'remote.agyQuota' ? { read: quotaRead, refresh: quotaRead } : undefined,
     effect: (callback: () => unknown) => callback(),
@@ -134,6 +136,48 @@ function modelControl(renderer: ReactTestRenderer, kind: 'enabled' | 'effort' | 
   return renderer.root.findByProps({ name: `model-${kind}-${id}` })
 }
 function renderedText(renderer: ReactTestRenderer): string { return JSON.stringify(renderer.toJSON()) }
+
+it('设置与额度药丸跟随 DSH 语言，不因浏览器语言或界面切换丢失草稿', async () => {
+  let snapshot = { active: 'zh' }
+  const listeners = new Set<() => void>()
+  const locale = {
+    getSnapshot: () => snapshot,
+    subscribe(listener: () => void) { listeners.add(listener); return () => { listeners.delete(listener) } },
+  }
+  const changeLocale = (active: string) => { snapshot = { active }; for (const listener of listeners) listener() }
+  const { Card, Pill } = loadCard(undefined, 1200, locale)
+  const { remote, mutate } = transport(document({ modelOverrides: { 'gemini-4-hydrogen': { effort: 'medium' } } }))
+  const modelSnapshot = { current: { provider: 'antigravity-acp', model: 'gemini-4-hydrogen' } }
+  const store = { subscribe: () => () => {}, getSnapshot: () => modelSnapshot }
+  let card!: ReactTestRenderer
+  let pill!: ReactTestRenderer
+  await act(async () => {
+    card = create(React.createElement(Card, { remote }))
+    pill = create(React.createElement(Pill, { store }))
+  })
+  renderers.push(card, pill)
+  const effort = () => modelControl(card, 'effort', 'gemini-4-hydrogen')
+  const labels = () => effort().findAllByType('option').map(option => option.children.join(''))
+  expect(labels().slice(1)).toEqual(['低', '中', '高'])
+  const pillTitle = () => pill.root.findByProps({ 'aria-haspopup': 'dialog' }).props.title
+  expect(pillTitle()).toBe('ACP · gemini-4-hydrogen · 正在读取额度')
+  await act(async () => { effort().props.onChange({ target: { value: 'high' } }) })
+  await act(async () => changeLocale('en'))
+  expect(labels().slice(1)).toEqual(['Low', 'Medium', 'High'])
+  expect(effort().props.value).toBe('high')
+  expect(pillTitle()).toBe('ACP · gemini-4-hydrogen · Reading quota')
+  await act(async () => changeLocale('ja'))
+  expect(labels().slice(1)).toEqual(['Low', 'Medium', 'High'])
+  await act(async () => changeLocale('zh'))
+  expect(labels().slice(1)).toEqual(['低', '中', '高'])
+  expect(effort().props.value).toBe('high')
+  expect(pillTitle()).toBe('ACP · gemini-4-hydrogen · 正在读取额度')
+  expect(mutate).not.toHaveBeenCalled()
+  await act(async () => { card.unmount(); pill.unmount() })
+  expect(listeners.size).toBe(0)
+  renderers.splice(renderers.indexOf(card), 1)
+  renderers.splice(renderers.indexOf(pill), 1)
+})
 
 describe('quota pill with real React state and effects', () => {
   it('设置页关闭时，实际共享读取器仍随代理退出和换账户清空并更新药丸', async () => {

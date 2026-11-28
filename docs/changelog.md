@@ -6,6 +6,7 @@
 
 ## 未发布
 
+- **界面语言**：插件设置和额度药丸跟随 DSH 的语言设置，切换语言时保留未保存的模型设置；支持简体中文，其他语言显示英文。原生模型选择器的 ACP 思考档位与代理模式统一为 `Low / Medium / High`，档位 ID 不变。见 [PR #27](https://github.com/KouzakiUmi/dsh-antigravity-acp/pull/27)。
 - **ACP 工具调用**：识别 Antigravity CLI 1.5.15+ 的 MCP 权限提示格式，兼容服务器名带 8 位小写十六进制后缀的写法。权限提示中的工具摘要不参与参数预检或执行；实际参数仍由私有 MCP 桥转交 DSH。见 [PR #28](https://github.com/KouzakiUmi/dsh-antigravity-acp/pull/28)。
 
 ## 0.1.56 · 2026-11-28

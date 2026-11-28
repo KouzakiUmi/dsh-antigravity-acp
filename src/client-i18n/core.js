@@ -7,11 +7,14 @@
  * - Host 回传的状态文本也走 `t()`：命中字典则翻译，未命中原样透传。
  */
 const EN_MESSAGES = { ...EN_UI, ...EN_HOST }
+let dshLocale
+function subscribeLocale(listener) { return dshLocale?.subscribe(listener) ?? (() => {}) }
 function resolveLocale() {
-  const tag = (typeof navigator !== 'undefined' && (navigator.languages?.[0] || navigator.language))
+  const tag = dshLocale?.getSnapshot().active
     || (typeof document !== 'undefined' && document.documentElement?.lang)
+    || (typeof navigator !== 'undefined' && (navigator.languages?.[0] || navigator.language))
     || ''
-  return !tag || /^zh/i.test(tag) ? 'zh' : 'en'
+  return !tag || /^zh(?:-|$)/i.test(tag) ? 'zh' : 'en'
 }
 function msg(source) { return source }
 function t(source, params) {

@@ -18,11 +18,11 @@ function literals(text: string): string[] {
 }
 
 /** 只跑 i18n 内核：以给定语言环境求值，返回 t 与字典。 */
-function kernel(navigator?: { language: string }) {
+function kernel(navigator?: { language: string }, document?: { documentElement: { lang: string } }) {
   const start = source.indexOf('const EN_UI')
   const end = source.indexOf('function t(')
   const tail = source.indexOf('\n}\n', end) + 3
-  return runInNewContext(`${source.slice(start, tail)}\n({ t, EN_MESSAGES })`, { navigator }) as {
+  return runInNewContext(`${source.slice(start, tail)}\n({ t, EN_MESSAGES })`, { navigator, document }) as {
     t: (source: unknown, params?: Record<string, unknown>) => unknown
     EN_MESSAGES: Record<string, string>
   }
@@ -49,5 +49,6 @@ describe('client i18n', () => {
     expect(en.t('{count} 项', { count: 3 })).toBe('3 items')
     expect(en.t('字典里没有的 Host 文本')).toBe('字典里没有的 Host 文本')
     expect(kernel({ language: 'zh-CN' }).t('{count} 项', { count: 3 })).toBe('3 项')
+    expect(kernel({ language: 'en-US' }, { documentElement: { lang: 'zh-CN' } }).t('保存')).toBe('保存')
   })
 })

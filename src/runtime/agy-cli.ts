@@ -107,7 +107,7 @@ export type AgyReasoningEffort = (typeof AGY_REASONING_EFFORTS)[number]
  */
 export type AgyModelTier = AgyReasoningEffort | 'xhigh'
 
-/** Display name mapping (aligned with proxy mode and DSH built-in adapters: Low / Medium / High). */
+/** 原生选择器只接收字符串：与代理路由一致，使用英文目录标签。 */
 export const AGY_REASONING_EFFORT_NAMES: Record<AgyReasoningEffort, string> = {
   low: 'Low',
   medium: 'Medium',
