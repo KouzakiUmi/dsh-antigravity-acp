@@ -98,11 +98,14 @@ export function outputMatches(fresh: readonly RequestMessage[], expected: string
 export function routeFingerprint(
   options: Pick<AdapterRequestOptions, 'provider' | 'model' | 'reasoningEffort' | 'system' | 'tools'>,
   override?: { target?: string; effort?: string },
+  bridgeServerName?: string,
 ): string {
   return createHash('sha256').update(stable({
     provider: options.provider, model: options.model, effort: options.reasoningEffort?.toString(),
     // 公开模型 ID 不变时，设置页的官方映射或默认档位仍可能改变实际路由。
     override,
+    // 带工具的旧会话可能持有按旧桥名缓存的 schema；桥名变更时按 DSH 历史重建。
+    bridgeServerName,
     system: options.system ?? '',
     tools: [...(options.tools ?? [])].sort((a, b) => a.name.localeCompare(b.name)),
   })).digest('hex')

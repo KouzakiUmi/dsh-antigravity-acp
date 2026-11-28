@@ -52,8 +52,8 @@ export const AGY_BRIDGE_ERROR = {
   INVALID_ARGUMENTS: 'AGY_BRIDGE_INVALID_ARGUMENTS',
 } as const
 
-/** 桥为 agent 暴露的 MCP server 名称（ACP 侧注册名）。 */
-export const BRIDGE_MCP_SERVER_NAME = 'dsh-tools'
+/** ACP 侧 MCP 注册名。agy 会把它拼进工具名；短名给宿主工具留出更多字符（#26）。 */
+export const BRIDGE_MCP_SERVER_NAME = 'dsh'
 /** 注册时使用的鉴权请求头名；值为 `Bearer <token>`。 */
 export const BRIDGE_AUTH_HEADER = 'authorization'
 /** MCP Streamable HTTP 规范的会话头名（客户端 initialize 之后必须回带）。 */

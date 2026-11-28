@@ -27,7 +27,7 @@ import { SessionMapStore } from '../src/runtime/session-map.js'
 import type { SessionMapEntry } from '../src/runtime/session-map.js'
 import { outputHash, prefixHash, routeFingerprint } from '../src/adapter/session-reuse.js'
 import { AGY_TURN_ERROR } from '../src/adapter/prompt-turn.js'
-import { AGY_BRIDGE_ERROR } from '../src/bridge/mcp-bridge.js'
+import { AGY_BRIDGE_ERROR, BRIDGE_MCP_SERVER_NAME } from '../src/bridge/mcp-bridge.js'
 import { AgentLink, AgentLinkError, AGY_LINK_ERROR } from '../src/protocol/agent-link.js'
 import { AGY_CLIENT_CAPABILITIES } from '../src/index.js'
 import { parsePromptTranscript } from '../src/adapter/prompt-transcript.js'
@@ -1808,9 +1808,9 @@ describe('权限与原生活动策略', () => {
     const streaming = collect(harness.adapter.stream(baseOptions({ tools: TOOLS })))
     await waitForRequest(harness.agent, 'session/prompt')
     const calls = [
-      { sessionId: SESSION_1, name: 'call_mcp_tool', kind: 'other', server: 'dsh-tools', tool: 'unknown' },
-      { sessionId: SESSION_1, name: 'run_command', kind: 'execute', server: 'dsh-tools', tool: 'read_file' },
-      { sessionId: 'SECRET_FOREIGN_SESSION', name: 'call_mcp_tool', kind: 'other', server: 'dsh-tools', tool: 'read_file' },
+      { sessionId: SESSION_1, name: 'call_mcp_tool', kind: 'other', server: BRIDGE_MCP_SERVER_NAME, tool: 'unknown' },
+      { sessionId: SESSION_1, name: 'run_command', kind: 'execute', server: BRIDGE_MCP_SERVER_NAME, tool: 'read_file' },
+      { sessionId: 'SECRET_FOREIGN_SESSION', name: 'call_mcp_tool', kind: 'other', server: BRIDGE_MCP_SERVER_NAME, tool: 'read_file' },
       { sessionId: SESSION_1, name: undefined, kind: 'other', server: 'external', tool: 'read_file' },
     ]
     for (const call of calls) {
@@ -1820,7 +1820,7 @@ describe('权限与原生活动策略', () => {
           toolCallId: 'SECRET_ID', name: call.name, kind: call.kind,
           _meta: { is_mcp_tool_call: true, mcp: { server: call.server, tool: call.tool } },
           title: 'SECRET_TITLE',
-          rawInput: { ServerName: 'dsh-tools', ToolName: 'read_file', Arguments: { path: 'SECRET_PATH', token: 'SECRET_TOKEN' } },
+          rawInput: { ServerName: BRIDGE_MCP_SERVER_NAME, ToolName: 'read_file', Arguments: { path: 'SECRET_PATH', token: 'SECRET_TOKEN' } },
         },
         options: [
           { optionId: 'yes', name: '允许一次', kind: 'allow_once' },
@@ -2069,7 +2069,7 @@ describe('ACP 私有 MCP 权限与原 prompt 续轮', () => {
       sessionId,
       toolCall: {
         toolCallId: id, kind: 'other',
-        _meta: { is_mcp_tool_call: true, mcp: { server: 'dsh-tools', tool: 'read_file' } },
+        _meta: { is_mcp_tool_call: true, mcp: { server: BRIDGE_MCP_SERVER_NAME, tool: 'read_file' } },
         rawInput: { arguments: args, ...args },
       },
       options: [
@@ -2085,7 +2085,7 @@ describe('ACP 私有 MCP 权限与原 prompt 续轮', () => {
     const streaming = collect(harness.adapter.stream(baseOptions({ tools: TOOLS })))
     await waitForRequest(harness.agent, 'session/prompt')
     expect(harness.agent.requestsFor('session/new')[0]!.params._meta).toEqual({
-      antigravity: { enabledTools: [], eagerMcpServers: ['dsh-tools'] },
+      antigravity: { enabledTools: [], eagerMcpServers: ['dsh'] },
     })
     const approval: RequestPermissionRequest = permission()
     approval.toolCall.kind = 'read'
@@ -2118,7 +2118,7 @@ describe('ACP 私有 MCP 权限与原 prompt 续轮', () => {
     const harness = createHarness({ log: { info: vi.fn(), warn } })
     const first = collect(harness.adapter.stream(baseOptions({ tools: TOOLS })))
     await waitForRequest(harness.agent, 'session/prompt')
-    const name = 'mcp_dsh-tools_a4a4b434_read_file'
+    const name = 'mcp_dsh_a4a4b434_read_file'
     const approval: RequestPermissionRequest = {
       ...permission(),
       toolCall: { toolCallId: 'cli-tool', name, title: `Run ${name}`, rawInput: { toolSummary: 'Read another file' } },
@@ -3054,8 +3054,24 @@ describe('ACP 会话复用与跨进程恢复', () => {
   }
 
   function savedEntry(options = baseOptions({ sessionId: DSH_SESSION, messages: secondRoundMessages() })): SessionMapEntry {
-    return { sessionId: 'saved-acp', cwd: process.cwd(), sentCount: 1, sentHash: prefixHash(options.messages, 1), outputHash: outputHash([{ type: 'text', text: '第一轮回答' }]), route: routeFingerprint(options), updatedAt: Date.now() }
+    return { sessionId: 'saved-acp', cwd: process.cwd(), sentCount: 1, sentHash: prefixHash(options.messages, 1), outputHash: outputHash([{ type: 'text', text: '第一轮回答' }]), route: routeFingerprint(options, undefined, options.tools?.length ? BRIDGE_MCP_SERVER_NAME : undefined), updatedAt: Date.now() }
   }
+
+  it('升级后旧的带工具会话不用 session/load，保留 DSH 历史并按短桥名重建', async () => {
+    const request = baseOptions({ sessionId: DSH_SESSION, messages: secondRoundMessages(), tools: TOOLS })
+    const entry = { ...savedEntry(request), route: routeFingerprint(request) }
+    const harness = createHarness({ resumeSessions: true, loadSessionCapability: true,
+      loadSessionMap: async () => ({ [`${DSH_SESSION}::chat`]: entry }), saveSessionMap: () => undefined })
+    const running = collect(harness.adapter.stream(request))
+    await waitForRequest(harness.agent, 'session/prompt')
+    expect(harness.agent.requestsFor('session/load')).toHaveLength(0)
+    expect(harness.agent.requestsFor('session/new')[0]?.params).toMatchObject({
+      mcpServers: [{ name: 'dsh' }], _meta: { antigravity: { enabledTools: [], eagerMcpServers: ['dsh'] } },
+    })
+    expect(promptTexts(harness, 0)).toContain('第一轮回答')
+    await replyWithText(harness, '使用新桥名续聊')
+    expect(visibleText(await running)).toBe('使用新桥名续聊')
+  })
 
   it('恢复阶段启动失败时归还磁盘 claim，别的 worker 仍能接管该条目', async () => {
     const sessionStore = new SessionMapStore({ load: async () => ({}), save: () => undefined })
