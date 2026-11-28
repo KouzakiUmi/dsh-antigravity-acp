@@ -4,10 +4,6 @@
 
 记录源码与发布内容，不将本地构建、npm 发布和本机升级混为同一状态。日期采用 Asia/Hong_Kong。更早历史见 [Git 提交记录](https://github.com/KouzakiUmi/dsh-antigravity-acp/commits/main/)。
 
-## Unreleased
-
-- **Fix ACP reasoning effort labels in the model selector**: Change `AGY_REASONING_EFFORT_NAMES` from hardcoded Chinese (`低` / `中` / `高`) to English (`Low` / `Medium` / `High`), matching proxy mode (`src/proxy/adapter.ts`) and DSH built-in adapters (`llm-pi-ai`).
-
 ## 0.1.53 · 2026-11-26
 
 - **设置页：已过官方下线日的模型家族移出列表并清理其配置**：退役表（`src/adapter/model-retirement.ts`）里官方下线日已过的家族（当前为 GPT-OSS 120B，2026-11-18）不再出现在设置页模型列表，目录观测行、退役表补行与 `modelOverrides` 里的残留键一律跳过。残留的配置键在打开设置页时移入草稿并显示为未保存项，模型页注明是哪个家族、保存后移除其设置；点「保存」才真正删除，「撤销」可放弃，只读设置下不产生这类待保存项。判定按退役表的官方下线日与本地日历日（下线日当天结束），与徽章共用同一个函数：Gemini 4 Argon 与 Gemini 3.8 Flash 将在 2026-11-30 之后进入同一处理。保存只删除已退役家族的键：其余键里只有用户改过且仍有净改动的键以草稿为准，未触及的键（含另一链路、仅默认值的记录与外部新增的键）逐字保留服务端最新值；「撤销」放弃清理后，同命名空间的刷新不会把它重新排入。显式清空某个模型的全部字段等于删除该键，这一删除意图保留到服务端该键实际消失为止（中途被外部改成仅默认值也不放弃），远端键删除后意图即完成，之后外部重建同名键不受影响。下线日之前的家族保持 0.1.51 的行为（保留条目、「即将下线」徽章、默认关闭、可显式启用），目录观测、家族折叠与路由不变。
