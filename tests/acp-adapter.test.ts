@@ -2113,6 +2113,37 @@ describe('ACP 私有 MCP 权限与原 prompt 续轮', () => {
     expect(harness.agent.requestsFor('session/prompt')).toHaveLength(1)
   })
 
+  it('新版 CLI 权限提示只放行一次、不预检摘要；经 MCP 转交实际参数并回原 prompt', async () => {
+    const warn = vi.fn()
+    const harness = createHarness({ log: { info: vi.fn(), warn } })
+    const first = collect(harness.adapter.stream(baseOptions({ tools: TOOLS })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    const name = 'mcp_dsh-tools_a4a4b434_read_file'
+    const approval: RequestPermissionRequest = {
+      ...permission(),
+      toolCall: { toolCallId: 'cli-tool', name, title: `Run ${name}`, rawInput: { toolSummary: 'Read another file' } },
+    }
+    expect(await harness.agent.callClient('session/request_permission', approval))
+      .toMatchObject({ result: { outcome: { outcome: 'selected', optionId: 'yes' } } })
+    expect(await harness.agent.callClient('session/request_permission', approval))
+      .toMatchObject({ result: { outcome: { outcome: 'cancelled' } } })
+    expect(harness.adapter.bridge.pendingCallIds()).toEqual([])
+    expect(warn.mock.calls.map(([text]) => String(text)).join(' ')).not.toContain('缺少必填')
+
+    const client = await connectAgentMcpClient(harness)
+    const pending = client.callTool({ name: 'read_file', arguments: { path: 'actual.txt' } })
+    const chunks = await first
+    const call = chunks.find((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call')
+    expect(call).toMatchObject({ block: { name: 'read_file', arguments: '{"path":"actual.txt"}' } })
+    const next = collect(harness.adapter.stream(baseOptions({ tools: TOOLS, messages: toolHistory([
+      { callId: toolCallIdOf(call), path: 'actual.txt', result: 'actual file contents' },
+    ]) })))
+    expect(toolResultText(await pending)).toBe('actual file contents')
+    await replyWithText(harness, '继续回答')
+    expect(visibleText(await next)).toBe('继续回答')
+    expect(harness.agent.requestsFor('session/prompt')).toHaveLength(1)
+  })
+
   it('同批并行权限与 MCP 调用全部交给 DSH；第二批仍复用原 prompt', async () => {
     const harness = createHarness({ parkSettleMs: 30 })
     const options = baseOptions({ tools: TOOLS })

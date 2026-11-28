@@ -4,6 +4,10 @@
 
 记录源码与发布内容，不将本地构建、npm 发布和本机升级混为同一状态。日期采用 Asia/Hong_Kong。更早历史见 [Git 提交记录](https://github.com/KouzakiUmi/dsh-antigravity-acp/commits/main/)。
 
+## 未发布
+
+- **ACP 工具调用**：识别 Antigravity CLI 1.5.15+ 的 MCP 权限提示格式，兼容服务器名带 8 位小写十六进制后缀的写法。权限提示中的工具摘要不参与参数预检或执行；实际参数仍由私有 MCP 桥转交 DSH。见 [PR #28](https://github.com/KouzakiUmi/dsh-antigravity-acp/pull/28)。
+
 ## 0.1.56 · 2026-11-28
 
 - **模型列表**：四条路由统一整理显示名、启用项置顶，并将 Gemini 1–3.x 等旧版默认关闭。AI Studio 和 Vertex AI 默认只开 Gemini 4；ACP / 代理保留 Claude 等非 Gemini 模型的原有默认规则。已有显式开关和自定义显示名继续生效。图片生成、语音、音乐、视频、向量嵌入等专用模型不进入聊天列表。
