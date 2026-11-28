@@ -18,8 +18,16 @@ export interface UndiciLike {
   fetch: (input: string, init?: Record<string, unknown>) => Promise<Response>
 }
 
-export type ManagedFetch = typeof fetch & { close(): Promise<void> }
+type FetchDispatch = (input: Parameters<typeof fetch>[0], init?: RequestInit, onDispatch?: () => void) => Promise<Response>
+export type ManagedFetch = typeof fetch & { close(): Promise<void>; dispatch: FetchDispatch }
 export const PROXY_CLOSE_TIMEOUT_MS = 2_000
+
+function beforeDispatch(input: Parameters<typeof fetch>[0], init: RequestInit | undefined, onDispatch?: () => void): void {
+  if (!onDispatch) return
+  const signal = init?.signal === undefined && input instanceof Request ? input.signal : init?.signal
+  signal?.throwIfAborted()
+  onDispatch()
+}
 
 export interface ProxiedFetchDeps {
   /** 加载 undici；失败返回 undefined。测试注入替身。 */
@@ -68,22 +76,16 @@ export function matchesBypass(hostname: string, bypass: string): boolean {
 export function createLiveProxiedFetch(readProxy: () => ResolvedProxy | undefined, deps: ProxiedFetchDeps = {}): ManagedFetch {
   const routes = new Map<string, ManagedFetch>()
   let closed = false
-  const request: typeof fetch = (input, init) => {
-    if (closed) return Promise.reject(new ProxyConfigError('代理传输已关闭；请求未发送'))
-    let proxy: ResolvedProxy | undefined
-    try {
-      proxy = readProxy()
-    } catch (error) {
-      // readProxy 会按当前设置重新解析；地址被改坏时按 fetch 契约返回 rejected
-      // promise 而不是同步抛，避免调用方在 `.catch()` 上拿到 undefined。
-      return Promise.reject(error)
-    }
+  // Async keeps invalid live configuration a rejected promise, per fetch's contract.
+  const request: FetchDispatch = async (input, init, onDispatch) => {
+    if (closed) throw new ProxyConfigError('代理传输已关闭；请求未发送')
+    const proxy = readProxy()
     const key = JSON.stringify(proxy ?? null)
     let route = routes.get(key)
     if (!route) { route = createProxiedFetch(proxy, deps); routes.set(key, route) }
-    return route(input, init)
+    return route.dispatch(input, init, onDispatch)
   }
-  return Object.assign(request, { close: async () => {
+  return Object.assign(request, { dispatch: request, close: async () => {
     closed = true
     const results = await Promise.allSettled([...routes.values()].map(route => route.close()))
     routes.clear()
@@ -94,7 +96,11 @@ export function createLiveProxiedFetch(readProxy: () => ResolvedProxy | undefine
 
 export function createProxiedFetch(proxy: ResolvedProxy | undefined, deps: ProxiedFetchDeps = {}): ManagedFetch {
   const fallback = deps.fallback ?? ((input, init) => globalThis.fetch(input, init))
-  if (!proxy) return Object.assign(((input, init) => fallback(input, init)) as typeof fetch, { close: async () => undefined })
+  const direct: FetchDispatch = async (input, init, onDispatch) => {
+    beforeDispatch(input, init, onDispatch)
+    return fallback(input, init)
+  }
+  if (!proxy) return Object.assign(direct, { dispatch: direct, close: async () => undefined })
   if (!isSupportedProxy(proxy.url)) throw new ProxyConfigError('插件请求支持 HTTP、HTTPS、SOCKS5 代理；不支持 SOCKS4')
   const load = deps.loadUndici ?? defaultLoadUndici
   let closed = false
@@ -121,7 +127,7 @@ export function createProxiedFetch(proxy: ResolvedProxy | undefined, deps: Proxi
     })
     return prepared
   }
-  const doFetch: typeof fetch = async (input, init) => {
+  const doFetch: FetchDispatch = async (input, init, onDispatch) => {
     if (closed) throw new ProxyConfigError('代理传输已关闭；请求未发送')
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
     let hostname = ''
@@ -130,7 +136,7 @@ export function createProxiedFetch(proxy: ResolvedProxy | undefined, deps: Proxi
     } catch {
       throw new ProxyConfigError('请求地址无效；请求未发送')
     }
-    if (matchesBypass(hostname, proxy.bypass)) return fallback(input, init)
+    if (matchesBypass(hostname, proxy.bypass)) return direct(input, init, onDispatch)
     const route = await prepare()
     if (closed) throw new ProxyConfigError('代理传输已关闭；请求未发送')
     const requestInit = input instanceof Request ? {
@@ -139,10 +145,11 @@ export function createProxiedFetch(proxy: ResolvedProxy | undefined, deps: Proxi
       cache: input.cache, integrity: input.integrity, keepalive: input.keepalive,
       referrer: input.referrer, referrerPolicy: input.referrerPolicy, duplex: 'half',
     } : {}
+    beforeDispatch(input, init, onDispatch)
     return route.undici.fetch(url, { ...requestInit, ...(init as Record<string, unknown> | undefined), dispatcher: route.agent })
   }
   let closing: Promise<void> | undefined
-  return Object.assign(doFetch, { close: () => {
+  return Object.assign(doFetch, { dispatch: doFetch, close: () => {
     closed = true
     closing ??= (async () => {
       const stop = (async () => {

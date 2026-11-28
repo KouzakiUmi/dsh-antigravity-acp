@@ -567,7 +567,7 @@ describe('额度药丸（conversation.input.right）', () => {
     expect(openBars.slice(2).every((item) => (item.props.style as { height?: string }).height === '4px')).toBe(true)
     const gemini = elements(opened).find((item) => item.props['aria-label'] === 'Gemini额度')!
     expect(gemini.props.style).toMatchObject({ padding: '9px 0' })
-    expect(elements(gemini).some((item) => (item.props.style as { gridTemplateColumns?: string } | undefined)?.gridTemplateColumns === 'repeat(auto-fit, minmax(120px, 1fr))')).toBe(true)
+    expect(elements(gemini).some((item) => (item.props.style as { gridTemplateColumns?: string } | undefined)?.gridTemplateColumns === 'repeat(auto-fit, minmax(min(120px, 100%), 1fr))')).toBe(true)
   })
 
   it('未知自定义模型不借用其它模型额度；缓存状态与禁用窗口有明确语义', () => {
@@ -582,7 +582,7 @@ describe('额度药丸（conversation.input.right）', () => {
     const listeners = new Map<string, (event: { key?: string; target?: unknown }) => void>()
     const pill = loadRegistrations({ quotaSnapshot: completeQuota, stateOverrides: { 2: true }, listeners }).get('antigravity-quota')!.component
     pill({ store: modelStore('antigravity-acp') })
-    listeners.get('keydown')?.({ key: 'Escape' })
+    expect(listeners.has('keydown')).toBe(false) // Escape is handled inside the popover, not globally.
     expect(lastStateCalls.at(-1)).toBe(false)
     listeners.get('pointerdown')?.({ target: {} })
     expect(lastStateCalls.at(-1)).toBe(false)
@@ -591,22 +591,21 @@ describe('额度药丸（conversation.input.right）', () => {
   })
 
   it('窄屏靠左的药丸：右缘对齐出界更多时翻转 left:0，向上展开', () => {
-    // 右缘 75：右对齐溢出 277；左对齐（left=-25+340=315 < 363）不溢出 → left:0。
+    // 右对齐出界；左对齐 12+340=352 ≤ 375 → 保留 left:0。
     const pill = loadRegistrations({ stateOverrides: { 2: true }, refStateBindings: { 4: 3 }, refOverrides: {
-      5: { getBoundingClientRect: () => ({ left: -25, right: 75, top: 760, bottom: 786 }) },
+      5: { getBoundingClientRect: () => ({ left: 12, right: 112, top: 760, bottom: 786 }) },
     } }).get('antigravity-quota')!.component
     pill({ store: modelStore('antigravity-acp') })
     expect(lastStateCalls).toContainEqual(expect.objectContaining({ position: 'absolute', left: 0, right: 'auto', width: 340, bottom: 'calc(100% + 8px)' }))
   })
 
-  it('视口内的药丸保持 absolute 右缘对齐锚点，不做视口钳位（0.1.51 遮挡回归）', () => {
-    // 右缘 260：右对齐左端 -80 虽为负，仍比左对齐（260+... 右端 500 出界 137）更贴近
-    // 视口 → 保持 right:0 锚定，不换算 fixed 坐标、不推离锚点。
+  it('两种对齐都出界时相对药丸平移，仍保持 absolute 锚定', () => {
+    // 右对齐左端 -80，左对齐右端 500，平移到视口左右边距以内。
     const pill = loadRegistrations({ stateOverrides: { 2: true }, refStateBindings: { 4: 3 }, refOverrides: {
       5: { getBoundingClientRect: () => ({ left: 160, right: 260, top: 760, bottom: 786 }) },
     } }).get('antigravity-quota')!.component
     pill({ store: modelStore('antigravity-acp') })
-    expect(lastStateCalls).toContainEqual(expect.objectContaining({ position: 'absolute', right: 0, left: 'auto', width: 340, bottom: 'calc(100% + 8px)' }))
+    expect(lastStateCalls).toContainEqual(expect.objectContaining({ position: 'absolute', right: 'auto', left: -148, width: 340, bottom: 'calc(100% + 8px)' }))
   })
 
   it('贴右缘的药丸右对齐无溢出；顶部空间不足且下方更宽裕才向下', () => {
@@ -837,6 +836,11 @@ describe('额度药丸：remote 客户端挂载', () => {
       'dsh-bundle-antigravity-host#agyQuota/account',
       'dsh-bundle-antigravity-host#agyQuota/models',
       'dsh-bundle-antigravity-host#agyProxyAccount/account',
+      'dsh-bundle-antigravity-host#agyAistudio/models',
+      'dsh-bundle-antigravity-host#agyAistudio/setKey',
+      'dsh-bundle-antigravity-host#agyAistudio/keyStatus',
+      'dsh-bundle-antigravity-host#agyAistudio/usage',
+      'dsh-bundle-antigravity-host#agyVertex/models',
     ])
     expect(call.package).toBe('dsh-bundle-antigravity-host')
     expect(call.descriptors?.[0]?.id).toBe('dsh-bundle-antigravity-host#agyQuota/read')
@@ -894,6 +898,25 @@ describe('退役模型表：client 内置表与 host 单一规则源一致', () 
   })
 })
 
+describe('附属功能表：client 内置表与 host FEATURE_SPECS 一致', () => {
+  it('client bundle 内的功能 id 与默认开关和 host FEATURE_SPECS 完全相同', async () => {
+    const { FEATURE_SPECS: hostSpecs } = await import('../src/features/specs.js')
+    const source = buildClientSource()
+    // FEATURES 字面量含 msg() 调用，不能用 new Function 直接求值；正则依赖 client.js
+    // 中字面量的 4 空格缩进，改表结构时同步本断言。
+    const match = source.match(/const FEATURES = (\[[\s\S]*?\n    \])/)
+    expect(match, 'client.js 缺少常量 FEATURES').not.toBeNull()
+    const block = match![1] ?? ''
+    const pairs: Array<{ id: string; defaultEnabled: boolean }> = []
+    const itemRe = /id: '([^']+)'[^]*?defaultEnabled: (true|false)/g
+    let item: RegExpExecArray | null
+    while ((item = itemRe.exec(block)) !== null) pairs.push({ id: item[1]!, defaultEnabled: item[2] === 'true' })
+    expect(pairs.map(({ id }) => id)).toEqual(hostSpecs.map((spec) => spec.id))
+    expect(pairs.map(({ id, defaultEnabled }) => ({ id, defaultEnabled })))
+      .toEqual(hostSpecs.map((spec) => ({ id: spec.id, defaultEnabled: spec.defaultEnabled })))
+  })
+})
+
 describe('编排合成条目常量：client 内置值与 host 单一规则源一致', () => {
   it('client 内置的 ORCHESTRATOR_MODEL_ID / NAME 与 src/orchestrator/types.ts 完全相同', async () => {
     const host = await import('../src/orchestrator/types.js')
@@ -905,5 +928,22 @@ describe('编排合成条目常量：client 内置值与 host 单一规则源一
     }
     expect(literal('ORCHESTRATOR_MODEL_ID')).toBe(host.ORCHESTRATOR_MODEL_ID)
     expect(literal('ORCHESTRATOR_MODEL_NAME')).toBe(host.ORCHESTRATOR_MODEL_NAME)
+  })
+})
+
+describe('浏览器 bundle 注入共享模型策略', () => {
+  it('AI Studio 与 Vertex 年代默认结果与 Host 同源', async () => {
+    const { defaultChatModelEnabled: hostFn } = await import('../src/adapter/model-catalog-policy.js')
+    const source = buildClientSource()
+    const shared = source.slice(source.indexOf('function bareModelId('), source.indexOf('/** ACP / 代理额外应用'))
+    expect(shared).toContain('function defaultChatModelEnabled')
+    const clientFn = new Function('id', `${shared}\nreturn defaultChatModelEnabled(id)`) as (id: string) => boolean
+    const ids = [
+      'aistudio-gemini-4-argon', 'aistudio-gemini-4.5-flash', 'gemini-4-hydrogen',
+      'aistudio-gemini-3.8-flash', 'aistudio-gemini-3-pro', 'aistudio-gemini-2.5-flash',
+      'aistudio-gemini-2.0-flash', 'aistudio-gemini-1.5-pro', 'aistudio-gemini-1.0-pro',
+      'aistudio-gemma-3-27b-it', 'aistudio-learnlm-2.0-flash-experimental', '',
+    ]
+    for (const id of ids) expect(clientFn(id), id).toBe(hostFn(id))
   })
 })

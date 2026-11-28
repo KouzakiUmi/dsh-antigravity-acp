@@ -112,6 +112,28 @@ export interface AntigravityHostConfig {
   cliQuotaEnabled?: boolean
   /** 编排模式（antigravity-orchestrator）配置。 */
   orchestrator?: OrchestratorConfig
+  /**
+   * 附属功能模块的逐项开关（默认全关）。键是功能 id（见 src/features/specs.ts），
+   * 值为是否启用。开启后由宿主行的功能注册表动态挂载，无需重载宿主；当前生成模式
+   * 不在该功能 compatibleModes 内时即使开关打开也不挂载。
+   */
+  features?: Record<string, boolean>
+  /**
+   * AI Studio 独立 provider 开关（默认关闭）：开启后本 bundle 的第三行组件
+   * `antigravity-aistudio-router` 注册 `aistudio` 路由，用 Gemini API key 直连
+   * generativelanguage.googleapis.com。与 ACP / 代理两条互斥链路并存（服务不同
+   * 的 Gemini 模型），不参与模式仲裁；key 未配置时即使开关打开也不注册路由。
+   */
+  aistudioEnabled?: boolean
+  /**
+   * AI Studio API key 的凭据引用名（POSIX 环境变量名，默认 AISTUDIO_API_KEY）。
+   * 设置只存引用名，真实值经宿主 credentials 接缝按操作解析，不进设置明文/日志。
+   */
+  aistudioCredentialRef?: string
+  vertexEnabled?: boolean
+  vertexProject?: string
+  vertexLocation?: string
+  vertexModels?: string[]
 }
 
 /** 编排模式（planner → executor）的用户配置。 */
@@ -128,19 +150,15 @@ export interface OrchestratorConfig {
 
 // Only fields owned by the custom settings card are live. Ordinary launch/pool
 // configuration remains ordinary, so editing it still follows the host lifecycle.
-export const LIVE_SETTING_KEYS = ['autoWarmup', 'reuseSessions', 'modelOverrides', 'proxyUrl', 'proxyBypass', 'agyCliPath', 'resumeSessions', 'keepProcessAfterCancel', 'cancelGraceMs', 'idleRecycleMs', 'proxyMode', 'cliQuotaEnabled', 'orchestrator'] as const
+export const LIVE_SETTING_KEYS = ['autoWarmup', 'reuseSessions', 'modelOverrides', 'proxyUrl', 'proxyBypass', 'agyCliPath', 'resumeSessions', 'keepProcessAfterCancel', 'cancelGraceMs', 'idleRecycleMs', 'proxyMode', 'cliQuotaEnabled', 'orchestrator', 'features', 'aistudioEnabled', 'aistudioCredentialRef', 'vertexEnabled', 'vertexProject', 'vertexLocation', 'vertexModels'] as const
 export type LiveSettingKey = typeof LIVE_SETTING_KEYS[number]
 export type AntigravityPluginConfig = Omit<AntigravityHostConfig, LiveSettingKey> & {
   [K in LiveSettingKey]?: AntigravityHostConfig[K] | Volatile<AntigravityHostConfig[K]>
 }
 
-function readSetting(value: string | Volatile<string | undefined> | undefined): string | undefined
-function readSetting(value: boolean | Volatile<boolean | undefined> | undefined): boolean | undefined
-function readSetting(value: number | Volatile<number | undefined> | undefined): number | undefined
-function readSetting(value: Record<string, ModelOverride> | Volatile<Record<string, ModelOverride> | undefined> | undefined): Record<string, ModelOverride> | undefined
-function readSetting(value: OrchestratorConfig | Volatile<OrchestratorConfig | undefined> | undefined): OrchestratorConfig | undefined
-function readSetting(value: string | boolean | number | Record<string, ModelOverride> | OrchestratorConfig | Volatile<string | boolean | number | Record<string, ModelOverride> | OrchestratorConfig | undefined> | undefined): string | boolean | number | Record<string, ModelOverride> | OrchestratorConfig | undefined {
-  return typeof value === 'object' && value !== null && 'get' in value ? (value as Volatile<unknown>).get() as OrchestratorConfig : value as string | boolean | number | Record<string, ModelOverride> | OrchestratorConfig | undefined
+function readSetting<T>(value: T | Volatile<T | undefined> | undefined): T | undefined {
+  // Config snapshots are read-only at runtime. Call sites only read or capture the value.
+  return typeof value === 'object' && value !== null && 'get' in value ? (value as Volatile<T | undefined>).get() as T | undefined : value as T | undefined
 }
 
 /** Keep references live; callers may spread this view to capture one operation. */
@@ -160,6 +178,13 @@ export function liveHostConfig(config: AntigravityPluginConfig): AntigravityHost
     get proxyMode() { return readSetting(config.proxyMode) },
     get cliQuotaEnabled() { return readSetting(config.cliQuotaEnabled) },
     get orchestrator() { return readSetting(config.orchestrator) },
+    get features() { return readSetting(config.features) },
+    get aistudioEnabled() { return readSetting(config.aistudioEnabled) },
+    get aistudioCredentialRef() { return readSetting(config.aistudioCredentialRef) },
+    get vertexEnabled() { return readSetting(config.vertexEnabled) },
+    get vertexProject() { return readSetting(config.vertexProject) },
+    get vertexLocation() { return readSetting(config.vertexLocation) },
+    get vertexModels() { return readSetting(config.vertexModels) },
   }
 }
 
@@ -176,7 +201,7 @@ export const MODEL_EFFORTS = ['low', 'medium', 'high'] as const
  * `ModelOverride`，只经过可移植路径。
  */
 const ModelOverrideSchema = Schema.object({
-  enabled: Schema.boolean().default(true).description('是否出现在 DSH 模型选择器'),
+  enabled: Schema.boolean().description('是否出现在 DSH 模型选择器；未设置时使用对应路由的目录默认值'),
   effort: Schema.union(MODEL_EFFORTS).description('默认思考档位：low / medium / high'),
   name: Schema.string().description('显示名覆盖'),
   target: Schema.string().description('映射到的官方模型 ID，优先于家族 + 档位路由'),
@@ -231,4 +256,15 @@ export const Config = Schema.object({
     OrchestratorConfig,
     'volatile-defined'
   >,
+  features: Schema.dict(Schema.boolean()).default({}).volatile().description('附属功能模块的逐项开关（默认全关）：开启后动态挂载对应功能，无需重载宿主；键是功能 id，见设置页列表') as Schema<
+    Record<string, boolean>,
+    Record<string, boolean>,
+    'volatile-defined'
+  >,
+  aistudioEnabled: Schema.boolean().default(false).volatile().description('AI Studio 独立 provider（默认关闭）：开启后用 Gemini API key 直连 generativelanguage.googleapis.com，注册 aistudio 路由；与 ACP / 代理模式并存，key 未配置时不注册'),
+  aistudioCredentialRef: Schema.string().default('AISTUDIO_API_KEY').volatile().description('AI Studio API key 的凭据引用名（环境变量名，默认 AISTUDIO_API_KEY）；真实值经宿主凭据接缝解析，设置只存引用名'),
+  vertexEnabled: Schema.boolean().default(false).volatile().description('启用标准 Vertex AI 独立模型路由；使用 Google 应用默认凭据'),
+  vertexProject: Schema.string().default('').volatile().description('Google Cloud 项目 ID 或编号，留空读取宿主环境变量'),
+  vertexLocation: Schema.string().default('').volatile().description('模型区域，留空读取宿主环境变量，未配置时使用 global'),
+  vertexModels: Schema.array(Schema.string()).default([]).volatile().description('Vertex AI 模型选择器中的 Gemini 发布商模型 ID，可从设置页拉取或手动添加'),
 })

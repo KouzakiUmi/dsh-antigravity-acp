@@ -3,7 +3,7 @@
  * 假 CliRun，不 spawn 任何进程。夹具取自 2026-10-16 真实探针输出的**形态**，
  * 数值为虚构，不含任何凭据。
  */
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
   agyCliCandidates,
   AgyCliError,
@@ -198,6 +198,18 @@ describe('fetchAgyModels', () => {
     const models = await fetchAgyModels(run, 'C:\\agy\\bin\\agy.exe')
     expect(models.map((m) => m.id)).toContain('claude-opus-5-5-low')
     expect(at(calls, 0)).toEqual(['C:\\agy\\bin\\agy.exe', 'models'])
+  })
+
+  it('模式取消会传给 CLI，迟到目录不再解析', async () => {
+    const controller = new AbortController()
+    const run = vi.fn(async (request: { signal?: AbortSignal }) => {
+      expect(request.signal).toBe(controller.signal)
+      controller.abort(new Error('mode switched'))
+      return { exitCode: 0, stderr: '', stdout: MODELS_TSV }
+    })
+    await expect(fetchAgyModels(run, 'x', controller.signal)).rejects.toThrow('mode switched')
+    await expect(fetchAgyModels(run, 'x', controller.signal)).rejects.toThrow('mode switched')
+    expect(run).toHaveBeenCalledTimes(1)
   })
 
   it('失败/空输出抛 AgyCliError', async () => {

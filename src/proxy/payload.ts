@@ -460,14 +460,14 @@ export interface ProxyProviderEvent {
 
 const MAX_PROVIDER_PARTS = 4096
 
-/** 解析一条 SSE data（兼容 `)]}'` 前缀与多种响应包裹形态）。 */
-export function parseProxyProviderEvent(data: string): ProxyProviderEvent {
+/** 解析一条 SSE data（兼容 `)]}'` 前缀与多种响应包裹形态）；label 参数化错误措辞。 */
+export function parseProxyProviderEvent(data: string, label = '代理模式'): ProxyProviderEvent {
   const normalized = data.trim().replace(/^\)\]\}'(?:\r?\n)?/u, '')
   let value: unknown
   try { value = JSON.parse(normalized) as unknown } catch {
-    throw llmError('代理模式响应包含非法 JSON', 'PROTOCOL_DRIFT')
+    throw llmError(`${label}响应包含非法 JSON`, 'PROTOCOL_DRIFT')
   }
-  if (!isRecord(value)) throw llmError('代理模式响应事件不是对象', 'PROTOCOL_DRIFT')
+  if (!isRecord(value)) throw llmError(`${label}响应事件不是对象`, 'PROTOCOL_DRIFT')
   if (isRecord(value.error)) return { parts: [], error: errorDetails(value.error) }
   const root = isRecord(value.response) ? value.response : value
   if (isRecord(root.error)) return { parts: [], error: errorDetails(root.error) }

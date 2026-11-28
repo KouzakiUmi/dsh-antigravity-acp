@@ -28,7 +28,7 @@ type SharedQuotaReader = ((force: boolean, source?: string) => Promise<unknown>)
   observeProxyAccount(snapshot: { phase: string; revision: number }): void
   observeMode(source: string): void
 }
-function loadCard(quotaRead?: () => Promise<unknown>) {
+function loadCard(quotaRead?: () => Promise<unknown>, viewportWidth = 1200) {
   let registration: { factory(require: (id: string) => unknown): { apply(ctx: unknown): void } } | undefined
   const components = new Map<string, React.ComponentType<Record<string, unknown>>>()
   const injections = new Map<string, () => Record<string, unknown>>()
@@ -36,7 +36,7 @@ function loadCard(quotaRead?: () => Promise<unknown>) {
   let timerId = 0
   runInNewContext(buildClientSource(), {
     window: { __ModuleLoader__: { load: (value: typeof registration) => { registration = value } }, innerHeight: 800, addEventListener: () => {}, removeEventListener: () => {} },
-    document: { documentElement: { clientWidth: 1200 }, addEventListener: () => {}, removeEventListener: () => {} },
+    document: { documentElement: { clientWidth: viewportWidth }, addEventListener: () => {}, removeEventListener: () => {} },
     setInterval: (callback: () => void, delay: number) => { intervals.set(++timerId, { callback, delay }); return timerId },
     clearInterval: (id: number) => intervals.delete(id),
     setTimeout, clearTimeout,
@@ -81,10 +81,10 @@ function transport(initial = document()) {
   }
 }
 
-async function mount(remote: unknown, control?: unknown, proxyControl?: unknown, readQuota?: unknown) {
+async function mount(remote: unknown, control?: unknown, proxyControl?: unknown, readQuota?: unknown, aistudioControl?: unknown, readVertexModels?: unknown) {
   const { Card, intervals } = loadCard()
   let renderer!: ReactTestRenderer
-  await act(async () => { renderer = create(React.createElement(Card, { remote, control, proxyControl, readQuota })) })
+  await act(async () => { renderer = create(React.createElement(Card, { remote, control, proxyControl, readQuota, aistudioControl, readVertexModels })) })
   renderers.push(renderer)
   return { renderer, intervals }
 }
@@ -104,8 +104,8 @@ async function mountPill(readQuota: unknown) {
 
 /** 带真实几何的药丸挂载：按钮 ref 注入 getBoundingClientRect，驱动 useLayoutEffect 定位。
  *  快照必须是稳定引用：useSyncExternalStore 每次返回新对象会触发无限重渲染。 */
-async function mountPillWithRect(rect: { left: number; right: number; top: number; bottom: number }) {
-  const { Pill } = loadCard()
+async function mountPillWithRect(rect: { left: number; right: number; top: number; bottom: number }, options: { viewportWidth?: number; buttonFocus?: () => void; dialogFocus?: () => void } = {}) {
+  const { Pill } = loadCard(undefined, options.viewportWidth)
   const snapshot = { current: { provider: 'antigravity-acp', model: 'gemini-flash' } }
   const store = { subscribe: () => () => {}, getSnapshot: () => snapshot }
   const readQuota = async () => ({ status: 'ok', groups: [{ name: 'Gemini', buckets: [{ window: '5h', remainingPct: 95 }] }] })
@@ -114,8 +114,8 @@ async function mountPillWithRect(rect: { left: number; right: number; top: numbe
     renderer = create(React.createElement(Pill, { store, readQuota }), {
       createNodeMock: (element) =>
         element.type === 'button' && (element.props as Record<string, unknown>)['aria-haspopup'] === 'dialog'
-          ? { getBoundingClientRect: () => rect, focus: () => {} }
-          : null,
+          ? { getBoundingClientRect: () => rect, focus: options.buttonFocus ?? (() => {}) }
+          : (element.props as Record<string, unknown>).role === 'dialog' ? { focus: options.dialogFocus ?? (() => {}) } : null,
     })
   })
   renderers.push(renderer)
@@ -265,6 +265,23 @@ describe('quota pill with real React state and effects', () => {
     })
   })
 
+  it('窄屏两边都装不下时，额度弹层留在视口内；Escape 返回药丸', async () => {
+    const buttonFocus = vi.fn()
+    const dialogFocus = vi.fn()
+    const renderer = await mountPillWithRect({ left: 128, right: 192, top: 620, bottom: 648 }, { viewportWidth: 320, buttonFocus, dialogFocus })
+    const dialog = renderer.root.findByProps({ role: 'dialog' })
+    const trigger = renderer.root.findByProps({ 'aria-haspopup': 'dialog' })
+    expect(dialog.props.style).toMatchObject({ position: 'absolute', left: -116, width: 296 })
+    expect(trigger.props['aria-controls']).toBe(dialog.props.id)
+    expect(dialogFocus).toHaveBeenCalledWith({ preventScroll: true })
+    const preventDefault = vi.fn(), stopPropagation = vi.fn()
+    await act(async () => { renderer.root.findByProps({ className: 'antigravity-usage-pill' }).props.onKeyDown({ key: 'Escape', preventDefault, stopPropagation }) })
+    expect(preventDefault).toHaveBeenCalledOnce()
+    expect(stopPropagation).toHaveBeenCalledOnce()
+    expect(buttonFocus).toHaveBeenCalledWith({ preventScroll: true })
+    expect(renderer.root.findAllByProps({ role: 'dialog' })).toHaveLength(0)
+  })
+
   it('刷新异常保留成功快照并标缓存，后续成功清除缓存标记', async () => {
     let fail = false
     const snapshot = { status: 'ok', updatedAt: '2026-10-25T00:00:00Z', groups: [
@@ -289,6 +306,48 @@ describe('quota pill with real React state and effects', () => {
 })
 
 describe('settings card with real React state and effects', () => {
+  it('页签支持方向键、首尾跳转及与面板互相标注', async () => {
+    const service = transport()
+    const { renderer } = await mount(service.remote)
+    const tabs = renderer.root.findAllByProps({ role: 'tab' })
+    const nodes = tabs.map(() => ({ focus: vi.fn() }))
+    const press = async (index: number, key: string) => {
+      const preventDefault = vi.fn()
+      await act(async () => { tabs[index]!.props.onKeyDown({ key, preventDefault, currentTarget: { parentElement: { querySelectorAll: () => nodes } } }) })
+      return preventDefault
+    }
+    expect(tabs.map(tab => tab.props.tabIndex)).toEqual([0, -1, -1, -1, -1, -1])
+    expect(await press(0, 'ArrowLeft')).toHaveBeenCalledOnce()
+    expect(nodes[5]!.focus).toHaveBeenCalledOnce()
+    const panel = renderer.root.findByProps({ id: tabs[5]!.props['aria-controls'] })
+    expect(panel.props).toMatchObject({ 'aria-labelledby': tabs[5]!.props.id, hidden: false })
+    await press(5, 'Home')
+    expect(tabs[0]!.props['aria-selected']).toBe(true)
+    expect(panel.props.hidden).toBe(true)
+    await press(0, 'ArrowRight')
+    expect(tabs[1]!.props.tabIndex).toBe(0)
+    await press(1, 'End')
+    expect(tabs[5]!.props.tabIndex).toBe(0)
+    expect(await press(5, 'Tab')).not.toHaveBeenCalled()
+  })
+
+  it('宿主读取悬挂时显示可重试错误，恢复后仍保留草稿', async () => {
+    vi.useFakeTimers()
+    const service = transport()
+    const { renderer } = await mount(service.remote, controlWith())
+    await act(async () => { fieldInput(renderer, 'proxyMode').props.onChange({ target: { checked: true } }) })
+    const stalled = deferred<SettingsDocument>()
+    service.describe.mockReturnValueOnce(stalled.promise)
+    const refresh = () => renderer.root.findByProps({ title: '重新读取配置并保留草稿' })
+    await act(async () => { void refresh().props.onClick(); await vi.advanceTimersByTimeAsync(12_001) })
+    expect(renderedText(renderer)).toContain('读取设置超时，请点击刷新重试。')
+    expect(refresh().props.disabled).toBe(false)
+    await act(async () => { await refresh().props.onClick() })
+    expect(renderedText(renderer)).not.toContain('读取设置超时')
+    expect(fieldInput(renderer, 'proxyMode').props.checked).toBe(true)
+    await act(async () => { stalled.resolve(document({ proxyMode: false }, 99)) })
+    expect(fieldInput(renderer, 'proxyMode').props.checked).toBe(true)
+  })
   it('实际共享读取器丢弃旧账户的迟到广播，不覆盖新账户已成功额度', async () => {
     const pending = deferred<unknown>()
     const quotaRead = vi.fn(async () => ({ status: 'ok', groups: [{ name: 'CURRENT-B', buckets: [{ remainingPct: 34 }] }] }) as unknown)
@@ -500,7 +559,8 @@ describe('settings card with real React state and effects', () => {
 
   it('设置卡片只提交即时字段，普通配置以重载指引呈现', async () => {
     const liveKeys: readonly string[] = [...LIVE_SETTING_KEYS]
-    const fields = liveKeys.filter(key => key !== 'modelOverrides' && key !== 'proxyBypass' && key !== 'orchestrator')
+    // 复合字典字段（modelOverrides / orchestrator / features）由专属控件渲染，不计入普通即时输入框统计。
+    const fields = liveKeys.filter(key => key !== 'modelOverrides' && key !== 'proxyBypass' && key !== 'orchestrator' && key !== 'features')
     // 普通（非 volatile）配置：宿主既不投影也不接受写入，不能出现在可编辑控件里。
     const plainFields = Object.keys(Config.dict ?? {}).filter(key => !liveKeys.includes(key))
     expect(plainFields).toEqual(expect.arrayContaining(['binaryPath', 'autoDownload', 'acpVersion', 'extraArgs', 'maxConcurrentSessions', 'queueTimeoutMs', 'requestTimeoutMs', 'handshakeTimeoutMs', 'authTimeoutMs', 'promptTimeoutMs', 'bridgeParkSettleMs']))
@@ -512,7 +572,7 @@ describe('settings card with real React state and effects', () => {
       expect(revision).toBe(1)
       for (const value of ops) {
         const op = value as { path: string[]; value: unknown }
-        expect([...fields, 'modelOverrides', 'orchestrator']).toContain(op.path[0])
+        expect([...fields, 'modelOverrides', 'orchestrator', 'features']).toContain(op.path[0])
         projected[op.path[0]!] = op.value
       }
       service.change(document(projected, 2))
@@ -566,7 +626,7 @@ describe('settings card with real React state and effects', () => {
       modelControl(renderer, 'target', 'gemini-3-pro').props.onChange({ target: { value: '' } })
     })
     await act(async () => { await button(renderer, '保存').props.onClick() })
-    expect(service.mutate).toHaveBeenCalledWith('llm-antigravity-acp', [{ op: 'set', path: ['modelOverrides'], value: {} }], 1)
+    expect(service.mutate).toHaveBeenCalledWith('llm-antigravity-acp', [{ op: 'set', path: ['modelOverrides'], value: { 'gemini-3-pro': { enabled: true } } }], 1)
   })
 
   it('设置页显示已观测的上下文和输出上限，不把容量当成草稿字段', async () => {
@@ -614,8 +674,8 @@ describe('settings card with real React state and effects', () => {
     expect(renderedText(renderer)).toContain('不在当前目录')
     // 两个观测模型 + 两个尚未下线的退役表内置家族 + 一个已保存但不在目录的 ID = 5 行。
     expect(renderedText(renderer)).toContain('全部 5')
-    // 退役家族默认隐藏，观测模型与已保存 ID 默认启用。
-    expect(renderedText(renderer)).toContain('已隐藏 2')
+    // 两个退役家族和观测到的旧版 Gemini 默认隐藏。
+    expect(renderedText(renderer)).toContain('已隐藏 3')
   })
 
   it('ACP 模式即使目录含带前缀的编排合成条目，退役补行仍用裸家族 ID', async () => {
@@ -769,7 +829,7 @@ describe('settings card with real React state and effects', () => {
     expect(renderedText(renderer)).not.toContain('项未保存')
     expect(renderedText(renderer)).not.toContain('已过官方下线日')
     expect(button(renderer, '保存').props.disabled).toBe(true)
-    expect(modelControl(renderer, 'enabled', 'gemini-3-pro').props.checked).toBe(true)
+    expect(modelControl(renderer, 'enabled', 'gemini-3-pro').props.checked).toBe(false)
   })
 
   it('撤销清理后编辑其它模型，保存不删除已退役键', async () => {
@@ -853,7 +913,7 @@ describe('settings card with real React state and effects', () => {
     const { renderer } = await mount(service.remote, controlWith())
     expect(modelControl(renderer, 'enabled', 'gemini-4-hydrogen').props.checked).toBe(true)
     await act(async () => { renderer.root.findByProps({ 'aria-label': '搜索模型' }).props.onChange({ target: { value: 'hydrogen' } }) })
-    await act(async () => { await button(renderer, '全部启用').props.onClick() })
+    await act(async () => { await button(renderer, '启用筛选结果').props.onClick() })
     expect(modelControl(renderer, 'enabled', 'gemini-4-hydrogen')).toBeDefined()
     expect(renderedText(renderer)).not.toContain('项未保存')
     expect(button(renderer, '保存').props.disabled).toBe(true)
@@ -1005,7 +1065,7 @@ describe('settings card with real React state and effects', () => {
     await act(async () => { filter.props.onChange({ target: { value: 'hidden' } }) })
     expect(modelControl(renderer, 'enabled', 'gemini-3-pro').props.checked).toBe(false)
     expect(renderer.root.findAllByProps({ name: 'model-enabled-claude-sonnet-5-5' })).toHaveLength(0)
-    await act(async () => { button(renderer, '全部启用').props.onClick() })
+    await act(async () => { button(renderer, '启用筛选结果').props.onClick() })
     await act(async () => { filter.props.onChange({ target: { value: 'all' } }) })
     expect(modelControl(renderer, 'enabled', 'gemini-3-pro').props.checked).toBe(true)
   })
@@ -1116,8 +1176,9 @@ describe('settings card with real React state and effects', () => {
       return revision === 1 ? { status: 'ok', models: [] } : catalog()
     })
     const { renderer, intervals } = await mount(service.remote, control)
-    // 空目录仍有尚未下线的退役表内置家族补行（默认关闭并带下线徽章），不显示空列表提示。
-    expect(renderedText(renderer)).not.toContain('暂无模型')
+    // 空目录仍有尚未下线的退役表内置家族补行（默认关闭并带下线徽章），ACP / 代理列表不显示空列表提示。
+    // AI Studio Tab 常驻挂载，其空表提示文案不同（请先配置 API key），故只断言 ACP / 代理的空表文案不出现。
+    expect(renderedText(renderer)).not.toContain('暂无模型。请先连接当前账户')
     expect(renderedText(renderer)).toContain('即将下线 11-30')
     expect(renderedText(renderer)).toContain('全部 2')
     revision = 2
@@ -1126,6 +1187,343 @@ describe('settings card with real React state and effects', () => {
     expect(renderedText(renderer)).toContain('文本 · 图片')
     await act(async () => { await button(renderer, '刷新模型目录').props.onClick() })
     expect(modelControl(renderer, 'enabled', 'fresh-model')).toBeDefined()
+  })
+
+  it('生成模式切换时旧手动目录请求不能阻塞或覆盖新目录', async () => {
+    const service = transport()
+    const old = deferred<unknown>()
+    let proxy = false
+    const control = vi.fn(async (method: string, request?: { force?: boolean }) => {
+      if (method === 'account') return { state: 'idle', generationMode: { requested: proxy ? 'proxy' : 'acp', proxyRouterReady: proxy } }
+      if (proxy) return { status: 'ok', models: [{ id: 'antigravity-gemini-4-new', name: 'New proxy model' }] }
+      if (request?.force) return old.promise
+      return { status: 'ok', models: [{ id: 'gemini-4-old', name: 'Old ACP model' }] }
+    })
+    const { renderer, intervals } = await mount(service.remote, control)
+    await act(async () => { button(renderer, '模型').props.onClick() })
+    await act(async () => { void button(renderer, '刷新模型目录').props.onClick() })
+    expect(renderedText(renderer)).toContain('正在拉取模型目录')
+    proxy = true
+    await act(async () => { for (const timer of intervals.values()) if (timer.delay === 2000) timer.callback() })
+    expect(renderedText(renderer)).toContain('New proxy model')
+    await act(async () => { old.resolve({ status: 'ok', models: [{ id: 'gemini-4-old', name: 'Late ACP model' }] }) })
+    expect(renderedText(renderer)).toContain('New proxy model')
+    expect(renderedText(renderer)).not.toContain('Late ACP model')
+  })
+
+  it('设置加载与保存不等待独立 provider 注册查询', async () => {
+    const service = transport(document({ aistudioEnabled: false }))
+    const providers = deferred<{ id: string }[]>()
+    const remote = { ...service.remote, llm: { listProviders: () => providers.promise } }
+    const { renderer } = await mount(remote)
+    const enabled = fieldInput(renderer, 'aistudioEnabled')
+    expect(enabled.props.disabled).toBe(false)
+    await act(async () => { enabled.props.onChange({ target: { checked: true } }) })
+    await act(async () => { await button(renderer, '保存').props.onClick() })
+    expect(service.mutate).toHaveBeenCalledWith('llm-antigravity-acp', [{ op: 'set', path: ['aistudioEnabled'], value: true }], 1)
+    await act(async () => { providers.resolve([{ id: 'antigravity-acp' }]) })
+  })
+
+  it('AI Studio 同引用换 key 成功后立即隐藏旧目录与掩码，待新结果再展示', async () => {
+    const service = transport(document({ aistudioEnabled: true }))
+    const newModels = deferred<unknown>()
+    const newKey = deferred<unknown>()
+    let changed = false
+    const control = vi.fn(async (method: string) => {
+      if (method === 'models') return changed ? newModels.promise : { status: 'ok', models: [{ id: 'aistudio-gemini-4-old', name: 'Old model' }] }
+      if (method === 'keyStatus') return changed ? newKey.promise : { status: 'ok', configured: true, writable: true, masked: 'old-mask' }
+      if (method === 'setKey') { changed = true; return { status: 'ok' } }
+      return { status: 'unconfigured' }
+    })
+    const { renderer } = await mount(service.remote, undefined, undefined, undefined, control)
+    await act(async () => { button(renderer, 'AI Studio').props.onClick() })
+    const current = () => JSON.stringify(renderer.toJSON())
+    expect(current()).toContain('Old model')
+    expect(current()).toContain('old-mask')
+    const keyInput = renderer.root.findByProps({ 'aria-label': 'AI Studio API key' })
+    await act(async () => { keyInput.props.onChange({ target: { value: 'synthetic-new-key' } }) })
+    await act(async () => { button(renderer, '保存 key').props.onClick() })
+    expect(current()).not.toContain('Old model')
+    expect(current()).not.toContain('old-mask')
+    expect(control).toHaveBeenCalledWith('models', { force: true })
+    await act(async () => {
+      newModels.resolve({ status: 'ok', models: [{ id: 'aistudio-gemini-4-new', name: 'Fresh model' }] })
+      newKey.resolve({ status: 'ok', configured: true, writable: true, masked: 'new-mask' })
+    })
+    expect(current()).toContain('Fresh model')
+    expect(current()).toContain('new-mask')
+  })
+
+  it('AI Studio Tab：独立模型表隐藏思考档、显示名覆盖生效，手动 key 经 setKey 写入', async () => {
+    const service = transport(document({ aistudioEnabled: true, aistudioCredentialRef: 'AISTUDIO_API_KEY', modelOverrides: { 'aistudio-gemini-3-pro': { name: 'Gemini 3 Pro（长）' } } }))
+    const control = vi.fn(async (method: string) => method === 'account' ? { state: 'idle', message: 'ready' } : { status: 'ok', models: [] })
+    const aistudioControl = vi.fn(async (method: string) => {
+      if (method === 'models') return { status: 'ok', models: [
+        { id: 'aistudio-gemini-3.8-flash', name: 'Gemini 3.8 Flash', inputModalities: ['text'], contextWindow: 1048576 },
+        { id: 'aistudio-gemini-3-pro', name: 'Gemini 3 Pro', inputModalities: ['text'] },
+      ] }
+      if (method === 'keyStatus') return { status: 'ok', configured: true, writable: true, masked: 'AIza…xxxx' }
+      if (method === 'setKey') return { status: 'ok' }
+      return undefined
+    })
+    const { renderer } = await mount(service.remote, control, undefined, undefined, aistudioControl)
+    await act(async () => { await button(renderer, 'AI Studio').props.onClick() })
+    await act(async () => {})
+    // 独立模型表：aistudio- 目录行在场，显示名覆盖生效。
+    expect(modelControl(renderer, 'enabled', 'aistudio-gemini-3.8-flash')).toBeDefined()
+    expect(modelControl(renderer, 'name', 'aistudio-gemini-3-pro').props.value).toBe('Gemini 3 Pro（长）')
+    // 首期不映射思考档：AI Studio 行无 effort 选择器。
+    expect(renderer.root.findAllByProps({ name: 'model-effort-aistudio-gemini-3.8-flash' })).toHaveLength(0)
+    // 掩码状态显示已配置。
+    expect(renderedText(renderer)).toContain('已配置')
+    // 手动 key 写入：密码框输入 + 保存 → setKey（只写不回显）。
+    const keyInput = renderer.root.findByProps({ 'aria-label': 'AI Studio API key' })
+    await act(async () => { keyInput.props.onChange({ target: { value: 'AIzaSyNEWKEY123' } }) })
+    await act(async () => { await button(renderer, '保存 key').props.onClick() })
+    expect(aistudioControl).toHaveBeenCalledWith('setKey', { value: 'AIzaSyNEWKEY123' })
+  })
+
+  it('Vertex AI 使用独立目录，将模型列表和逐模型设置一同保存', async () => {
+    const id = 'vertex-ai-gemini-4-hydrogen'
+    const service = transport(document({ vertexEnabled: true, vertexProject: 'example-project', vertexLocation: 'global',
+      vertexModels: ['gemini-4-hydrogen'], modelOverrides: { [id]: { name: 'Hydrogen on Vertex' } } }))
+    const { renderer } = await mount(service.remote, controlWith())
+    const vertex = renderer.root.findByProps({ id: button(renderer, 'Vertex AI').props['aria-controls'] })
+    const acp = renderer.root.findByProps({ id: button(renderer, '模型').props['aria-controls'] })
+    expect(acp.findAllByProps({ name: 'model-enabled-' + id })).toHaveLength(0)
+    await act(async () => { button(renderer, 'Vertex AI').props.onClick() })
+    expect(vertex.props.style.display).toBe('flex')
+    expect(modelControl(renderer, 'enabled', id).props.checked).toBe(true)
+    expect(modelControl(renderer, 'name', id).props.value).toBe('Hydrogen on Vertex')
+    expect(renderer.root.findAllByProps({ name: 'model-effort-' + id })).toHaveLength(0)
+    await act(async () => {
+      fieldInput(renderer, 'vertexModels').props.onChange({ target: { value: 'gemini-4-hydrogen\n gemini-4-neon \n' } })
+      modelControl(renderer, 'enabled', id).props.onChange({ target: { checked: false } })
+    })
+    expect(modelControl(renderer, 'enabled', 'vertex-ai-gemini-4-neon').props.checked).toBe(true)
+    await act(async () => { await button(renderer, '保存').props.onClick() })
+    expect(service.mutate.mock.calls[0]![1]).toEqual(expect.arrayContaining([
+      { op: 'set', path: ['vertexModels'], value: ['gemini-4-hydrogen', 'gemini-4-neon'] },
+      { op: 'set', path: ['modelOverrides'], value: { [id]: { enabled: false, name: 'Hydrogen on Vertex' } } },
+    ]))
+  })
+
+  it.each(['acp', 'proxy', 'aistudio', 'vertex'])('模型表规则适用于 %s，按启用排序并保留原行实例', async (route) => {
+    const prefix = { acp: '', proxy: 'antigravity-', aistudio: 'aistudio-', vertex: 'vertex-ai-' }[route]!
+    const old = 'gemini-2.5-flash'
+    const manual = 'gemini-2.0-pro'
+    const fresh = 'gemini-4-flash-lite'
+    const hidden = 'gemini-4-pro'
+    const nonchat = 'gemini-4-image'
+    const supplemental = 'gemini-4-embedding'
+    const models = [old, manual, fresh, hidden, nonchat].map(id => ({ id: prefix + id, name: prefix + id }))
+    const service = transport(document({ proxyMode: route === 'proxy', aistudioEnabled: true,
+      vertexModels: [old, manual, fresh, hidden, nonchat], modelOverrides: {
+        [prefix + manual]: { enabled: true, name: 'Chosen legacy' }, [prefix + hidden]: { enabled: false }, [prefix + supplemental]: { enabled: true },
+      } }))
+    const aistudioControl = async (method: string) => method === 'models' ? { status: 'ok', models } : { status: 'unconfigured' }
+    const control = async (method: string) => method === 'models' ? { status: 'ok', models } : { generationMode: { requested: route === 'proxy' ? 'proxy' : 'acp' } }
+    const { renderer } = await mount(service.remote, control, undefined, undefined, aistudioControl)
+    const page = renderer.root.findByProps({ id: button(renderer, route === 'aistudio' ? 'AI Studio' : route === 'vertex' ? 'Vertex AI' : '模型').props['aria-controls'] })
+    const toggles = () => page.findAllByType('input').filter(node => String(node.props.name).startsWith('model-enabled-'))
+    expect(toggles().slice(0, 2).map(node => node.props.name)).toEqual([`model-enabled-${prefix + manual}`, `model-enabled-${prefix + fresh}`])
+    expect(toggles().find(node => node.props.name === `model-enabled-${prefix + fresh}`)?.props['aria-label']).toBe('Gemini 4 Flash-Lite')
+    expect(toggles().map(node => node.props.name)).not.toContain(`model-enabled-${prefix + nonchat}`)
+    expect(toggles().map(node => node.props.name)).not.toContain(`model-enabled-${prefix + supplemental}`)
+    expect(page.findAllByProps({ className: 'agy-model-legacy' }).length).toBeGreaterThanOrEqual(2)
+    const oldToggle = page.findByProps({ name: `model-enabled-${prefix + old}` })
+    const oldInput = page.findByProps({ name: `model-name-${prefix + old}` })
+    expect(oldToggle.props.checked).toBe(false)
+    const doc = { activeElement: null as object | null, body: {} }
+    const focused = { isConnected: true, ownerDocument: doc, focus: vi.fn() }
+    doc.activeElement = focused
+    await act(async () => {
+      oldToggle.props.onChange({ currentTarget: focused, target: { checked: true } })
+      doc.activeElement = doc.body
+    })
+    expect(focused.focus).toHaveBeenCalledWith({ preventScroll: true })
+    expect(toggles()[0]).toBe(oldToggle)
+    expect(page.findByProps({ name: `model-name-${prefix + old}` })).toBe(oldInput)
+    await act(async () => { page.findByProps({ 'aria-label': '搜索模型' }).props.onChange({ target: { value: 'Chosen legacy' } }) })
+    expect(toggles().map(node => node.props.name)).toEqual([`model-enabled-${prefix + manual}`])
+    if (route === 'vertex') expect(fieldInput(renderer, 'vertexModels').props.value).toContain(nonchat)
+    await act(async () => { await button(renderer, '保存').props.onClick() })
+    expect(service.mutate.mock.calls[0]![1]).toEqual([{ op: 'set', path: ['modelOverrides'], value: {
+      [prefix + old]: { enabled: true }, [prefix + manual]: { enabled: true, name: 'Chosen legacy' },
+      [prefix + hidden]: { enabled: false }, [prefix + supplemental]: { enabled: true },
+    } }])
+  })
+
+  it('模型离开当前筛选时把焦点移到下一项或筛选控件', async () => {
+    const service = transport(document({ vertexEnabled: true, vertexModels: ['gemini-4-hydrogen', 'gemini-4-neon'] }))
+    const { Card } = loadCard()
+    const doc = { body: {}, activeElement: null as object | null }
+    const first = { isConnected: true, ownerDocument: doc, focus: vi.fn() }
+    const next = { isConnected: true, ownerDocument: doc, focus: vi.fn() }
+    const filter = { focus: vi.fn() }
+    const list = { querySelectorAll: () => [first, next].filter(item => item.isConnected) }
+    let renderer!: ReactTestRenderer
+    await act(async () => {
+      renderer = create(React.createElement(Card, { remote: service.remote }), { createNodeMock: node => {
+        if (node.props.role === 'list') return list
+        if (node.props['aria-label'] === '筛选模型') return filter
+        return null
+      } })
+    })
+    renderers.push(renderer)
+    await act(async () => { button(renderer, 'Vertex AI').props.onClick() })
+    const page = renderer.root.findByProps({ id: button(renderer, 'Vertex AI').props['aria-controls'] })
+    await act(async () => { page.findByProps({ 'aria-label': '筛选模型' }).props.onChange({ target: { value: 'enabled' } }) })
+    expect(button(renderer, '隐藏筛选结果').props.disabled).toBe(false)
+    for (const [id, node] of [['hydrogen', first], ['neon', next]] as const) {
+      doc.activeElement = node
+      await act(async () => {
+        modelControl(renderer, 'enabled', `vertex-ai-gemini-4-${id}`).props.onChange({ currentTarget: node, target: { checked: false } })
+        node.isConnected = false
+        doc.activeElement = doc.body
+      })
+      expect(page.findAllByProps({ name: `model-enabled-vertex-ai-gemini-4-${id}` })).toHaveLength(0)
+    }
+    expect(next.focus).toHaveBeenCalledWith({ preventScroll: true })
+    expect(filter.focus).toHaveBeenCalledWith({ preventScroll: true })
+    expect(button(renderer, '隐藏筛选结果').props.disabled).toBe(true)
+  })
+
+  it('Vertex 拉取不自动调用、不自动保存；空范围可拉取并合并到最新草稿', async () => {
+    const service = transport(document({ vertexModels: ['gemini-manual'], modelOverrides: { 'vertex-ai-gemini-manual': { name: 'Custom' } } }))
+    const pending = deferred<unknown>()
+    const read = vi.fn().mockReturnValue(pending.promise)
+      .mockResolvedValueOnce({ status: 'error', message: 'AUTH: test ADC unavailable' })
+      .mockResolvedValueOnce({ status: 'ok', ids: [] })
+    const { renderer } = await mount(service.remote, undefined, undefined, undefined, undefined, read)
+    await act(async () => { button(renderer, 'Vertex AI').props.onClick() })
+    expect(read).not.toHaveBeenCalled()
+    expect(fieldInput(renderer, 'vertexLocation').props.value).toBe('')
+    expect(button(renderer, '拉取模型').props.disabled).toBe(false)
+    await act(async () => { await button(renderer, '拉取模型').props.onClick() })
+    expect(renderedText(renderer)).toContain('AUTH: test ADC unavailable')
+    await act(async () => { await button(renderer, '拉取模型').props.onClick() })
+    expect(renderedText(renderer)).toContain('发布商目录未返回 Gemini 模型。')
+    expect(fieldInput(renderer, 'vertexModels').props.value).toBe('gemini-manual')
+    await act(async () => { void button(renderer, '拉取模型').props.onClick() })
+    expect(button(renderer, '拉取模型').props.disabled).toBe(true)
+    await act(async () => { fieldInput(renderer, 'vertexModels').props.onChange({ target: { value: 'gemini-manual\ngemini-typed' } }) })
+    await act(async () => { pending.resolve({ status: 'ok', ids: [' gemini-catalog ', 'gemini-catalog', 'gemini-manual', 'invalid'] }) })
+    expect(fieldInput(renderer, 'vertexModels').props.value).toBe('gemini-manual\ngemini-typed\ngemini-catalog')
+    expect(modelControl(renderer, 'name', 'vertex-ai-gemini-manual').props.value).toBe('Custom')
+    expect(service.mutate).not.toHaveBeenCalled()
+    expect(read.mock.calls).toEqual(Array.from({ length: 3 }, () => [{ project: '', location: '' }]))
+    await act(async () => { await button(renderer, '保存').props.onClick() })
+    expect(service.mutate).toHaveBeenCalledWith('llm-antigravity-acp', [{ op: 'set', path: ['vertexModels'], value: ['gemini-manual', 'gemini-typed', 'gemini-catalog'] }], 1)
+  })
+
+  it('Vertex 范围编辑后禁止拉取并丢弃旧结果，已保存的新范围可重新拉取', async () => {
+    const initial = { vertexProject: 'old-project', vertexLocation: 'global', vertexModels: ['gemini-manual'] }
+    const service = transport(document(initial))
+    const old = deferred<unknown>()
+    const read = vi.fn().mockReturnValueOnce(old.promise).mockResolvedValue({ status: 'ok', ids: ['gemini-fresh'] })
+    const { renderer } = await mount(service.remote, undefined, undefined, undefined, undefined, read)
+    await act(async () => { button(renderer, 'Vertex AI').props.onClick() })
+    await act(async () => { void button(renderer, '拉取模型').props.onClick() })
+    await act(async () => { fieldInput(renderer, 'vertexLocation').props.onChange({ target: { value: 'us-central1' } }) })
+    expect(button(renderer, '拉取模型').props.disabled).toBe(true)
+    expect(renderedText(renderer)).toContain('请先保存 Vertex AI 项目和区域，再拉取模型。')
+    service.set(document({ ...initial, vertexLocation: 'us-central1' }, 2))
+    await act(async () => { await button(renderer, '保存').props.onClick() })
+    await act(async () => { await button(renderer, '拉取模型').props.onClick() })
+    await act(async () => { old.resolve({ status: 'ok', ids: ['gemini-stale'] }) })
+    expect(fieldInput(renderer, 'vertexModels').props.value).toBe('gemini-manual\ngemini-fresh')
+    expect(read.mock.calls).toEqual([[{ project: 'old-project', location: 'global' }], [{ project: 'old-project', location: 'us-central1' }]])
+  })
+
+  it('AI Studio 本地用量显示窗口、0 与未知、最近 429 和官方链接，轮换时丢弃旧返回', async () => {
+    const settings = transport(document({ aistudioEnabled: true }))
+    const old = deferred<unknown>()
+    const sample = {
+      status: 'ok', pacificDay: '2026-11-27', minuteTruncated: false,
+      minute: { requests: 1, inputTokens: null, reportedRequests: 0 },
+      today: { requests: 2, inputTokens: 0, reportedRequests: 1 }, models: [],
+      last429: { at: '2026-11-27T12:00:00.000Z', source: 'sse', model: 'gemini-4-argon', retryAfterMs: 1250 },
+    }
+    let reads = 0
+    const control = vi.fn(async (method: string) => {
+      if (method === 'usage') {
+        reads++
+        if (reads === 2) return old.promise
+        return reads === 1 ? sample : { status: 'unconfigured' }
+      }
+      return method === 'keyStatus' ? { status: 'ok', configured: true, writable: true } : { status: 'ok', models: [] }
+    })
+    const { renderer } = await mount(settings.remote, undefined, undefined, undefined, control)
+    expect(reads).toBe(0)
+    await act(async () => { await button(renderer, 'AI Studio').props.onClick() })
+    const current = () => JSON.stringify(renderer.toJSON())
+    for (const text of ['最近 1 分钟', 'Pacific 今日（2026-11-27）', '上游输入 token 未报告', '0 输入 token', 'SSE · gemini-4-argon', '1.25 秒', 'https://aistudio.google.com/rate-limit', 'https://aistudio.google.com/usage']) expect(current()).toContain(text)
+    await act(async () => { void renderer.root.findByProps({ 'aria-label': '刷新 AI Studio 本地用量' }).props.onClick() })
+    await act(async () => { settings.change(document({ aistudioEnabled: true, aistudioCredentialRef: 'NEW_KEY' }, 2)) })
+    await act(async () => { old.resolve(sample) })
+    expect(current()).toContain('配置 API key 后即可查看本地用量。')
+    expect(current()).not.toContain('SSE · gemini-4-argon')
+  })
+
+  it('AI Studio 凭据引用变化会刷新目录和掩码，并丢弃旧响应', async () => {
+    const settings = transport(document({ aistudioEnabled: true, aistudioCredentialRef: 'OLD_KEY' }))
+    const oldModels = deferred<unknown>()
+    const oldKey = deferred<unknown>()
+    let changed = false
+    const control = vi.fn(async (method: string) => {
+      if (method === 'keyStatus') return changed ? { status: 'ok', configured: true, writable: true, masked: 'new-mask' } : oldKey.promise
+      if (method === 'models') return changed ? { status: 'ok', models: [{ id: 'aistudio-gemini-4-new', name: 'Fresh model' }] } : oldModels.promise
+      return { status: 'unconfigured' }
+    })
+    const { renderer } = await mount(settings.remote, undefined, undefined, undefined, control)
+    await act(async () => { button(renderer, 'AI Studio').props.onClick() })
+    expect(control.mock.calls.some(([method]) => method === 'models')).toBe(true)
+    const reads = control.mock.calls.length
+    changed = true
+    await act(async () => { settings.change(document({ aistudioEnabled: true, aistudioCredentialRef: 'NEW_KEY' }, 2)) })
+    expect(control.mock.calls.slice(reads).map(([method]) => method)).toEqual(expect.arrayContaining(['models', 'keyStatus']))
+    await act(async () => {
+      oldModels.resolve({ status: 'ok', models: [{ id: 'aistudio-gemini-4-old', name: 'Old model' }] })
+      oldKey.resolve({ status: 'ok', configured: true, writable: true, masked: 'old-mask' })
+    })
+    const rendered = JSON.stringify(renderer.toJSON())
+    expect(rendered).toContain('Fresh model')
+    expect(rendered).toContain('new-mask')
+    expect(rendered).not.toContain('Old model')
+    expect(rendered).not.toContain('old-mask')
+  })
+
+  it('AI Studio 默认仅 4 系开启、启用置顶、显式启用非 4 系落盘', async () => {
+    const service = transport(document({ aistudioEnabled: true }))
+    const control = vi.fn(async (method: string) => method === 'account' ? { state: 'idle', message: 'ready' } : { status: 'ok', models: [] })
+    const aistudioControl = vi.fn(async (method: string) => {
+      if (method === 'models') return { status: 'ok', models: [
+        { id: 'aistudio-gemini-3.8-flash', name: 'Gemini 3.8 Flash', inputModalities: ['text'] },
+        { id: 'aistudio-gemini-4-argon', name: 'Gemini 4 Argon', inputModalities: ['text'] },
+        { id: 'aistudio-gemini-2.5-flash', name: 'Gemini 2.5 Flash', inputModalities: ['text'] },
+      ] }
+      if (method === 'keyStatus') return { status: 'ok', configured: true, writable: true }
+      return { status: 'ok' }
+    })
+    const { renderer } = await mount(service.remote, control, undefined, undefined, aistudioControl)
+    await act(async () => { await button(renderer, 'AI Studio').props.onClick() })
+    await act(async () => {})
+    const toggles = renderer.root.findAllByProps({ type: 'checkbox' }).filter(node => String(node.props.name).startsWith('model-enabled-aistudio-'))
+    // 启用置顶：4 系排第一。
+    expect(toggles[0]!.props.name).toBe('model-enabled-aistudio-gemini-4-argon')
+    const byId = new Map(toggles.map(node => [node.props.name, node]))
+    expect(byId.get('model-enabled-aistudio-gemini-4-argon')!.props.checked).toBe(true)
+    expect(byId.get('model-enabled-aistudio-gemini-3.8-flash')!.props.checked).toBe(false)
+    expect(byId.get('model-enabled-aistudio-gemini-2.5-flash')!.props.checked).toBe(false)
+    // 显式启用非 4 系 → 保存落盘 enabled:true（默认关闭模型的启用必须落盘）。
+    await act(async () => { byId.get('model-enabled-aistudio-gemini-3.8-flash')!.props.onChange({ target: { checked: true } }) })
+    await act(async () => { await button(renderer, '保存').props.onClick() })
+    const ops = service.mutate.mock.calls.at(-1)![1] as Array<{ path: string[]; value: Record<string, unknown> }>
+    const overrides = ops.find(op => op.path[0] === 'modelOverrides')!.value
+    expect(overrides['aistudio-gemini-3.8-flash']).toMatchObject({ enabled: true })
+    // 4 系默认开启不写 enabled:true（默认值不落盘）。
+    expect(overrides['aistudio-gemini-4-argon']).toBeUndefined()
   })
 
   it('后台目录通知不覆盖手动拉取的等待状态和失败原因，可再次点击重试', async () => {

@@ -2,14 +2,14 @@ import { LlmAdapter } from '@deepseek-ai/dsh-llm'
 import type { LlmError } from '@deepseek-ai/dsh-llm'
 import { llmError } from '../runtime/llm-error.js'
 import type { LlmModelInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
-import type { AdapterPreparedCall, AdapterRequestOptions, AdapterRequestOwner } from '../adapter/request-options.js'
+import type { AcpRequestOptions, AdapterPreparedCall, AdapterRequestOptions, AdapterRequestOwner } from '../adapter/request-options.js'
 import type { AcpLifecycleSnapshot } from '../runtime/lifecycle.js'
 import type { AntigravityAcpAdapter } from '../adapter/antigravity-adapter.js'
 import { AGY_TURN_ERROR } from '../adapter/prompt-turn.js'
 
 /** Workers own independent transports, bridges and prompt state. No tool execution lives here. */
 export interface AcpWorker {
-  adapter: Pick<AntigravityAcpAdapter, 'busy' | 'stream' | 'listModels' | 'resolveModel' | 'warmup' | 'discoverModels'> & Partial<Pick<AntigravityAcpAdapter, 'prepareCall'>>
+  adapter: Pick<AntigravityAcpAdapter, 'busy' | 'stream' | 'listModels' | 'listSettingsModels' | 'resolveModel' | 'warmup' | 'discoverModels'> & Partial<Pick<AntigravityAcpAdapter, 'prepareCall'>>
   ensureImages?: (signal?: AbortSignal) => Promise<void>
   read(): AcpLifecycleSnapshot
   dispose(): Promise<void>
@@ -34,6 +34,7 @@ export class PooledAcpAdapter extends LlmAdapter {
   /** DSH 对话 → 承载它的 worker 下标：会话复用记录在 worker 内部，换 worker 即丢失。 */
   private readonly affinity = new Map<string, number>()
   private closed = false
+  private admission = new AbortController()
   private poll?: ReturnType<typeof setInterval>
   private readonly capacity: number
   private readonly queueTimeoutMs: number
@@ -58,7 +59,13 @@ export class PooledAcpAdapter extends LlmAdapter {
   get busy(): boolean { return this.slots.some(s => s.leased || s.worker.adapter.busy) }
   override providerInfo(provider: string) { return { id: provider, name: 'Antigravity (ACP)' } }
   override async listModels(provider: string): Promise<readonly LlmModelInfo[]> {
-    const lists = await Promise.all(this.slots.map(s => s.worker.adapter.listModels(provider)))
+    return this.listWorkerModels(provider, 'listModels')
+  }
+  async listSettingsModels(provider: string): Promise<readonly LlmModelInfo[]> {
+    return this.listWorkerModels(provider, 'listSettingsModels')
+  }
+  private async listWorkerModels(provider: string, method: 'listModels' | 'listSettingsModels'): Promise<readonly LlmModelInfo[]> {
+    const lists = await Promise.all(this.slots.map(s => s.worker.adapter[method](provider)))
     return [...new Map(lists.flat().map(m => [m.id, m])).values()]
   }
   override async resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
@@ -86,8 +93,30 @@ export class PooledAcpAdapter extends LlmAdapter {
     this.prepared = false
   }
 
+  /** Cancel queued and preparing work without interrupting prompts already started. */
+  setEnabled(enabled: boolean): void {
+    if (!enabled && !this.admission.signal.aborted) {
+      this.admission.abort(llmError('代理模式已开启，ACP 请求已取消', AGY_TURN_ERROR.ABORTED))
+      this.invalidatePreparation()
+      this.preparationAbort?.abort()
+      this.preparation = undefined
+      this.preparationAbort = undefined
+    } else if (enabled && this.admission.signal.aborted && !this.closed) {
+      this.admission = new AbortController()
+    }
+  }
+
+  modeSignal(): AbortSignal { return this.admission.signal }
+
+  private waitingSignal(signal?: AbortSignal): AbortSignal {
+    const mode = this.admission.signal
+    return signal === undefined ? mode : AbortSignal.any([mode, signal])
+  }
+
   override async prepareCall(provider: string, model: string, signal?: AbortSignal): Promise<AdapterPreparedCall> {
     if (this.closed) throw llmError('ACP 插件已卸载', 'AGY_LINK_CLOSED')
+    const mode = this.admission.signal
+    signal = this.waitingSignal(signal)
     if (signal?.aborted) throw llmError('ACP 请求已取消', AGY_TURN_ERROR.ABORTED)
     // Discover input capabilities before DSH projects attachments into a text-only request.
     while (!this.prepared) {
@@ -116,18 +145,28 @@ export class PooledAcpAdapter extends LlmAdapter {
       }
     }
     if (this.closed) throw llmError('ACP 插件已卸载', 'AGY_LINK_CLOSED')
-    return { model: await this.resolveModel(provider, model, signal), stream: options => this.stream(options) }
+    const resolved = await this.resolveModel(provider, model, signal)
+    signal.throwIfAborted()
+    return { model: resolved, stream: options => this.streamInMode(options, mode) }
   }
   override async *stream(options: AdapterRequestOptions): AsyncGenerator<StreamChunk> {
-    const slot = await this.acquire(options, options.signal)
+    yield* this.streamInMode(options, this.admission.signal)
+  }
+
+  private async *streamInMode(options: AdapterRequestOptions, mode: AbortSignal): AsyncGenerator<StreamChunk> {
+    const waiting = options.signal === undefined ? mode : AbortSignal.any([mode, options.signal])
+    const slot = await this.acquire(options, waiting)
     try {
       // 握手失败或取消也必须归还槽位，不能让池被一次图片准备错误耗尽。
-      if (slot.worker.ensureImages && hasImageInput(options)) await slot.worker.ensureImages(options.signal)
+      waiting.throwIfAborted()
+      if (slot.worker.ensureImages && hasImageInput(options)) await slot.worker.ensureImages(waiting)
+      waiting.throwIfAborted()
       slot.owner = { sessionId: options.sessionId, purpose: options.purpose }
       // 粘住承载该对话的 worker：ACP 会话复用记录在 worker 内部。
       const affinityKey = this.affinityKey(options)
       if (affinityKey !== undefined) this.rememberAffinity(affinityKey, this.slots.indexOf(slot))
-      yield* slot.worker.adapter.stream(options)
+      const request: AcpRequestOptions = { ...options, admissionSignal: mode }
+      yield* slot.worker.adapter.stream(request)
     } finally {
       slot.leased = false
       if (!slot.worker.adapter.busy) slot.owner = undefined
@@ -139,14 +178,16 @@ export class PooledAcpAdapter extends LlmAdapter {
   async warmup(signal?: AbortSignal): Promise<void> {
     // An active worker already has a connection; warming a second worker is unnecessary.
     if (this.busy) return
-    const slot = await this.acquire(undefined, signal)
-    try { await slot.worker.adapter.warmup(signal) }
+    const waiting = this.waitingSignal(signal)
+    const slot = await this.acquire(undefined, waiting)
+    try { waiting.throwIfAborted(); await slot.worker.adapter.warmup(waiting) }
     finally { slot.leased = false; this.dispatch() }
   }
 
   async discoverModels(signal?: AbortSignal, interactive = true): Promise<readonly LlmModelInfo[]> {
-    const slot = await this.acquire(undefined, signal)
-    try { return await slot.worker.adapter.discoverModels(signal, interactive) }
+    const waiting = this.waitingSignal(signal)
+    const slot = await this.acquire(undefined, waiting)
+    try { waiting.throwIfAborted(); return await slot.worker.adapter.discoverModels(waiting, interactive) }
     finally { slot.leased = false; this.dispatch() }
   }
 
@@ -184,6 +225,7 @@ export class PooledAcpAdapter extends LlmAdapter {
       waiter.cleanup()
       waiter.reject(llmError('ACP 插件已卸载', 'AGY_LINK_CLOSED'))
     }
+    this.admission.abort(llmError('ACP 插件已卸载', 'AGY_LINK_CLOSED'))
     const results = await Promise.allSettled(this.slots.map(s => s.worker.dispose()))
     const failed = results.find((r): r is PromiseRejectedResult => r.status === 'rejected')
     if (failed) throw failed.reason

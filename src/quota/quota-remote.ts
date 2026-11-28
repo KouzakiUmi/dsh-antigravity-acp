@@ -26,6 +26,8 @@ import { fetchProxyQuotaSnapshot } from '../proxy/quota-source.js'
 import type { ProxyCredentialSource } from '../proxy/adapter.js'
 import type { ProxyTransport } from '../proxy/transport.js'
 import { AGY_PROXY_ACCOUNT_INVOCATIONS } from '../proxy/account-remote.js'
+import { AGY_AISTUDIO_INVOCATIONS } from '../aistudio/remote.js'
+import { AGY_VERTEX_INVOCATIONS } from '../vertex/remote.js'
 import { cliQuotaIdentity, markQuotaAge, quotaIdentity, QuotaSnapshotStore } from './snapshot-store.js'
 import type { QuotaMode } from './snapshot-store.js'
 import type { HistoryTruncationNotice } from '../runtime/history-notices.js'
@@ -153,7 +155,7 @@ export function registerAgYQuotaRemote(ctx: Context): void {
           face: 'host',
           schemas: [],
           model: { services: [], events: [], objects: [] },
-          invocations: [...AGY_QUOTA_INVOCATIONS, ...AGY_PROXY_ACCOUNT_INVOCATIONS],
+          invocations: [...AGY_QUOTA_INVOCATIONS, ...AGY_PROXY_ACCOUNT_INVOCATIONS, ...AGY_AISTUDIO_INVOCATIONS, ...AGY_VERTEX_INVOCATIONS],
         })
       } catch (error) {
         ctx.logger?.warn?.('antigravity-acp: 额度 remote 注册失败', error)
@@ -222,6 +224,7 @@ export class AgYQuotaService extends TypertRemoteService {
   private readonly _control: SettingsControl | undefined
   private readonly _historyNotices: AgYQuotaServiceOptions['historyNotices']
   private _inflight?: { key: string; result: Promise<boolean> }
+  private _scopeGeneration = 0
 
   constructor(ctx: Context, options: AgYQuotaServiceOptions = {}) {
     super(ctx, AGY_QUOTA_SERVICE)
@@ -238,15 +241,18 @@ export class AgYQuotaService extends TypertRemoteService {
     this._log = options.log
     this._control = options.control
     this._historyNotices = options.historyNotices
-    if (options.background) {
+    if (options.background || options.onScopeChange) {
       ctx.effect(() => {
         const tick = () => { void this.refresh().catch(error => this._log?.warn('antigravity-acp: 额度刷新失败：' + redactSensitiveText(String(error)))) }
         let start: ReturnType<typeof setTimeout> | undefined
         const schedule = () => { clearTimeout(start); start = setTimeout(tick, 0); start.unref() }
-        const off = options.onScopeChange?.(schedule)
-        schedule()
-        const interval = setInterval(tick, QUOTA_CACHE_MS)
-        interval.unref()
+        const off = options.onScopeChange?.(() => {
+          this._scopeGeneration += 1
+          if (options.background) schedule()
+        })
+        if (options.background) schedule()
+        const interval = options.background ? setInterval(tick, QUOTA_CACHE_MS) : undefined
+        interval?.unref()
         return () => { off?.(); clearTimeout(start); clearInterval(interval); this._lifetime.abort() }
       }, 'antigravity: background quota refresh')
     }
@@ -306,7 +312,7 @@ export class AgYQuotaService extends TypertRemoteService {
 
   private epoch(): string {
     const mode = this.currentMode()
-    return JSON.stringify([mode, mode === 'proxy' ? this._proxyQuota?.credential.revision?.() ?? 0 : 0, this._cliQuotaEnabled?.() === true])
+    return JSON.stringify([this._scopeGeneration, mode, mode === 'proxy' ? this._proxyQuota?.credential.revision?.() ?? 0 : 0, this._cliQuotaEnabled?.() === true])
   }
 
   private async snapshotScope(request?: AgYQuotaRequest): Promise<{ mode: QuotaMode; epoch: string; key: string; persistent: boolean; cliOn: boolean }> {

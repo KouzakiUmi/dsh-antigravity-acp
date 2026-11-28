@@ -59,6 +59,22 @@ const fullCatalogResponse = () => Response.json({
   },
 })
 
+it('代理编排从目录到 planner 期间切换账户时不派发生成', async () => {
+  let account = 'old'
+  const credential = vi.fn(async () => ({ accessToken: account, source: 'login' as const, updatedAt: 'x' }))
+  const request = vi.fn(async ({ url }: { url: string }) => {
+    if (!url.includes('fetchAvailableModels')) return sse([textEvent('unexpected generation', 'STOP')])
+    account = 'new'
+    return fullCatalogResponse()
+  })
+  const adapter = new AntigravityProxyAdapter({ credential: { credential }, transport: { request } })
+  await expect(collect(adapter.stream({
+    provider: PROXY_PROVIDER_ID, model: ORCHESTRATOR_MODEL_ID,
+    messages: [createUserMessage({ content: [{ type: 'text', text: 'synthetic task' }], source: { kind: 'user' } })],
+  }))).rejects.toMatchObject({ code: 'CANCELLED' })
+  expect(request).toHaveBeenCalledTimes(1)
+})
+
 describe('代理模式 Orchestrator 目录合成', () => {
   it('planner 与 executor wire 都可见时出现合成条目，取最小容量与 executor 模态', async () => {
     const request = vi.fn(async () => fullCatalogResponse())

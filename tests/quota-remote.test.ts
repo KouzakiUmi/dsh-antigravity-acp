@@ -100,7 +100,7 @@ describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
       expect(credential).toHaveBeenCalledTimes(2)
     } finally { await ctx.fiber.dispose(); vi.useRealTimers() }
   })
-  it('同一 package-face 只注册一次，同时贡献额度与代理账户两个命名空间', () => {
+  it('同一 package-face 只注册一次，同时贡献额度、代理账户、AI Studio 和 Vertex 命名空间', () => {
     const register = vi.fn((_contribution: unknown) => () => {})
     const scope = { get: () => ({ register }), effect: (callback: () => unknown) => callback() }
     const ctx = { inject: (_services: string[], callback: (scope: unknown) => void) => callback(scope) } as unknown as Context
@@ -108,8 +108,10 @@ describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
     expect(register).toHaveBeenCalledOnce()
     const contribution = register.mock.calls[0]![0] as unknown as { package: string; face: string; invocations: { namespace: string; method: string }[] }
     expect(contribution).toMatchObject({ package: 'dsh-bundle-antigravity-host', face: 'host' })
-    expect(new Set(contribution.invocations.map(item => item.namespace))).toEqual(new Set(['agyQuota', 'agyProxyAccount']))
+    expect(new Set(contribution.invocations.map(item => item.namespace))).toEqual(new Set(['agyQuota', 'agyProxyAccount', 'agyAistudio', 'agyVertex']))
     expect(contribution.invocations.filter(item => item.namespace === 'agyProxyAccount').map(item => item.method)).toEqual(['account'])
+    expect(contribution.invocations.filter(item => item.namespace === 'agyAistudio').map(item => item.method)).toEqual(['models', 'setKey', 'keyStatus', 'usage'])
+    expect(contribution.invocations.filter(item => item.namespace === 'agyVertex').map(item => item.method)).toEqual(['models'])
   })
 
   it('首次导入提高 revision 后只重取一次，后续读取可命中缓存', async () => {
@@ -226,6 +228,38 @@ describe('AgYQuotaService 经 Cordis Proxy 调用', () => {
         expect(result).toMatchObject({ status: 'error', groups: [], error: { code: 'token-missing' } })
       }
       expect(credential).toHaveBeenCalled()
+    } finally { release(); await fiber.dispose(); await ctx.fiber.dispose() }
+  })
+
+  it('模式往返时旧刷新不能复用，即使回到同一作用域', async () => {
+    const ctx = new Context()
+    let mode: 'acp' | 'proxy' = 'proxy'
+    let change = () => {}
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    let markStarted!: () => void
+    const started = new Promise<void>(resolve => { markStarted = resolve })
+    let calls = 0
+    const request = vi.fn(async ({ url }: { url: string }) => {
+      if (url.includes('loadCodeAssist')) return new Response(JSON.stringify({ cloudaicompanionProject: 'synthetic-project' }))
+      const call = ++calls
+      if (call === 1) { markStarted(); await gate }
+      return Response.json({ groups: [{ displayName: `refresh-${call}`, buckets: [] }] })
+    })
+    const fiber = await ctx.plugin(AgYQuotaService, {
+      mode: () => mode, onScopeChange: notify => { change = notify; return () => {} },
+      proxyQuota: { credential: { credential: async () => ({ accessToken: 'synthetic', source: 'login', updatedAt: 'x' }) }, transport: { request } },
+    })
+    try {
+      const service = ctx.get(AGY_QUOTA_SERVICE) as AgYQuotaService
+      const old = service.refresh()
+      await started
+      mode = 'acp'; change()
+      mode = 'proxy'; change()
+      const fresh = service.refresh()
+      release()
+      for (const result of await Promise.all([old, fresh])) expect(result.groups[0]?.name).toBe('refresh-2')
+      expect(calls).toBe(2)
     } finally { release(); await fiber.dispose(); await ctx.fiber.dispose() }
   })
 

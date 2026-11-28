@@ -15,14 +15,19 @@
 | [`src/bridge/`](https://github.com/KouzakiUmi/dsh-antigravity-acp/tree/main/src/bridge/) | 私有 loopback MCP、工具目录、挂起调用与结果回填 |
 | [`src/runtime/`](https://github.com/KouzakiUmi/dsh-antigravity-acp/tree/main/src/runtime/) | 官方程序、运行目录、登录材料、代理、CLI 与模型缓存 |
 | [`src/quota/`](https://github.com/KouzakiUmi/dsh-antigravity-acp/tree/main/src/quota/) | 套餐 / Credits 快照、连接控制与 Typert remote |
-| [`src/proxy/`](https://github.com/KouzakiUmi/dsh-antigravity-acp/tree/main/src/proxy/) | 代理模式（默认关闭）：OAuth 登录态、agy 线传输、`antigravity-proxy` 路由与模式总线 |
+| [`src/proxy/`](https://github.com/KouzakiUmi/dsh-antigravity-acp/tree/main/src/proxy/) | 代理模式（默认关闭）：OAuth 登录态、agy 线传输、`antigravity-proxy` 路由与模式总线；`gemini-stream.ts` 是端点无关的 Gemini 流解析共享层（代理与 AI Studio 同消费） |
+| [`src/aistudio/`](https://github.com/KouzakiUmi/dsh-antigravity-acp/tree/main/src/aistudio/) | AI Studio 独立 provider（默认关闭，第三组件行）：Gemini API key 鉴权（经宿主 credentials 接缝）、`/v1beta/models` 实时发现、标准 Gemini REST payload、`aistudio` 路由与设置总线；与 ACP / 代理并存 |
 | [`src/client.js`](https://github.com/KouzakiUmi/dsh-antigravity-acp/blob/main/src/client.js) | 惰性 CommonJS 客户端、设置卡片与额度药丸；无 Node 原生导入。构建时由 [`scripts/client-bundle.mjs`](https://github.com/KouzakiUmi/dsh-antigravity-acp/blob/main/scripts/client-bundle.mjs) 把 `@include` 的 [`src/client-i18n/`](https://github.com/KouzakiUmi/dsh-antigravity-acp/tree/main/src/client-i18n) 片段内联成单文件 |
 | [`src/client-i18n/`](https://github.com/KouzakiUmi/dsh-antigravity-acp/tree/main/src/client-i18n) | 客户端界面 i18n：`core.js`（`t()` / `msg()` 与语言判定）、`en-ui.js`（界面英文字典）、`en-host.js`（Host 固定状态文本的英文字典）；键是中文原文，缺译回落中文。新增文案必须同步字典，`tests/client-i18n.test.ts` 会拦截缺项与占位符不一致 |
 | [`src/settings.ts`](https://github.com/KouzakiUmi/dsh-antigravity-acp/blob/main/src/settings.ts) | 完整 Config 与默认值 |
+| [`src/vertex/`](../src/vertex/) | 标准 Vertex AI：ADC、宿主环境变量回退、发布商目录读取、按项目与区域路由、replay 校验 |
+| [`model-catalog-policy.ts`](../src/adapter/model-catalog-policy.ts) | 四条路由共用的聊天型号过滤、代际默认和显示名整理，构建时注入独立客户端 |
+| [`src/adapter/gemini-payload.ts`](../src/adapter/gemini-payload.ts) | AI Studio 与 Vertex AI 共用的标准 Gemini REST 请求构造 |
+| [`src/colab/`](../src/colab/) | 可单独启停的 Colab Host 组件，使用 DSH 审批、受管子进程和附件服务；同包导出 `./colab` |
 | [`cordis.patch.yml`](../cordis.patch.yml) | 仅插入本插件，不抢占默认模型 |
 | [`tests/`](https://github.com/KouzakiUmi/dsh-antigravity-acp/tree/main/tests/) | 假 ACP / MCP、隔离 runtime、真实 React renderer 与回归测试 |
 
-npm 包名为 `dsh-bundle-antigravity-host`，provider ID 为 `antigravity-acp`，内部插件名为 `llm-antigravity-acp`，三者不混用。工具执行权仍在 DSH；ACP `tool_call` 通知不是本机执行指令。
+npm 包名为 `dsh-bundle-antigravity-host`，provider ID 为 `antigravity-acp` / `antigravity-proxy` / `aistudio` / `vertex-ai`，内部插件名为 `llm-antigravity-acp` / `antigravity-proxy-router` / `antigravity-aistudio-router` / `antigravity-vertex-ai-router`。工具执行权在 DSH；ACP `tool_call` 通知不直接执行本机操作。
 
 ## 依赖与契约基准
 
@@ -30,8 +35,9 @@ npm 包名为 `dsh-bundle-antigravity-host`，provider ID 为 `antigravity-acp`�
 
 | 依赖 / 协议 | 当前基准 | 核验边界 |
 |---|---|---|
-| DSH `dsh-llm` / `dsh-subprocess` / `dsh-typert-protocol` | 开发依赖 `0.2.2-rc.3` | 本地类型、调用链与测试；不是全部 peer 范围实机认证 |
-| 可选 `dsh-attachment` | 开发依赖 `0.2.2-rc.3` | Host 服务在场时读取图片，缺少时文本降级 |
+| DSH `dsh-llm` / `dsh-subprocess` / `dsh-typert-protocol` | 宿主 peer；开发基准 `0.2.2-rc.5` | 共享宿主模块；工作区同版运行类型检查和测试 |
+| `dsh-attachment` | 宿主 peer；开发基准 `0.2.2-rc.5` | 提供代理图片尺寸计算；附件服务仍按功能注入 |
+| `dsh-credentials` | 宿主 peer；开发基准 `0.2.2-rc.5` | 提供 AI Studio 凭据引用校验；密钥由宿主凭据服务管理 |
 | Cordis | 开发依赖 `4.1.0` | 生命周期与注入契约 |
 | ACP SDK / wire protocol | SDK `1.4.0` / wire **v1** | 两者不是同一版本；v2 / RFD 草案不能替代 v1 |
 | 默认官方 ACP server | `1.5.2` | 与 SDK 分别设置；1.5.2 仅离线核对全平台发行布局与解压体积，协议行为与厂商 `_meta.antigravity` 扩展的实测基准仍为 1.4.0，不自动适用于任意上游版本 |
@@ -40,7 +46,7 @@ npm 包名为 `dsh-bundle-antigravity-host`，provider ID 为 `antigravity-acp`�
 | undici | `8.12.3` | 本包直接依赖，HTTP / SOCKS 代理；SOCKS5 可能输出实验性 API 警告 |
 | React / test renderer | `18.3.1` | Client 使用宿主 React；renderer 是测试开发依赖，不是生产私带的 UI 运行时 |
 
-三个 `dsh-*` peer 当前均声明 `>=0.2.0-rc.1 <0.2.1-0 || >=0.2.1-0 <0.3.0-0 || >=0.2.2-0 <0.3.0-0`，Cordis peer 为 `>=4.0.4 <5`。末段是 semver prerelease 语义的必需补写：`-0` 界标只放行同版本组的 prerelease，不外推到更高 patch（`>=0.2.1-0` 拒绝 `0.2.2-rc.x`）；实测整体放宽为 `>=0.2.0-0 <0.3.0-0` 同样拒绝 `0.2.2-rc.3`。宽范围只表达 npm 安装准入，不能推导全部版本通过运行验证，也不替代 DSH loader 自身的装载条件。CLI、Desktop 壳与实际 Core 的版本应分别核对。
+五个 `dsh-*` peer 使用 `>=0.2.2-rc.5 <0.2.3-0`，Cordis 使用 `~4.1.0`。npm 校验实际解析到的 peer；DSH 用 Core 自身的版本校验 `dsh-*` 范围。`<0.2.3-0` 排除下一补丁的预发布版。类型与测试所用的 DSH 包也固定为同一基准，锁文件测试会检查间接依赖，桌面探针会检查编译产物使用宿主模块。更新锁文件后用 Linux 目标的 `npm ci --dry-run --ignore-scripts` 复检可选平台依赖。
 
 ## 构建与本地打包
 
@@ -59,7 +65,7 @@ npm pack
 
 检查 tarball 的包名 / 版本、导出入口、客户端、patch 和文档后，再通过目标 DSH 插件管理入口安装。工作区构建、包内容检查、Profile 安装、启用与真实调用分别验证。
 
-在 Desktop 会话中构建后，可从 Git Bash 用以下命令验证本机分发归档。脚本使用临时缓存和安装根，不加载桌面 Profile，不读取账户或发送生成请求：
+主包构建已包含 Colab 的 `dist/colab/index.js`。可从 Git Bash 验证本机 Desktop 组件；脚本使用临时目录，不加载桌面 Profile、不读取账号或发送生成请求：
 
 ```sh
 ELECTRON_RUN_AS_NODE=1 "$DSH_NODE_EXECUTABLE" scripts/check-desktop-compat.cjs
@@ -72,6 +78,9 @@ ELECTRON_RUN_AS_NODE=1 "$DSH_NODE_EXECUTABLE" scripts/check-desktop-compat.cjs
 | 验证项 | 状态与范围 |
 |---|---|
 | TypeScript | `npm run typecheck` 通过 |
+| UI 键盘和窄屏 | Windows 全量回归覆盖页签方向键、筛选后焦点转移、设置读取超时与草稿保留、额度弹层的 Escape 和定位。使用 Chrome 在 320px 浅色、375px 暗色设置页及 320px 的长文案额度夹具检查横向溢出；使用离线模拟数据，没有访问运行中的 DSH Web。 |
+| 0.1.55 核心依赖与隔离回归 | Core `0.2.2-rc.5`：全量回归覆盖模式切换的排队、启动与实际派发边界、额度往返、代理账户绑定、AI Studio / Vertex 配置变化和 Colab 产物。Desktop 2.0.24-next 的实际解析表提供五个 DSH peer，隔离探针使用宿主模块装载全部 Host 入口。未改动本机 Profile。 |
+| 0.1.54：AI Studio 本地用量 / Vertex AI / Colab | `npm run check`：68 个测试文件，1129 项通过、1 项跳过。覆盖凭据切换时的用量、掩码与目录隔离，HTTP/SSE 429、Vertex 流式工具回填，以及 Colab 固定 argv、审批、Notebook 副本和退出边界。Desktop 2.0.24-next / Core 0.2.2-rc.5 的隔离组件探针校验了默认关闭声明、Colab 工具注册及卸载不影响已有模型路由。真实项目、Colab 账号、Notebook 远程执行与桌面 GUI 尚未验收。 |
 | macOS 钥匙串登录态（#23） | 2026-11-26 Windows / 系统 Node：57 个文件 / 975 项通过、1 项跳过。`tests/cli-login.test.ts` 锁定 `go-keyring-base64:` 解码（含原样 JSON 与坏值降级）、`expiry_date` 毫秒→ISO、`security find-generic-password` 只读 argv 与非 0 退出 / spawn 抛错降级；`tests/credentials.test.ts` 覆盖文件优先 → 钥匙串 → 旧版 `oauth_creds.json` 候选链、既有凭据可用时不读钥匙串、吊销后改用钥匙串、三源换发失败顺序与全缺席降级文案；`tests/agent-link.test.ts` 锁定 `AGY_ACP_FORCE_FILE_STORAGE=1` 注入（父环境覆盖无效）与首个 `session/new` 36 秒冷启动在握手档下成功、后续会话回普通档、显式 `timeoutMs` 优先；`tests/quota.test.ts` / `tests/snapshot-store.test.ts` 覆盖额度取数与快照身份的钥匙串兜底同序。全部为注入依赖的合成测试：真实 macOS 钥匙串读取、`AGY_ACP_FORCE_FILE_STORAGE` 对官方二进制的实际效果与 macOS 冷启动整链均未实机验证 |
 | 隔离回归 | 2026-11-22 使用系统 Node 24：48 个文件 / 865 项通过（契约基准 Core `0.2.2-rc.3` / Cordis `4.1.0`），包含旧宿主错误回退、目录停用项与档位、Schema 字段优先、已保存项目额度回退、会话表 LRU 容量与 429 限流文案，以及解压守卫常量对官方分发包实测体积的下限回归 |
 | 辅助程序执行位与会话诊断（0.1.48） | 2026-11-22 Windows / 系统 Node 24：48 个文件 / 870 项通过、1 项跳过。注入 chmod 覆盖主程序与 `localharness_external` 同时补位、辅助程序缺失或为目录时跳过、windows 不改权限；`session/new` 拒绝时附加诊断且错误码、JSON-RPC 细节与 cause 保留，空诊断、诊断回调抛错与主动取消不附加。真实权限位整链测试（下载 → 解压 → 两个入口带执行位、旧 0644 缓存命中后修复）只在 POSIX 运行，本机跳过，未在 macOS / Linux 实机执行 |
@@ -89,10 +98,13 @@ ELECTRON_RUN_AS_NODE=1 "$DSH_NODE_EXECUTABLE" scripts/check-desktop-compat.cjs
 | 额度快照 | 用桌面包内 Cordis 拉取真实 Google 额度，获得 3 个分组；新开隔离 Host，在上游不可调用的条件下重读同一快照，分组与时间戳一致。自动回归覆盖独立定时、手动合并、读取不等待刷新、换账户隔离与过期标记。2026-11-26 真实代理快照核实上游已合并为 2 组（Gemini Models / Claude and GPT models），客户端动态遍历无硬编码组数，旧独立 Argon 组并入 Gemini 展示 |
 | 退役模型与额度药丸（0.1.51） | 系统 Node 24：`tests/model-retirement.test.ts` 锁定退役表（家族键归一、档位 ID 命中、日期与迁移字段）；`tests/model-settings.test.ts` 覆盖默认关闭与显式启用优先；client/host 两表家族与日期一致性、「即将下线」徽章与开关默认态由 `tests/client-loader.test.ts` 锁定；药丸短周期在上排序（weekly/5h 逆序夹具）与空组不再渲染均有回归。弹层定位在 0.1.52 回归为 absolute 锚定（fixed ＋ 视口钳位在宿主面板内必然遮挡，见 0.1.52 记录）：`tests/client-loader.test.ts` 锁定定位函数三类分支，`tests/client-interaction.test.ts` 以注入按钮几何的真实 React 渲染锁定 absolute 右缘锚定、左对齐翻转与上下选边。真实上游拉取与 GUI 弹层位置未实机验收 |
 | 设置页移出已退役家族、内置显示名与链路过滤（0.1.53） | 2026-11-26 Windows / 系统 Node：`tests/client-interaction.test.ts` 以真实 React renderer 锁定已过下线日家族的观测行、补行与残留配置键均不显示，下线日过后按同一判定移出，残留键随草稿保存删除并在模型页注明来源，撤销放弃删除，撤销后的刷新与只读切换不重新排入，只读设置不产生待保存项，清理保存不覆盖外部更新、不删除另一链路或仅默认值的键，保存成功回读后不再标脏，退役边界按本地日历日（在 Asia/Hong_Kong、America/Los_Angeles、UTC 三个时区下运行）；已知家族显示内置名而未知 ID 保持原始 ID，ACP 模式不补带 `antigravity-` 前缀的键、代理模式不补裸 ID、合成条目两边同名，且被过滤的键随保存原样提交；`tests/client-loader.test.ts` 锁定 client 内置 `ORCHESTRATOR_MODEL_ID` / `NAME` 与 host 常量一致。退役判定按本地时间与墙钟比较，相关用例用 `vi.setSystemTime` 固定（两个 client 测试加载器把测试进程的 `Date` 传入 vm 上下文），断言不随真实日期漂移。真实宿主 GUI 中的列表与保存流程未实机验收 |
+| 附属功能模块注册表 + `image-gen` 图像生成工具（未发布） | 2026-11-27 Windows / 系统 Node：全量 58 文件 / 1019 项通过、1 项跳过（`npm run check` 含 typecheck + test + build）。`tests/features-registry.test.ts` 13 项锁定规格/实现加载期双向校验（缺实现、孤儿实现、重复 id、空 compatibleModes、端点越界）、端点安全域（仅 https + Google 已知域）、动态挂载的幂等差量同步、`sync` 的 `force` 选项先卸载再重挂、模式不兼容跳过、未知 id 忽略、mount 抛错不阻断、dispose 全卸载；`tests/client-loader.test.ts` 锁定 client 内置 `FEATURES` 表的 id / defaultEnabled 与 host `FEATURE_SPECS` 一致；`tests/client-interaction.test.ts` 把 `features` 纳入复合字典字段排除（与 `modelOverrides` / `orchestrator` 同模式），设置卡只提交即时字段的断言仍通过。协议口径（端点、模型校验、`responseModalities` 请求体、`inlineData` 递归解析）与同 auth-core 3.0.14 的 `dsh-tool-antigravity` 0.5.2 对齐。全部为注入依赖的合成测试，未触真实上游与账户；真实代理账户端到端生成、宿主 GUI 中 `agy_image_generate` 工具的调用与图片块渲染、原图文件下载均未实机验收 |
+| AI Studio 独立 provider + Gemini 流解析层抽取（未发布） | 2026-11-27 Windows / 系统 Node：全量 63 文件 / 1085 项通过、1 项跳过（`npm run check` 含 typecheck + test + build）。解析层抽取（`gemini-stream.ts` 共享生成器 + 块组装器工厂）以代理既有测试全绿为门槛、行为不变；`parseProxyProviderEvent` 标签参数化不破坏代理断言。AI Studio 59 项单测：`tests/aistudio-discovery.test.ts`（发现过滤 / 容量 / 去重 / 分页 / catalogId↔wireModel / 段转义 / URL 不含 key / 非聊天模态过滤 / 仅 4 系默认启用谓词）、`tests/aistudio-payload.test.ts`（标准 Gemini contents / systemInstruction / 思考 thought:true / 工具绑定 / 错误结果 / 孤立结果 PROTOCOL_DRIFT / replay 签名回填与块签名优先 / generationConfig / temperature 越界 / 工具净化 / 图片 UNSUPPORTED_MODALITY）、`tests/aistudio-adapter.test.ts`（直挂 candidates 文本 / 思考 / 工具流、多轮 thoughtSignature 经 replay 回填进请求体、usage、x-goog-api-key 头鉴权且 URL 不含 key、HTTP 401/429/400 上下文超限映射、流内 error→finish error、缺 key AUTH 不发请求、凭据接缝解析拒绝→可读 LlmError 不泄漏原始 rejection、空响应 EMPTY_RESPONSE、目录缓存 TTL/force/失败保留、resolveModel 容量与文本模态、target 改写线模型、prepareCall 解析模型并经 stream 闭包派发（target 映射）、真实上游帧形态（CRLF 分隔 + modelVersion/responseId 额外字段 + thoughtSignature + functionCall）、多轮 tool-call+text 多块 replay 签名对齐、目录外 INVALID_MODEL、默认仅 4 系进选择器 / 非 4 显式启用后出现 / 仅改显示名不启用）、`tests/aistudio-settings-bus.test.ts`（默认引用名 / trim / 开关与引用名变化通知 / 无变化不通知 / 退订 / 透传）、`tests/aistudio-remote.test.ts`（8 项：models 目录投影与 force 透传 / 失败折叠 error 并脱敏 / setKey 经 `credentials.set` 写入引用名 trim 后只写不回显 / 写入失败脱敏 / 凭据缺席与无效引用名与空值可读 error / keyStatus describe 掩码视图绝不返回全值 / 描述符 service·namespace·method·id 对齐与 setKey 必填参数）。`tests/client-interaction.test.ts` 即时字段输入框一致性锁定纳入 `aistudioEnabled` / `aistudioCredentialRef`，`belongsToMode` 排除 `aistudio-` 键；新增 AI Studio Tab 用例（专属模型表无思考档列、显示名覆盖生效、手动 key 经 `agyAistudio.setKey` 写入、默认仅 4 系开启 + 启用置顶 + 非 4 系显式启用落盘）。`tests/quota-remote.test.ts` / `tests/client-loader.test.ts` 命名空间与描述符一致性锁定纳入 `agyAistudio`（models / setKey / keyStatus，与 `agyQuota` / `agyProxyAccount` 合并进同一 contribution）；另锁定 client 内置 `aistudioDefaultEnabled` 与 host 逐 ID 同结论。单测为注入依赖的合成测试（mock fetch / SSE）。**真实 key 探针已核实上游契约**（2026-11-27，用户自备 key，经环境代理）：① `x-goog-api-key` 头鉴权生效——`GET /v1beta/models` 与 `POST :streamGenerateContent?alt=sse` 均 200，key 不进 URL；② 发现响应字段（`name`/`displayName`/`inputTokenLimit`/`outputTokenLimit`/`supportedGenerationMethods`）与发现解析吻合，返回 50 模型 / 49 支持 generateContent；③ SSE 为裸 `{candidates,usageMetadata,modelVersion,responseId}`、**CRLF `\r\n\r\n` 分隔**（`iterateProxySse` 原生处理 `\r\n`），思考/工具部分携带 `thoughtSignature`。真实形态已锁进单测（CRLF + 额外字段 + thoughtSignature + functionCall + usage）。**真实发现**：`gemini-2.5-flash` 对新用户停用（目录列出但生成 404，上游推荐 `gemini-3.8-flash`）；`gemini-3.8-flash` 正常生成——目录含对当前 key 不可生成的模型，adapter 对此报可读 404，不做逐模型探测过滤。**工具往返 + 多轮 replay 集成核实**：用编译后的真实 `AistudioAdapter` 对真实上游跑 `get_weather` 工具触发→`functionResponse` 回填→续答两轮——Turn 1 finish `tool-calls`（`get_weather`/`{city:Paris}`，replay 含真实 `thoughtSignature`），Turn 2 finish `stop` 并正确引用回填值续答；usage 不相交计数（input/output/reasoning/total）正确。关键约束：回填的 `functionCall` part **必须**携带 `thoughtSignature`（上游强制，缺失报 400），且助手内容须用流发出的**全部块**忠实重建（与 `replayState.blocks` 同源同序），`compatibleAistudioReplayState` 按 kinds 长度+顺序对齐才取回签名——只取 tool-call 单块会因长度不匹配拒绝致签名丢失。该真实多块对齐形态已锁进单测。**全链路经真实宿主 `BlockAssembler` 核实**：把真实 adapter 流喂进宿主 `BlockAssembler`（`@deepseek-ai/dsh-llm` 导出），用其 `blocks()`/`replayState` 重建助手消息再续轮，签名正确附上。宿主正常路径 `assembled()` 保留全部块（含空 text，空块过滤仅在 `interruptedBlocks()` 中断路径），replay 信封按 `blocks.length` 对齐保留、max-tokens 时块与 replay 同步裁剪——故 adapter 发出块（`states.map`）与宿主存储内容 kinds 恒对齐，签名不丢。该全链路已锁进单测。宿主 GUI 中选择 AI Studio 模型聊天与工具回填仍待用户实机验收 |
 | prompt 字节预算与裁剪可观测（#16） | 系统 Node 24：`tests/history-notices.test.ts` 锁定事件日志有界与最新在前；`tests/settings-schema.test.ts` 覆盖 `promptByteBudget` 默认值、越界拒绝与非 volatile；`tests/acp-adapter.test.ts` 在 FakeAcpAgent 下验证配置预算传入 prompt 组装、超限裁剪触发 `onHistoryNotice` 且提示块与实际字节不超预算；`tests/quota-remote.test.ts` 验证裁剪事件只随 read 附带、不写入快照存储；真实 React renderer 验证药丸警示、详情文案与 10 分钟窗口过期不提示。真实长会话 GUI 裁剪提示未实机验收 |
 | 上下文容量审计回退（#17） | 系统 Node 24：`tests/model-capacity.test.ts` 锁定 Neon / Hydrogen 登记值、auth-core 快照家族值与未知家族 undefined；`tests/acp-adapter.test.ts` 验证未实测家族声明审计容量、实测优先于审计、目录行 `contextWindowSource` 随观测状态切换；`tests/settings-control.test.ts` 验证来源字段透传；真实 React renderer 验证「审计参考」标注与实测文案不混淆。宿主压缩引擎报错路径按已安装 Core `0.2.2-rc.5` 源码核对（`dsh-compaction-basic` 模型切换 / 溢出恢复对无容量路由抛错），未在真实账号 GUI 复现原始报错 |
 | 代理 429 诊断（#14） | 系统 Node 24：`tests/proxy-adapter.test.ts` 覆盖 HTTP 429 配额耗尽分支附带 JSON `error.message`（脱敏、保留重置时间）、普通限流分支既有口径、流内限流事件附带上游原话并脱敏。真实账户 429 复现未执行（探针期间观测到 ACP 线配额耗尽文案 `reached your current quota`，已纳入耗尽识别） |
 | 工具 / runtime | 假 ACP / MCP、乱序工具结果、池所有权、续轮变更、取消、写入阻塞和回收 |
+| ACP 新版 MCP 权限提示（#28） | `tests/permission-handoff.test.ts` 覆盖旧格式、新版名称与标题、8 位后缀、跨会话、外部元数据和歧义名称。`tests/acp-adapter.test.ts` 用假 ACP agent 和真实 loopback MCP 桥核对单次许可、工具摘要不触发参数告警、实际参数与工具结果回原 prompt。未运行真实 Antigravity CLI 或宿主 GUI。 |
 | 工具目录预算（#18） | 真实探针（官方 1.5.2 缓存二进制 + 本机登录态，`scripts/probe-tool-budget.mjs`）：60,197 字节 / 24 工具全可见；100,197 字节丢前 4 个 12KB 描述工具（其余 20 个可见），确认丢弃层在官方 agent / 上游。系统 Node 24：`tests/tool-catalog.test.ts` 锁定预算内 / 禁用原样、最长优先裁剪、UTF-8 边界、参数单独超限尽力而为；`tests/acp-adapter.test.ts` 验证发布到 MCP 桥前裁剪、名称参数不变、告警留痕与预算内不告警。裁剪后真实长工具集 GUI 验收未执行 |
 | Claude 历史工具批次 | 桌面 Core `0.2.2-rc.5` + 真实 Sonnet 5.5 `medium`：并行两个工具只回填一个后续发消息，已安装 0.1.42 上游 HTTP 400 / `PROTOCOL_DRIFT`；候选用同一历史正常完成（HTTP 200），两个结果都缺失时也正常完成；当前批次未收齐时在本地返回 `INVALID_ARGS`，不派发 |
 | 图片 | 附件引用校验、图片内容映射与跨 worker 能力；代理模式 inlineData 准入、12MB 预算与 offload 协商、附件缺席降级；未调用真实视觉模型 |
@@ -144,7 +156,7 @@ node scripts/preview-ui.mjs
 
 1. 核对版本、锁文件、变更范围、文档与测试；确保目标版本未发布。
 2. 提交并推送到目标分支，确认远端 SHA 与已验证内容一致。
-3. 手动在对应 ref 运行工作流。现有任务使用 GitHub-hosted Ubuntu、Node 24，执行 `npm ci --ignore-scripts`、`npm run check`，再 `npm publish --provenance --access public`。
+3. 手动在与包版本同名的 `v<version>` 标签运行工作流。任务在 GitHub-hosted Ubuntu / Node 24 校验标签与版本一致，执行 `npm ci --ignore-scripts`、`npm run check`，并通过 `npm pack --dry-run --ignore-scripts --json | node scripts/check-npm-pack.mjs` 校验打包清单，再 `npm publish --provenance --access public`。
 4. 观察这一次运行的 SHA、检查结果与 publish 步骤。失败时先判断是否已经产生远端副作用，不盲目重跑同一版本。
 5. 在 registry 核对版本、dist-tag、tarball、仓库来源和 provenance；仅 workflow 返回成功还不足以宣称用户已装上该版本。
 
@@ -155,7 +167,7 @@ npm view dsh-bundle-antigravity-host version dist-tags --json
 npm view dsh-bundle-antigravity-host@0.1.24 version gitHead dist --json
 ```
 
-发布使用 npm trusted publishing 的 GitHub Actions OIDC，工作流声明 `id-token: write`，不应为本流程保存长期 npm 写入 token。npm 上必须已有与仓库 / 工作流匹配的 trusted publisher 授权；本地 `npm whoami` 不能验证 CI 的 OIDC 权限。当前流程不创建 GitHub Release，也不安装 / 升级任何本机 Profile。
+发布使用 npm trusted publishing 的 GitHub Actions OIDC，工作流声明 `id-token: write`。npm 上必须已有与仓库 / 工作流匹配的 trusted publisher 授权。GitHub Release 单独创建并指向同一个版本提交；工作流不安装或更新本机 Profile。
 
 ## 文档来源与已知覆盖缺口
 

@@ -35,6 +35,7 @@ class FakeWorker implements AcpWorker {
     get busy() { return owner(this).busy },
     stream: (options) => this.stream(options),
     listModels: vi.fn(async () => this.catalog),
+    listSettingsModels: vi.fn(async () => this.catalog),
     resolveModel: vi.fn(async () => this.resolved),
     warmup: vi.fn(async () => { this.running = true; await this.warmupGate?.promise }),
     discoverModels: vi.fn(async () => { this.running = true; await this.discoveryGate?.promise; return this.catalog }),
@@ -114,6 +115,23 @@ function outcome<T>(promise: Promise<T>) {
 afterEach(async () => {
   for (const pool of pools.splice(0)) await pool.dispose()
   vi.useRealTimers()
+})
+
+it('切到代理再切回时，拒绝旧 ACP 排队和已准备请求，但不打断已运行的提示', async () => {
+  const { pool, workers } = setup({ capacity: 1 })
+  const prepared = await pool.prepareCall('test', 'model')
+  const active = run(pool, request('active'))
+  await flush()
+  const queued = outcome(run(pool, request('queued')))
+  await flush()
+  pool.setEnabled(false)
+  pool.setEnabled(true)
+  expect(await queued).toMatchObject({ ok: false, error: { code: AGY_TURN_ERROR.ABORTED } })
+  const stale = (async () => { for await (const _ of prepared.stream(request('stale'))) { /* no work should reach the worker */ } })()
+  await expect(stale).rejects.toMatchObject({ code: AGY_TURN_ERROR.ABORTED })
+  expect(workers[0]!.calls.map(call => call.options.sessionId)).toEqual(['active'])
+  workers[0]!.calls[0]!.complete('finish')
+  expect((await active).at(-1)).toMatchObject({ type: 'finish', reason: { kind: 'stop' } })
 })
 
 describe('会话粘性（ACP 会话复用需要同一 worker）', () => {
@@ -579,9 +597,13 @@ describe('PooledAcpAdapter scheduling with independent fake workers', () => {
   it('passes the requested interactive-auth policy to model discovery', async () => {
     const { pool, workers } = setup()
     const controller = new AbortController()
+    const discovery = vi.mocked(workers[0]!.adapter.discoverModels)
     await pool.discoverModels(controller.signal, false)
-    expect(workers[0]!.adapter.discoverModels).toHaveBeenLastCalledWith(controller.signal, false)
+    expect(discovery).toHaveBeenLastCalledWith(expect.any(AbortSignal), false)
+    const first = discovery.mock.lastCall![0]!
     await pool.discoverModels(controller.signal)
-    expect(workers[0]!.adapter.discoverModels).toHaveBeenLastCalledWith(controller.signal, true)
+    expect(discovery).toHaveBeenLastCalledWith(expect.any(AbortSignal), true)
+    controller.abort()
+    expect(first.aborted).toBe(true)
   })
 })

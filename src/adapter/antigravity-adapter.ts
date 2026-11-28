@@ -21,7 +21,8 @@ import type {
   TokenUsage,
   ToolSchema,
 } from '@deepseek-ai/dsh-llm'
-import type { AdapterPreparedCall, AdapterRequestOptions, AdapterRequestOwner } from './request-options.js'
+import type { AcpRequestOptions, AdapterPreparedCall, AdapterRequestOptions, AdapterRequestOwner } from './request-options.js'
+import { isNonChatModel } from './model-catalog-policy.js'
 import type { AnyRequest, McpServer as AcpMcpServer, PromptResponse, SessionConfigOption, SessionNotification, Usage } from '@agentclientprotocol/sdk'
 import { AgentLinkError } from '../protocol/agent-link.js'
 import type { AgentLink, AgentLinkHandlers } from '../protocol/agent-link.js'
@@ -591,7 +592,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       throwIfAborted(signal)
       if (!findModelSelector(session.configOptions)) throw llmError('ACP 会话未提供模型目录', AGY_ADAPTER_ERROR.NO_MODEL_SELECTOR)
       this.observeSessionConfigOptions(session.configOptions)
-      return await this.listModels(AGY_PROVIDER_ID)
+      return await this.listSettingsModels(AGY_PROVIDER_ID)
     } catch (error) {
       if (link) this.#scheduleRecycle(link)
       throw error
@@ -697,6 +698,15 @@ export class AntigravityAcpAdapter extends LlmAdapter {
    * （adapter/model-retirement.ts）经可见性层默认关闭，用户可显式重新启用。
    */
   override async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+    return this.#listCatalog(_provider, false)
+  }
+
+  /** Settings can enable any observed chat model, including those off by default. */
+  async listSettingsModels(provider: string): Promise<readonly LlmModelInfo[]> {
+    return this.#listCatalog(provider, true)
+  }
+
+  async #listCatalog(_provider: string, includeDisabled: boolean): Promise<readonly LlmModelInfo[]> {
     const folded = await this.#foldCatalog(_provider)
     const orch = this.#orchestratorSettingsSnapshot()
     const observedFamilies = await this.#observedAcpFamilies(_provider)
@@ -718,7 +728,8 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     const visible = offered === undefined
       ? candidates
       : candidates.filter((model) => model.id === ORCHESTRATOR_MODEL_ID || offered.has(model.id))
-    const models = applyModelSettings(this.#modelSettingsSnapshot(), visible)
+    const settings = this.#modelSettingsSnapshot()
+    const models = applyModelSettings(settings, includeDisabled ? visible : visible.filter(({ id }) => !isNonChatModel(modelSettingFor(settings, id).target ?? id)), includeDisabled)
     return [
       ...models.map((model) => {
         // 实测容量优先；未实测时用审计参考值（issue #17），来源随目录行下发，
@@ -822,12 +833,13 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     // 磁盘缓存来自 ACP 原始档位观测，优先于其它 worker 的 CLI 家族兜底。
     const cached = this.#catalog.length > 0 ? this.#catalog : await this.#cachedModels(provider)
     const source = cached.length > 0 ? cached : [...this.#fallbackCatalog]
-    const observed = source.filter((model) => model.id !== AGY_PLACEHOLDER_MODEL_ID)
+    const observed = source.filter((model) => model.id !== AGY_PLACEHOLDER_MODEL_ID && !isNonChatModel(model.id))
     // ACP 目录（会话观测或其磁盘缓存）是当前认证方式下的权威清单：官方 server
     // 对清单外的型号直接拒绝 set_config_option（实测 oauth-personal 下 Claude 报
     // 「not available for the current authentication method」）。此时 CLI 清单仍
     // 参与档位表（路由不变），但选择器只列 ACP 提供的家族；尚无 ACP 目录时整份兜底。
-    const offered = observed.length > 0 && cached.length > 0 ? new Set(observed.map((model) => modelFamilyId(model.id))) : undefined
+    const offered = cached.some(model => model.id !== AGY_PLACEHOLDER_MODEL_ID)
+      ? new Set(observed.map(model => modelFamilyId(model.id))) : undefined
     const cliRows = await this.#cliRawRows()
     const folded = foldAgyModelFamilies([
       ...observed
@@ -910,6 +922,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
    * 真正的能力拒绝发生在 ACP 会话侧（模型不存在时 agent 自行报错）。
    */
   override async resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+    assertChatModel(model, modelSettingFor(this.#modelSettingsSnapshot(), model).target)
     // 显示名与档位不能只依赖此前是否有人列过目录；跨 worker 导入目录后
     // 也要走同一份折叠结果。这里仅读缓存，不启动 ACP 连接。
     const folded = await withAbort(this.#foldCatalog(provider), signal)
@@ -1039,7 +1052,8 @@ export class AntigravityAcpAdapter extends LlmAdapter {
    */
   #leadingEmittedBlock: ContentBlock | undefined
 
-  override async *stream(options: AdapterRequestOptions): AsyncIterable<StreamChunk> {
+  override async *stream(options: AcpRequestOptions): AsyncIterable<StreamChunk> {
+    assertChatModel(options.model)
     // temperature / stop 在 ACP v1 没有会话通道：不因它们拒绝整个请求（否则宿主里
     // 任何携带这两个字段的流程都会整单失败），只明确告知「值不生效」。
     const unsupported = unsupportedOptions(options)
@@ -1057,6 +1071,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     this.#clearIdleRecycle()
     let handedOff = false
     try {
+      options.admissionSignal?.throwIfAborted()
       const inner = options.model === ORCHESTRATOR_MODEL_ID
         ? this.#streamOrchestrated(options)
         : this.#streamExclusive(options)
@@ -1450,7 +1465,8 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   }
 
   /** 同一时刻只有一个 stream 能创建/切换会话或消费回合队列。 */
-  async *#streamExclusive(options: AdapterRequestOptions): AsyncGenerator<StreamChunk> {
+  async *#streamExclusive(options: AcpRequestOptions): AsyncGenerator<StreamChunk> {
+    options.admissionSignal?.throwIfAborted()
     const tail = trailingToolResults(options.messages)
     let turn = this.#turn
     if (turn?.awaitingToolResults) {
@@ -1485,7 +1501,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
    *   只在计划真正改变（或新轮）时才不匹配并触发 `#abandonTurn` 全量重建；
    *   相同计划或规划失败降级时沿用原 `system`，工具结果经原 MCP 桥只回填一次。
    */
-  async *#streamOrchestrated(options: AdapterRequestOptions): AsyncGenerator<StreamChunk> {
+  async *#streamOrchestrated(options: AcpRequestOptions): AsyncGenerator<StreamChunk> {
     const orch = this.#orchestratorSettingsSnapshot()
     if (!orch.enabled) {
       const executorOptions: AdapterRequestOptions = {
@@ -1519,6 +1535,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
 
     if (decision.plan) {
       const result = await this.#runAcpPlanner(options, orch, requestedPlannerEffort, goal, evidence, storedState.plan, sessionId)
+      options.admissionSignal?.throwIfAborted()
       if (options.signal?.aborted) {
         yield {
           type: 'finish',
@@ -1580,7 +1597,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
   }
 
   async #runAcpPlanner(
-    options: AdapterRequestOptions,
+    options: AcpRequestOptions,
     orch: OrchestratorSettings,
     plannerEffort: string,
     goal: string,
@@ -1597,7 +1614,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       ? AbortSignal.any([callerSignal, timeoutController.signal])
       : timeoutController.signal
 
-    const key = sessionKey ?? 'anonymous'
+    const key = sessionKey || undefined
     let entry: PlannerSessionEntry | undefined
     let promptSettled = false
     let plannerUsage: TokenUsage | undefined
@@ -1613,13 +1630,13 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       throwIfAborted(combinedSignal)
 
       // 复用前提：同一链路且尚未关闭且 cwd 一致
-      const cached = this.#plannerSessions.get(key)
-      if (cached && !cached.link.closed && cached.link === link && cached.cwd === this.#cwd) {
+      const cached = key === undefined ? undefined : this.#plannerSessions.get(key)
+      if (key !== undefined && cached && !cached.link.closed && cached.link === link && cached.cwd === this.#cwd) {
         this.#plannerSessions.delete(key)
         this.#plannerSessions.set(key, cached)
         entry = cached
       } else {
-        if (cached) {
+        if (key !== undefined && cached) {
           this.#plannerSessions.delete(key)
           if (!cached.link.closed) this.#closeSession(cached.link, cached.sessionId)
         }
@@ -1636,7 +1653,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
           cwd: this.#cwd,
           configOptions: created.configOptions ?? [],
         }
-        this.#rememberPlannerSession(key, entry)
+        if (key !== undefined) this.#rememberPlannerSession(key, entry)
       }
       sessionIdForPrompt = entry.sessionId
 
@@ -1738,6 +1755,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       let promptResponse: PromptResponse
       let promptPromise: Promise<PromptResponse> | undefined
       try {
+        options.admissionSignal?.throwIfAborted()
         // 不传 signal 给 link.prompt：与 PromptTurn 一致，我们需要在 session/cancel 后
         // 保留 JSON-RPC pending 槽位以观察对端是否回复了终态 PromptResponse。
         promptPromise = link.prompt({
@@ -1750,7 +1768,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         promptSettled = true
       } catch (error) {
         if (promptPromise && sessionIdForPrompt) {
-          this.#plannerSessions.delete(key)
+          if (key !== undefined) this.#plannerSessions.delete(key)
           void link.cancel(sessionIdForPrompt).catch(() => undefined)
           const graceMs = callerSignal?.aborted
             ? (this.#keepProcessAfterCancel ? this.#cancelGraceMs : 0)
@@ -1761,6 +1779,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
           if (confirmed) {
             promptSettled = true
             this.#closeSession(link, sessionIdForPrompt)
+            entry = undefined
           } else {
             this.#scheduleRecycle(link)
           }
@@ -1782,7 +1801,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     } catch (error) {
       if (linkForPrompt && !promptSettled && !this.#unrecycledLink) {
         // setup 阶段（newSession / setConfigOption）超时或取消，未进入 prompt
-        this.#plannerSessions.delete(key)
+        if (key !== undefined) this.#plannerSessions.delete(key)
         this.#scheduleRecycle(linkForPrompt)
       }
       if (callerSignal?.aborted) return {}
@@ -1790,6 +1809,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       return { ...(plannerUsage === undefined ? {} : { usage: plannerUsage }) }
     } finally {
       clearTimeout(timeoutTimer)
+      if (key === undefined && promptSettled && entry !== undefined) this.#closeSession(entry.link, entry.sessionId)
       if (this.#plannerCollector?.sessionId === sessionIdForPrompt) {
         this.#plannerCollector = undefined
       }
@@ -1906,9 +1926,10 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     }
   }
 
-  async *#runNewRound(options: AdapterRequestOptions): AsyncGenerator<StreamChunk> {
+  async *#runNewRound(options: AcpRequestOptions): AsyncGenerator<StreamChunk> {
     this.#clearIdleRecycle()
     await withAbort(this.#settleRecycle(), options.signal)
+    options.admissionSignal?.throwIfAborted()
     if (this.#disposed) throw llmError('Antigravity ACP adapter 已卸载', 'AGY_LINK_CLOSED')
     this.#turnOwner = {
       ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
@@ -2029,10 +2050,19 @@ export class AntigravityAcpAdapter extends LlmAdapter {
     )
     // 复用会话只发增量；否则全量重建（含 system、工具策略与历史强调块）。
     let content: Awaited<ReturnType<typeof buildPromptWithImages>>
+    let record = reused
     try {
       content = reused
         ? await buildPromptDeltaWithImages(incrementalMessages(options.messages, reused.sentCount), this.#imageOptions(options.signal))
         : await buildPromptWithImages(options.system, options.messages, tools, this.#imageOptions(options.signal))
+      options.admissionSignal?.throwIfAborted()
+      if (record === undefined && key !== undefined && this.#reuseSessions) record = this.#rememberSession(options, key, link, sessionId)
+      // 新 prompt 尚未开始，旧恢复游标不能再用于并发恢复。
+      if (record) {
+        this.#sessionStore?.delete(record.key, this.#sessionOwner)
+        if (this.#sessionStore) await withAbort(this.#sessionStore.flush(), options.signal)
+      }
+      options.admissionSignal?.throwIfAborted()
     } catch (error) {
       // prompt 还没发出去就失败（图片不可用 / 被取消 / 内容不支持）：刚建立的
       // ACP 会话与磁盘 claim 必须当场回收，不能只靠空闲回收兜底。
@@ -2044,25 +2074,16 @@ export class AntigravityAcpAdapter extends LlmAdapter {
         this.#ephemeral.delete(turn)
         this.#closeSession(ephemeral, turn.sessionId)
       }
-      if (reused) this.#dropSession(reused, 'prompt 构造失败')
+      if (record) this.#dropSession(record, 'prompt 构造失败')
       else if (key !== undefined) this.#sessionStore?.unclaim(key, this.#sessionOwner)
       this.#lifecycle?.failed(error)
       throw error
-    }
-    this.#lifecycle?.promptSent()
-    // 全量重建后先把「已发送」记到本轮完整历史，之后才有资格复用。
-    const record = reused ?? (key !== undefined && this.#reuseSessions
-      ? this.#rememberSession(options, key, link, sessionId)
-      : undefined)
-    // 在新 prompt 在途期间，不把上一轮的旧游标继续当作可恢复状态。
-    if (record) {
-      this.#sessionStore?.delete(record.key, this.#sessionOwner)
-      if (this.#sessionStore) await withAbort(this.#sessionStore.flush(), options.signal)
     }
     if (this.#disposed) {
       turn.abort('adapter 已卸载')
       throw llmError('Antigravity ACP adapter 已卸载', 'AGY_LINK_CLOSED')
     }
+    this.#lifecycle?.promptSent()
     turn.startPrompt(content, options.signal)
     try {
       let chunks = 0
@@ -2384,6 +2405,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
             : family
       },
     })
+    assertChatModel(model, requested)
     const selector = this.#modelSelector
     if (!selector) {
       throw llmError(
@@ -2453,6 +2475,10 @@ export function explainUnavailableModel(error: unknown, model: string): unknown 
     `${error.message}（官方 ACP 当前登录方式不提供 ${model}，请在模型选择里换用 ACP 目录内的型号，或改用代理模式）`,
     { cause: error, ...(error.jsonRpc === undefined ? {} : { jsonRpc: error.jsonRpc }) },
   )
+}
+
+function assertChatModel(model: string, target = model): void {
+  if (isNonChatModel(model) || isNonChatModel(target)) throw llmError('ACP 文本路由不支持此模型或映射目标', 'INVALID_MODEL')
 }
 
 function throwIfAborted(signal?: AbortSignal): void {

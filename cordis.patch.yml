@@ -1,7 +1,11 @@
-# 两行组件：
+# 五行组件：
 # - llm-antigravity-acp：官方 ACP 宿主（默认模式），不写入任何 agent-default-model row；
 # - antigravity-proxy-router：代理模式路由（默认关闭，proxyMode 开启后注册
-#   antigravity-proxy 并由宿主行注销 antigravity-acp，两者互斥）。
+#   antigravity-proxy 并由宿主行注销 antigravity-acp，两者互斥）；
+# - antigravity-aistudio-router：AI Studio 独立 provider（默认关闭，aistudioEnabled
+#   开启后注册 aistudio，用 Gemini API key 直连；与 ACP / 代理并存，不参与互斥仲裁）。
+# - antigravity-vertex-ai-router：标准 Vertex AI 独立 provider（默认关闭，走 Google ADC）。
+# - antigravity-colab：独立启停的 Colab 工具组件（默认关闭）。
 - insert:
     - id: llm-antigravity-acp
       name: dsh-bundle-antigravity-host
@@ -9,3 +13,13 @@
     - id: antigravity-proxy-router
       name: dsh-bundle-antigravity-host/proxy
       inject: [llm, antigravityProxyAuth, antigravityProxyMode]
+    - id: antigravity-aistudio-router
+      name: dsh-bundle-antigravity-host/aistudio
+      inject: [llm, antigravityAistudioSettings]
+    - id: antigravity-vertex-ai-router
+      name: dsh-bundle-antigravity-host/vertex
+      inject: [llm, subprocess, antigravityVertexSettings]
+    - id: antigravity-colab
+      name: dsh-bundle-antigravity-host/colab
+      disabled: true
+      inject: [tools, subprocess]

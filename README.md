@@ -4,13 +4,13 @@
 
 **在 DSH 里使用 Antigravity 模型，工具仍交给 DSH。**
 
-接入 Google 官方 Antigravity ACP agent，在同一个对话界面选择模型、查看额度、预热连接。
+把 Antigravity ACP、Google AI Studio 和 Vertex AI 接入同一个 DSH 模型选择器，还可按需启用 Google Colab 工具。
 
 [![npm](https://img.shields.io/npm/v/dsh-bundle-antigravity-host?color=3b82f6&label=npm)](https://www.npmjs.com/package/dsh-bundle-antigravity-host)
 [![license](https://img.shields.io/badge/license-MIT-64748b)](LICENSE)
 [![Node.js](https://img.shields.io/badge/Node.js-%E2%89%A522.19-64748b)](#兼容性与验证范围)
 
-[快速开始](#快速开始) · [功能预览](#功能预览) · [功能亮点](#功能亮点) · [配置参考](docs/configuration.md) · [排障](docs/reference.md#排障) · [更新记录](docs/changelog.md)
+[快速开始](#快速开始) · [选择接入方式](#选择接入方式) · [功能预览](#功能预览) · [配置参考](docs/configuration.md) · [更新记录](docs/changelog.md)
 
 <img src="https://raw.githubusercontent.com/KouzakiUmi/dsh-antigravity-acp/main/assets/banner.svg" width="1200" alt="Antigravity ACP for DSH：官方 Antigravity agent 经 ACP 与私有 loopback 桥相连，工具调用交给 DSH 校验、审批与执行，结果回填 agent（示意图）">
 
@@ -18,27 +18,7 @@
 
 ---
 
-> **0.1.47 · Linux 连接修复与默认版本升级**：解压守卫按全平台官方包实测体积校准（单条目 1.5 GiB、总量 2 GiB），修复 Linux 下 `AGY_ARCHIVE_TOO_LARGE` 导致 ACP 连接失败（#13）；默认 ACP server 升级到 1.5.2。类型检查、**48 个文件 / 865 项测试**与构建通过，并经真实凭据端到端 smoke 验证。[查看更新记录](docs/changelog.md#0147--2026-11-22)
-
-> **0.1.46 · 客户端 i18n 与可靠性修复**：设置卡片、额度药丸与 Host 固定状态文本支持简体中文 / English（语言取自浏览器，缺译回落中文）；移除 `cloakSensitiveWords` 开关；修复恢复路径绕过会话表 64 项容量上限。类型检查、**48 个文件 / 864 项测试**与构建通过。[查看更新记录](docs/changelog.md#0146--2026-11-20)
-
-> **0.1.43 · 思考摘要、图片和上下文**：代理模式接入 Hydrogen / Neon 的思考摘要和图片输入，显示目录容量及准确的会话用量；额度改为由 Host 独立刷新、界面读取本地快照。[查看更新记录](docs/changelog.md#0143--2026-11-19)
-
-> **0.1.42 · 代理模式新增模型**：接入 Gemini 4 Hydrogen 和 Gemini 4 Neon，按当前账户实际可用的思考档位派发，已实测两组模型的短文本生成。[查看更新记录](docs/changelog.md#0142--2026-11-19)
-
-> **0.1.41 · 代理模型目录修复**：模型目录移除单独的 256 KiB 阈值，沿用普通响应预算；已用真实 Google 回包复现旧版错误并验证修复。[查看更新记录](docs/changelog.md#0141--2026-11-19)
-
-> **0.1.40 · 代理长响应修复**：代理生成流总量上限从 8 MiB 提高到 64 MiB，单个 SSE 帧仍限 2 MiB。[查看更新记录](docs/changelog.md#0140--2026-11-19)
-
-> **0.1.39 · DSH 兼容性与代理可靠性**：对齐 Core 0.2.2-rc.3 并保留旧版自定义错误码；代理目录过滤禁用模型和档位，工具联合分支保留主 Schema 字段，项目探测临时失败时复用已保存的项目查询额度。[查看更新记录](docs/changelog.md#0139--2026-11-19)
-
-> **0.1.36 · 紧凑设置与账户隔离**：设置页改为连接 / 模型 / 额度 / 高级分页，无修改时隐藏保存横幅；模型使用紧凑列表，支持搜索、筛选、批量启停与完整详情。修复 ACP 复用会话沿用旧映射、代理目录跨账户残留、刷新失败误换 CLI 账户及额度来源错配。类型检查、**44 个文件 / 804 项测试**与构建通过。[查看更新与限制](docs/changelog.md#0136--2026-11-04)
-
-> **0.1.25**：修复冷启动时登录 / 预热握手超时（新增 `handshakeTimeoutMs`，默认 120 秒），默认开启预热并显示启动进度。类型检查、**33 个文件 / 515 项测试**与构建通过；真实 Desktop GUI 与跨平台验收尚未完成。[查看本次更新与限制](docs/changelog.md#0125--2026-10-22)。上一版 0.1.24 的并发池、模型发现与图片输入见[更新记录](docs/changelog.md#0124--2026-10-22)。
-
-> **0.1.31 · 一轮可靠性加固**：额度 HTTP 取数补超时（挂起的请求不再让药丸永久停在读取中）、401/403 重试改按状态码判断、非法代理不再让插件装载失败、恢复会话失败归还磁盘 claim、单条畸形 JSON-RPC 帧只丢弃不再判死整条链路、zip 解压加压缩炸弹上限。本地类型检查、**38 个文件 / 658 项测试**与构建通过。发布不代表本机安装已更新。[查看更新与生效边界](docs/changelog.md#0131--2026-10-30)
-
-> **0.1.35 · 代理模式与完整设置**：保存 `proxyMode` 即注销 ACP，不再因代理组件缺席或注册失败回退官方进程；设置页补齐启动、并发、排队与各类超时控制，保存栏随滚动常驻顶部，对话药丸保留原尺寸且只留一个额度入口。本版本与 0.1.32–0.1.34 合并发布（npm 从 0.1.31 直达 0.1.35）。类型检查、**44 个文件 / 792 项隔离测试**与构建通过；真实账户与安装后的 GUI 尚待验收。[查看更新与生效边界](docs/changelog.md#0135--2026-11-03)
+> **0.1.56 · 模型目录与设置界面**：四条路由统一排序、显示名和旧版标记，AI Studio 与 Vertex AI 默认只启用 Gemini 4 对话模型。设置页支持键盘切换和窄屏换行，额度与限流文本共用宿主字体。[完整更新记录](docs/changelog.md#0156--2026-11-28)
 
 ## 快速开始
 
@@ -56,6 +36,18 @@ dsh plugin --profile web add dsh-bundle-antigravity-host
 
 **额度或 AI Credits 没有显示？** 额度查询默认不调用本机 `agy`。ACP 套餐额度走内置直连，代理模式走代理账户；AI Credits 默认不查询。只有在设置页「额度」打开「用 agy CLI 查询额度」并保存后，才会调用 `agy -p /usage` 与 `agy -p /credits`。ACP 登录成功不代表 CLI 也已登录。[登录态与数据来源](docs/reference.md#登录态与额度来源)
 
+## 选择接入方式
+
+| 接入 | 从哪里开启 | 使用的账号或凭据 |
+|---|---|---|
+| **Antigravity ACP（默认）** | 设置 → 连接 / 登录 ACP | Antigravity 官方登录态 |
+| **Antigravity 代理** | 设置 → 运行模式 | 独立连接的 Google 代理账户；开启后停用 ACP |
+| **Google AI Studio** | 设置 → AI Studio | Gemini API key；此 Host 的用量和限流单独显示，项目总量见 AI Studio 看板 |
+| **Vertex AI** | 设置 → Vertex AI | 项目、区域可继承宿主环境变量；用 ADC 拉取 Gemini 模型，支持文本流式和工具回填 |
+| **Google Colab** | 插件 → Google Colab | [官方 Colab CLI 与已有 ADC](docs/colab.md)；可查 Compute Units，经审批在指定的现有运行时执行 Python / Notebook |
+
+AI Studio 和 Vertex AI 可与 ACP 或代理模式并用。Colab 随同一个包安装，默认关闭，不注册模型；关闭它只会移除 Colab 工具。
+
 ## 功能预览
 
 <picture>
@@ -71,7 +63,7 @@ dsh plugin --profile web add dsh-bundle-antigravity-host
 
 默认按需启动最多 **2 个独立 worker**，可配置为 1–4 个。一个会话等待工具审批时，其它会话可使用空闲 worker；同一工具回合的结果仍回到原 worker。容量用满后排队，支持取消，默认等待上限 120 秒，主对话优先于排队中的后台标题。
 
-这不是无限并发，也不保证上游账户额度随 worker 数增加。[并发与续轮边界](docs/reference.md#并发与工具续轮)
+并发 worker 共用当前链路的上游账户额度。[并发与续轮配置](docs/reference.md#并发与工具续轮)
 
 ### 先连接、拿目录，再开始聊天
 
@@ -83,7 +75,7 @@ dsh plugin --profile web add dsh-bundle-antigravity-host
 
 在 **宿主附件服务可用且上游声明 image capability** 时，当前消息、历史消息和工具返回的图片通过真实图片内容传入。支持 PNG、JPEG、WebP 与 GIF；只读取宿主附件，不自行抓取图片 URL。已被宿主卸载的图片会明确说明未发送像素。
 
-这是输入能力，不包含图片生成、音频或视频；真实图片识别效果尚未实机验收。[多模态限制](docs/reference.md#图片输入)
+图片生成走独立的 `agy_image_generate` 工具，在代理模式的「高级 → 附属功能」中启用。音频、视频未接入。[图片输入](docs/reference.md#图片输入)
 
 ### 规划与执行分开
 
@@ -109,7 +101,7 @@ flowchart LR
     B --> G
 ```
 
-本包是 **Host + Web Client bundle**：Host 注册模型 provider、管理官方进程和工具桥，Client 提供设置页与额度药丸。不修改 DSH Core，也不把官方 CLI 包装成聊天接口；CLI 仅用于 ACP 只读模型目录，以及在显式开启「用 agy CLI 查询额度」后用于额度与余额查询。
+本包是 **Host + Web Client bundle**：Host 注册模型 provider、管理官方进程和工具桥，Client 提供设置页与额度药丸。`agy` CLI 用于 ACP 只读模型目录，以及显式开启「用 agy CLI 查询额度」后的额度与余额查询。Colab 官方 CLI 由同包的可选工具组件调用，不参与模型路由。
 
 **它不是直接的 Gemini 模型 API。** 默认情况下同一 DSH 对话会复用同一个 ACP 会话，在输入前缀与上一步输出一致时，后续回合只发送新增消息，未变化的上下文去重，变化内容仍发送，历史由官方 agent 自己持有；历史被压缩、回退或编辑，或模型、系统提示、工具目录变化时自动重建会话并全量重放一次（`reuseSessions=false` 可回到每轮重放）。工具续轮仍在同一个 prompt 内完成。角色消息、采样控制、延迟与计费不能视为和原生 API 相同。
 
@@ -129,15 +121,15 @@ flowchart LR
 | 项目 | 当前声明 / 证据 |
 |---|---|
 | Node.js | `>=22.19` |
-| DSH Core peer 范围 | `>=0.2.0-rc.1 <0.2.1-0 \|\| >=0.2.1-0 <0.3.0-0 \|\| >=0.2.2-0 <0.3.0-0`，适用于所声明的三个 `dsh-*` peer；npm 与 DSH 分别检查准入 |
-| 开发契约基准 | `dsh-llm` / `dsh-subprocess` / `dsh-typert-protocol` / `dsh-attachment` **0.2.2-rc.3**，Cordis **4.1.0**（与实机内嵌版本一致，类型检查在该基准下运行） |
+| 当前源码的 DSH Core peer 范围 | `>=0.2.2-rc.5 <0.2.3-0`；运行期使用宿主的 LLM、子进程、Typert、附件和凭据模块 |
+| Cordis peer 范围 | `~4.1.0` |
+| 开发契约基准 | DSH Core **0.2.2-rc.5**、Cordis **4.1.0** |
 | 上游协议 | ACP **v1**；SDK **1.4.0** 与默认 server **1.5.2** 是两个独立版本 |
-| 当前源码本地验证 | 0.1.53（契约基准 `0.2.2-rc.3` / Cordis `4.1.0`）：类型检查、57 个文件 / 1005 项测试（Windows 上 1 项 POSIX 权限位测试跳过）与构建通过；设置页的退役清理在三个时区下回归，macOS 钥匙串登录态兜底经注入依赖的单元测试覆盖，macOS 实机未验证；桌面契约用 2.0.24-next / Core `0.2.2-rc.5` 真实组件复检（路由互斥、Typert 注册与清理、自定义错误码）；另有无 CLI 的真实本地 OAuth 回调闭环及既有离线 Chrome 36 项布局检查 |
-| 实机运行时核对 | 2026-11-16 复核实机分发包（`app.asar`）内嵌 **dsh-llm / dsh-subprocess / dsh-typert-protocol / dsh-attachment 0.2.2-rc.3，cordis 4.1.0**；此前 2026-11-12 在 0.2.2-rc.1 逐项核对的导出（`LlmAdapter` 方法集、`registerAdapter().replace([])`、`LlmError`、品牌类型构造函数、`settings.describe/mutate`、`attachments` 服务名、Typert 远程注册形状、客户端 `__ModuleLoader__.load` / `$mount` / `settings.section`）在 rc.3 类型层复核通过——`LlmError` constructor 自 rc.3 起只接受 `BuiltinLlmFailureCode`，本包自定义码改经 `LlmError.fromFailure` 原样抛出；未在 0.2.2-rc.3 上跑真实生成 |
-| 桌面契约核对 | DSH NEXT **2.0.23-next**（Core **0.2.2-rc.3**，Cordis **4.1.0**）：使用分发包的真实组件在独立进程验证 peer 范围、ACP / 代理路由互斥切换、Typert 贡献注册与卸载清理、自定义错误码及其状态和原因。未加载桌面 Profile |
-| 尚未覆盖 | 0.1.39 安装后的 Desktop GUI、真实 Google 授权、真实上游生成与图片识别、非 Windows 实机 |
+| 0.1.54 本地验证 | 类型检查、68 个测试文件（1129 项通过、1 项跳过）和构建。 |
+| 桌面组件验证 | DSH NEXT **2.0.24-next** / Core **0.2.2-rc.5**：隔离验证了模型路由并存、Typert 注册与清理、Colab 工具注册和停用，以及无审批渠道时拒绝执行。 |
+| 待实机验收 | 完整 Desktop GUI、真实 Vertex AI 生成、Colab 账号余额和 Notebook 执行。已有 AI Studio 上游验证见[技术记录](docs/aistudio-provider-design.md#11-真实-key-探针核实结论2026-11-27)。 |
 
-宿主附件服务是可选依赖，缺少时仍可文本聊天。npm 对照已解析的依赖版本检查 peer；本包未声明 `engines.dsh`，DSH 对照自身 Core 版本检查 `dsh-*` peer，并让预发布版本参与范围匹配。路由、服务与客户端装载另行验证。[完整声明与验证方法](docs/development.md)
+插件复用宿主的核心模块，不私装固定的旧版本。附件和凭据**服务**仍按功能使用：没有附件服务时可文本聊天，没有凭据服务时 AI Studio 无法读取 API key。[完整声明与验证方法](docs/development.md)
 
 ## 文档导航
 
@@ -145,11 +137,12 @@ flowchart LR
 |---|---|
 | 安装、连接、查看额度或排查错误 | [使用与技术参考](docs/reference.md) |
 | 调整并发、超时、模型、代理或二进制位置 | [完整配置与环境变量](docs/configuration.md) |
+| 启用 Colab、查询 Compute Units 或运行 Notebook | [Colab 工具使用说明](docs/colab.md) |
 | 查看各版本更新、迁移注意与剩余限制 | [更新记录](docs/changelog.md) |
 | 构建、测试、打包或维护 npm 发布流程 | [开发、验证与发布](docs/development.md) |
 
 ## 许可与反馈
 
-本插件采用 [MIT License](LICENSE)。Google Antigravity 官方程序是独立下载的第三方软件，不随本包再分发；本插件并非 Google 官方产品。
+本插件采用 [MIT License](LICENSE)。Antigravity 官方程序和 Colab CLI 均独立获取，不随包分发。
 
 遇到问题请[提交 Issue](https://github.com/KouzakiUmi/dsh-antigravity-acp/issues)，附插件版本、**实际 DSH Core 版本**、操作系统、操作步骤和已脱敏错误码。不要附 token、Cookie、完整 OAuth URL、代理密码或凭据文件。

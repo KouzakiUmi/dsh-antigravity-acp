@@ -196,7 +196,7 @@ export class PromptTurn {
    * 仅私有 MCP 路由选择 allow_once，让实际 tools/call 在桥上 park；
    * 不从权限提示合成第二次工具执行，不在这里封口或回收进程。
    * 前提是 session/new 已移除 AGY 内置工具，且客户端 fs/terminal 已关闭。
-   * eager 工具按官方固定标题匹配目录；allow_always 从不选择。
+   * 工具匹配当前目录；allow_always 从不选择。
    */
   handleRequestPermission(request: RequestPermissionRequest): RequestPermissionResponse {
     // 迟到/外来会话的请求不能消耗当前回合的拒绝预算，也不能获准继续。
@@ -213,7 +213,7 @@ export class PromptTurn {
     if (handoff && allowance) {
       if (this.#permissionIds.has(request.toolCall.toolCallId)) return { outcome: { outcome: 'cancelled' } }
       this.#permissionIds.add(request.toolCall.toolCallId)
-      this.#reportArgumentIssues(handoff)
+      if (handoff.arguments !== undefined) this.#reportArgumentIssues(handoff.name, handoff.arguments)
       this.#onBridgePermission?.(handoff.name)
       return { outcome: { outcome: 'selected', optionId: allowance.optionId } }
     }
@@ -234,13 +234,13 @@ export class PromptTurn {
   }
 
   /** 对照当前目录 schema 预检转交调用的参数键（只诊断，不改写、不拦截）。 */
-  #reportArgumentIssues(handoff: { name: string; arguments: string }): void {
+  #reportArgumentIssues(name: string, serializedArguments: string): void {
     if (!this.#onArgumentIssues) return
-    const tool = this.#bridge.toolSchemas().find((item) => item.name === handoff.name)
+    const tool = this.#bridge.toolSchemas().find((item) => item.name === name)
     if (!tool) return
     let args: unknown
     try {
-      args = JSON.parse(handoff.arguments)
+      args = JSON.parse(serializedArguments)
     } catch {
       return
     }

@@ -388,6 +388,24 @@ describe('模型目录来自 ACP 会话配置', () => {
     expect(follower.agent.requests).toEqual([])
   })
 
+  it('已进入 worker 的请求在图片准备期间切模式不会发送 prompt', async () => {
+    const data = Uint8Array.of(137, 80, 78, 71)
+    const ref = { attachmentId: 'sha256:fixture', mediaType: 'image/png', bytes: data.length, width: 1, height: 1 } as ImageAttachmentRef
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const readImage = vi.fn(async () => { await gate; return { ref, data } })
+    const harness = createHarness({ readImage, imageCapability: true })
+    const mode = new AbortController()
+    const pending = collect(harness.adapter.stream({ ...baseOptions({ messages: [createUserMessage({ content: [{ type: 'image', attachment: ref }], source: { kind: 'user' } })] }), admissionSignal: mode.signal }))
+    try {
+      await vi.waitFor(() => expect(readImage).toHaveBeenCalled())
+      mode.abort(new Error('mode switched'))
+    } finally { release() }
+    await expect(pending).rejects.toThrow('mode switched')
+    expect(harness.agent.requestsFor('session/prompt')).toEqual([])
+    expect(harness.adapter.busy).toBe(false)
+  })
+
   it('工具图像结果在原 prompt 中以 MCP image 回填', async () => {
     const data = Uint8Array.from([137, 80, 78, 71])
     const ref = { attachmentId: 'sha256:tool', mediaType: 'image/png', bytes: data.length, width: 1, height: 1 } as ImageAttachmentRef
@@ -491,7 +509,8 @@ describe('模型目录来自 ACP 会话配置', () => {
 
     expect(harness.adapter.catalogObserved).toBe(true)
     // 只展示真实目录；旧 server-default 会话仍可路由，但不再广告首次登录占位项。
-    expect(await harness.adapter.listModels(AGY_PROVIDER_ID)).toEqual([
+    expect(await harness.adapter.listModels(AGY_PROVIDER_ID)).toEqual([])
+    expect(await harness.adapter.listSettingsModels(AGY_PROVIDER_ID)).toEqual([
       { provider: AGY_PROVIDER_ID, id: 'gemini-3-pro', name: 'Gemini 3 Pro', description: '质量优先', inputModalities: ['text'] },
       { provider: AGY_PROVIDER_ID, id: 'gemini-3-flash', name: 'Gemini 3 Flash', inputModalities: ['text'] },
     ])
@@ -507,6 +526,7 @@ describe('模型目录来自 ACP 会话配置', () => {
   it('未观测到真实目录时用磁盘缓存兜住模型选择器，且仍零 ACP 交互', async () => {
     const reads: number[] = []
     const harness = createHarness({
+      modelOverrides: { 'gemini-3-flash-cached': { enabled: true } },
       loadCachedCatalog: async () => {
         reads.push(1)
         return [{ id: 'gemini-3-flash-cached', name: 'Gemini 3 Flash (缓存)', description: '上次会话观测到' }]
@@ -526,6 +546,32 @@ describe('模型目录来自 ACP 会话配置', () => {
     // 只读一次，后续列目录不再碰文件系统。
     await harness.adapter.listModels(AGY_PROVIDER_ID)
     expect(reads).toHaveLength(1)
+  })
+
+  it('完整设置目录保留旧版；选择器过滤非对话型号和非对话映射', async () => {
+    const harness = createHarness({
+      modelOverrides: { 'gemini-4-neon': { target: 'gemini-4-image-preview' }, 'gemini-3.5-flash': { enabled: true } },
+      loadCliCatalog: async () => [
+        { id: 'gemini-3.5-flash', name: 'gemini-3.5-flash' },
+        { id: 'gemini-4-neon', name: 'gemini-4-neon' },
+        { id: 'gemini-2.5-pro', name: 'gemini-2.5-pro' },
+        { id: 'gemini-4-tts', name: 'Gemini 4 TTS' },
+      ],
+    })
+    expect((await harness.adapter.listSettingsModels(AGY_PROVIDER_ID)).map(({ name }) => name)).toEqual(['Gemini 3.5 Flash', 'Gemini 4 Neon', 'Gemini 2.5 Pro'])
+    expect((await harness.adapter.listModels(AGY_PROVIDER_ID)).map(({ id }) => id)).toEqual(['gemini-3.5-flash'])
+    await expect(harness.adapter.resolveModel(AGY_PROVIDER_ID, 'gemini-4-neon')).rejects.toMatchObject({ code: 'INVALID_MODEL' })
+    await expect(harness.adapter.resolveModel(AGY_PROVIDER_ID, 'gemini-4-tts')).rejects.toMatchObject({ code: 'INVALID_MODEL' })
+    expect(harness.agent.requests).toEqual([])
+  })
+
+  it('权威 ACP 目录仅有非对话型号时，不从 CLI 补入未获授权的家族', async () => {
+    const harness = createHarness({
+      loadCachedCatalog: async () => [{ id: 'gemini-4-tts', name: 'Gemini 4 TTS' }],
+      loadCliCatalog: async () => [{ id: 'gemini-4-neon', name: 'Gemini 4 Neon' }],
+    })
+    expect(await harness.adapter.listSettingsModels(AGY_PROVIDER_ID)).toEqual([])
+    expect(await harness.adapter.listModels(AGY_PROVIDER_ID)).toEqual([])
   })
 
   it('缓存读取抛错时返回空目录，不编造占位模型', async () => {
@@ -596,6 +642,7 @@ describe('模型目录来自 ACP 会话配置', () => {
 
   it('占位 id 与官方目录同名时去重，选择器不出现重复条目', async () => {
     const harness = createHarness({
+      modelOverrides: { 'gemini-3-flash': { enabled: true } },
       configOptions: [
         {
           id: 'model',
@@ -650,11 +697,11 @@ describe('模型目录来自 ACP 会话配置', () => {
     harness.agent.on('session/set_config_option', () => NO_REPLY)
     const streaming = collect(harness.adapter.stream(baseOptions({ model: 'gemini-3-flash' })))
     await waitForRequest(harness.agent, 'session/set_config_option')
-    const before = await harness.adapter.listModels(AGY_PROVIDER_ID)
+    const before = await harness.adapter.listSettingsModels(AGY_PROVIDER_ID)
     expect(before.length).toBeGreaterThan(0)
     await harness.agent.reply('session/set_config_option', {})
     await waitForRequest(harness.agent, 'session/prompt')
-    expect(await harness.adapter.listModels(AGY_PROVIDER_ID)).toEqual(before)
+    expect(await harness.adapter.listSettingsModels(AGY_PROVIDER_ID)).toEqual(before)
     await harness.agent.reply('session/prompt', { stopReason: 'end_turn' })
     await streaming
   })
@@ -688,7 +735,7 @@ describe('模型目录来自 ACP 会话配置', () => {
     })
     await harness.agent.reply('session/prompt', { stopReason: 'end_turn' })
     await streaming
-    expect(await harness.adapter.listModels(AGY_PROVIDER_ID)).toEqual([
+    expect(await harness.adapter.listSettingsModels(AGY_PROVIDER_ID)).toEqual([
       { provider: AGY_PROVIDER_ID, id: 'gemini-3-flash', name: 'Gemini 3 Flash', inputModalities: ['text'] },
     ])
   })
@@ -756,7 +803,8 @@ describe('模型目录来自 ACP 会话配置', () => {
     expect(ids.some((id) => /-(low|medium|high)$/.test(id))).toBe(false)
     expect(ids.some((id) => id.includes('gpt-oss'))).toBe(false)
     expect(ids).not.toContain('gemini-4-argon')
-    expect(models.find((model) => model.id === 'gemini-3-flash')?.name).toBe('Gemini 3 Flash')
+    expect(ids).not.toContain('gemini-3-flash')
+    expect((await harness.adapter.listSettingsModels(AGY_PROVIDER_ID)).find((model) => model.id === 'gemini-3-flash')?.name).toBe('Gemini 3 Flash')
     expect(models.find((model) => model.id === 'claude-opus-5-5')?.name).toBe('Claude Opus 5.5')
   })
 
@@ -780,7 +828,7 @@ describe('模型目录来自 ACP 会话配置', () => {
         throw new Error('cli 不可用')
       },
     })
-    const models = await harness.adapter.listModels(AGY_PROVIDER_ID)
+    const models = await harness.adapter.listSettingsModels(AGY_PROVIDER_ID)
     expect(models.map((model) => model.id)).toEqual(['gemini-3-pro'])
   })
 
@@ -1100,7 +1148,7 @@ describe('StreamChunk 序列映射', () => {
     })
     // 未实测：取映射目标 gpt-oss-120b 的审计值 131072，而不是原家族。
     expect((await harness.adapter.resolveModel(AGY_PROVIDER_ID, 'gemini-3-pro')).context).toEqual({ contextWindow: 131_072 })
-    const models = await harness.adapter.listModels(AGY_PROVIDER_ID) as unknown as Array<{ id: string; contextWindow?: number; contextWindowSource?: string }>
+    const models = await harness.adapter.listSettingsModels(AGY_PROVIDER_ID) as unknown as Array<{ id: string; contextWindow?: number; contextWindowSource?: string }>
     expect(models.find((model) => model.id === 'gemini-3-pro')).toMatchObject({ contextWindow: 131_072, contextWindowSource: 'audited' })
   })
 
@@ -2065,6 +2113,37 @@ describe('ACP 私有 MCP 权限与原 prompt 续轮', () => {
     expect(harness.agent.requestsFor('session/prompt')).toHaveLength(1)
   })
 
+  it('新版 CLI 权限提示只放行一次、不预检摘要；经 MCP 转交实际参数并回原 prompt', async () => {
+    const warn = vi.fn()
+    const harness = createHarness({ log: { info: vi.fn(), warn } })
+    const first = collect(harness.adapter.stream(baseOptions({ tools: TOOLS })))
+    await waitForRequest(harness.agent, 'session/prompt')
+    const name = 'mcp_dsh-tools_a4a4b434_read_file'
+    const approval: RequestPermissionRequest = {
+      ...permission(),
+      toolCall: { toolCallId: 'cli-tool', name, title: `Run ${name}`, rawInput: { toolSummary: 'Read another file' } },
+    }
+    expect(await harness.agent.callClient('session/request_permission', approval))
+      .toMatchObject({ result: { outcome: { outcome: 'selected', optionId: 'yes' } } })
+    expect(await harness.agent.callClient('session/request_permission', approval))
+      .toMatchObject({ result: { outcome: { outcome: 'cancelled' } } })
+    expect(harness.adapter.bridge.pendingCallIds()).toEqual([])
+    expect(warn.mock.calls.map(([text]) => String(text)).join(' ')).not.toContain('缺少必填')
+
+    const client = await connectAgentMcpClient(harness)
+    const pending = client.callTool({ name: 'read_file', arguments: { path: 'actual.txt' } })
+    const chunks = await first
+    const call = chunks.find((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call')
+    expect(call).toMatchObject({ block: { name: 'read_file', arguments: '{"path":"actual.txt"}' } })
+    const next = collect(harness.adapter.stream(baseOptions({ tools: TOOLS, messages: toolHistory([
+      { callId: toolCallIdOf(call), path: 'actual.txt', result: 'actual file contents' },
+    ]) })))
+    expect(toolResultText(await pending)).toBe('actual file contents')
+    await replyWithText(harness, '继续回答')
+    expect(visibleText(await next)).toBe('继续回答')
+    expect(harness.agent.requestsFor('session/prompt')).toHaveLength(1)
+  })
+
   it('同批并行权限与 MCP 调用全部交给 DSH；第二批仍复用原 prompt', async () => {
     const harness = createHarness({ parkSettleMs: 30 })
     const options = baseOptions({ tools: TOOLS })
@@ -2077,7 +2156,12 @@ describe('ACP 私有 MCP 权限与原 prompt 续轮', () => {
     const pending = ['a', 'b', 'c'].map((path) => client.callTool({ name: 'read_file', arguments: { path } }))
     const calls = (await first).filter((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call')
     expect(calls).toHaveLength(3)
-    const entries = calls.map((call, index) => ({ callId: toolCallIdOf(call), path: ['a', 'b', 'c'][index]!, result: `result-${index}` }))
+    const entries = calls.map((call) => {
+      if (call.type !== 'block-end' || call.block.type !== 'tool-call') throw new Error('Expected tool call')
+      const { path } = JSON.parse(call.block.arguments) as { path: string }
+      return { callId: toolCallIdOf(call), path, result: `result-${path}` }
+    })
+    expect(entries.map(({ path }) => path).sort()).toEqual(['a', 'b', 'c'])
     const messages = [
       ...baseOptions().messages,
       createAssistantMessage({
@@ -2093,7 +2177,7 @@ describe('ACP 私有 MCP 权限与原 prompt 续轮', () => {
       })),
     ]
     const second = collect(harness.adapter.stream(baseOptions({ tools: TOOLS, messages })))
-    expect((await Promise.all(pending)).map(toolResultText)).toEqual(['result-0', 'result-1', 'result-2'])
+    expect((await Promise.all(pending)).map(toolResultText)).toEqual(['result-a', 'result-b', 'result-c'])
     await harness.agent.callClient('session/request_permission', permission(SESSION_1, 'next-batch'))
     const nextPending = client.callTool({ name: 'read_file', arguments: { path: 'a.txt' } })
     const nextCalls = (await second).filter((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call')
@@ -3187,12 +3271,12 @@ describe('ACP 会话复用与跨进程恢复', () => {
     await waitForRequest(harness.agent, 'session/prompt')
     await replyWithText(harness, 'first')
     await first
-    expect((await harness.adapter.listModels(AGY_PROVIDER_ID)).length).toBeGreaterThan(0)
+    expect((await harness.adapter.listSettingsModels(AGY_PROVIDER_ID)).length).toBeGreaterThan(0)
     const second = collect(harness.adapter.stream(baseOptions()))
     await waitForRequest(harness.agent, 'session/prompt', 2)
     await replyWithText(harness, 'second', 1)
     expect(visibleText(await second)).toBe('second')
-    expect((await harness.adapter.listModels(AGY_PROVIDER_ID)).map(model => model.id)).toContain('gemini-3-pro')
+    expect((await harness.adapter.listSettingsModels(AGY_PROVIDER_ID)).map(model => model.id)).toContain('gemini-3-pro')
   })
 
   it('内存会话表有界，超过 64 个会话关闭最旧会话', async () => {

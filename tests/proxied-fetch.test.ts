@@ -44,6 +44,29 @@ describe('explicit proxy safety', () => {
     expect(fallbackCalls).toBe(0)
   })
 
+  it('observes handoff to the HTTP client, not local configuration or startup failures', async () => {
+    const onDispatch = vi.fn()
+    const failure = createProxiedFetch({ url: 'http://localhost:7890', bypass: '' }, { loadUndici: async () => undefined })
+    await expect(failure.dispatch('https://example.invalid/', {}, onDispatch)).rejects.toThrow(/undici/)
+    const fallback = vi.fn(async () => new Response('ok'))
+    const proxied = vi.fn(async () => { throw new Error('network failure') })
+    const request = createLiveProxiedFetch(() => ({ url: 'http://localhost:7890', bypass: 'localhost' }), {
+      fallback, loadUndici: async () => ({ ProxyAgent: class {}, fetch: proxied }),
+    })
+    const abort = new AbortController()
+    const pending = request.dispatch('https://example.invalid/', { signal: abort.signal }, onDispatch)
+    abort.abort()
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    expect(onDispatch).not.toHaveBeenCalled()
+    expect(proxied).not.toHaveBeenCalled()
+    await expect(request.dispatch('https://example.invalid/', {}, onDispatch)).rejects.toThrow('network failure')
+    await request.dispatch('https://localhost/', {}, onDispatch)
+    expect(onDispatch).toHaveBeenCalledTimes(2)
+    expect(proxied).toHaveBeenCalledTimes(1)
+    expect(fallback).toHaveBeenCalledTimes(1)
+    await request.close()
+  })
+
   it('rejects instead of throwing synchronously when the saved proxy becomes invalid', async () => {
     // readProxy 按最新设置解析；用户把地址改坏后，下一次取数必须拿到 rejected
     // promise（fetch 契约），否则调用方的 .catch()/.then(onError) 收不到它。

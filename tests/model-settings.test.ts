@@ -11,7 +11,7 @@ describe('模型目录用户设置', () => {
     })
     expect([...settings.keys()]).toEqual(['claude-opus-5-5', 'gemini-4-argon'])
     expect(settings.get('claude-opus-5-5')).toEqual({ enabled: true })
-    expect(settings.get('gemini-4-argon')).toEqual({ enabled: true, effort: 'high', name: 'Argon', target: 'gemini-4-argon-preview' })
+    expect(settings.get('gemini-4-argon')).toEqual({ enabled: false, effort: 'high', name: 'Argon', target: 'gemini-4-argon-preview' })
   })
 
   it('非对象配置整体降级为空设置，不让一份坏配置击穿目录', () => {
@@ -42,7 +42,7 @@ describe('模型目录用户设置', () => {
   })
 
   it('列表套用显示名覆盖并跳过停用项，不新增条目', () => {
-    const settings = normalizeModelSettings({ 'gemini-3-pro': { name: '改名' }, 'gemini-3-flash': { enabled: false } })
+    const settings = normalizeModelSettings({ 'gemini-3-pro': { enabled: true, name: '改名' }, 'gemini-3-flash': { enabled: false } })
     const rows = applyModelSettings(settings, [
       { id: 'gemini-3-pro', name: 'Gemini 3 Pro', description: '质量优先' },
       { id: 'gemini-3-flash', name: 'Gemini 3 Flash' },

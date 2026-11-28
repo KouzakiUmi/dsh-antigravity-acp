@@ -46,6 +46,7 @@ export type ProxyTransportErrorCode =
   | 'forbidden'
   | 'rate-limited'
   | 'upstream'
+  | 'malformed-function-call'
   | 'proxy-unsupported'
 
 export class ProxyTransportError extends Error {

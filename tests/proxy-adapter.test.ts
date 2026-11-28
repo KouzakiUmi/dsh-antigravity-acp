@@ -131,6 +131,55 @@ describe('代理模式流式工具与签名', () => {
     expect(credential.mock.calls.map(call => call[1])).toEqual([undefined, { forceRefresh: true }])
   })
 
+  it('流内 403 明确报告停用时不换发或重试', async () => {
+    const credential = vi.fn(async () => ({ accessToken: 'synthetic', source: 'login' as const, updatedAt: 'x' }))
+    const request = vi.fn(async () => new Response('data: {"error":{"code":403,"status":"PERMISSION_DENIED","message":"This service has been disabled in this account"}}\n\n'))
+    const instance = new AntigravityProxyAdapter({ credential: { credential }, transport: { request } })
+    await expect(collect(instance.stream(options))).rejects.toMatchObject({ code: 'AGY_ACCOUNT_SUSPENDED' })
+    expect(request).toHaveBeenCalledTimes(1)
+    expect(credential).toHaveBeenCalledTimes(1)
+  })
+
+  it('已派发的普通模型请求不对另一账户重放', async () => {
+    const credential = vi.fn(async (_signal?: AbortSignal, refresh?: { forceRefresh?: boolean }) => ({
+      accessToken: refresh?.forceRefresh ? 'new-fixture' : 'old-fixture', source: 'login' as const, updatedAt: 'x',
+    }))
+    const request = vi.fn(async () => new Response('data: {"error":{"status":"UNAUTHENTICATED"}}\n\n'))
+    const instance = new AntigravityProxyAdapter({ credential: { credential }, transport: { request } })
+    await expect(collect(instance.stream(options))).rejects.toMatchObject({ code: 'CANCELLED' })
+    expect(credential).toHaveBeenCalledTimes(2)
+    expect(request).toHaveBeenCalledTimes(1)
+  })
+
+  it('MALFORMED_FUNCTION_CALL 未出块时有界重试一次并成功', async () => {
+    const request = vi.fn()
+      .mockResolvedValueOnce(new Response(`data: ${JSON.stringify(event([], 'MALFORMED_FUNCTION_CALL'))}\n\n`))
+      .mockResolvedValueOnce(new Response(`data: ${JSON.stringify(event([{ text: 'ok' }], 'STOP'))}\n\n`))
+    const instance = new AntigravityProxyAdapter({ credential: { credential: async () => ({ accessToken: 'synthetic', source: 'login', updatedAt: 'x' }) }, transport: { request } })
+    const chunks = await collect(instance.stream(options))
+    expect(chunks.at(-1)).toMatchObject({ type: 'finish', reason: { kind: 'stop' } })
+    expect(request).toHaveBeenCalledTimes(2)
+  })
+
+  it('MALFORMED_FUNCTION_CALL 重试一次仍失败则按错误收尾', async () => {
+    const request = vi.fn(async () => new Response(`data: ${JSON.stringify(event([], 'MALFORMED_FUNCTION_CALL'))}\n\n`))
+    const instance = new AntigravityProxyAdapter({ credential: { credential: async () => ({ accessToken: 'synthetic', source: 'login', updatedAt: 'x' }) }, transport: { request } })
+    const chunks = await collect(instance.stream(options))
+    expect(chunks.at(-1)).toMatchObject({ type: 'finish', reason: { kind: 'error', failure: { code: 'MALFORMED_FUNCTION_CALL' } } })
+    expect(request).toHaveBeenCalledTimes(2)
+  })
+
+  it('已出文本后 MALFORMED_FUNCTION_CALL 不重试（避免重复文本）', async () => {
+    const request = vi.fn(async () => new Response([
+      `data: ${JSON.stringify(event([{ text: 'partial' }]))}\n\n`,
+      `data: ${JSON.stringify(event([], 'MALFORMED_FUNCTION_CALL'))}\n\n`,
+    ].join('')))
+    const instance = new AntigravityProxyAdapter({ credential: { credential: async () => ({ accessToken: 'synthetic', source: 'login', updatedAt: 'x' }) }, transport: { request } })
+    const chunks = await collect(instance.stream(options))
+    expect(chunks.at(-1)).toMatchObject({ type: 'finish', reason: { kind: 'error', failure: { code: 'MALFORMED_FUNCTION_CALL' } } })
+    expect(request).toHaveBeenCalledTimes(1)
+  })
+
   it('已出文本后鉴权失败不重新派发生成', async () => {
     const request = vi.fn(async () => new Response([
       `data: ${JSON.stringify(event([{ text: 'partial' }]))}\n\n`,
@@ -255,6 +304,22 @@ describe('代理凭据取消', () => {
 })
 
 describe('代理模型设置与调用准备', () => {
+  it('设置目录保留旧版，选择器不默认启用；非对话映射不影响其他模型', async () => {
+    const neon = 'antigravity-gemini-4-neon'
+    const request = vi.fn(async () => Response.json({ models: {
+      'gemini-3.8-flash-medium': {}, 'gemini-4-neon-medium': {}, 'gemini-3.1-flash-image': {}, 'claude-opus-5-5-medium': {},
+    } }))
+    const instance = new AntigravityProxyAdapter({
+      credential: { credential: async () => ({ accessToken: 'fixture', source: 'login', updatedAt: 'x' }) }, transport: { request },
+      readSettings: () => ({ modelOverrides: { [neon]: { target: 'gemini-4-tts' } } }),
+    })
+    expect((await instance.discoverModels()).map(row => row.id)).toEqual(expect.arrayContaining([model, 'antigravity-claude-opus-5-5']))
+    expect((await instance.listModels(PROXY_PROVIDER_ID)).map(row => row.id)).toEqual(['antigravity-claude-opus-5-5'])
+    await expect(instance.prepareCall(PROXY_PROVIDER_ID, neon)).rejects.toMatchObject({ code: 'INVALID_MODEL' })
+    await expect(instance.prepareCall(PROXY_PROVIDER_ID, 'antigravity-gemini-3.1-flash-image')).rejects.toMatchObject({ code: 'INVALID_MODEL' })
+    expect(request).toHaveBeenCalledOnce()
+  })
+
   it('经 DSH Core 保留混合档位家族的图片，再按实际路由校验', async () => {
     const image = { attachmentId: 'test-image', mediaType: 'image/png', width: 1, height: 1, bytes: 3 } as ImageAttachmentRef
     const reader: ProxyAttachmentReader = { readImage: vi.fn(), readImageRequest: vi.fn(async () => ({ data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' })) }
@@ -346,7 +411,7 @@ describe('代理模型设置与调用准备', () => {
         'claude-opus-5-5-low': { disabled: true, modelName: 'claude-opus-5-5-high' },
       } }) : new Response(`data: ${JSON.stringify(event([{ text: 'ok' }], 'STOP'))}\n\n`))
     const instance = new AntigravityProxyAdapter({
-      readSettings: () => ({ modelOverrides: { [model]: { effort: 'high' } } }),
+      readSettings: () => ({ modelOverrides: { [model]: { enabled: true, effort: 'high' } } }),
       credential: { credential: async () => ({ accessToken: 'fixture', source: 'login', updatedAt: 'x' }) },
       transport: { request },
     })
