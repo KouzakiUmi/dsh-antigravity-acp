@@ -107,11 +107,11 @@ export type AgyReasoningEffort = (typeof AGY_REASONING_EFFORTS)[number]
  */
 export type AgyModelTier = AgyReasoningEffort | 'xhigh'
 
-/** 显示名映射（档位标签与思考强度菜单同名）。 */
+/** 原生选择器只接收字符串：与代理路由一致，使用英文目录标签。 */
 export const AGY_REASONING_EFFORT_NAMES: Record<AgyReasoningEffort, string> = {
-  low: '低',
-  medium: '中',
-  high: '高',
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High',
 }
 
 /**

@@ -345,7 +345,7 @@ describe('browser client module', () => {
     expect(plugin.name).toBe('dsh-bundle-antigravity-host')
     // remote.settings / remote.llm 必须逐个声明：缺任一项时读属性会抛
     // 「cannot get property "remote.<ns>" without inject」并击穿 settings.section。
-    expect(plugin.inject).toEqual(['slots', 'remote', 'remote.settings', 'remote.llm'])
+    expect(plugin.inject).toEqual(['locale', 'slots', 'remote', 'remote.settings', 'remote.llm'])
     expect(plugin.apply).toBeTypeOf('function')
   })
 

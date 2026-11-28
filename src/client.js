@@ -414,7 +414,7 @@ window.__ModuleLoader__.load({
     function unwrap(result) {
       if (result && typeof result === 'object' && 'ok' in result) {
         if (result.ok) return result.value
-        throw new Error(t(result.error?.message) || t('未知错误'))
+        throw new Error(result.error?.message || msg('未知错误'))
       }
       return result
     }
@@ -470,7 +470,8 @@ window.__ModuleLoader__.load({
       if (!status) return null
       const error = status.kind === 'error'
       const tone = error ? '#ef4444' : status.kind === 'busy' ? '#eab308' : '#22c55e'
-       return h('p', { role: error ? 'alert' : 'status', style: { margin: 0, padding: '8px 12px', borderRadius: '10px', border: '1px solid ' + tone + '47', fontSize: '12px', lineHeight: 1.5, overflowWrap: 'anywhere', color: error ? 'var(--agy-error-text)' : 'inherit', background: tone + '1a' } }, t(status.text))
+       return h('p', { role: error ? 'alert' : 'status', style: { margin: 0, padding: '8px 12px', borderRadius: '10px', border: '1px solid ' + tone + '47', fontSize: '12px', lineHeight: 1.5, overflowWrap: 'anywhere', color: error ? 'var(--agy-error-text)' : 'inherit', background: tone + '1a' } },
+         t(status.text, status.params && { ...status.params, label: t(status.params.label) }))
     }
     function RuntimeDetails({ runtime }) {
       if (!runtime) return null
@@ -734,7 +735,7 @@ window.__ModuleLoader__.load({
         try {
           await onSave(value)
           setValue('')
-          setMessage(t('API key 已保存到凭据存储。'))
+          setMessage(msg('API key 已保存到凭据存储。'))
         } catch (error) {
           setMessage(error instanceof Error ? error.message : String(error))
         } finally { setBusy(false) }
@@ -749,7 +750,7 @@ window.__ModuleLoader__.load({
           h('button', { type: 'button', style: PRIMARY, disabled: disabled || busy || !value.trim(), onClick: () => void submit() }, t(busy ? '保存中…' : '保存 key'))),
         h('p', { role: 'status', style: { margin: 0, fontSize: '11.5px', lineHeight: 1.5, opacity: .7 } },
           configured ? t('已配置{masked}', { masked: masked ? ` (${masked})` : '' }) : t('尚未配置 API key。')),
-        message ? h('p', { role: 'status', style: { margin: 0, fontSize: '11.5px', lineHeight: 1.5, overflowWrap: 'anywhere' } }, message) : null)
+        message ? h('p', { role: 'status', style: { margin: 0, fontSize: '11.5px', lineHeight: 1.5, overflowWrap: 'anywhere' } }, t(message)) : null)
     }
 
     function AistudioUsagePanel({ control, credentialChanging }) {
@@ -845,21 +846,21 @@ window.__ModuleLoader__.load({
       const pull = async () => {
         if (!readModels || disabled || scopeDirty || pending.current) return
         pending.current = true
-        setState({ busy: true, text: t('正在拉取 Vertex AI 模型…') })
+        setState({ busy: true, text: msg('正在拉取 Vertex AI 模型…') })
         try {
           const value = parseVertexModelsResult(unwrap(await readModels(JSON.parse(scope))))
           if (!active.current) return
           if (value.status === 'error') {
-            setState({ busy: false, text: t(value.message) })
+            setState({ busy: false, text: value.message })
             return
           }
           const ids = [...new Set(value.ids.map(id => id.trim()).filter(id => VERTEX_MODEL_PATTERN.test(id) && !isNonChatModel(id)))]
           const added = ids.length ? mergeModels(scope, ids) : undefined
-          setState({ busy: false, text: ids.length === 0 ? t('发布商目录未返回 Gemini 模型。')
+          setState({ busy: false, text: ids.length === 0 ? msg('发布商目录未返回 Gemini 模型。')
             : added === undefined ? undefined
-            : added ? t('已将 {count} 个模型添加到草稿。', { count: added }) : t('目录中的模型已在草稿中。') })
+            : added ? msg('已将 {count} 个模型添加到草稿。') : msg('目录中的模型已在草稿中。'), params: { count: added } })
         } catch {
-          if (active.current) setState({ busy: false, text: t('Vertex AI 目录读取失败，请重试。') })
+          if (active.current) setState({ busy: false, text: msg('Vertex AI 目录读取失败，请重试。') })
         } finally { pending.current = false }
       }
       return h(React.Fragment ?? 'div', null,
@@ -867,7 +868,7 @@ window.__ModuleLoader__.load({
           action: h('button', { type: 'button', style: ACTION, 'aria-busy': state.busy || undefined,
             disabled: !readModels || disabled || scopeDirty || state.busy, onClick: pull }, t('拉取模型')) }),
         scopeDirty || state.text ? h('p', { role: 'status', style: { margin: '0 0 8px', overflowWrap: 'anywhere' } },
-          scopeDirty ? t('请先保存 Vertex AI 项目和区域，再拉取模型。') : state.text) : null)
+          scopeDirty ? t('请先保存 Vertex AI 项目和区域，再拉取模型。') : t(state.text, state.params)) : null)
     }
 
     /** 代理账户面板：授权 URL 只在显式连接后显示。 */
@@ -910,7 +911,7 @@ window.__ModuleLoader__.load({
         const operation = ++actionVersion.current
         ++version.current
         setBusy(true)
-        setMessage(action === 'login' ? t('正在准备授权…') : '')
+        setMessage(action === 'login' ? msg('正在准备授权…') : '')
         try {
           const value = unwrap(await control('account', { action }))
           if (!alive.current || operation !== actionVersion.current) return
@@ -945,6 +946,7 @@ window.__ModuleLoader__.load({
     }
 
     function AntigravitySettingsCard(props) {
+      React.useSyncExternalStore(subscribeLocale, resolveLocale, resolveLocale)
       const remote = props.remote
       const [account, setAccount] = React.useState(undefined)
       const [models, setModels] = React.useState([])
@@ -961,12 +963,12 @@ window.__ModuleLoader__.load({
         manualModelPull.current = force ? version : false
         if (reset) setModels([])
         setModelBusy(true)
-        if (force) setModelMessage(t('正在拉取模型目录…'))
+        if (force) setModelMessage(msg('正在拉取模型目录…'))
         try {
           const value = unwrap(await props.control('models', force ? { force: true } : undefined))
           if (!alive.current || version !== modelVersion.current) return
           setModels(value.models ?? [])
-          setModelMessage(value.status === 'error' ? t(value.message) : '')
+          setModelMessage(value.status === 'error' ? value.message : '')
         } catch (error) { if (alive.current && version === modelVersion.current) setModelMessage(error instanceof Error ? error.message : String(error)) }
         finally {
           if (manualModelPull.current === version) manualModelPull.current = false
@@ -1041,16 +1043,16 @@ window.__ModuleLoader__.load({
       const aistudioKeyStatus = aistudioKey?.scope === scope ? aistudioKey.value : undefined
       const pullAistudioModels = React.useCallback(async (force = false) => {
         if (aistudioScope.current !== scope) return
-        if (!scope.control) { setAistudioModelMessage(t('AI Studio 控制服务不可用：请确认 Host 与 Client 版本一致。')); return }
+        if (!scope.control) { setAistudioModelMessage(msg('AI Studio 控制服务不可用：请确认 Host 与 Client 版本一致。')); return }
         const request = ++scope.models
         const current = () => alive.current && aistudioScope.current === scope && scope.models === request
         setAistudioModelBusy(true)
-        if (force) setAistudioModelMessage(t('正在拉取 AI Studio 模型目录…'))
+        if (force) setAistudioModelMessage(msg('正在拉取 AI Studio 模型目录…'))
         try {
           const value = unwrap(await scope.control('models', force ? { force: true } : undefined))
           if (!current()) return
           setAistudioCatalog({ scope, models: value.models ?? [] })
-          setAistudioModelMessage(value.status === 'error' ? t(value.message ?? 'AI Studio 目录读取失败。') : '')
+          setAistudioModelMessage(value.status === 'error' ? value.message ?? msg('AI Studio 目录读取失败。') : '')
         } catch (error) {
           if (current()) setAistudioModelMessage(error instanceof Error ? error.message : String(error))
         } finally { if (current()) setAistudioModelBusy(false) }
@@ -1065,9 +1067,9 @@ window.__ModuleLoader__.load({
       }, [scope])
       // 手动 key 只写不回显：经 Host credentials.set 写入凭据存储，成功后刷新掩码状态与目录。
       const saveAistudioKey = React.useCallback(async (value) => {
-        if (!props.aistudioControl) throw new Error(t('AI Studio 控制服务不可用：请确认 Host 与 Client 版本一致。'))
+        if (!props.aistudioControl) throw new Error(msg('AI Studio 控制服务不可用：请确认 Host 与 Client 版本一致。'))
         const result = unwrap(await props.aistudioControl('setKey', { value }))
-        if (result.status === 'error') throw new Error(t(result.message ?? 'API key 保存失败。'))
+        if (result.status === 'error') throw new Error(result.message ?? msg('API key 保存失败。'))
         if (!alive.current || aistudioScope.current !== scope) return
         ++scope.models
         ++scope.key
@@ -1210,12 +1212,12 @@ window.__ModuleLoader__.load({
         // 这里降级为卡片内可读错误，绝不让异常穿出组件击穿 settings.section。
         try {
           if (!remote?.settings?.describe) {
-            setStatus({ kind: 'error', text: t('宿主未提供 settings.describe，无法在此编辑配置') })
+            setStatus({ kind: 'error', text: msg('宿主未提供 settings.describe，无法在此编辑配置') })
             setLoading(false)
             return
           }
           setLoading(true)
-           const settings = unwrap(await withTimeout(remote.settings.describe(), 12_000, t('读取设置超时，请点击刷新重试。')))
+           const settings = unwrap(await withTimeout(remote.settings.describe(), 12_000, msg('读取设置超时，请点击刷新重试。')))
           if (!alive.current || version !== settingsVersion.current) return
           const namespaces = Array.isArray(settings?.namespaces) ? settings.namespaces : []
           // 只按精确 namespace 匹配：按字段回退会命中别人的配置，而保存用的
@@ -1290,7 +1292,7 @@ window.__ModuleLoader__.load({
           setDirtyKeys([...dirty.current])
           setConflicts((previous) => [...new Set([...previous.filter((key) => dirty.current.has(key)), ...changed])])
           setWritable(settings?.writable === true)
-          if (!found) setStatus({ kind: 'error', text: t('宿主尚未提供 Antigravity ACP 的可编辑设置。请确认 Host 与 Client 插件版本一致，并重新加载插件后刷新配置。') })
+          if (!found) setStatus({ kind: 'error', text: msg('宿主尚未提供 Antigravity ACP 的可编辑设置。请确认 Host 与 Client 插件版本一致，并重新加载插件后刷新配置。') })
           else if (!preserveStatus) setStatus(null)
         } catch (cause) {
           if (alive.current && version === settingsVersion.current) setStatus({ kind: 'error', text: cause instanceof Error ? cause.message : String(cause) })
@@ -1305,18 +1307,18 @@ window.__ModuleLoader__.load({
           && (!Number.isSafeInteger(draftRef.current[field.key]) || draftRef.current[field.key] < (field.min ?? 0) || (field.max !== undefined && draftRef.current[field.key] > field.max)))
         if (invalid) {
           setStatus({ kind: 'error', text: invalid.max === undefined
-            ? t('{label}必须是不小于 {min} 的整数。', { label: t(invalid.label), min: invalid.min ?? 0 })
-            : t('{label}必须是 {min}–{max} 的整数。', { label: t(invalid.label), min: invalid.min, max: invalid.max }) })
+            ? msg('{label}必须是不小于 {min} 的整数。')
+            : msg('{label}必须是 {min}–{max} 的整数。'), params: { label: invalid.label, min: invalid.min ?? 0, max: invalid.max } })
           return
         }
         if (dirty.current.has(ORCHESTRATOR_KEY) && !isOrchestratorDraftValid(draftRef.current[ORCHESTRATOR_KEY])) {
           const maxField = ORCHESTRATOR_FIELDS.maxPlansPerTurn
-          setStatus({ kind: 'error', text: t('{label}必须是 {min}–{max} 的整数。', { label: t(maxField.label), min: maxField.min, max: maxField.max }) })
+          setStatus({ kind: 'error', text: msg('{label}必须是 {min}–{max} 的整数。'), params: { label: maxField.label, min: maxField.min, max: maxField.max } })
           return
         }
         savingRef.current = true
         setSaving(true)
-        setStatus({ kind: 'busy', text: t('保存中…') })
+        setStatus({ kind: 'busy', text: msg('保存中…') })
         // 只提交用户改动过的字段，空串也是有效改动；未编辑字段遵循最新服务端值。
         // modelOverrides / orchestrator / features 均为整份对象字段，按同样方式提交。
         const ops = [...FIELDS.map((field) => field.key), OVERRIDES_KEY, ORCHESTRATOR_KEY, FEATURES_KEY]
@@ -1348,8 +1350,8 @@ window.__ModuleLoader__.load({
           setDirtyKeys([...dirty.current])
           setConflicts([])
           setStatus({ kind: 'ok', text: ops.some((operation) => operation.path[0] === 'proxyMode')
-            ? t('已保存并切换模式，请在会话中选择对应模型。')
-            : t('已保存；进行中的会话不会被中断。') })
+            ? msg('已保存并切换模式，请在会话中选择对应模型。')
+            : msg('已保存；进行中的会话不会被中断。') })
           await reload(true)
           void accountAction('status')
           void pullModels(true)
@@ -1399,7 +1401,7 @@ window.__ModuleLoader__.load({
         setDraft(draftRef.current)
         setDirtyKeys([])
         setConflicts([])
-        setStatus({ kind: 'ok', text: t('已撤销未保存修改。') })
+        setStatus({ kind: 'ok', text: msg('已撤销未保存修改。') })
       }
 
       const connection = connectionStatus(account, registered)
@@ -1769,6 +1771,7 @@ window.__ModuleLoader__.load({
       return { short: '', color: '#22c55e' }
     }
     function AgYQuotaPill({ store, readQuota, proxyControl }) {
+      React.useSyncExternalStore(subscribeLocale, resolveLocale, resolveLocale)
       const state = React.useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot)
       const isAcp = state?.current?.provider === PROVIDER
       const isProxy = state?.current?.provider === PROXY_PROVIDER
@@ -1906,7 +1909,7 @@ window.__ModuleLoader__.load({
             )
           }
           if (Date.now() >= deadline) {
-            throw new Error(t('额度服务未就绪（Host 端 remote.agyQuota 未挂载）'))
+            throw new Error(msg('额度服务未就绪（Host 端 remote.agyQuota 未挂载）'))
           }
           await new Promise((resolve) => setTimeout(resolve, 500))
         }
@@ -1916,7 +1919,7 @@ window.__ModuleLoader__.load({
         const requestedModel = model ?? modelsBySource.get(source)
         const epoch = epochs.get(source) ?? 0
         const value = unwrap(await read(force, source, requestedModel))
-        if (epoch !== (epochs.get(source) ?? 0)) throw new Error(t('账户已变化，请重新拉取额度'))
+        if (epoch !== (epochs.get(source) ?? 0)) throw new Error(msg('账户已变化，请重新拉取额度'))
         for (const listener of listeners) {
           if (source === undefined) listener(value)
           else listener(value, source)
@@ -1948,16 +1951,16 @@ window.__ModuleLoader__.load({
 
     function makeControlReader(scope) {
       return async (method, request) => {
-        if (!['account', 'models'].includes(method)) throw new Error(t('不支持的设置操作'))
+        if (!['account', 'models'].includes(method)) throw new Error(msg('不支持的设置操作'))
         const deadline = Date.now() + 20_000
         for (;;) {
           const service = scope.get('remote.agyQuota')
           if (typeof service?.[method] === 'function') {
             const pending = service[method](request)
             // 目录发现可能包含冷启动；各阶段超时由 Host 管理，客户端不另设更短的总期限。
-            return method === 'models' ? await pending : await withTimeout(pending, 60_000, t('设置操作超时，请重试'))
+            return method === 'models' ? await pending : await withTimeout(pending, 60_000, msg('设置操作超时，请重试'))
           }
-          if (Date.now() >= deadline) throw new Error(t('设置控制服务未就绪，请确认 Host 与 Client 版本一致'))
+          if (Date.now() >= deadline) throw new Error(msg('设置控制服务未就绪，请确认 Host 与 Client 版本一致'))
           await new Promise((resolve) => setTimeout(resolve, 500))
         }
       }
@@ -1966,14 +1969,14 @@ window.__ModuleLoader__.load({
     /** 代理账户控制读取器：remote.agyProxyAccount 由 Host 的代理行注册。 */
     function makeProxyControlReader(scope) {
       return async (method, request) => {
-        if (method !== 'account') throw new Error(t('不支持的代理账户操作'))
+        if (method !== 'account') throw new Error(msg('不支持的代理账户操作'))
         const deadline = Date.now() + 20_000
         for (;;) {
           const service = scope.get('remote.agyProxyAccount')
           if (typeof service?.account === 'function') {
-            return await withTimeout(service.account(request), 60_000, t('代理账户操作超时，请重试'))
+            return await withTimeout(service.account(request), 60_000, msg('代理账户操作超时，请重试'))
           }
-          if (Date.now() >= deadline) throw new Error(t('代理账户服务未就绪：请确认已启用本插件的代理路由组件（antigravity-proxy-router）'))
+          if (Date.now() >= deadline) throw new Error(msg('代理账户服务未就绪：请确认已启用本插件的代理路由组件（antigravity-proxy-router）'))
           await new Promise((resolve) => setTimeout(resolve, 500))
         }
       }
@@ -1982,15 +1985,15 @@ window.__ModuleLoader__.load({
     /** AI Studio 控制读取器：remote.agyAistudio 由 Host 的 AI Studio 行注册（目录 / 手动 key / 掩码状态）。 */
     function makeAistudioControlReader(scope) {
       return async (method, request) => {
-        if (!['models', 'setKey', 'keyStatus', 'usage'].includes(method)) throw new Error(t('不支持的 AI Studio 操作'))
+        if (!['models', 'setKey', 'keyStatus', 'usage'].includes(method)) throw new Error(msg('不支持的 AI Studio 操作'))
         const deadline = Date.now() + 20_000
         for (;;) {
           const service = scope.get('remote.agyAistudio')
           if (typeof service?.[method] === 'function') {
             // 目录发现可能含冷启动；超时由 Host 管理，客户端不另设更短总期限（与 models 同口径）。
-            return method === 'models' ? await service[method](request) : await withTimeout(service[method](request), 60_000, t('AI Studio 操作超时，请重试'))
+            return method === 'models' ? await service[method](request) : await withTimeout(service[method](request), 60_000, msg('AI Studio 操作超时，请重试'))
           }
-          if (Date.now() >= deadline) throw new Error(t('AI Studio 服务未就绪：请确认已启用本插件的 AI Studio 路由组件（antigravity-aistudio-router）'))
+          if (Date.now() >= deadline) throw new Error(msg('AI Studio 服务未就绪：请确认已启用本插件的 AI Studio 路由组件（antigravity-aistudio-router）'))
           await new Promise((resolve) => setTimeout(resolve, 500))
         }
       }
@@ -2103,36 +2106,36 @@ window.__ModuleLoader__.load({
     // ---- AI Studio remote 解析器（与 Host src/aistudio/remote.ts 逐字段对齐）----
     function parseAistudioModelsRequest(value) {
       if (value === undefined || value === null) return undefined
-      if (typeof value !== 'object' || Array.isArray(value)) throw new Error(t('AI Studio 目录请求格式无效'))
-      if (value.force !== undefined && typeof value.force !== 'boolean') throw new Error(t('AI Studio 目录请求 force 无效'))
+      if (typeof value !== 'object' || Array.isArray(value)) throw new Error(msg('AI Studio 目录请求格式无效'))
+      if (value.force !== undefined && typeof value.force !== 'boolean') throw new Error(msg('AI Studio 目录请求 force 无效'))
       return value.force === undefined ? {} : { force: value.force }
     }
     function parseAistudioSetKeyRequest(value) {
-      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(t('AI Studio key 请求格式无效'))
-      if (typeof value.value !== 'string' || !value.value.trim()) throw new Error(t('AI Studio key 不能为空'))
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(msg('AI Studio key 请求格式无效'))
+      if (typeof value.value !== 'string' || !value.value.trim()) throw new Error(msg('AI Studio key 不能为空'))
       return { value: value.value.trim() }
     }
     function parseAistudioKeyStatusRequest(value) {
       if (value === undefined || value === null) return undefined
-      if (typeof value !== 'object' || Array.isArray(value)) throw new Error(t('AI Studio key 状态请求格式无效'))
+      if (typeof value !== 'object' || Array.isArray(value)) throw new Error(msg('AI Studio key 状态请求格式无效'))
       return undefined
     }
     function parseAistudioModelsResult(value) {
-      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(t('AI Studio 目录返回格式无效'))
-      if (!['ok', 'error'].includes(value.status) || !Array.isArray(value.models)) throw new Error(t('AI Studio 目录返回格式无效'))
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(msg('AI Studio 目录返回格式无效'))
+      if (!['ok', 'error'].includes(value.status) || !Array.isArray(value.models)) throw new Error(msg('AI Studio 目录返回格式无效'))
       return value
     }
     function parseAistudioKeyResult(value) {
-      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(t('AI Studio key 返回格式无效'))
-      if (!['ok', 'error'].includes(value.status)) throw new Error(t('AI Studio key 返回格式无效'))
-      if (value.message !== undefined && typeof value.message !== 'string') throw new Error(t('AI Studio key 返回格式无效'))
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(msg('AI Studio key 返回格式无效'))
+      if (!['ok', 'error'].includes(value.status)) throw new Error(msg('AI Studio key 返回格式无效'))
+      if (value.message !== undefined && typeof value.message !== 'string') throw new Error(msg('AI Studio key 返回格式无效'))
       return value
     }
     function parseAistudioKeyStatusResult(value) {
-      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(t('AI Studio key 状态返回格式无效'))
-      if (!['ok', 'error'].includes(value.status) || typeof value.configured !== 'boolean' || typeof value.writable !== 'boolean') throw new Error(t('AI Studio key 状态返回格式无效'))
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(msg('AI Studio key 状态返回格式无效'))
+      if (!['ok', 'error'].includes(value.status) || typeof value.configured !== 'boolean' || typeof value.writable !== 'boolean') throw new Error(msg('AI Studio key 状态返回格式无效'))
       for (const field of ['source', 'masked', 'message']) {
-        if (value[field] !== undefined && typeof value[field] !== 'string') throw new Error(t('AI Studio key 状态返回格式无效'))
+        if (value[field] !== undefined && typeof value[field] !== 'string') throw new Error(msg('AI Studio key 状态返回格式无效'))
       }
       return value
     }
@@ -2194,7 +2197,7 @@ window.__ModuleLoader__.load({
     function parseVertexModelsResult(value) {
       if (value?.status === 'ok' && Array.isArray(value.ids) && value.ids.length <= 512 && value.ids.every(id => typeof id === 'string')) return { status: 'ok', ids: value.ids }
       if (value?.status === 'error' && typeof value.message === 'string') return { status: 'error', message: value.message }
-      throw new Error(t('Vertex AI 目录读取失败，请重试。'))
+      throw new Error(msg('Vertex AI 目录读取失败，请重试。'))
     }
 
     function parseVertexModelsRequest(value) {
@@ -2215,7 +2218,7 @@ window.__ModuleLoader__.load({
       return async (scope) => {
         const service = ctx.get('remote.agyVertex')
         if (typeof service?.models !== 'function') return { status: 'error', message: t('Vertex AI 目录服务未就绪。') }
-        return await withTimeout(service.models(scope), 60_000, t('Vertex AI 目录读取失败，请重试。'))
+        return await withTimeout(service.models(scope), 60_000, msg('Vertex AI 目录读取失败，请重试。'))
       }
     }
 
@@ -2223,8 +2226,13 @@ window.__ModuleLoader__.load({
       name: 'dsh-bundle-antigravity-host',
       // remote.settings / remote.llm 必须逐个声明：remote 各命名空间是独立服务，
       // 漏声明会在读取属性时抛「without inject」并击穿 settings.section 卡片。
-      inject: ['slots', 'remote', 'remote.settings', 'remote.llm'],
+      inject: ['locale', 'slots', 'remote', 'remote.settings', 'remote.llm'],
       apply(ctx) {
+        ctx.effect(() => {
+          const locale = ctx.locale
+          dshLocale = locale
+          return () => { if (dshLocale === locale) dshLocale = undefined }
+        }, 'antigravity: locale source')
         ctx.effect(() => {
           if (typeof document === 'undefined' || !document.head || !document.createElement) return () => {}
           const style = document.createElement('style')
