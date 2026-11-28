@@ -4,13 +4,13 @@ import type { ToolSchema } from '@deepseek-ai/dsh-llm'
 import { parsePermissionHandoff } from '../src/adapter/permission-handoff.js'
 
 const tools: ToolSchema[] = [{ name: 'read', description: 'Read a file', parameters: { type: 'object', properties: { path: { type: 'string' } } } }]
-const context = { sessionId: 'current', serverName: 'dsh-tools', tools }
+const context = { sessionId: 'current', serverName: 'dsh', tools }
 function request(): RequestPermissionRequest {
   return {
     sessionId: 'current',
     toolCall: {
       toolCallId: 'official-call', kind: 'other',
-      _meta: { is_mcp_tool_call: true, mcp: { server: 'dsh-tools', tool: 'read' } },
+      _meta: { is_mcp_tool_call: true, mcp: { server: 'dsh', tool: 'read' } },
       rawInput: { arguments: { path: 'a.txt' }, path: 'a.txt' },
     },
     options: [{ optionId: 'allow', name: 'Allow', kind: 'allow_once' }],
@@ -26,14 +26,14 @@ describe('ACP 私有 MCP 权限路由解析（依赖会话禁用内置工具）'
     const value = request()
     delete value.toolCall._meta
     value.toolCall.name = 'call_mcp_tool'
-    value.toolCall.title = 'dsh-tools_read'
-    value.toolCall.rawInput = { ServerName: 'dsh-tools', ToolName: 'read', Arguments: { path: 'a.txt' } }
+    value.toolCall.title = 'dsh_read'
+    value.toolCall.rawInput = { ServerName: 'dsh', ToolName: 'read', Arguments: { path: 'a.txt' } }
     expect(parsePermissionHandoff(value, context)).toBeUndefined()
   })
 
   it('旧会话、未知工具和外部服务器不转交', () => {
     const foreign = request(); foreign.sessionId = 'old'
-    const unknown = request(); unknown.toolCall._meta = { is_mcp_tool_call: true, mcp: { server: 'dsh-tools', tool: 'unknown' } }
+    const unknown = request(); unknown.toolCall._meta = { is_mcp_tool_call: true, mcp: { server: 'dsh', tool: 'unknown' } }
     const other = request(); other.toolCall._meta = { is_mcp_tool_call: true, mcp: { server: 'other', tool: 'read' } }
     for (const value of [foreign, unknown, other]) expect(parsePermissionHandoff(value, context)).toBeUndefined()
     expect(parsePermissionHandoff(request(), { ...context, tools: [] })).toBeUndefined()
@@ -49,7 +49,7 @@ describe('ACP 私有 MCP 权限路由解析（依赖会话禁用内置工具）'
     expect(parsePermissionHandoff(value, context)?.name).toBe('read')
   })
 
-  it.each(['Run read?', 'Run dsh-tools_read?'])('官方 eager 工具格式 %s 无 MCP 元数据也能进入桥', (title) => {
+  it.each(['Run read?', 'Run dsh_read?'])('官方 eager 工具格式 %s 无 MCP 元数据也能进入桥', (title) => {
     const value = request()
     delete value.toolCall._meta
     value.toolCall.title = title
@@ -57,7 +57,7 @@ describe('ACP 私有 MCP 权限路由解析（依赖会话禁用内置工具）'
     expect(parsePermissionHandoff(value, context)).toEqual({ name: 'read', arguments: '{"path":"a.txt"}' })
   })
 
-  it.each(['mcp_dsh-tools_read', 'mcp_dsh-tools_a4a4b434_read'])('识别新版 CLI 名称 %s，不提取权限提示参数', (name) => {
+  it.each(['mcp_dsh_read', 'mcp_dsh_a4a4b434_read'])('识别新版 CLI 名称 %s，不提取权限提示参数', (name) => {
     const value = request()
     value.toolCall = { toolCallId: 'official-call', name, title: `Run ${name}`, rawInput: { toolSummary: 'Read a file' } }
     expect(parsePermissionHandoff(value, context)).toEqual({ name: 'read' })
@@ -66,18 +66,19 @@ describe('ACP 私有 MCP 权限路由解析（依赖会话禁用内置工具）'
   })
 
   it.each([
+    ['mcp_dsh-tools_read', 'Run mcp_dsh-tools_read'],
     ['mcp_other-tools_read', 'Run mcp_other-tools_read'],
     ['mcp_other-tools_a4a4b434_read', 'Run mcp_other-tools_a4a4b434_read'],
-    ['mcp_dsh-tools_unknown', 'Run mcp_dsh-tools_unknown'],
-    ['mcp_dsh-tools_a4a4b434_unknown', 'Run mcp_dsh-tools_a4a4b434_unknown'],
-    ['mcp_dsh-tools_a4a4b43_read', 'Run mcp_dsh-tools_a4a4b43_read'],
-    ['mcp_dsh-tools_a4a4b4341_read', 'Run mcp_dsh-tools_a4a4b4341_read'],
-    ['mcp_dsh-tools_A4A4B434_read', 'Run mcp_dsh-tools_A4A4B434_read'],
-    ['mcp_dsh-tools_a4a4b434_read', 'Run mcp_dsh-tools_read'],
-    ['mcp_dsh-tools_read', 'Run mcp_dsh-tools_read extra text'],
-    ['mcp_dsh-tools_read', 'Run read?'],
-    ['run_command', 'Run mcp_dsh-tools_read'],
-    [undefined, 'Run mcp_dsh-tools_read'],
+    ['mcp_dsh_unknown', 'Run mcp_dsh_unknown'],
+    ['mcp_dsh_a4a4b434_unknown', 'Run mcp_dsh_a4a4b434_unknown'],
+    ['mcp_dsh_a4a4b43_read', 'Run mcp_dsh_a4a4b43_read'],
+    ['mcp_dsh_a4a4b4341_read', 'Run mcp_dsh_a4a4b4341_read'],
+    ['mcp_dsh_A4A4B434_read', 'Run mcp_dsh_A4A4B434_read'],
+    ['mcp_dsh_a4a4b434_read', 'Run mcp_dsh_read'],
+    ['mcp_dsh_read', 'Run mcp_dsh_read extra text'],
+    ['mcp_dsh_read', 'Run read?'],
+    ['run_command', 'Run mcp_dsh_read'],
+    [undefined, 'Run mcp_dsh_read'],
   ])('拒绝未命中当前目录或名称与标题不一致的请求：%s / %s', (name, title) => {
     const value = request()
     value.toolCall = { toolCallId: 'official-call', name, title }
@@ -86,7 +87,7 @@ describe('ACP 私有 MCP 权限路由解析（依赖会话禁用内置工具）'
 
   it.each([true, undefined])('外部 MCP 元数据存在时不回退到新版 CLI 名称匹配（标记=%s）', (marked) => {
     const value = request()
-    value.toolCall.name = 'mcp_dsh-tools_read'
+    value.toolCall.name = 'mcp_dsh_read'
     value.toolCall.title = `Run ${value.toolCall.name}`
     value.toolCall._meta = { is_mcp_tool_call: marked, mcp: { server: 'external', tool: 'read' } }
     expect(parsePermissionHandoff(value, context)).toBeUndefined()
@@ -94,7 +95,7 @@ describe('ACP 私有 MCP 权限路由解析（依赖会话禁用内置工具）'
 
   it('目录中两种名称写法解析为不同工具时拒绝转交', () => {
     const value = request()
-    value.toolCall = { toolCallId: 'official-call', name: 'mcp_dsh-tools_a4a4b434_read', title: 'Run mcp_dsh-tools_a4a4b434_read' }
+    value.toolCall = { toolCallId: 'official-call', name: 'mcp_dsh_a4a4b434_read', title: 'Run mcp_dsh_a4a4b434_read' }
     const exact = { ...tools[0]!, name: 'a4a4b434_read' }
     expect(parsePermissionHandoff(value, { ...context, tools: [exact] })).toEqual({ name: exact.name })
     expect(parsePermissionHandoff(value, { ...context, tools: [...tools, exact] })).toBeUndefined()

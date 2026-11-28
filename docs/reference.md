@@ -93,10 +93,12 @@ dsh plugin --profile web add ./dsh-bundle-antigravity-host-0.1.56.tgz
 工具链路：
 
 1. 插件通过宿主 `ctx.subprocess` 以 stdio 启动官方 ACP server。
-2. 会话使用厂商扩展 `_meta.antigravity.enabledTools: []` 关闭内置工具，使用 `eagerMcpServers: ["dsh-tools"]` 提供当前 DSH 工具 schema。此扩展的实测适配基准是官方 server 1.4.0；默认下载版本已升至 1.5.2（发行布局与入口命名经全平台离线核对一致），但 1.5.2 的协议行为与厂商扩展尚未实机验收，不保证任意版本同样实现。
+2. 会话使用厂商扩展 `_meta.antigravity.enabledTools: []` 关闭内置工具，使用 `eagerMcpServers: ["dsh"]` 提供当前 DSH 工具 schema。这些扩展的实测适配基准是官方 server 1.4.0，默认下载版本为 1.5.2。
 3. 私有 MCP 桥仅绑定 `127.0.0.1`，新建或重建带工具的 ACP 会话时轮换 token 与授权代次；同一会话复用时保留授权，目录/归属变化则重建。
-4. ACP 权限提示只对已识别私有桥请求选择 `allow_once`。Antigravity CLI 1.5.15+ 格式要求 `Run <name>` 与当前工具目录中的 `mcp_dsh-tools_<tool>` 或 `mcp_dsh-tools_<8 位小写十六进制>_<tool>` 精确且无歧义地匹配；其中的工具摘要不参与参数预检。经鉴权的 `tools/call` 到桥后才挂起，并以 `tool-call` 交给 DSH。
+4. ACP 权限提示只对已识别私有桥请求选择 `allow_once`。Antigravity CLI 1.5.15+ 格式要求 `Run <name>` 与当前工具目录中的 `mcp_dsh_<tool>` 或 `mcp_dsh_<8 位小写十六进制>_<tool>` 精确且无歧义地匹配；其中的工具摘要不参与参数预检。经鉴权的 `tools/call` 到桥后才挂起，并以 `tool-call` 交给 DSH。
 5. DSH 负责校验、审批、执行；工具结果按调用 ID 匹配，携带 `isError` 回填同一 ACP prompt。支持乱序结果与后续批次。
+
+短桥名为上游的 64 字符限制留出空间：无后缀的 `mcp_dsh_` 占 8 字符，带八位后缀时前缀占 17 字符。插件不改写超过剩余预算的 DSH 工具名。
 
 桥可按 schema 修正常见、无歧义的参数别名，如 `path` / `AbsolutePath` → `file_path`、`CommandLine` → `command`。不覆盖已有字段，不猜多目标映射，不换算超时单位，不编造缺失说明。缺必填键时返回 `AGY_BRIDGE_INVALID_ARGUMENTS` 与正确签名，不进入 DSH；字段类型与取值仍由 DSH 校验。
 

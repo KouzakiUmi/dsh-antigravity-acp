@@ -1102,7 +1102,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       : options.reasoningEffort === undefined && setting.effort !== undefined
         ? { effort: setting.effort }
         : undefined
-    return routeFingerprint(options, override)
+    return routeFingerprint(options, override, options.tools?.length ? BRIDGE_MCP_SERVER_NAME : undefined)
   }
 
   /**
@@ -1117,7 +1117,7 @@ export class AntigravityAcpAdapter extends LlmAdapter {
       return undefined
     }
     if (entry.cwd !== this.#cwd) return discard('会话工作目录与当前不一致')
-    if (entry.route !== this.#sessionRouteFingerprint(options)) return discard('模型、系统提示或工具目录已变化')
+    if (entry.route !== this.#sessionRouteFingerprint(options)) return discard('模型、系统提示、工具目录或 MCP 桥已变化')
     if (options.messages.length <= entry.sentCount) return discard('没有新增消息')
     if (!prefixMatches(options.messages, entry.sentCount, entry.sentHash)) return discard('历史不是已发送前缀的追加')
     if (!outputMatches(options.messages.slice(entry.sentCount), entry.outputHash)) return discard('上一轮输出已变化或来自其他会话')

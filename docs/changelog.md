@@ -6,6 +6,7 @@
 
 ## 未发布
 
+- **ACP 私有 MCP 桥**：注册名由 `dsh-tools` 缩为 `dsh`，[#26](https://github.com/KouzakiUmi/dsh-antigravity-acp/issues/26) 报告中的拼接工具名由 65 字符降为 59；原工具名与 schema 不变。升级后旧的带工具会话按 DSH 历史重建，不继续载入按旧桥名缓存的 schema。
 - **界面语言**：插件设置和额度药丸跟随 DSH 的语言设置，切换语言时保留未保存的模型设置；支持简体中文，其他语言显示英文。原生模型选择器的 ACP 思考档位与代理模式统一为 `Low / Medium / High`，档位 ID 不变。见 [PR #27](https://github.com/KouzakiUmi/dsh-antigravity-acp/pull/27)。
 - **ACP 工具调用**：识别 Antigravity CLI 1.5.15+ 的 MCP 权限提示格式，兼容服务器名带 8 位小写十六进制后缀的写法。权限提示中的工具摘要不参与参数预检或执行；实际参数仍由私有 MCP 桥转交 DSH。见 [PR #28](https://github.com/KouzakiUmi/dsh-antigravity-acp/pull/28)。
 

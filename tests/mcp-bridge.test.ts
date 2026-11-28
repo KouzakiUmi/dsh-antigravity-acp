@@ -35,6 +35,7 @@ interface Endpoint {
 /** ACP session/new 注册的 http 型 MCP server 的形状（按 SDK 运行期数据窄化）。 */
 interface HttpMcpRegistration {
   type: string
+  name: string
   url: string
   headers: Array<{ name: string; value: string }>
 }
@@ -240,7 +241,23 @@ describe('MCP 桥多会话隔离', () => {
     const client = await connectClient(endpoint, 'agent-session-1')
     expect((await client.listTools()).tools.map((tool) => tool.name)).toEqual(['read_file'])
     expect(endpointOf(bridge).headers[BRIDGE_AUTH_HEADER]).toBe(`Bearer ${bridge.token}`)
-    expect(BRIDGE_MCP_SERVER_NAME).toBe('dsh-tools')
+  })
+
+  it('短桥名使 #26 的工具进入 64 字符预算，MCP 名称与 schema 原样发布', async () => {
+    const bridge = makeBridge()
+    const name = 'mcp__wincu__windows_computer_use_accessibility_tree'
+    const inputSchema = { type: 'object' as const, properties: { treeDeltaBase: { type: 'string' } } }
+    bridge.publishTools([{ name, description: 'Regression fixture', parameters: inputSchema }])
+    await bridge.start()
+    const registration = bridge.acpRegistration()[0] as HttpMcpRegistration
+    expect(registration.name).toBe('dsh')
+    const client = await connectClient(endpointOf(bridge), 'name-budget-check')
+    expect(client.getServerVersion()?.name).toBe(registration.name)
+    const { tools } = await client.listTools()
+    expect(tools).toMatchObject([{ name, inputSchema }])
+    expect(`mcp_dsh-tools_${name}`).toHaveLength(65)
+    expect(`mcp_${registration.name}_${tools[0]!.name}`).toMatch(/^[a-zA-Z0-9_-]{1,64}$/)
+    expect(`mcp_${registration.name}_${tools[0]!.name}`).toHaveLength(59)
   })
 
   it('切换回合时关闭上一回合的 MCP 会话通道，旧 session id 被拒', async () => {

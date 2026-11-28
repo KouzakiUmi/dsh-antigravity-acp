@@ -57,6 +57,7 @@ npm 包名 `dsh-bundle-antigravity-host`、provider ID `antigravity-acp` / `anti
 
 - 协议约束不是 OS 沙箱；ACP fs / terminal 与未知原生权限请求一律拒绝。
 - ACP 权限提示路由集中在 [`permission-handoff.ts`](src/adapter/permission-handoff.ts)：保留旧版元数据和固定标题格式；新版 CLI 的名称和标题须唯一匹配当前会话的桥工具。工具摘要不参加参数诊断，执行仍取自已鉴权的 MCP `tools/call`，由 DSH 审批。
+- 私有 MCP 桥使用短注册名 `dsh`（[#26](https://github.com/KouzakiUmi/dsh-antigravity-acp/issues/26)），不改宿主工具名或 schema。带工具的 ACP 路由指纹包含桥名；升级后旧映射按 DSH 历史重建，不带工具的映射不受影响。
 - 官方 agent 对超约 60KB 的 MCP 工具目录会丢弃工具（issue #18 探针实测）；插件按 `toolCatalogByteBudget`（默认 55000，0 禁用）在发布前把描述总量裁进预算，名称与参数不变，被裁描述带标记并写宿主日志（[`tool-catalog.ts`](src/adapter/tool-catalog.ts)）。
 - 编排模式的 planner 阶段不经过 DSH 审批：ACP 链路在会话工作目录下运行官方 `mode=plan`，官方内置工具仍会执行只读命令，计划文件写在官方 brain 目录；代理链路的 planner 请求不声明工具。两条链路的 planner 会话都不注册 MCP 桥，DSH 工具只由 executor 轮次调用。
 - `temperature` / `stop` 无 ACP v1 会话通道，记录警告并忽略；`maxTokens` 忽略；`reasoningEffort` 是家族 → 档位的路由键。
